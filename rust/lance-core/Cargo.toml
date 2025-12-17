@@ -24,6 +24,7 @@ datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
 deepsize.workspace = true
 futures.workspace = true
+itertools.workspace = true
 libc.workspace = true
 mock_instant.workspace = true
 moka.workspace = true
@@ -51,6 +52,7 @@ libc = { version = "0.2" }
 [dev-dependencies]
 lance-testing.workspace = true
 proptest.workspace = true
+rstest.workspace = true
 
 [features]
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]

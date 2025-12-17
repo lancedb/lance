@@ -71,6 +71,41 @@ jobs:
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
           EOF
+      - name: Copy contributing docs
+        run: |
+          mkdir -p docs/src/community/project-specific/lance
+
+          # Lance project files
+          cp CONTRIBUTING.md docs/src/community/project-specific/lance/general.md
+          cp release_process.md docs/src/community/project-specific/lance/release.md
+          cp rust/CONTRIBUTING.md docs/src/community/project-specific/lance/rust.md
+          cp python/CONTRIBUTING.md docs/src/community/project-specific/lance/python.md
+          cp docs/CONTRIBUTING.md docs/src/community/project-specific/lance/docs.md
+
+          # External project files
+          cp lance-ray/CONTRIBUTING.md docs/src/community/project-specific/ray.md
+          cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
+          cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
+
+          # Create .pages for project-specific
+          cat > docs/src/community/project-specific/.pages << 'EOF'
+          nav:
+            - index.md
+            - Lance: lance
+            - Lance Namespace: namespace.md
+            - Lance Ray: ray.md
+            - Lance Spark: spark.md
+          EOF
+
+          # Create .pages for lance subfolder
+          cat > docs/src/community/project-specific/lance/.pages << 'EOF'
+          nav:
+            - General: general.md
+            - Release: release.md
+            - Rust: rust.md
+            - Python: python.md
+            - Docs: docs.md
+          EOF
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

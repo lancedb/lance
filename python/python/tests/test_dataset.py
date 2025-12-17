@@ -1181,6 +1181,44 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
+def test_cleanup_with_retain_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_policy"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.versions()) == 4
+    stats = ds.cleanup_old_versions(retain_versions=3)
+    assert stats.old_versions == 1
+    assert len(ds.versions()) == 3
+    assert ds.count_rows() == len(ds.to_table())
+
+
+def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_policy"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    moment = datetime.now()
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    stats = ds.cleanup_old_versions(
+        older_than=datetime.now() - moment, retain_versions=2
+    )
+    assert stats.old_versions == 2
+    assert len(ds.versions()) == 2
+    assert ds.count_rows() == len(ds.to_table())
+
+
 def test_auto_cleanup(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2501,10 +2539,14 @@ def test_add_null_columns_with_conflict_names(tmp_path: Path):
     assert len(fragments) == 1
     assert len(fragments[0].data_files()) == 1
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns(pa.field("id", pa.float32()))
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
 
 

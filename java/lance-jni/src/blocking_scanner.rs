@@ -55,7 +55,7 @@ impl BlockingScanner {
 // Write Methods //
 ///////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'local>(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject,
     jdataset: JObject,
@@ -165,13 +165,7 @@ fn inner_create_scanner<'local>(
         scanner.with_row_address();
     }
 
-    let query_is_present = env.call_method(&query_obj, "isPresent", "()Z", &[])?.z()?;
-
-    if query_is_present {
-        let java_obj = env
-            .call_method(&query_obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-
+    env.get_optional(&query_obj, |env, java_obj| {
         // Set column and key for nearest search
         let column = env.get_string_from_method(&java_obj, "getColumn")?;
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
@@ -207,17 +201,12 @@ fn inner_create_scanner<'local>(
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
         scanner.use_index(use_index);
-    }
+        Ok(())
+    })?;
+
     scanner.batch_readahead(batch_readahead as usize);
 
-    let column_orders_is_present = env
-        .call_method(&column_orderings, "isPresent", "()Z", &[])?
-        .z()?;
-    if column_orders_is_present {
-        let java_obj = env
-            .call_method(&column_orderings, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-
+    env.get_optional(&column_orderings, |env, java_obj| {
         let list = env.get_list(&java_obj)?;
         let mut iter = list.iter(env)?;
         let mut results = Vec::with_capacity(list.size(env)? as usize);
@@ -233,14 +222,15 @@ fn inner_create_scanner<'local>(
             results.push(col_order)
         }
         scanner.order_by(Some(results))?;
-    }
+        Ok(())
+    })?;
 
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_releaseNativeScanner(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_releaseNativeScanner(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) {
@@ -277,7 +267,7 @@ fn attach_native_scanner<'local>(
 }
 
 fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let res = env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])?;
+    let res = env.new_object("org/lance/ipc/LanceScanner", "()V", &[])?;
     Ok(res)
 }
 
@@ -285,7 +275,7 @@ fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
 // Read Methods //
 //////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
     mut env: JNIEnv,
     j_scanner: JObject,
     stream_addr: jlong,
@@ -305,7 +295,7 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_importFfiSchema(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_importFfiSchema(
     mut env: JNIEnv,
     j_scanner: JObject,
     schema_addr: jlong,
@@ -328,7 +318,7 @@ fn inner_import_ffi_schema(env: &mut JNIEnv, j_scanner: JObject, schema_addr: jl
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_nativeCountRows(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeCountRows(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) -> jlong {

@@ -23,11 +23,11 @@ info:
     
     The `components/schemas`, `components/responses`, `components/examples`, `tags` sections define
     the request and response shape for each operation in a Lance Namespace across all implementations.
-    See https://lancedb.github.io/lance-namespace/spec/operations for more details.
+    See https://lance.org/format/namespace/operations for more details.
     
     The `servers`, `security`, `paths`, `components/parameters` sections are for the 
     Lance REST Namespace implementation, which defines a complete REST server that can work with Lance datasets.
-    See https://lancedb.github.io/lance-namespace/spec/impls/rest for more details.
+    See https://lance.org/format/namespace/impls/rest for more details.
 servers:
   - url: "{scheme}://{host}:{port}/{basePath}"
     description: Generic server URL with all parts configurable

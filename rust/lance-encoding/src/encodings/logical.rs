@@ -3,5 +3,6 @@
 
 pub mod blob;
 pub mod list;
+pub mod map;
 pub mod primitive;
 pub mod r#struct;

@@ -2,12 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::datafusion::LanceTableProvider;
+use crate::dataset::utils::SchemaAdapter;
 use crate::Dataset;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
+use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -75,6 +77,7 @@ impl SqlQueryBuilder {
                 row_addr,
             )),
         )?;
+        register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
     }
@@ -90,7 +93,18 @@ impl SqlQuery {
     }
 
     pub async fn into_stream(self) -> lance_core::Result<SendableRecordBatchStream> {
-        self.dataframe.execute_stream().await.map_err(|e| e.into())
+        let exec_node = self
+            .dataframe
+            .execute_stream()
+            .await
+            .map_err(lance_core::Error::from)?;
+        let schema = exec_node.schema();
+        if SchemaAdapter::requires_logical_conversion(&schema) {
+            let adapter = SchemaAdapter::new(schema);
+            Ok(adapter.to_logical_stream(exec_node))
+        } else {
+            Ok(exec_node)
+        }
     }
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
@@ -109,11 +123,18 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use crate::Dataset;
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
-
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use arrow_schema::{DataType, Field};
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_datagen::{array, gen_batch};
 
     #[tokio::test]
@@ -279,5 +300,69 @@ mod tests {
   "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_nested_json_access() {
+        let json_rows = vec![
+            Some(r#"{"user": {"profile": {"name": "Alice", "settings": {"theme": "dark"}}}}"#),
+            Some(r#"{"user": {"profile": {"name": "Bob", "settings": {"theme": "light"}}}}"#),
+        ];
+        let json_array = StringArray::from(json_rows);
+        let id_array = Int32Array::from(vec![1, 2]);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(json_array)],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let ds = Dataset::write(reader, "memory://test_nested_json_access", None)
+            .await
+            .unwrap();
+
+        let results = ds
+            .sql(
+                "SELECT id FROM dataset WHERE \
+                 json_get_string(json_get(json_get(data, 'user'), 'profile'), 'name') = 'Alice'",
+            )
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(batch.num_rows(), 1);
+        pretty_assertions::assert_eq!(batch.num_columns(), 1);
+        pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+
+        let results = ds
+            .sql(
+                "SELECT id FROM dataset WHERE \
+                 json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'",
+            )
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(batch.num_rows(), 1);
+        pretty_assertions::assert_eq!(batch.num_columns(), 1);
+        pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
     }
 }

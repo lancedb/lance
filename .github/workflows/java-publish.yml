@@ -4,6 +4,9 @@ on:
     # Trigger on published to include both stable and preview/beta releases
     types: [published]
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - .github/workflows/java-publish.yml
   workflow_dispatch:
@@ -24,7 +27,7 @@ on:
 jobs:
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-2404-8x-arm64
+    runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 60
     steps:
       - name: Checkout repository

@@ -11,7 +11,7 @@ use lance_namespace_impls::DirectoryNamespaceBuilder;
 #[cfg(feature = "rest")]
 use lance_namespace_impls::RestNamespaceBuilder;
 #[cfg(feature = "rest-adapter")]
-use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig};
+use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
@@ -356,20 +356,23 @@ impl PyRestNamespace {
 pub struct PyRestAdapter {
     backend: Arc<dyn lance_namespace::LanceNamespace>,
     config: RestAdapterConfig,
+    handle: Option<RestAdapterHandle>,
 }
 
 #[cfg(feature = "rest-adapter")]
 #[pymethods]
 impl PyRestAdapter {
-    /// Create a new REST adapter server with namespace configuration
+    /// Create a new REST adapter server with namespace configuration.
+    /// Default port is 2333 per REST spec. Use port 0 to let OS assign an ephemeral port.
+    /// Use `port` property after `start()` to get the actual port.
     #[new]
-    #[pyo3(signature = (namespace_impl, namespace_properties, session = None, host = "127.0.0.1".to_string(), port = 2333))]
+    #[pyo3(signature = (namespace_impl, namespace_properties, session = None, host = None, port = None))]
     fn new(
         namespace_impl: String,
         namespace_properties: Option<&Bound<'_, PyDict>>,
         session: Option<&Bound<'_, Session>>,
-        host: String,
-        port: u16,
+        host: Option<String>,
+        port: Option<u16>,
     ) -> PyResult<Self> {
         let mut props = HashMap::new();
 
@@ -377,13 +380,11 @@ impl PyRestAdapter {
             props = dict_to_hashmap(dict)?;
         }
 
-        // Use ConnectBuilder to build namespace from impl and properties
         let mut builder = ConnectBuilder::new(namespace_impl);
         for (k, v) in props {
             builder = builder.property(k, v);
         }
 
-        // Add session if provided
         if let Some(sess) = session {
             builder = builder.session(sess.borrow().inner.clone());
         }
@@ -392,30 +393,44 @@ impl PyRestAdapter {
             .block_on(None, builder.connect())?
             .infer_error()?;
 
-        let config = RestAdapterConfig { host, port };
+        let mut config = RestAdapterConfig::default();
+        if let Some(h) = host {
+            config.host = h;
+        }
+        if let Some(p) = port {
+            config.port = p;
+        }
 
-        Ok(Self { backend, config })
+        Ok(Self {
+            backend,
+            config,
+            handle: None,
+        })
+    }
+
+    /// Get the actual port the server is listening on.
+    /// Returns 0 if server is not started yet.
+    #[getter]
+    fn port(&self) -> u16 {
+        self.handle.as_ref().map(|h| h.port()).unwrap_or(0)
     }
 
     /// Start the REST server in the background
-    fn serve(&mut self, py: Python) -> PyResult<()> {
+    fn start(&mut self, py: Python) -> PyResult<()> {
         let adapter = RestAdapter::new(self.backend.clone(), self.config.clone());
+        let handle = crate::rt()
+            .block_on(Some(py), adapter.start())?
+            .infer_error()?;
 
-        crate::rt().spawn_background(Some(py), async move {
-            let _ = adapter.serve().await;
-        });
-
-        // Give server time to start
-        py.allow_threads(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        });
-
+        self.handle = Some(handle);
         Ok(())
     }
 
     /// Stop the REST server
     fn stop(&mut self) {
-        // Server will be stopped when dropped
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+        }
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

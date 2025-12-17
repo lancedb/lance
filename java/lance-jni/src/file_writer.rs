@@ -58,12 +58,12 @@ fn attach_native_writer<'local>(
 }
 
 fn create_java_writer_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let res = env.new_object("com/lancedb/lance/file/LanceFileWriter", "()V", &[])?;
+    let res = env.new_object("org/lance/file/LanceFileWriter", "()V", &[])?;
     Ok(res)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
     file_uri: JString,
@@ -123,7 +123,7 @@ fn inner_open<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_closeNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
 ) -> JObject<'local> {
@@ -150,7 +150,36 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_closeNative<'
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_writeNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_nativeAddSchemaMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> JObject<'local> {
+    if let Err(e) = inner_add_schema_metadata(&mut env, writer, schema_metadata) {
+        e.throw(&mut env);
+        return JObject::null();
+    }
+    JObject::null()
+}
+
+fn inner_add_schema_metadata(
+    env: &mut JNIEnv<'_>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> Result<()> {
+    let metadata_map = JMap::from_env(env, &schema_metadata)?;
+    let metadata = to_rust_map(env, &metadata_map)?;
+    let writer_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingFileWriter>(writer, NATIVE_WRITER) }?;
+    let mut writer = writer_guard.inner.lock().unwrap();
+    metadata.into_iter().for_each(|(k, v)| {
+        writer.add_schema_metadata(k, v);
+    });
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_writeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
     batch_address: jlong,

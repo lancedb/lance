@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::exec::{get_session_context, LanceExecutionOptions};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
@@ -19,10 +20,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor
 use datafusion::common::DFSchema;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::{SessionContext, SessionState};
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -163,22 +161,9 @@ struct LanceContextProvider {
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let config = SessionConfig::new();
-        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
-
-        let ctx = SessionContext::new_with_config_rt(config.clone(), runtime.clone());
-        crate::udf::register_functions(&ctx);
-
+        let ctx = get_session_context(&LanceExecutionOptions::default());
         let state = ctx.state();
-
-        // SessionState does not expose expr_planners, so we need to get them separately
-        let mut state_builder = SessionStateBuilder::new()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .with_default_features();
-
-        // unwrap safe because with_default_features sets expr_planners
-        let expr_planners = state_builder.expr_planners().as_ref().unwrap().clone();
+        let expr_planners = state.expr_planners().to_vec();
 
         Self {
             options: ConfigOptions::default(),
@@ -835,8 +820,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL filter clause.
     ///
-    /// Note: the returned expression must be passed through [optimize_expr()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_expr()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let ast_expr = parse_sql_filter(filter)?;
@@ -854,8 +839,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
-    /// Note: the returned expression must be passed through [optimize_filter()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_filter()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         if self.schema.field_with_name(expr).is_ok() {
             return Ok(col(expr));

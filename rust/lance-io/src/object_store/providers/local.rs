@@ -31,6 +31,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
@@ -51,11 +52,10 @@ impl ObjectStoreProvider for FileStoreProvider {
 
     fn calculate_object_store_prefix(
         &self,
-        scheme: &str,
-        _authority: &str,
+        url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        Ok(scheme.to_string())
+        Ok(url.scheme().to_string())
     }
 }
 
@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(
             "file",
             provider
-                .calculate_object_store_prefix("file", "etc", None)
+                .calculate_object_store_prefix(&Url::parse("file:///etc").unwrap(), None)
                 .unwrap()
         );
     }
@@ -100,7 +100,10 @@ mod tests {
         assert_eq!(
             "file-object-store",
             provider
-                .calculate_object_store_prefix("file-object-store", "etc", None)
+                .calculate_object_store_prefix(
+                    &Url::parse("file-object-store:///etc").unwrap(),
+                    None
+                )
                 .unwrap()
         );
     }

@@ -42,12 +42,14 @@ macro_rules! ok_or_throw_with_return {
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
+mod delta;
 pub mod error;
 pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
 mod merge_insert;
+mod namespace;
 mod optimize;
 mod schema;
 mod sql;
@@ -133,7 +135,7 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_JniLoader_initLanceLogger() {
+pub extern "system" fn Java_org_lance_JniLoader_initLanceLogger() {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");

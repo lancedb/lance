@@ -52,6 +52,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
+    IOStats,
     LanceSchema,
     ScanStatistics,
     _Dataset,
@@ -70,11 +71,13 @@ from .udf import batch_udf as batch_udf
 from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
-    from lance_namespace import LanceNamespace
     from pyarrow._compute import Expression
+
+    from lance.namespace import LanceNamespace
 
     from .commit import CommitLock
     from .io import StorageOptionsProvider
+    from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
 
@@ -645,7 +648,26 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.checkout_latest()
 
     def list_indices(self) -> List[Index]:
+        """
+        Returns index information for all indices in the dataset.
+
+        This method is deprecated as it requires loading the statistics for each index
+        which can be a very expensive operation.  Instead use describe_indices() to
+        list index information and index_statistics() to get the statistics for
+        individual indexes of interest.
+        """
+        # TODO: https://github.com/lancedb/lance/issues/5237 deprecate this method
+        # warnings.warn(
+        #     "The 'list_indices' method is deprecated.  It may be removed in a future"
+        #     "version.  Use describe_indices() instead.",
+        #     DeprecationWarning,
+        # )
+
         return self._ds.load_indices()
+
+    def describe_indices(self) -> List[IndexDescription]:
+        """Returns index information for all indices in the dataset."""
+        return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -702,7 +724,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -964,7 +986,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -1346,6 +1368,87 @@ class LanceDataset(pa.dataset.Dataset):
             return None
         return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
 
+    def io_stats_snapshot(self) -> IOStats:
+        """
+        Get a snapshot of current IO statistics without resetting counters.
+
+        Returns the current IO statistics without modifying the internal state.
+        Use this when you need to check stats without resetting them. Multiple
+        calls will return the same values until IO operations are performed.
+
+        Returns
+        -------
+        IOStats
+            Object containing IO statistics with the following attributes:
+            - read_iops: Number of read operations
+            - read_bytes: Total bytes read
+            - write_iops: Number of write operations
+            - write_bytes: Total bytes written
+            - num_hops: Number of network hops (for remote storage)
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://test_stats")
+        >>> result = dataset.to_table()
+        >>> # Check stats without resetting
+        >>> stats = dataset.io_stats_snapshot()
+        >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+        Read ... bytes in ... operations
+        >>> # Can check again and see the same values
+        >>> stats2 = dataset.io_stats_snapshot()
+        >>> assert stats.read_bytes == stats2.read_bytes
+
+        See Also
+        --------
+        io_stats_incremental : Get stats and reset counters for incremental tracking
+        """
+        return self._ds.io_stats_snapshot()
+
+    def io_stats_incremental(self) -> IOStats:
+        """
+        Get incremental IO statistics and reset the counters.
+
+        Returns IO statistics (number of operations and bytes) since the last
+        time this method was called, then resets the internal counters to zero.
+        This is useful for tracking IO operations between different stages of
+        processing.
+
+        Returns
+        -------
+        IOStats
+            Object containing IO statistics with the following attributes:
+            - read_iops: Number of read operations
+            - read_bytes: Total bytes read
+            - write_iops: Number of write operations
+            - write_bytes: Total bytes written
+            - num_hops: Number of network hops (for remote storage)
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://test_stats")
+        >>> result = dataset.to_table()
+        >>> # Get incremental stats (and reset)
+        >>> stats = dataset.io_stats_incremental()
+        >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+        Read ... bytes in ... operations
+        >>> # Next call returns only new stats since last call
+        >>> more_data = dataset.to_table()
+        >>> stats2 = dataset.io_stats_incremental()
+        >>> print(f"Read {stats2.read_bytes} more bytes")
+        Read ... more bytes
+
+        See Also
+        --------
+        io_stats_snapshot : Get stats without resetting counters
+        """
+        return self._ds.io_stats_incremental()
+
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -1537,12 +1640,11 @@ class LanceDataset(pa.dataset.Dataset):
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
         elif addresses is not None:
-            # ROW ids and Row address are the same until stable ROW ID is implemented.
-            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
         elif indices is not None:
             lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
         else:
-            raise ValueError("Either ids or indices must be specified")
+            raise ValueError("Either ids, addresses, or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
@@ -2181,6 +2283,7 @@ class LanceDataset(pa.dataset.Dataset):
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
@@ -2200,8 +2303,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If not specified, this
-            will default to two weeks.
+            Only versions older than this will be removed.  If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -2221,10 +2327,14 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
         """
-        if older_than is None:
+        if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
+
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
         )
 
     def create_scalar_index(
@@ -2235,7 +2345,6 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
-            Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
@@ -2304,7 +2413,7 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``FTS/INVERTED``. It is used to index document columns. This index
+        * ``INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
@@ -2324,8 +2433,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
-            ``"INVERTED"`` or ``"BLOOMFILTER"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``, or
+            ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2354,8 +2463,8 @@ class LanceDataset(pa.dataset.Dataset):
             It won't impact the performance of non-phrase queries even if it is set to
             True.
         base_tokenizer: str, default "simple"
-            This is for the ``INVERTED`` index. The base tokenizer to use. The value
-            can be:
+            This is for the ``INVERTED`` index. The base tokenizer to use. The
+            value can be:
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
@@ -2446,7 +2555,7 @@ class LanceDataset(pa.dataset.Dataset):
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" or "BLOOMFILTER" are supported for '
+                        '"INVERTED", or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -2479,7 +2588,7 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED", "FTS"]:
+            elif index_type in ["INVERTED"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
@@ -2694,6 +2803,10 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
+
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
@@ -2778,6 +2891,13 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        if accelerator is not None and index_type != "IVF_PQ":
+            LOGGER.warning(
+                "Index type %s does not support GPU acceleration; falling back to CPU",
+                index_type,
+            )
+            accelerator = None
+
         if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
@@ -3483,6 +3603,88 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def delta(
+        self,
+        compared_against: Optional[int] = None,
+        *,
+        begin_version: Optional[int] = None,
+        end_version: Optional[int] = None,
+    ) -> "DatasetDelta":
+        """
+        Compare changes between two versions of this dataset.
+
+        You must specify either ``compared_against`` (shorthand for comparing the
+        current version against a specific older version) or both ``begin_version``
+        and ``end_version`` for an explicit range.
+
+        Parameters
+        ----------
+        compared_against : int, optional
+            The version to compare the current dataset version against.
+            This is a shorthand for setting ``begin_version=compared_against``
+            and ``end_version=self.version``.
+        begin_version : int, optional
+            The start version (exclusive) for the comparison range.
+            Must be used together with ``end_version``.
+        end_version : int, optional
+            The end version (inclusive) for the comparison range.
+            Must be used together with ``begin_version``.
+
+        Returns
+        -------
+        DatasetDelta
+            An object that can list transactions or stream inserted/updated rows.
+
+        Raises
+        ------
+        ValueError
+            If both ``compared_against`` and version range are specified,
+            or if neither is specified.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            import lance
+            import pyarrow as pa
+
+            # Write initial data (v1)
+            ds = lance.write_dataset(
+                pa.table({"id": [1, 2], "val": ["a", "b"]}),
+                "memory://delta_demo"
+            )
+
+            # Append some data to create v2
+            ds_append = lance.write_dataset(
+                pa.table({"id": [3], "val": ["c"]}),
+                "memory://delta_demo",
+                mode="append"
+            )
+
+            # Compute inserted rows from v1 -> v2 (shorthand)
+            delta = ds_append.delta(compared_against=1)
+            reader = delta.get_inserted_rows()
+            for batch in reader:
+                print(batch)
+
+            # Or using explicit version range
+            delta = ds_append.delta(begin_version=1, end_version=2)
+        """
+        has_compared_against = compared_against is not None
+
+        builder = _DatasetDeltaBuilder(self._ds.delta())
+
+        if has_compared_against:
+            builder = builder.compared_against_version(compared_against)
+        else:
+            if begin_version:
+                builder = builder.with_begin_version(begin_version)
+
+            if end_version:
+                builder = builder.with_end_version(end_version)
+
+        return builder.build()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3647,6 +3849,61 @@ class SqlQueryBuilder:
         return SqlQuery(self._builder.build())
 
 
+class DatasetDelta:
+    """
+    A view of differences between two versions.
+
+    Created by :meth:`LanceDataset.delta`.
+    Provides convenient methods to stream inserted/updated rows or list transactions.
+    """
+
+    def __init__(self, delta):
+        self._delta = delta
+
+    def list_transactions(self) -> List[Transaction]:
+        """
+        List transactions in the range from begin_version + 1 to end_version.
+        """
+        return self._delta.list_transactions()
+
+    def get_inserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted rows.
+        """
+        return self._delta.get_inserted_rows()
+
+    def get_updated_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for updated rows.
+        """
+        return self._delta.get_updated_rows()
+
+
+class _DatasetDeltaBuilder:
+    """Internal builder for :class:`DatasetDelta`.
+
+    This class is not part of the public API. Use :meth:`LanceDataset.delta` instead.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def compared_against_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.compared_against_version(version)
+        return self
+
+    def with_begin_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_begin_version(version)
+        return self
+
+    def with_end_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_end_version(version)
+        return self
+
+    def build(self) -> DatasetDelta:
+        return DatasetDelta(self._builder.build())
+
+
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset
     merged: Transaction
@@ -3749,6 +4006,10 @@ class LanceOperation:
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
             The fragments that make up the new dataset.
+        initial_bases: list[DatasetBasePath], optional
+            Base paths to register when creating a new dataset (CREATE mode only).
+            **Only valid in CREATE mode**. Will raise an error if used with
+            OVERWRITE on existing dataset.
 
         Warning
         -------
@@ -3783,6 +4044,7 @@ class LanceOperation:
 
         new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
+        initial_bases: Optional[List[DatasetBasePath]] = None
 
         def __post_init__(self):
             if isinstance(self.new_schema, pa.Schema):
@@ -5108,6 +5370,7 @@ def write_dataset(
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
     ignore_namespace_table_storage_options: bool = False,
+    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5215,6 +5478,13 @@ def write_dataset(
         not be created, so credentials will not be automatically refreshed.
         This is useful when you want to use your own credentials instead of the
         namespace-provided credentials.
+    s3_credentials_refresh_offset_seconds : optional, int
+        The number of seconds before credential expiration to trigger a refresh.
+        Default is 60 seconds. Only applicable when using AWS S3 with temporary
+        credentials. For example, if set to 60, credentials will be refreshed
+        when they have less than 60 seconds remaining before expiration. This
+        should be set shorter than the credential lifetime to avoid using
+        expired credentials.
 
     Notes
     -----
@@ -5253,9 +5523,11 @@ def write_dataset(
         # - APPEND/OVERWRITE mode: calls namespace.describe_table()
         # - Both modes: create storage options provider and merge storage options
 
-        from lance_namespace import CreateEmptyTableRequest, DescribeTableRequest
-
-        from .namespace import LanceNamespaceStorageOptionsProvider
+        from .namespace import (
+            CreateEmptyTableRequest,
+            DescribeTableRequest,
+            LanceNamespaceStorageOptionsProvider,
+        )
 
         # Determine which namespace method to call based on mode
         if mode == "create":
@@ -5342,6 +5614,12 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
+
+    # Add s3_credentials_refresh_offset_seconds if specified
+    if s3_credentials_refresh_offset_seconds is not None:
+        params["s3_credentials_refresh_offset_seconds"] = (
+            s3_credentials_refresh_offset_seconds
+        )
 
     if commit_lock:
         if not callable(commit_lock):

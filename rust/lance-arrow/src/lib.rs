@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -39,14 +39,14 @@ pub mod r#struct;
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 
-/// Arrow extension metadata key for extension metadata  
+/// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Key used by lance to mark a field as a blob
 /// TODO: Use Arrow extension mechanism instead?
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
-/// Key used by Lance to record the blob column format version.
-pub const BLOB_VERSION_META_KEY: &str = "lance-encoding:blob-version";
+/// Arrow extension type name for Lance blob v2 columns
+pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -516,7 +516,7 @@ pub trait RecordBatchExt {
     /// Afterwards we add all non-matching right columns to the output.
     ///
     /// Note: This method likely does not handle nested fields correctly and you may want to consider
-    /// using [`merge_with_schema`] instead.
+    /// using [`Self::merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -604,6 +604,9 @@ pub trait RecordBatchExt {
 
     /// Create a new RecordBatch with compacted memory after slicing.
     fn shrink_to_fit(&self) -> Result<RecordBatch>;
+
+    /// Helper method to sort the RecordBatch by a column
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -777,6 +780,18 @@ impl RecordBatchExt for RecordBatch {
     fn shrink_to_fit(&self) -> Result<Self> {
         // Deep copy the sliced record batch, instead of whole batch
         crate::deepcopy::deep_copy_batch_sliced(self)
+    }
+
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<Self> {
+        if column >= self.num_columns() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Column index out of bounds: {}",
+                column
+            )));
+        }
+        let column = self.column(column);
+        let sorted = arrow_ord::sort::sort_to_indices(column, options, None)?;
+        self.take(&sorted)
     }
 }
 
@@ -1409,7 +1424,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 
 /// Interleave multiple RecordBatches into a single RecordBatch.
 ///
-/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+/// Behaves like [`arrow_select::interleave::interleave`], but for RecordBatches.
 pub fn interleave_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],

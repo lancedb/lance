@@ -28,8 +28,9 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::BlobStructuralEncoder;
+use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
 use crate::encodings::logical::list::ListStructuralEncoder;
+use crate::encodings::logical::map::MapStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::repdef::RepDefBuilder;
@@ -46,7 +47,7 @@ pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
 ///
 /// Maps to a top-level array
 ///
-/// For example, FixedSizeList<Int32> will have two EncodedArray instances and one EncodedPage
+/// For example, `FixedSizeList<Int32>` will have two EncodedArray instances and one EncodedPage
 #[derive(Debug)]
 pub struct EncodedPage {
     // The encoded page buffers
@@ -398,10 +399,24 @@ impl StructuralEncodingStrategy {
                         self.compression_strategy.clone(),
                     )?));
                 }
+                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
+                    return Ok(Box::new(BlobV2StructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
+                DataType::Struct(_) => {
+                    return Err(Error::InvalidInput {
+                        source: "Blob v2 struct input requires file version >= 2.2".into(),
+                        location: location!(),
+                    });
+                }
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!(
-                            "Blob encoding only supports Binary/LargeBinary, got {}",
+                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
                             data_type
                         )
                         .into(),
@@ -431,6 +446,65 @@ impl StructuralEncodingStrategy {
                         root_field_metadata,
                     )?;
                     Ok(Box::new(ListStructuralEncoder::new(
+                        options.keep_original_array,
+                        child_encoder,
+                    )))
+                }
+                DataType::Map(_, keys_sorted) => {
+                    // TODO: We only support keys_sorted=false for now,
+                    //  because converting a rust arrow map field to the python arrow field will
+                    //  lose the keys_sorted property.
+                    if keys_sorted {
+                        return Err(Error::NotSupported {
+                            source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into(),
+                            location: location!(),
+                        });
+                    }
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::NotSupported {
+                            source: format!(
+                                "Map data type is only supported in Lance file format 2.2+, current version: {}",
+                                self.version
+                            )
+                            .into(),
+                            location: location!(),
+                        });
+                    }
+                    let entries_child = field.children.first().ok_or_else(|| Error::Schema {
+                        message: "Map should have an entries child".to_string(),
+                        location: location!(),
+                    })?;
+                    let DataType::Struct(struct_fields) = entries_child.data_type() else {
+                        return Err(Error::Schema {
+                            message: "Map entries field must be a Struct<key, value>".to_string(),
+                            location: location!(),
+                        });
+                    };
+                    if struct_fields.len() < 2 {
+                        return Err(Error::Schema {
+                            message: "Map entries struct must contain both key and value fields"
+                                .to_string(),
+                            location: location!(),
+                        });
+                    }
+                    let key_field = &struct_fields[0];
+                    if key_field.is_nullable() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                                key_field.name()
+                            ),
+                            location: location!(),
+                        });
+                    }
+                    let child_encoder = self.do_create_field_encoder(
+                        _encoding_strategy_root,
+                        entries_child,
+                        column_index,
+                        options,
+                        root_field_metadata,
+                    )?;
+                    Ok(Box::new(MapStructuralEncoder::new(
                         options.keep_original_array,
                         child_encoder,
                     )))

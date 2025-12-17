@@ -110,6 +110,47 @@ def test_blob_files_by_address(dataset_with_blobs):
             assert f.read() == expected
 
 
+def test_blob_files_by_address_with_stable_row_ids(tmp_path):
+    table = pa.table(
+        {
+            "blobs": pa.array([b"foo"], pa.large_binary()),
+            "idx": pa.array([0], pa.uint64()),
+        },
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("idx", pa.uint64()),
+            ]
+        ),
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        enable_stable_row_ids=True,
+    )
+
+    ds.insert(
+        pa.table(
+            {
+                "blobs": pa.array([b"bar"], pa.large_binary()),
+                "idx": pa.array([1], pa.uint64()),
+            },
+            schema=table.schema,
+        )
+    )
+
+    t = ds.to_table(columns=["idx"], with_row_address=True)
+    row_idx = t.column("idx").to_pylist().index(1)
+    addr = t.column("_rowaddr").to_pylist()[row_idx]
+
+    blobs = ds.take_blobs("blobs", addresses=[addr])
+    assert len(blobs) == 1
+    with blobs[0] as f:
+        assert f.read() == b"bar"
+
+
 def test_blob_by_indices(tmp_path, dataset_with_blobs):
     indices = [0, 4]
     blobs = dataset_with_blobs.take_blobs("blobs", indices=indices)

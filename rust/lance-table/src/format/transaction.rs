@@ -8,7 +8,7 @@
 //! message at a semantic level while remaining crate-local, so lance-table does
 //! not depend on higher layers (e.g., lance crate).
 //!
-//! Conversion to protobuf occurs at the write boundary. See the From<Transaction>
+//! Conversion to protobuf occurs at the write boundary. See the `From<Transaction>`
 //! implementation below.
 
 use crate::format::pb;

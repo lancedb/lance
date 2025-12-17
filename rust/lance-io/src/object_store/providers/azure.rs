@@ -122,15 +122,16 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
     fn calculate_object_store_prefix(
         &self,
-        scheme: &str,
-        authority: &str,
+        url: &Url,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
+        let authority = url.authority();
         let (container, account) = match authority.find("@") {
             Some(at_index) => {
                 // The URI looks like 'az://container@account.dfs.core.windows.net/path-part/file',
@@ -159,7 +160,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
                 (authority, account)
             }
         };
-        Ok(format!("{}${}@{}", scheme, container, account))
+        Ok(format!("{}${}@{}", url.scheme(), container, account))
     }
 }
 
@@ -278,7 +279,10 @@ mod tests {
         assert_eq!(
             "az$container@bob",
             provider
-                .calculate_object_store_prefix("az", "container", Some(&options))
+                .calculate_object_store_prefix(
+                    &Url::parse("az://container/path").unwrap(),
+                    Some(&options)
+                )
                 .unwrap()
         );
     }
@@ -291,8 +295,7 @@ mod tests {
             "az$container@account",
             provider
                 .calculate_object_store_prefix(
-                    "az",
-                    "container@account.dfs.core.windows.net",
+                    &Url::parse("az://container@account.dfs.core.windows.net/path").unwrap(),
                     Some(&options)
                 )
                 .unwrap()
@@ -305,7 +308,10 @@ mod tests {
         let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
         let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
         let result = provider
-            .calculate_object_store_prefix("az", "container", Some(&options))
+            .calculate_object_store_prefix(
+                &Url::parse("az://container/path").unwrap(),
+                Some(&options),
+            )
             .expect_err("expected error")
             .to_string();
         assert_eq!(expected, &result[..expected.len()]);

@@ -144,6 +144,13 @@ impl DatasetConsistencyWrapper {
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
+        let dataset_uri = read_guard.uri().to_string();
+        let current_version = read_guard.version().version;
+        log::debug!(
+            "Reload starting for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
         let latest_version = read_guard
             .latest_version_id()
             .await
@@ -154,11 +161,17 @@ impl DatasetConsistencyWrapper {
                 ))),
                 location: location!(),
             })?;
-        let current_version = read_guard.version().version;
+        log::debug!(
+            "Reload got latest_version={} for uri={}, current_version={}",
+            latest_version,
+            dataset_uri,
+            current_version
+        );
         drop(read_guard);
 
         // If already up-to-date, return early
         if latest_version == current_version {
+            log::debug!("Already up-to-date for uri={}", dataset_uri);
             return Ok(());
         }
 
@@ -335,14 +348,23 @@ impl ManifestNamespace {
     }
 
     /// Construct a full URI from root and relative location
-    fn construct_full_uri(&self, relative_location: &str) -> Result<String> {
-        let base_url = lance_io::object_store::uri_to_url(&self.root)?;
+    pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
+        let mut base_url = lance_io::object_store::uri_to_url(root)?;
+
+        // Ensure the base URL has a trailing slash so that URL.join() appends
+        // rather than replaces the last path segment.
+        // Without this fix, "s3://bucket/path/subdir".join("table.lance")
+        // would incorrectly produce "s3://bucket/path/table.lance" (missing subdir).
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+
         let full_url = base_url
             .join(relative_location)
             .map_err(|e| Error::InvalidInput {
                 source: format!(
-                    "Failed to join URI '{}' with '{}': {}",
-                    self.root, relative_location, e
+                    "Failed to join URI '{}' with '{}': {:?}",
+                    root, relative_location, e
                 )
                 .into(),
                 location: location!(),
@@ -936,6 +958,7 @@ impl ManifestNamespace {
         session: Option<Arc<Session>>,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
+        log::debug!("Attempting to load manifest from {}", manifest_path);
         let mut builder = DatasetBuilder::from_uri(&manifest_path);
 
         if let Some(sess) = session.clone() {
@@ -947,7 +970,6 @@ impl ManifestNamespace {
         }
 
         let dataset_result = builder.load().await;
-
         if let Ok(dataset) = dataset_result {
             Ok(DatasetConsistencyWrapper::new(dataset))
         } else {
@@ -975,7 +997,12 @@ impl ManifestNamespace {
                     location: location!(),
                 })?;
 
-            log::info!("Successfully created manifest table at {}", manifest_path);
+            log::info!(
+                "Successfully created manifest table at {}, version={}, uri={}",
+                manifest_path,
+                dataset.version().version,
+                dataset.uri()
+            );
             Ok(DatasetConsistencyWrapper::new(dataset))
         }
     }
@@ -1051,10 +1078,18 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = Self::str_object_id(table_id);
         let table_info = self.query_manifest_for_table(&object_id).await?;
 
+        // Extract table name and namespace from table_id
+        let table_name = table_id.last().cloned().unwrap_or_default();
+        let namespace_id: Vec<String> = if table_id.len() > 1 {
+            table_id[..table_id.len() - 1].to_vec()
+        } else {
+            vec![]
+        };
+
         match table_info {
             Some(info) => {
                 // Construct full URI from relative location
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Try to open the dataset to get version and schema
                 match Dataset::open(&table_uri).await {
@@ -1070,21 +1105,27 @@ impl LanceNamespace for ManifestNamespace {
                         let json_schema = arrow_schema_to_json(&arrow_schema)?;
 
                         Ok(DescribeTableResponse {
+                            table: Some(table_name.clone()),
+                            namespace: Some(namespace_id.clone()),
                             version: Some(version as i64),
-                            location: Some(table_uri),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
                             schema: Some(Box::new(json_schema)),
-                            properties: None,
                             storage_options: self.storage_options.clone(),
+                            stats: None,
                         })
                     }
                     Err(_) => {
                         // If dataset can't be opened (e.g., empty table), return minimal info
                         Ok(DescribeTableResponse {
+                            table: Some(table_name),
+                            namespace: Some(namespace_id),
                             version: None,
-                            location: Some(table_uri),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
                             schema: None,
-                            properties: None,
                             storage_options: self.storage_options.clone(),
+                            stats: None,
                         })
                     }
                 }
@@ -1160,7 +1201,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate that request_data is provided
         if data.is_empty() {
@@ -1168,21 +1209,6 @@ impl LanceNamespace for ManifestNamespace {
                 source: "Request data (Arrow IPC stream) is required for create_table".into(),
                 location: location!(),
             });
-        }
-
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_uri
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
         }
 
         // Write the data using Lance Dataset
@@ -1223,9 +1249,9 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(CreateTableResponse {
+            transaction_id: None,
             version: Some(1),
             location: Some(table_uri),
-            properties: None,
             storage_options: self.storage_options.clone(),
         })
     }
@@ -1256,7 +1282,7 @@ impl LanceNamespace for ManifestNamespace {
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.child(info.location.as_str());
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -1413,6 +1439,7 @@ impl LanceNamespace for ManifestNamespace {
         .await?;
 
         Ok(CreateNamespaceResponse {
+            transaction_id: None,
             properties: request.properties,
         })
     }
@@ -1542,7 +1569,7 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_path = self.base_path.child(dir_name.as_str());
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
         if let Some(req_location) = &request.location {
@@ -1595,6 +1622,7 @@ impl LanceNamespace for ManifestNamespace {
         );
 
         Ok(CreateEmptyTableResponse {
+            transaction_id: None,
             location: Some(table_uri),
             properties: None,
             storage_options: self.storage_options.clone(),
@@ -1670,7 +1698,8 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(RegisterTableResponse {
-            location,
+            transaction_id: None,
+            location: Some(location),
             properties: None,
         })
     }
@@ -1701,9 +1730,7 @@ impl LanceNamespace for ManifestNamespace {
             Some(info) => {
                 // Delete from manifest only (leave physical data intact)
                 self.delete_from_manifest(&object_id).await?;
-
-                // Construct the full URI using helper function
-                self.construct_full_uri(&info.location)?
+                Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
                 return Err(Error::Namespace {
@@ -1714,6 +1741,7 @@ impl LanceNamespace for ManifestNamespace {
         };
 
         Ok(DeregisterTableResponse {
+            transaction_id: None,
             id: request.id.clone(),
             location: Some(table_uri),
             properties: None,
@@ -1723,7 +1751,7 @@ impl LanceNamespace for ManifestNamespace {
 
 #[cfg(test)]
 mod tests {
-    use crate::DirectoryNamespaceBuilder;
+    use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{
@@ -2399,6 +2427,61 @@ mod tests {
         assert_eq!(
             response.properties.unwrap().get("key1"),
             Some(&"value1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_construct_full_uri_with_cloud_urls() {
+        // Test S3-style URL with nested path (no trailing slash)
+        let s3_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            s3_result, "s3://bucket/path/subdir/table.lance",
+            "S3 URL should correctly append table name to nested path"
+        );
+
+        // Test Azure-style URL with nested path (no trailing slash)
+        let az_result =
+            ManifestNamespace::construct_full_uri("az://container/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            az_result, "az://container/path/subdir/table.lance",
+            "Azure URL should correctly append table name to nested path"
+        );
+
+        // Test GCS-style URL with nested path (no trailing slash)
+        let gs_result =
+            ManifestNamespace::construct_full_uri("gs://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            gs_result, "gs://bucket/path/subdir/table.lance",
+            "GCS URL should correctly append table name to nested path"
+        );
+
+        // Test with deeper nesting
+        let deep_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/a/b/c/d", "my_table.lance").unwrap();
+        assert_eq!(
+            deep_result, "s3://bucket/a/b/c/d/my_table.lance",
+            "Deeply nested path should work correctly"
+        );
+
+        // Test with root-level path (single segment after bucket)
+        let shallow_result =
+            ManifestNamespace::construct_full_uri("s3://bucket", "table.lance").unwrap();
+        assert_eq!(
+            shallow_result, "s3://bucket/table.lance",
+            "Single-level nested path should work correctly"
+        );
+
+        // Test that URLs with trailing slash already work (no regression)
+        let trailing_slash_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir/", "table.lance")
+                .unwrap();
+        assert_eq!(
+            trailing_slash_result, "s3://bucket/path/subdir/table.lance",
+            "URL with existing trailing slash should still work"
         );
     }
 }

@@ -324,7 +324,7 @@ def test_struct_field_order(tmp_path):
 
 
 @pytest.mark.skip(
-    reason="enable this in recurring test https://github.com/lancedb/lance/pull/4190"
+    reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
     " as it requires release mode"
 )
 def test_filter_depth_limit():

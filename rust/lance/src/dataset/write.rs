@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::session::Session;
 use crate::Dataset;
 
@@ -42,7 +43,7 @@ use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
 
-fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
     if storage_version >= LanceFileVersion::V2_2 {
         BlobVersion::V2
     } else {
@@ -589,9 +590,7 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let allow_blob_version_change =
-        dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
-    let (mut schema, storage_version) = if let Some(dataset) = dataset {
+    let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
@@ -639,7 +638,19 @@ pub async fn write_fragments_internal(
     };
 
     let target_blob_version = blob_version_for(storage_version);
-    schema.apply_blob_version(target_blob_version, allow_blob_version_change)?;
+    if let Some(dataset) = dataset {
+        let existing_version = dataset.blob_version();
+        if existing_version != target_blob_version {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Blob column version mismatch. Existing dataset uses {:?} but requested write requires {:?}. Changing blob version is not allowed",
+                    existing_version, target_blob_version
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+    }
 
     let fragments = do_write_fragments(
         object_store,
@@ -706,13 +717,21 @@ struct V2WriterAdapter {
     writer: current_writer::FileWriter,
     path: String,
     base_id: Option<u32>,
+    preprocessor: Option<BlobPreprocessor>,
 }
 
 #[async_trait::async_trait]
 impl GenericWriter for V2WriterAdapter {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        for batch in batches {
-            self.writer.write_batch(batch).await?;
+        if let Some(pre) = self.preprocessor.as_mut() {
+            let processed = preprocess_blob_batches(batches, pre).await?;
+            for batch in processed {
+                self.writer.write_batch(&batch).await?;
+            }
+        } else {
+            for batch in batches {
+                self.writer.write_batch(batch).await?;
+            }
         }
         Ok(())
     }
@@ -720,6 +739,9 @@ impl GenericWriter for V2WriterAdapter {
         Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        if let Some(pre) = self.preprocessor.as_mut() {
+            pre.finish().await?;
+        }
         let field_ids = self
             .writer
             .field_id_to_column_indices()
@@ -764,13 +786,16 @@ pub async fn open_writer_with_options(
     add_data_dir: bool,
     base_id: Option<u32>,
 ) -> Result<Box<dyn GenericWriter>> {
-    let filename = format!("{}.lance", generate_random_filename());
+    let data_file_key = generate_random_filename();
+    let filename = format!("{}.lance", data_file_key);
 
-    let full_path = if add_data_dir {
-        base_dir.child(DATA_DIR).child(filename.as_str())
+    let data_dir = if add_data_dir {
+        base_dir.child(DATA_DIR)
     } else {
-        base_dir.child(filename.as_str())
+        base_dir.clone()
     };
+
+    let full_path = data_dir.child(filename.as_str());
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
@@ -794,10 +819,20 @@ pub async fn open_writer_with_options(
                 ..Default::default()
             },
         )?;
+        let preprocessor = if schema_has_blob_v2(schema) {
+            Some(BlobPreprocessor::new(
+                object_store.clone(),
+                data_dir.clone(),
+                data_file_key.clone(),
+            ))
+        } else {
+            None
+        };
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
             base_id,
+            preprocessor,
         };
         Box::new(writer_adapter) as Box<dyn GenericWriter>
     };
@@ -865,7 +900,7 @@ impl WriterGenerator {
 
         let writer = if let Some(base_info) = self.select_target_base() {
             open_writer_with_options(
-                base_info.object_store.as_ref(),
+                &base_info.object_store,
                 &self.schema,
                 &base_info.base_dir,
                 self.storage_version,
@@ -875,7 +910,7 @@ impl WriterGenerator {
             .await?
         } else {
             open_writer(
-                self.object_store.as_ref(),
+                &self.object_store,
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
@@ -1393,7 +1428,7 @@ mod tests {
         let base_dir = Path::from("test/bucket2");
 
         let mut inner_writer = open_writer_with_options(
-            object_store.as_ref(),
+            &object_store,
             &schema,
             &base_dir,
             LanceFileVersion::Stable,

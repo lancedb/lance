@@ -76,7 +76,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{futures::Capacity, mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -92,7 +92,7 @@ use lance_datafusion::{
 use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
@@ -106,6 +106,7 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
+use tracing::error;
 
 mod assign_action;
 mod exec;
@@ -564,7 +565,7 @@ impl MergeInsertJob {
             let col = &self.params.on[0];
             self.dataset
                 .load_scalar_index(
-                    ScalarIndexCriteria::default()
+                    IndexCriteria::default()
                         .for_column(col)
                         // Unclear if this would work if the index does not support exact equality
                         .supports_exact_equality(),
@@ -886,7 +887,7 @@ impl MergeInsertJob {
                         .data_storage_format
                         .lance_file_version()?;
                     let mut writer = open_writer(
-                        dataset.object_store(),
+                        &dataset.object_store,
                         &write_schema,
                         &dataset.base,
                         data_storage_version,
@@ -1131,16 +1132,27 @@ impl MergeInsertJob {
             match frag_id.first() {
                 Some(ScalarValue::UInt64(Some(frag_id))) => {
                     let frag_id = *frag_id;
-                    let fragment =
-                        dataset
-                            .get_fragment(frag_id as usize)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!(
-                                    "Got non-existent fragment id from merge result: {}",
-                                    frag_id
-                                ),
-                                location: location!(),
-                            })?;
+                    let fragment = dataset.get_fragment(frag_id as usize).ok_or_else(|| {
+                        error!(
+                            fragment_id = frag_id,
+                            dataset_uri = %dataset.uri(),
+                            manifest_version = dataset.manifest().version,
+                            manifest_path = %dataset.manifest_location().path,
+                            branch = ?dataset.manifest().branch,
+                            "Non-existent fragment id returned from merge result",
+                        );
+                        Error::Internal {
+                            message: format!(
+                                "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
+                                frag_id,
+                                dataset.uri(),
+                                dataset.manifest().version,
+                                dataset.manifest_location().path,
+                                dataset.manifest().branch.as_deref().unwrap_or("main"),
+                            ),
+                            location: location!(),
+                        }
+                    })?;
                     let metadata = fragment.metadata.clone();
 
                     let fut = handle_fragment(
@@ -1309,7 +1321,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_v2(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
+    ) -> Result<(Transaction, MergeStats, Option<RowAddrTreeMap>)> {
         let plan = self.create_plan(source).await?;
 
         // Execute the plan
@@ -1368,7 +1380,7 @@ impl MergeInsertJob {
                 location: location!(),
             })?;
 
-        let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
+        let affected_rows = merge_insert_exec.affected_rows().map(RowAddrTreeMap::from);
 
         Ok((transaction, stats, affected_rows))
     }
@@ -1553,7 +1565,7 @@ impl MergeInsertJob {
                 update_mode: Some(RewriteRows),
             };
 
-            let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
+            let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
             (operation, affected_rows)
         };
 
@@ -1736,7 +1748,7 @@ pub struct MergeStats {
 
 pub struct UncommittedMergeInsert {
     pub transaction: Transaction,
-    pub affected_rows: Option<RowIdTreeMap>,
+    pub affected_rows: Option<RowAddrTreeMap>,
     pub stats: MergeStats,
 }
 
@@ -3669,7 +3681,7 @@ mod tests {
 
         let check_indices = async |dataset: &Dataset, id_frags: &[u32], value_frags: &[u32]| {
             let id_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("id_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("id_idx"))
                 .await
                 .unwrap();
 
@@ -3686,7 +3698,7 @@ mod tests {
             }
 
             let value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("value_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("value_idx"))
                 .await
                 .unwrap();
 
@@ -3703,7 +3715,7 @@ mod tests {
             }
 
             let other_value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("other_value_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("other_value_idx"))
                 .await
                 .unwrap()
                 .unwrap();

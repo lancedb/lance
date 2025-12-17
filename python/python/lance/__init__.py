@@ -8,8 +8,6 @@ import os
 import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-from lance_namespace import DescribeTableRequest, LanceNamespace
-
 from . import io, log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
@@ -34,7 +32,11 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
-from .namespace import LanceNamespaceStorageOptionsProvider
+from .namespace import (
+    DescribeTableRequest,
+    LanceNamespace,
+    LanceNamespaceStorageOptionsProvider,
+)
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -155,7 +157,7 @@ def dataset(
         across multiple datasets.
     namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
-        Use lance_namespace.connect() from the lance_namespace package.
+        Use lance.namespace.connect() to create a namespace instance.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table().

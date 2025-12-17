@@ -114,6 +114,7 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
         let request = DescribeTableRequest {
             id: Some(self.table_id.clone()),
             version: None,
+            with_table_uri: None,
         };
 
         let response = self

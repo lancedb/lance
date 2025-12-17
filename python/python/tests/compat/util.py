@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# Utilities shared by datagen.py and test_compat.py
+# Utilities shared by datagen.py
 #
 # Everything here must be runnable by older versions of Lance.
 

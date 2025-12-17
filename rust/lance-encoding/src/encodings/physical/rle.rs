@@ -199,7 +199,7 @@ impl RleMiniBlockEncoder {
         let type_size = std::mem::size_of::<T>();
 
         let chunk_start = offset * type_size;
-        // FIXME(xuanwo): we don't allow 4096 values as a workaround for https://github.com/lancedb/lance/issues/4429
+        // FIXME(xuanwo): we don't allow 4096 values as a workaround for https://github.com/lance-format/lance/issues/4429
         // Since while rep/def takes 4B, 4Ki values will lead to the
         // generated chunk buffer too large.MAX_MINIBLOCK_VALUES
         //

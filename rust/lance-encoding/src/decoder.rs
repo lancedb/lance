@@ -11,7 +11,7 @@
 //!
 //! # Scheduling
 //!
-//! Scheduling is split into [`self::FieldScheduler`] and [`self::PageScheduler`].
+//! Scheduling is split into `FieldScheduler` and `PageScheduler`.
 //! There is one field scheduler for each output field, which may map to many
 //! columns of actual data.  A field scheduler is responsible for figuring out
 //! the order in which pages should be scheduled.  Field schedulers then delegate
@@ -23,8 +23,8 @@
 //!
 //! # Decoding
 //!
-//! Decoders are split into [`self::PhysicalPageDecoder`] and
-//! [`self::LogicalPageDecoder`].  Note that both physical and logical decoding
+//! Decoders are split into `PhysicalPageDecoder` and
+//! [`LogicalPageDecoder`].  Note that both physical and logical decoding
 //! happens on a per-page basis.  There is no concept of a "field decoder" or
 //! "column decoder".
 //!
@@ -60,7 +60,7 @@
 //! encoding.  That encoding can then contain other logical encodings or physical encodings.
 //! Physical encodings can also contain other physical encodings.
 //!
-//! So, for example, a single field in the Arrow schema might have the type List<UInt32>
+//! So, for example, a single field in the Arrow schema might have the type `List<UInt32>`
 //!
 //! The encoding tree could then be:
 //!
@@ -239,6 +239,7 @@ use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
 use crate::encodings::logical::list::StructuralListScheduler;
+use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
@@ -773,6 +774,25 @@ impl CoreFieldDecoderStrategy {
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
+            DataType::Map(_, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::NotSupported {
+                        source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into(),
+                        location: location!(),
+                    });
+                }
+                let entries_child = field
+                    .children
+                    .first()
+                    .expect("Map field must have an entries child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
+                    as Box<dyn StructuralFieldScheduler>)
+            }
             _ => todo!("create_structural_field_scheduler for {}", data_type),
         }
     }
@@ -789,7 +809,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
         } else if data_type.is_binary_like() {
-            let column_info = column_infos.next().unwrap().clone();
+            let column_info = column_infos.expect_next()?.clone();
             // Column is blob and user is asking for binary data
             if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
                 let desc_scheduler =
@@ -1323,8 +1343,7 @@ impl BatchDecodeStream {
     ///
     /// # Arguments
     ///
-    /// * `scheduled` - an incoming stream of decode tasks from a
-    ///   [`crate::decode::DecodeBatchScheduler`]
+    /// * `scheduled` - an incoming stream of decode tasks from a `DecodeBatchScheduler`
     /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
@@ -1669,8 +1688,7 @@ impl StructuralBatchDecodeStream {
     ///
     /// # Arguments
     ///
-    /// * `scheduled` - an incoming stream of decode tasks from a
-    ///   [`crate::decode::DecodeBatchScheduler`]
+    /// * `scheduled` - an incoming stream of decode tasks from a `DecodeBatchScheduler`
     /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
@@ -1862,21 +1880,24 @@ pub fn create_decode_stream(
     is_structural: bool,
     should_validate: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
-) -> BoxStream<'static, ReadBatchTask> {
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
         let structural_decoder = StructuralStructDecoder::new(
             arrow_schema.fields,
             should_validate,
             /*is_root=*/ true,
-        );
-        StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
+        )?;
+        Ok(
+            StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder)
+                .into_stream(),
+        )
     } else {
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream()
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
     }
 }
 
@@ -1890,28 +1911,28 @@ pub fn create_decode_iterator(
     should_validate: bool,
     is_structural: bool,
     messages: VecDeque<Result<DecoderMessage>>,
-) -> Box<dyn RecordBatchReader + Send + 'static> {
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
         let simple_struct_decoder =
-            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true);
-        Box::new(BatchDecodeIterator::new(
+            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true)?;
+        Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
             num_rows,
             simple_struct_decoder,
             arrow_schema,
-        ))
+        )))
     } else {
         let root_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        Box::new(BatchDecodeIterator::new(
+        Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
             num_rows,
             root_decoder,
             arrow_schema,
-        ))
+        )))
     }
 }
 
@@ -1936,7 +1957,7 @@ fn create_scheduler_decoder(
         is_structural,
         config.decoder_config.validate_on_decode,
         rx,
-    );
+    )?;
 
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
@@ -2099,7 +2120,7 @@ pub fn schedule_and_decode_blocking(
         config.decoder_config.validate_on_decode,
         is_structural,
         messages.into(),
-    );
+    )?;
 
     Ok(decode_iterator)
 }
@@ -2216,7 +2237,7 @@ impl PriorityRange for SimplePriorityRange {
 
 /// Determining the priority of a list request is tricky.  We want
 /// the priority to be the top-level row.  So if we have a
-/// list<list<int>> and each outer list has 10 rows and each inner
+/// `list<list<int>>` and each outer list has 10 rows and each inner
 /// list has 5 rows then the priority of the 100th item is 1 because
 /// it is the 5th item in the 10th item of the *second* row.
 ///
@@ -2641,7 +2662,7 @@ pub async fn decode_batch(
         is_structural,
         should_validate,
         rx,
-    );
+    )?;
     decode_stream.next().await.unwrap().task.await
 }
 

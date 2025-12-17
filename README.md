@@ -9,10 +9,10 @@
 
 <a href="https://lance.org">Documentation</a> •
 <a href="https://lance.org/community">Community</a> •
-<a href="https://discord.gg/zMM32dvNtd">Discord</a>
+<a href="https://discord.gg/lance">Discord</a>
 
-[CI]: https://github.com/lancedb/lance/actions/workflows/rust.yml
-[CI Badge]: https://github.com/lancedb/lance/actions/workflows/rust.yml/badge.svg
+[CI]: https://github.com/lance-format/lance/actions/workflows/rust.yml
+[CI Badge]: https://github.com/lance-format/lance/actions/workflows/rust.yml/badge.svg
 [Docs]: https://lance.org
 [Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
 [crates.io]: https://crates.io/crates/lance
@@ -53,7 +53,7 @@ The key features of Lance include:
 For more details, see the full [Lance format specification](https://lance.org/format).
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/docs/community/contributing) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/community/contributing/) for more information.
 
 ## Quick Start
 
@@ -66,8 +66,11 @@ pip install pylance
 To install a preview release:
 
 ```shell
-pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
+pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
 ```
+
+> [!NOTE]
+> For versions prior to 1.0.0-beta.4, you can find them at https://pypi.fury.io/lancedb/pylance
 
 > [!TIP]
 > Preview releases are released more often than full releases and contain the

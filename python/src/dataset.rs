@@ -15,7 +15,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::{Duration, TimeDelta};
+use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
 use log::error;
@@ -33,6 +33,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
@@ -86,7 +87,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::PyIndexConfig;
+use crate::indices::{PyIndexConfig, PyIndexDescription};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -96,10 +97,12 @@ use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
+use self::io_stats::IoStats;
 
 pub mod blob;
 pub mod cleanup;
 pub mod commit;
+pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
@@ -386,7 +389,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
 }
 
 /// Python binding for BasePath
-#[pyclass(name = "DatasetBasePath", module = "lance")]
+#[pyclass(name = "DatasetBasePath", module = "_lib")]
 #[derive(Clone)]
 pub struct DatasetBasePath {
     #[pyo3(get)]
@@ -1172,13 +1175,26 @@ impl Dataset {
 
     fn take_blobs(
         self_: PyRef<'_, Self>,
-        row_indices: Vec<u64>,
+        row_ids: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = rt()
+            .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    fn take_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_blobs(&row_indices, blob_column),
+                self_
+                    .ds
+                    .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
@@ -1494,23 +1510,33 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
         &self,
-        older_than_micros: i64,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> PyResult<CleanupStats> {
-        let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = rt()
-            .block_on(
-                None,
-                self.ds.cleanup_old_versions(
-                    older_than,
-                    delete_unverified,
-                    error_if_tagged_old_versions,
-                ),
-            )?
+            .block_on(None, async {
+                let mut builder = CleanupPolicyBuilder::default();
+                if let Some(v) = older_than_micros {
+                    let older_than = Duration::microseconds(v);
+                    builder = builder.before_timestamp(Utc::now() - older_than);
+                }
+                if let Some(v) = retain_versions {
+                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+                }
+                if let Some(v) = delete_unverified {
+                    builder = builder.delete_unverified(v);
+                }
+                if let Some(v) = error_if_tagged_old_versions {
+                    builder = builder.error_if_tagged_old_versions(v);
+                }
+
+                self.ds.cleanup_with_policy(builder.build()).await
+            })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
@@ -2043,6 +2069,18 @@ impl Dataset {
 
     fn session(&self) -> Session {
         Session::new(self.ds.session())
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters
+    fn io_stats_snapshot(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_snapshot();
+        IoStats::from_lance(stats)
+    }
+
+    /// Get incremental IO statistics for this dataset
+    fn io_stats_incremental(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_incremental();
+        IoStats::from_lance(stats)
     }
 
     #[staticmethod]
@@ -2599,6 +2637,26 @@ impl Dataset {
         let builder = self.ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=())]
+    fn describe_indices(&self, py: Python<'_>) -> PyResult<Vec<PyIndexDescription>> {
+        let new_self = self.ds.as_ref().clone();
+        let indices = rt()
+            .block_on(Some(py), new_self.describe_indices(None))?
+            .infer_error()?;
+        Ok(indices
+            .into_iter()
+            .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
+            .collect())
+    }
+
+    /// Create a delta builder to explore changes between dataset versions.
+    #[pyo3(signature=())]
+    fn delta(&self) -> PyResult<DatasetDeltaBuilder> {
+        let ds = self.ds.as_ref().clone();
+        let builder = ds.delta();
+        Ok(DatasetDeltaBuilder { builder })
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2697,6 +2755,83 @@ impl SqlQueryBuilder {
         Ok(SqlQuery {
             builder: self.builder.clone(),
         })
+    }
+}
+
+// -------------------- Delta API Bindings --------------------
+
+#[pyclass(name = "DatasetDelta", module = "_lib", subclass)]
+pub struct DatasetDelta {
+    inner: lance::dataset::delta::DatasetDelta,
+}
+
+#[pymethods]
+impl DatasetDelta {
+    /// List transactions between begin_version+1 and end_version.
+    fn list_transactions(
+        &self,
+    ) -> PyResult<Vec<PyLance<lance::dataset::transaction::Transaction>>> {
+        let txs = rt()
+            .block_on(None, self.inner.list_transactions())?
+            .infer_error()?;
+        Ok(txs.into_iter().map(PyLance).collect())
+    }
+
+    /// Get inserted rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_inserted_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_inserted_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+
+    /// Get updated rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_updated_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_updated_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+}
+
+#[pyclass(name = "DatasetDeltaBuilder", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct DatasetDeltaBuilder {
+    builder: lance::dataset::delta::DatasetDeltaBuilder,
+}
+
+#[pymethods]
+impl DatasetDeltaBuilder {
+    #[pyo3(signature = (version))]
+    fn compared_against_version(&self, version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().compared_against_version(version),
+        }
+    }
+
+    #[pyo3(signature = (begin_version))]
+    fn with_begin_version(&self, begin_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_begin_version(begin_version),
+        }
+    }
+
+    #[pyo3(signature = (end_version))]
+    fn with_end_version(&self, end_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_end_version(end_version),
+        }
+    }
+
+    fn build(&self) -> PyResult<DatasetDelta> {
+        let delta = self.builder.clone().build().infer_error()?;
+        Ok(DatasetDelta { inner: delta })
     }
 }
 
@@ -2935,10 +3070,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                     })
             });
 
-        if storage_options.is_some() || storage_options_provider.is_some() {
+        let s3_credentials_refresh_offset_seconds =
+            get_dict_opt::<u64>(options, "s3_credentials_refresh_offset_seconds")?;
+
+        if storage_options.is_some()
+            || storage_options_provider.is_some()
+            || s3_credentials_refresh_offset_seconds.is_some()
+        {
+            let s3_credentials_refresh_offset = s3_credentials_refresh_offset_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(std::time::Duration::from_secs(60));
+
             p.store_params = Some(ObjectStoreParams {
                 storage_options,
                 storage_options_provider,
+                s3_credentials_refresh_offset,
                 ..Default::default()
             });
         }

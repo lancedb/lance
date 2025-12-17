@@ -26,8 +26,8 @@ use tokio::task::spawn;
 
 pub mod background_iterator;
 
-/// A trait for [BatchRecord] iterators, readers and streams
-/// that can be converted to a concrete stream type [SendableRecordBatchStream].
+/// A trait for [`RecordBatch`] iterators, readers and streams
+/// that can be converted to a concrete stream type [`SendableRecordBatchStream`].
 ///
 /// This also cam read the schema from the first batch
 /// and then update the schema to reflect the dictionary columns.

@@ -1,7 +1,7 @@
 # Distributed Write
 
 !!! warning
-    Lance provides out-of-the-box [Ray](../integrations/ray.md) and [Spark](https://github.com/lancedb/lance-spark) integrations.
+    Lance provides out-of-the-box [Ray](https://github.com/lance-format/lance-ray) and [Spark](https://github.com/lance-format/lance-spark) integrations.
 
     This page is intended for users who wish to perform distributed operations in a custom manner, i.e. using `slurm` or `Kubernetes` without the Lance integration.
 
@@ -104,7 +104,7 @@ import lance
 ds = lance.dataset(data_uri)
 read_version = ds.version # record the read version
 
-op = lance.LanceOperation.Append(schema, all_fragments)
+op = lance.LanceOperation.Append(all_fragments)
 lance.LanceDataset.commit(
     data_uri,
     op,

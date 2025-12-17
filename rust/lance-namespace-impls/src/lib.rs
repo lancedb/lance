@@ -48,4 +48,4 @@ pub use dir::{manifest::ManifestNamespace, DirectoryNamespace, DirectoryNamespac
 pub use rest::{RestNamespace, RestNamespaceBuilder};
 
 #[cfg(feature = "rest-adapter")]
-pub use rest_adapter::{RestAdapter, RestAdapterConfig};
+pub use rest_adapter::{RestAdapter, RestAdapterConfig, RestAdapterHandle};

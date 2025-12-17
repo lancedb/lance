@@ -102,7 +102,7 @@ message MiniBlockLayout {
   // If there is repetition then the depth must be at least 1.  If there are many layers
   // of repetition then deeper repetition indices will support deeper nested random access.  For
   // example, given 5 layers of repetition then the repetition index depth must be at least
-  // 3 to support access like rows[50][17][3].
+  // 3 to support access like `rows[50][17][3]`.
   //
   // We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition
   // index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store
