@@ -64,7 +64,7 @@ These types use specialized logical encoders:
 - Dictionary with logical/non-primitive value types is not supported
 - Map type requires `keys_sorted=false`
 - Blob v1 only supports Arrow Binary/LargeBinary data types
-- Blob v2 struct requires the field to be marked as blob metadata
+- Blob v2 only supports Arrow Struct data types
 
 ## Search Cache
 
