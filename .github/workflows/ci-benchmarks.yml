@@ -49,8 +49,7 @@ jobs:
       - name: Build memtest
         run: |
           source venv/bin/activate
-          cd memtest
-          make build-release
+          make -C ../memtest build-release
       - name: Generate datasets
         run: |
           source venv/bin/activate

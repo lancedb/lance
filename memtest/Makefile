@@ -16,7 +16,7 @@ build:
 
 build-release:
 	cargo build --release
-	cp target/release/libmemtest.so python/memtest/
+	cp target/release/$(LIB_FILE) python/memtest/
 	pip install -e .
 
 test:
