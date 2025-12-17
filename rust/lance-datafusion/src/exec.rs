@@ -569,13 +569,11 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
     /// A visitor which calculates additional metrics for all the plans.
     struct CalculateVisitor {
         highest_index: usize,
-        index_to_cumulative_cpu: HashMap<usize, usize>,
-        index_to_cumulative_wall: HashMap<usize, Duration>,
+        index_to_elapsed: HashMap<usize, Duration>,
     }
 
     /// Result of calculating metrics for a subtree
     struct SubtreeMetrics {
-        cumulative_cpu: usize,
         min_start: Option<DateTime<Utc>>,
         max_end: Option<DateTime<Utc>>,
     }
@@ -585,48 +583,34 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             self.highest_index += 1;
             let plan_index = self.highest_index;
 
-            // Get CPU time for this node
-            let elapsed_cpu: usize = match plan.metrics() {
-                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
-                None => 0,
-            };
-
             // Get timestamps for this node
             let (mut min_start, mut max_end) = Self::node_timerange(plan);
 
             // Accumulate from children
-            let mut cumulative_cpu = elapsed_cpu;
             for child in plan.children() {
                 let child_metrics = self.calculate_metrics(child);
-                cumulative_cpu += child_metrics.cumulative_cpu;
                 min_start = Self::min_option(min_start, child_metrics.min_start);
                 max_end = Self::max_option(max_end, child_metrics.max_end);
             }
 
-            // Calculate wall clock duration for this subtree
-            let wall_duration = match (min_start, max_end) {
-                (Some(start), Some(end)) => (end - start).to_std().unwrap_or_default(),
-                _ => Duration::ZERO,
+            // Calculate wall clock duration for this subtree (only if we have timestamps)
+            let elapsed = match (min_start, max_end) {
+                (Some(start), Some(end)) => Some((end - start).to_std().unwrap_or_default()),
+                _ => None,
             };
 
-            self.index_to_cumulative_cpu
-                .insert(plan_index, cumulative_cpu);
-            self.index_to_cumulative_wall
-                .insert(plan_index, wall_duration);
-
-            SubtreeMetrics {
-                cumulative_cpu,
-                min_start,
-                max_end,
+            if let Some(e) = elapsed {
+                self.index_to_elapsed.insert(plan_index, e);
             }
+
+            SubtreeMetrics { min_start, max_end }
         }
 
         fn node_timerange(
             plan: &Arc<dyn ExecutionPlan>,
         ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-            let metrics = match plan.metrics() {
-                Some(m) => m,
-                None => return (None, None),
+            let Some(metrics) = plan.metrics() else {
+                return (None, None);
             };
             let min_start = metrics
                 .iter()
@@ -668,7 +652,22 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         ) -> std::fmt::Result {
             self.highest_index += 1;
             write!(f, "{:indent$}", "", indent = self.indent * 2)?;
-            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+
+            // Format the plan description
+            let displayable =
+                datafusion::physical_plan::display::DisplayableExecutionPlan::new(plan.as_ref());
+            let plan_str = displayable.one_line().to_string();
+            let plan_str = plan_str.trim();
+
+            // Write operator with elapsed time inserted after the name
+            match calcs.index_to_elapsed.get(&self.highest_index) {
+                Some(elapsed) => match plan_str.find(": ") {
+                    Some(i) => write!(f, "{}: elapsed={elapsed:?}, {}", &plan_str[..i], &plan_str[i + 2..])?,
+                    None => write!(f, "{plan_str}, elapsed={elapsed:?}")?,
+                },
+                None => write!(f, "{plan_str}")?,
+            }
+
             if let Some(metrics) = plan.metrics() {
                 let metrics = metrics
                     .aggregate_by_name()
@@ -679,17 +678,6 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             } else {
                 write!(f, ", metrics=[]")?;
             }
-            let cumulative_cpu = calcs
-                .index_to_cumulative_cpu
-                .get(&self.highest_index)
-                .unwrap();
-            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
-            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
-            let cumulative_wall = calcs
-                .index_to_cumulative_wall
-                .get(&self.highest_index)
-                .unwrap();
-            write!(f, ", cumulative_wall={cumulative_wall:?}")?;
             writeln!(f)?;
             self.indent += 1;
             for child in plan.children() {
@@ -707,8 +695,7 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
             let mut calcs = CalculateVisitor {
                 highest_index: 0,
-                index_to_cumulative_cpu: HashMap::new(),
-                index_to_cumulative_wall: HashMap::new(),
+                index_to_elapsed: HashMap::new(),
             };
             calcs.calculate_metrics(&self.plan);
             let mut prints = PrintVisitor {
