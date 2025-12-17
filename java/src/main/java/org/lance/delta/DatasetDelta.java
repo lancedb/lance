@@ -16,6 +16,7 @@ package org.lance.delta;
 import org.lance.Dataset;
 import org.lance.JniLoader;
 import org.lance.LockManager;
+import org.lance.Transaction;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -53,14 +54,14 @@ public class DatasetDelta implements Closeable {
    *
    * @return list of transactions
    */
-  public List<org.lance.Transaction> listTransactions() {
+  public List<Transaction> listTransactions() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDeltaHandle != 0, "DatasetDelta is closed");
       return nativeListTransactions();
     }
   }
 
-  private native List<org.lance.Transaction> nativeListTransactions();
+  private native List<Transaction> nativeListTransactions();
 
   /** Return a streaming ArrowReader for inserted rows. */
   public ArrowReader getInsertedRows() throws IOException {

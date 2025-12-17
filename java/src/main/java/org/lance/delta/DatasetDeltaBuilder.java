@@ -41,19 +41,30 @@ public class DatasetDeltaBuilder {
     this.dataset = dataset;
   }
 
-  /** Shorthand to compare current dataset version against the given version. */
+  /**
+   * Compare the current dataset version against the specified version. The delta will automatically
+   * order the versions so that `begin_version` is less than `end_version`. Cannot be used together
+   * with explicit `with_begin_version` and `with_end_version`.
+   */
   public DatasetDeltaBuilder comparedAgainstVersion(long version) {
     this.comparedAgainst = Optional.of(version);
     return this;
   }
 
   /** Set begin version (exclusive) for explicit range. */
+  /**
+   * Set the beginning version for the delta (exclusive). Must be used together with
+   * `with_end_version`.
+   */
   public DatasetDeltaBuilder withBeginVersion(long version) {
     this.beginVersion = Optional.of(version);
     return this;
   }
 
-  /** Set end version (inclusive) for explicit range. */
+  /**
+   * Set the ending version for the delta (inclusive). Must be used together with
+   * `with_begin_version`. Cannot be used together with `compared_against_version`.
+   */
   public DatasetDeltaBuilder withEndVersion(long version) {
     this.endVersion = Optional.of(version);
     return this;

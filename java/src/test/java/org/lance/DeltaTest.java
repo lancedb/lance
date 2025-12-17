@@ -35,7 +35,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 /** Tests for Dataset.delta() Java interface bridging Rust semantics. */
@@ -107,19 +106,37 @@ public class DeltaTest {
           Dataset ds2 =
               Dataset.write().stream(stream2).uri(uri).mode(WriteParams.WriteMode.APPEND).execute();
 
-          DatasetDelta delta = ds2.delta(Optional.of(1L), Optional.empty(), Optional.empty());
+          DatasetDelta delta = ds2.delta(1L);
           try {
             try (ArrowReader inserted = delta.getInsertedRows()) {
               int total = 0;
+              boolean foundRow = false;
+
               while (inserted.loadNextBatch()) {
-                Schema outSchema = inserted.getVectorSchemaRoot().getSchema();
+                VectorSchemaRoot outRoot = inserted.getVectorSchemaRoot();
+                Schema outSchema = outRoot.getSchema();
                 List<String> names =
                     outSchema.getFields().stream().map(Field::getName).collect(Collectors.toList());
                 Assertions.assertTrue(names.contains("_row_created_at_version"));
                 Assertions.assertTrue(names.contains("_row_last_updated_at_version"));
-                total += inserted.getVectorSchemaRoot().getRowCount();
+
+                IntVector outId = (IntVector) outRoot.getVector("id");
+                VarCharVector outVal = (VarCharVector) outRoot.getVector("val");
+
+                for (int i = 0; i < outRoot.getRowCount(); i++) {
+                  int id = outId.get(i);
+                  byte[] bytes = outVal.get(i);
+                  String val = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                  if (id == 3 && "c".equals(val)) {
+                    foundRow = true;
+                  }
+                }
+
+                total += outRoot.getRowCount();
               }
+
               Assertions.assertEquals(1, total);
+              Assertions.assertTrue(foundRow, "Inserted row (id=3, val=c) not found in delta");
             }
           } catch (UnsatisfiedLinkError e) {
             Assumptions.assumeTrue(
@@ -147,7 +164,7 @@ public class DeltaTest {
         WriteParams params =
             new WriteParams.Builder().withMode(WriteParams.WriteMode.APPEND).build();
         try (Dataset ds2 = Dataset.create(allocator, uri, schema, params); ) {
-          DatasetDelta delta = ds2.delta(Optional.empty(), Optional.of(1L), Optional.of(2L));
+          DatasetDelta delta = ds2.delta(1L, 2L);
           try {
             List<Transaction> txs = delta.listTransactions();
             Assertions.assertTrue(txs.size() == 1);

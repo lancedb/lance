@@ -1373,36 +1373,32 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Compute the delta between versions.
+   * Compute the delta between current version and this version.
    *
-   * <ul>
-   *   <li>Either {@code comparedAgainst} is non-null: compare current version against this version.
-   *   <li>Or both {@code beginVersion} (exclusive) and {@code endVersion} (inclusive) are non-null
-   *       for an explicit range.
-   *   <li>Mutually exclusive: do not specify both modes; do not provide incomplete range.
-   * </ul>
-   *
-   * <p>Examples:
-   *
-   * <pre>{@code
-   * // Shorthand: compare current version against v1
-   * DatasetDelta delta1 = dataset.delta(Optional.of(1L), Optional.empty(), Optional.empty());
-   *
-   * // Explicit range: (1, 2]
-   * DatasetDelta delta2 = dataset.delta(Optional.empty(), Optional.of(1L), Optional.of(2L));
-   * }</pre>
-   *
-   * @param comparedAgainst the version to compare the current dataset against (optional)
-   * @param beginVersion the beginning version (exclusive) for explicit range (optional)
-   * @param endVersion the ending version (inclusive) for explicit range (optional)
+   * @param comparedAgainst the version to compare the current dataset against
    * @return a DatasetDelta view
    * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
    */
-  public DatasetDelta delta(
-      Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion) {
+  public DatasetDelta delta(long comparedAgainst) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeBuildDelta(comparedAgainst, beginVersion, endVersion);
+      return nativeBuildDelta(Optional.of(comparedAgainst), Optional.empty(), Optional.empty());
+    }
+  }
+
+  /**
+   * Compute the delta between both {@code beginVersion} (exclusive) and {@code endVersion}
+   * (inclusive).
+   *
+   * @param beginVersion the beginning version (exclusive) for explicit range
+   * @param endVersion the ending version (inclusive) for explicit range
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public DatasetDelta delta(long beginVersion, long endVersion) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(Optional.empty(), Optional.of(beginVersion), Optional.of(endVersion));
     }
   }
 
