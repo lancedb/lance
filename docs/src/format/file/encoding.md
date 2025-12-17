@@ -52,7 +52,7 @@ These types are encoded using `PrimitiveStructuralEncoder`:
 ### Nested Types
 These types use specialized logical encoders:
 
-| Logical Data Type        | Arrow Data Type      | Encoding Strategy                                                            | Version Notes                                          |
+| Logical Data Type        | Arrow Data Type      | Encoding Strategy                                                            | Notes                                                  |
 |--------------------------|----------------------|------------------------------------------------------------------------------|--------------------------------------------------------|
 | **Struct**               | Struct               | `StructStructuralEncoder` (or `PrimitiveStructuralEncoder` for packed/empty) | Supported in 2.1+                                      |
 | **List** / **LargeList** | List / LargeList     | `ListStructuralEncoder`                                                      | Supported in 2.1+                                      |
