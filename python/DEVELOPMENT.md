@@ -104,6 +104,12 @@ maturin develop --profile release-with-debug --extras benchmarks --features data
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
 will provide debug symbols for profiling.)
 
+To enable Rust-side allocation tracing for Python tests / CI benchmarks:
+
+```shell
+maturin develop -m python/Cargo.toml --features memtrace
+```
+
 Then you can run the benchmarks with
 
 ```shell

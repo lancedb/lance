@@ -63,7 +63,7 @@ def test_full_scan(io_mem_benchmark):
 The `io_mem_benchmark` fixture:
 - Runs an optional warmup iteration (not measured)
 - Tracks IO stats via `dataset.io_stats_incremental()`
-- Optionally tracks memory via `lance-memtest` if preloaded
+- Optionally tracks memory via `lance.memtrace` if enabled at build time
 
 ### Running IO/Memory Benchmarks
 
@@ -72,9 +72,10 @@ Without memory tracking:
 pytest python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_btree_search -v
 ```
 
-With memory tracking (Linux only):
+With memory tracking:
 ```bash
-LD_PRELOAD=$(lance-memtest) pytest python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_btree_search -v
+maturin develop -m python/Cargo.toml --features memtrace
+pytest python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_btree_search -v
 ```
 
 ### Output

@@ -14,7 +14,7 @@ def is_on_google() -> bool:
     try:
         rsp = requests.get("http://metadata.google.internal", timeout=5)
         LOGGER.info("Metadata-Flavor: %s", rsp.headers.get("Metadata-Flavor"))
-        return rsp.headers["Metadata-Flavor"] == "Google"
+        return rsp.headers.get("Metadata-Flavor") == "Google"
     except requests.exceptions.RequestException as ex:
         LOGGER.info("Failed to connect to metadata server: %s", ex)
         return False

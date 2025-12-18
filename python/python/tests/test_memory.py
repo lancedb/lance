@@ -7,12 +7,13 @@ import lance
 import pyarrow as pa
 import pytest
 
-memtest = pytest.importorskip(
-    "memtest", reason="memtest is not available. Please install from ../memtest"
-)
-
 
 def test_insert_memory(tmp_path: Path):
+    if not hasattr(lance, "memtrace"):
+        pytest.skip(
+            "lance.memtrace is not enabled (build pylance with feature 'memtrace')"
+        )
+
     def batch_generator():
         # 5MB batches -> 100MB total
         for _ in range(20):
@@ -25,7 +26,7 @@ def test_insert_memory(tmp_path: Path):
         batches=batch_generator(),
     )
 
-    with memtest.track() as get_stats:
+    with lance.memtrace.track() as get_stats:
         lance.write_dataset(
             reader,
             tmp_path / "test.lance",

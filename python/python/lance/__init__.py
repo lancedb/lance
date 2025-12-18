@@ -79,6 +79,13 @@ __all__ = [
     "FFILanceTableProvider",
 ]
 
+try:
+    from . import memtrace as memtrace
+except ImportError:
+    pass
+else:
+    __all__.append("memtrace")
+
 
 def dataset(
     uri: Optional[Union[str, Path]] = None,

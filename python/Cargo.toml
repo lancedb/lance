@@ -76,6 +76,7 @@ bytes = "1.4"
 default = ["rest", "rest-adapter"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+memtrace = []
 rest = ["lance-namespace-impls/rest"]
 rest-adapter = ["lance-namespace-impls/rest-adapter"]
 

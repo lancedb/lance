@@ -67,6 +67,8 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+#[cfg(feature = "memtrace")]
+pub(crate) mod memtrace;
 pub(crate) mod namespace;
 pub(crate) mod reader;
 pub(crate) mod scanner;
@@ -287,6 +289,13 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
+    #[cfg(feature = "memtrace")]
+    {
+        m.add_wrapped(wrap_pyfunction!(memtrace::memtrace_is_enabled))?;
+        m.add_wrapped(wrap_pyfunction!(memtrace::memtrace_reset))?;
+        m.add_wrapped(wrap_pyfunction!(memtrace::memtrace_reset_peak_to_current))?;
+        m.add_wrapped(wrap_pyfunction!(memtrace::memtrace_get_stats))?;
+    }
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;

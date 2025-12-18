@@ -10,6 +10,10 @@ This module provides an `io_memory_benchmark` marker and fixture that tracks:
 - Read IOPS and bytes
 - Write IOPS and bytes
 
+Note: memory stats are collected via `lance.memtrace` when the Rust feature
+`memtrace` is enabled at build time, and only include allocations made through
+Rust's global allocator.
+
 Usage:
     @pytest.mark.io_memory_benchmark()
     def test_something(benchmark):
@@ -24,20 +28,19 @@ from typing import Any, Callable, List
 
 import pytest
 
-# Try to import memtest, but don't fail if not available
 try:
-    import memtest
+    import lance
 
-    MEMTEST_AVAILABLE = memtest.is_preloaded()
-except ImportError:
-    MEMTEST_AVAILABLE = False
+    MEMTRACE_AVAILABLE = hasattr(lance, "memtrace") and lance.memtrace.is_enabled()
+except Exception:
+    MEMTRACE_AVAILABLE = False
 
 
 @dataclass
 class BenchmarkStats:
     """Statistics collected during a benchmark run."""
 
-    # Memory stats (only populated if memtest is preloaded)
+    # Memory stats (only populated if memtrace is enabled)
     peak_bytes: int = 0
     total_allocations: int = 0
 
@@ -116,12 +119,12 @@ class IOMemoryBenchmark:
         dataset.io_stats_incremental()
 
         # Run with memory tracking if available
-        if MEMTEST_AVAILABLE:
-            memtest.reset_stats()
+        if MEMTRACE_AVAILABLE:
+            lance.memtrace.reset()
             result = func(dataset)
-            mem_stats = memtest.get_stats()
+            mem_stats = lance.memtrace.get_stats()
             self._stats.peak_bytes = mem_stats["peak_bytes"]
-            self._stats.total_allocations = mem_stats["total_allocations"]
+            self._stats.total_allocations = mem_stats["allocations"]
         else:
             result = func(dataset)
 
@@ -207,7 +210,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     name_width = max(name_width, len("Test"))
 
     # Header
-    if MEMTEST_AVAILABLE:
+    if MEMTRACE_AVAILABLE:
         terminalreporter.write_line(
             f"{'Test':<{name_width}}  {'Peak Mem':>10}  {'Allocs':>10}  "
             f"{'Read IOPS':>10}  {'Read Bytes':>12}  "
@@ -229,7 +232,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
     for result in sorted_results:
         s = result.stats
-        if MEMTEST_AVAILABLE:
+        if MEMTRACE_AVAILABLE:
             terminalreporter.write_line(
                 f"{result.name:<{name_width}}  "
                 f"{_format_bytes(s.peak_bytes):>10}  "
@@ -248,11 +251,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
                 f"{_format_bytes(s.write_bytes):>12}"
             )
 
-    if not MEMTEST_AVAILABLE:
+    if not MEMTRACE_AVAILABLE:
         terminalreporter.write_line("")
         terminalreporter.write_line(
             "Note: Memory tracking not available. "
-            "Run with LD_PRELOAD=$(lance-memtest) to enable."
+            "Build pylance with Rust feature 'memtrace' to enable."
         )
 
     terminalreporter.write_line("")
@@ -277,7 +280,7 @@ def pytest_sessionfinish(session, exitstatus):
             "write_iops": {"value": s.write_iops},
             "write_bytes": {"value": s.write_bytes},
         }
-        if MEMTEST_AVAILABLE:
+        if MEMTRACE_AVAILABLE:
             bmf_output[result.name]["peak_memory_bytes"] = {"value": s.peak_bytes}
             bmf_output[result.name]["total_allocations"] = {
                 "value": s.total_allocations
