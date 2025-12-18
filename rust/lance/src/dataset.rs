@@ -44,7 +44,7 @@ use lance_table::format::{
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
-    CommitLock, ManifestLocation, ManifestNamingScheme,
+    CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
 };
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
@@ -112,6 +112,7 @@ use lance_core::box_error;
 pub use lance_core::ROW_ID;
 use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::io::deletion::DELETIONS_DIR;
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -128,9 +129,10 @@ pub use write::{
     WriteDestination, WriteMode, WriteParams,
 };
 
-const INDICES_DIR: &str = "_indices";
+pub(crate) const INDICES_DIR: &str = "_indices";
+pub(crate) const DATA_DIR: &str = "data";
+pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 
-pub const DATA_DIR: &str = "data";
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -1082,7 +1084,7 @@ impl Dataset {
             Transaction::try_from(tx).map(Some)?
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
-            let path = self.base.child("_transactions").child(path.as_str());
+            let path = self.transactions_dir().child(path.as_str());
             let data = self.object_store.inner.get(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)?
@@ -1484,7 +1486,7 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
-    /// Take [BlobFile] by row ids (row address).
+    /// Take [BlobFile] by row IDs.
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
@@ -1611,6 +1613,18 @@ impl Dataset {
 
     pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
+    }
+
+    pub fn transactions_dir(&self) -> Path {
+        self.base.child(TRANSACTIONS_DIR)
+    }
+
+    pub fn deletions_dir(&self) -> Path {
+        self.base.child(DELETIONS_DIR)
+    }
+
+    pub fn versions_dir(&self) -> Path {
+        self.base.child(VERSIONS_DIR)
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {

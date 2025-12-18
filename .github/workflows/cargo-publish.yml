@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     # Needs additional disk space for the full build.
-    runs-on: ubuntu-2404-8x-x64
+    runs-on: warp-ubuntu-latest-x64-8x
     permissions:
       id-token: write
     timeout-minutes: 60

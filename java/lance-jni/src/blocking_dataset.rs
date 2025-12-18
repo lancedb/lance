@@ -36,8 +36,8 @@ use lance::dataset::{
     Version, WriteParams,
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
-use lance::table::format::Fragment;
 use lance::table::format::IndexMetadata;
+use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -53,6 +53,21 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
+
+impl FromJObjectWithEnv<BasePath> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
+        let id = env.get_u32_from_method(self, "getId")?;
+        let name = env.get_optional_string_from_method(self, "getName")?;
+        let path = env.get_string_from_method(self, "getPath")?;
+        let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
+        Ok(BasePath {
+            id,
+            name,
+            path,
+            is_dataset_root,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct BlockingDataset {
@@ -338,6 +353,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    initial_bases: JObject,
+    target_bases: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -352,7 +369,9 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            initial_bases,
+            target_bases,
         )
     )
 }
@@ -370,6 +389,8 @@ fn inner_create_with_ffi_schema<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    initial_bases: JObject,
+    target_bases: JObject,
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -388,6 +409,8 @@ fn inner_create_with_ffi_schema<'local>(
         storage_options_obj,
         JObject::null(), // No provider for schema-only creation
         s3_credentials_refresh_offset_seconds_obj,
+        initial_bases,
+        target_bases,
         reader,
     )
 }
@@ -420,6 +443,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    initial_bases: JObject,
+    target_bases: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -435,7 +460,9 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             data_storage_version,
             storage_options_obj,
             JObject::null(),
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            initial_bases,
+            target_bases
         )
     )
 }
@@ -455,6 +482,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    initial_bases: JObject,                // Optional<List<BasePath>>
+    target_bases: JObject,                 // Optional<List<String>>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -470,7 +499,9 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            initial_bases,
+            target_bases
         )
     )
 }
@@ -489,6 +520,8 @@ fn inner_create_with_ffi_stream<'local>(
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    initial_bases: JObject,                // Optional<List<BasePath>>
+    target_bases: JObject,                 // Optional<List<String>>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -504,6 +537,8 @@ fn inner_create_with_ffi_stream<'local>(
         storage_options_obj,
         storage_options_provider_obj,
         s3_credentials_refresh_offset_seconds_obj,
+        initial_bases,
+        target_bases,
         reader,
     )
 }
@@ -521,6 +556,8 @@ fn create_dataset<'local>(
     storage_options_obj: JObject,
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject,
+    initial_bases: JObject,
+    target_bases: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
@@ -536,6 +573,8 @@ fn create_dataset<'local>(
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,
+        &initial_bases,
+        &target_bases,
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
@@ -1000,60 +1039,18 @@ fn inner_open_native<'local>(
     let storage_options = to_rust_map(env, &jmap)?;
 
     // Extract storage options provider first (before get_bytes_opt which borrows env)
-    let storage_options_provider = if !storage_options_provider_obj.is_null() {
-        // Check if it's an Optional.empty()
-        let is_present = env
-            .call_method(&storage_options_provider_obj, "isPresent", "()Z", &[])?
-            .z()?;
-        if is_present {
-            // Get the value from Optional
-            let provider_obj = env
-                .call_method(
-                    &storage_options_provider_obj,
-                    "get",
-                    "()Ljava/lang/Object;",
-                    &[],
-                )?
-                .l()?;
-            Some(JavaStorageOptionsProvider::new(env, provider_obj)?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let storage_options_provider = env
+        .get_optional(&storage_options_provider_obj, |env, provider_obj| {
+            JavaStorageOptionsProvider::new(env, provider_obj)
+        })?;
 
     let storage_options_provider_arc =
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
     // Extract s3_credentials_refresh_offset_seconds
-    let s3_credentials_refresh_offset_seconds =
-        if !s3_credentials_refresh_offset_seconds_obj.is_null() {
-            let is_present = env
-                .call_method(
-                    &s3_credentials_refresh_offset_seconds_obj,
-                    "isPresent",
-                    "()Z",
-                    &[],
-                )?
-                .z()?;
-            if is_present {
-                let value = env
-                    .call_method(
-                        &s3_credentials_refresh_offset_seconds_obj,
-                        "get",
-                        "()Ljava/lang/Object;",
-                        &[],
-                    )?
-                    .l()?;
-                let long_value = env.call_method(&value, "longValue", "()J", &[])?.j()?;
-                Some(long_value as u64)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    let s3_credentials_refresh_offset_seconds = env
+        .get_long_opt(&s3_credentials_refresh_offset_seconds_obj)?
+        .map(|v| v as u64);
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
@@ -1365,7 +1362,7 @@ fn inner_shallow_clone<'local>(
 ) -> Result<JObject<'local>> {
     let target_path_str = target_path.extract(env)?;
     let storage_options = env.get_optional(&storage_options, |env, map_obj| {
-        let jmap = JMap::from_env(env, map_obj)?;
+        let jmap = JMap::from_env(env, &map_obj)?;
         to_rust_map(env, &jmap)
     })?;
 
@@ -1791,18 +1788,13 @@ fn inner_add_columns_by_sql_expressions(
 
     let rust_transform = NewColumnTransform::SqlExpressions(expressions);
 
-    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
-        let batch_size_value = env.get_long_opt(&batch_size)?;
-        match batch_size_value {
-            Some(value) => Some(
-                value
-                    .try_into()
-                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
-            ),
-            None => None,
-        }
-    } else {
-        None
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
+        ),
+        None => None,
     };
 
     let mut dataset_guard =
@@ -1841,18 +1833,13 @@ fn inner_add_columns_by_reader(
 
     let transform = NewColumnTransform::Reader(Box::new(reader));
 
-    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
-        let batch_size_value = env.get_long_opt(&batch_size)?;
-        match batch_size_value {
-            Some(value) => Some(
-                value
-                    .try_into()
-                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
-            ),
-            None => None,
-        }
-    } else {
-        None
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
+        ),
+        None => None,
     };
 
     let mut dataset_guard =

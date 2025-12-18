@@ -110,6 +110,47 @@ def test_blob_files_by_address(dataset_with_blobs):
             assert f.read() == expected
 
 
+def test_blob_files_by_address_with_stable_row_ids(tmp_path):
+    table = pa.table(
+        {
+            "blobs": pa.array([b"foo"], pa.large_binary()),
+            "idx": pa.array([0], pa.uint64()),
+        },
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("idx", pa.uint64()),
+            ]
+        ),
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        enable_stable_row_ids=True,
+    )
+
+    ds.insert(
+        pa.table(
+            {
+                "blobs": pa.array([b"bar"], pa.large_binary()),
+                "idx": pa.array([1], pa.uint64()),
+            },
+            schema=table.schema,
+        )
+    )
+
+    t = ds.to_table(columns=["idx"], with_row_address=True)
+    row_idx = t.column("idx").to_pylist().index(1)
+    addr = t.column("_rowaddr").to_pylist()[row_idx]
+
+    blobs = ds.take_blobs("blobs", addresses=[addr])
+    assert len(blobs) == 1
+    with blobs[0] as f:
+        assert f.read() == b"bar"
+
+
 def test_blob_by_indices(tmp_path, dataset_with_blobs):
     indices = [0, 4]
     blobs = dataset_with_blobs.take_blobs("blobs", indices=indices)
@@ -214,3 +255,31 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
 def test_scan_blob(tmp_path, dataset_with_blobs):
     ds = dataset_with_blobs.scanner(filter="idx = 2").to_table()
     assert ds.num_rows == 1
+
+
+def test_blob_extension_write_inline(tmp_path):
+    table = pa.table({"blob": lance.blob_array([b"foo", b"bar"])})
+    ds = lance.write_dataset(table, tmp_path / "test_ds_v2", data_storage_version="2.2")
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert pa.types.is_struct(desc.type)
+
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+
+
+def test_blob_extension_write_external(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    uri = blob_path.as_uri()
+
+    table = pa.table({"blob": lance.blob_array([uri])})
+    ds = lance.write_dataset(
+        table, tmp_path / "test_ds_v2_external", data_storage_version="2.2"
+    )
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"

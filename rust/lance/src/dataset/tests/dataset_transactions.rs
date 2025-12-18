@@ -7,7 +7,7 @@ use std::vec;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{write_manifest_file, ManifestWriteConfig, TRANSACTIONS_DIR};
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
@@ -297,7 +297,7 @@ async fn test_inline_transaction() {
 
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
-            let tx_path = ds.base.child("_transactions").child(tx_file.as_str());
+            let tx_path = ds.base.child(TRANSACTIONS_DIR).child(tx_file.as_str());
             let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }

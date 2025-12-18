@@ -166,6 +166,22 @@ impl LanceSchema {
     pub fn field(&self, name: &str) -> PyResult<Option<LanceField>> {
         Ok(self.0.field(name).map(|f| LanceField(f.clone())))
     }
+
+    /// Get a field by name or path with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    ///
+    /// For nested fields, use dot notation (e.g., "parent.child").
+    /// Field names containing dots must be quoted with backticks (e.g., "parent.`child.with.dot`").
+    ///
+    /// Returns None if the field is not found.
+    pub fn field_case_insensitive(&self, name: &str) -> PyResult<Option<LanceField>> {
+        Ok(self
+            .0
+            .field_case_insensitive(name)
+            .map(|f| LanceField(f.clone())))
+    }
 }
 
 pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {

@@ -46,6 +46,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult,
+    TRANSACTIONS_DIR,
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -77,7 +78,7 @@ pub(crate) async fn read_transaction_file(
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child("_transactions").child(transaction_file);
+    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -91,7 +92,7 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child("_transactions").child(file_name.as_str());
+    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();

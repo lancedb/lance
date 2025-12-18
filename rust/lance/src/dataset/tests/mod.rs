@@ -8,6 +8,7 @@ mod dataset_index;
 mod dataset_io;
 mod dataset_merge_update;
 mod dataset_migrations;
+mod dataset_scanner;
 mod dataset_schema_evolution;
 mod dataset_transactions;
 mod dataset_versioning;

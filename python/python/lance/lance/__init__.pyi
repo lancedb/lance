@@ -261,6 +261,16 @@ class _Dataset:
     ) -> pa.RecordBatch: ...
     def take_blobs(
         self,
+        row_ids: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_addresses(
+        self,
+        row_addresses: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_indices(
+        self,
         row_indices: List[int],
         blob_column: str,
     ) -> List[LanceBlobFile]: ...
@@ -571,6 +581,15 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+
+class DatasetBasePath:
+    def __init__(
+        self,
+        path: str,
+        name: Optional[str] = None,
+        is_dataset_root: bool = False,
+        id: Optional[int] = None,
+    ) -> None: ...
 
 __version__: str
 language_model_home: Callable[[], str]

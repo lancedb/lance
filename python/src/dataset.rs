@@ -15,7 +15,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::{Duration, TimeDelta};
+use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
 use log::error;
@@ -33,6 +33,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
@@ -388,7 +389,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
 }
 
 /// Python binding for BasePath
-#[pyclass(name = "DatasetBasePath", module = "lance")]
+#[pyclass(name = "DatasetBasePath", module = "_lib")]
 #[derive(Clone)]
 pub struct DatasetBasePath {
     #[pyo3(get)]
@@ -1174,13 +1175,26 @@ impl Dataset {
 
     fn take_blobs(
         self_: PyRef<'_, Self>,
-        row_indices: Vec<u64>,
+        row_ids: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = rt()
+            .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    fn take_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_blobs(&row_indices, blob_column),
+                self_
+                    .ds
+                    .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
@@ -1496,23 +1510,33 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
         &self,
-        older_than_micros: i64,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> PyResult<CleanupStats> {
-        let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = rt()
-            .block_on(
-                None,
-                self.ds.cleanup_old_versions(
-                    older_than,
-                    delete_unverified,
-                    error_if_tagged_old_versions,
-                ),
-            )?
+            .block_on(None, async {
+                let mut builder = CleanupPolicyBuilder::default();
+                if let Some(v) = older_than_micros {
+                    let older_than = Duration::microseconds(v);
+                    builder = builder.before_timestamp(Utc::now() - older_than);
+                }
+                if let Some(v) = retain_versions {
+                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+                }
+                if let Some(v) = delete_unverified {
+                    builder = builder.delete_unverified(v);
+                }
+                if let Some(v) = error_if_tagged_old_versions {
+                    builder = builder.error_if_tagged_old_versions(v);
+                }
+
+                self.ds.cleanup_with_policy(builder.build()).await
+            })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
@@ -1776,7 +1800,7 @@ impl Dataset {
             "ZONEMAP" => IndexType::ZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
-            "INVERTED" | "FTS" => IndexType::Inverted,
+            "INVERTED" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -1829,7 +1853,7 @@ impl Dataset {
                     params: Some(config.config.clone()),
                 })
             }
-            "INVERTED" | "FTS" => {
+            "INVERTED" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {

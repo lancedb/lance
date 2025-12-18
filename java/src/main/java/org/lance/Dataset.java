@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
+import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
@@ -141,7 +142,9 @@ public class Dataset implements Closeable {
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
               params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds());
+              params.getS3CredentialsRefreshOffsetSeconds(),
+              params.getInitialBases(),
+              params.getTargetBases());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -200,7 +203,9 @@ public class Dataset implements Closeable {
             params.getDataStorageVersion(),
             params.getStorageOptions(),
             Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds());
+            params.getS3CredentialsRefreshOffsetSeconds(),
+            params.getInitialBases(),
+            params.getTargetBases());
     dataset.allocator = allocator;
     return dataset;
   }
@@ -215,7 +220,9 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases);
 
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
@@ -227,7 +234,9 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases);
 
   private static native Dataset createWithFfiStreamAndProvider(
       long arrowStreamMemoryAddress,
@@ -240,7 +249,9 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases);
 
   /**
    * Open a dataset from the specified path.
@@ -1370,6 +1381,39 @@ public class Dataset implements Closeable {
   public SqlQuery sql(String sql) {
     return new SqlQuery(this, sql);
   }
+
+  /**
+   * Compute the delta between current version and this version.
+   *
+   * @param comparedAgainst the version to compare the current dataset against
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public DatasetDelta delta(long comparedAgainst) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(Optional.of(comparedAgainst), Optional.empty(), Optional.empty());
+    }
+  }
+
+  /**
+   * Compute the delta between both {@code beginVersion} (exclusive) and {@code endVersion}
+   * (inclusive).
+   *
+   * @param beginVersion the beginning version (exclusive) for explicit range
+   * @param endVersion the ending version (inclusive) for explicit range
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public DatasetDelta delta(long beginVersion, long endVersion) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(Optional.empty(), Optional.of(beginVersion), Optional.of(endVersion));
+    }
+  }
+
+  private native DatasetDelta nativeBuildDelta(
+      Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion);
 
   /**
    * Merge source data with the existing target data.

@@ -52,6 +52,7 @@ dist/
 cmake-build-*
 .vscode
 .DS_Store
+.metals
 
 python/lance/_*.cpp
 

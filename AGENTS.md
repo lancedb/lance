@@ -144,6 +144,14 @@ Tests:
 
 ## Review Guidelines
 
+Please note that the attention of contributors and maintainers is the MOST valuable resource.
+Less is more: focus on the most important aspects.
+
+- Your review output SHOULD be concise and clear.
+- You SHOULD only highlight P0 and P1 level issues, such as severe bugs, performance degradation, or security concerns.
+- You MUST not reiterate detailed changes in your review.
+- You MUST not repeat aspects of the PR that are already well done.
+            
 Please consider the following when reviewing code contributions.
 
 ### Rust API design

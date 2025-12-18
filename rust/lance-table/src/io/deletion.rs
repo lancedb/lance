@@ -22,7 +22,7 @@ use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType};
 
-pub(crate) const DELETION_DIRS: &str = "_deletions";
+pub const DELETIONS_DIR: &str = "_deletions";
 
 /// Get the Arrow schema for an Arrow deletion file.
 fn deletion_arrow_schema() -> Arc<Schema> {
@@ -42,7 +42,7 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
         ..
     } = deletion_file;
     let suffix = file_type.suffix();
-    base.child(DELETION_DIRS)
+    base.child(DELETIONS_DIR)
         .child(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
 }
 

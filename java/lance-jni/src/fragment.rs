@@ -257,6 +257,8 @@ fn create_fragment<'a>(
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,
+        &JObject::null(), // not used when creating fragments
+        &JObject::null(), // not used when creating fragments
     )?;
 
     let fragments = RT.block_on(FileFragment::create_fragments(
@@ -743,19 +745,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
 }
 
 fn get_base_id(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
-    let base_id = env
-        .call_method(obj, "getBaseId", "()Ljava/util/Optional;", &[])?
-        .l()?;
-
-    if env.call_method(&base_id, "isPresent", "()Z", &[])?.z()? {
-        let inner_value = env
-            .call_method(&base_id, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
-        Ok(Some(int_value as u32))
-    } else {
-        Ok(None)
-    }
+    env.get_optional_u32_from_method(obj, "getBaseId")
 }
 
 fn convert_to_java_integer<'local>(

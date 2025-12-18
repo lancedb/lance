@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -364,9 +365,10 @@ impl FlatMatchQueryExec {
         query: MatchQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
     ) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            EquivalenceProperties::new(schema),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -433,6 +435,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let unindexed_input =
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
+        let schema = self.schema();
         let stream = stream::once(async move {
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
@@ -453,6 +456,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 column,
                 query.terms,
                 &inverted_idx,
+                schema,
             ))
         })
         .try_flatten_unordered(None)
@@ -1130,6 +1134,7 @@ pub mod tests {
     use lance_index::scalar::inverted::query::{
         BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
     };
+    use lance_index::scalar::inverted::FTS_SCHEMA;
 
     use crate::{io::exec::PreFilterSource, utils::test::NoContextTestFixture};
 
@@ -1165,6 +1170,7 @@ pub mod tests {
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             flat_input,
+            FTS_SCHEMA.clone(),
         );
         flat_match_query
             .execute(0, Arc::new(TaskContext::default()))

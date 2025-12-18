@@ -370,16 +370,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis) # doctest: +ELLIPSIS
-            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
-              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
-                ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
-                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
-                    CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
-                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        CooperativeExec, metrics=[], cumulative_cpu=...
-                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
+            MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: elapsed=..., expr=[_rowid@1 as _rowid, ...], metrics=[...]
+                  ProjectionExec: elapsed=..., expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...]
+                    CoalesceBatchesExec: elapsed=..., ..., metrics=[...]
+                      HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                        CooperativeExec, elapsed=..., metrics=[]
+                          LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                         RepartitionExec: ...
-                          StreamingTableExec: ..., metrics=[], ...
+                          StreamingTableExec: ..., metrics=[]
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -1640,12 +1640,11 @@ class LanceDataset(pa.dataset.Dataset):
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
         elif addresses is not None:
-            # ROW ids and Row address are the same until stable ROW ID is implemented.
-            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
         elif indices is not None:
             lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
         else:
-            raise ValueError("Either ids or indices must be specified")
+            raise ValueError("Either ids, addresses, or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
@@ -2284,6 +2283,7 @@ class LanceDataset(pa.dataset.Dataset):
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
@@ -2303,8 +2303,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If not specified, this
-            will default to two weeks.
+            Only versions older than this will be removed.  If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -2324,10 +2327,14 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
         """
-        if older_than is None:
+        if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
+
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
         )
 
     def create_scalar_index(
@@ -2528,7 +2535,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        lance_field = self._ds.lance_schema.field(column)
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise KeyError(f"{column} not found in schema")
 
@@ -2816,7 +2823,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            lance_field = self._ds.lance_schema.field(c)
+            lance_field = self._ds.lance_schema.field_case_insensitive(c)
             if lance_field is None:
                 raise KeyError(f"{c} not found in schema")
             field = lance_field.to_arrow()
@@ -4697,7 +4704,7 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        lance_field = self.ds._ds.lance_schema.field(column)
+        lance_field = self.ds._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
 

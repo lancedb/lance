@@ -9,7 +9,7 @@ import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from . import io, log
-from .blob import BlobColumn, BlobFile
+from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -51,8 +51,12 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "Blob",
+    "BlobArray",
     "BlobColumn",
     "BlobFile",
+    "blob_array",
+    "blob_field",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",

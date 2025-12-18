@@ -452,7 +452,7 @@ fn inner_read_transaction<'local>(
     Ok(transaction)
 }
 
-fn convert_to_java_transaction<'local>(
+pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
     java_dataset: &JObject,
@@ -479,7 +479,7 @@ fn convert_to_java_transaction<'local>(
     Ok(java_transaction)
 }
 
-fn convert_to_java_operation<'local>(
+pub(crate) fn convert_to_java_operation<'local>(
     env: &mut JNIEnv<'local>,
     operation: Option<Operation>,
 ) -> Result<JObject<'local>> {
@@ -707,7 +707,7 @@ fn convert_to_java_operation_inner<'local>(
     }
 }
 
-fn convert_to_java_schema<'local>(
+pub(crate) fn convert_to_java_schema<'local>(
     env: &mut JNIEnv<'local>,
     schema: LanceSchema,
 ) -> Result<JObject<'local>> {

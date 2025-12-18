@@ -433,6 +433,62 @@ impl Schema {
         self.resolve(name).and_then(|fields| fields.last().copied())
     }
 
+    /// Get a field by its path, with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    /// Field names containing dots must be quoted: parent."child.with.dot"
+    pub fn field_case_insensitive(&self, name: &str) -> Option<&Field> {
+        self.resolve_case_insensitive(name)
+            .and_then(|fields| fields.last().copied())
+    }
+
+    /// Given a string column reference, resolve the path of fields with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual fields from the schema (preserving original case).
+    pub fn resolve_case_insensitive(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let split = parse_field_path(column.as_ref()).ok()?;
+        if split.is_empty() {
+            return None;
+        }
+
+        if split.len() == 1 {
+            let field_name = &split[0];
+            // Try exact match first
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
+            }
+            // Fall back to case-insensitive match
+            if let Some(field) = self
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field_name))
+            {
+                return Some(vec![field]);
+            }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
+        let mut fields = Vec::with_capacity(split.len());
+        let first = &split[0];
+
+        // Find the first field (try exact match, then case-insensitive)
+        let field = self.fields.iter().find(|f| &f.name == first).or_else(|| {
+            self.fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(first))
+        })?;
+
+        let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+        if field.resolve_case_insensitive(&mut split_refs, &mut fields) {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
     pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
@@ -692,6 +748,16 @@ impl TryFrom<&ArrowSchema> for Schema {
                         return Err(Error::Schema {
                             message: format!(
                                 "Primary key column must not be in a list type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a map type: {}",
                                 ancestor
                             ),
                             location: location!(),
@@ -1443,17 +1509,23 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-/// Format a field path, quoting field names that contain dots or backticks.
+/// Format a field path, quoting field names that require escaping.
 ///
-/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Field names are quoted if they contain any character that is not alphanumeric
+/// or underscore, to ensure safe SQL parsing.
+///
+/// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
+/// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
+/// For example: ["field`with`backticks"] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
         .map(|field| {
-            if field.contains('.') || field.contains('`') {
-                // Quote this field
+            // Quote if the field contains any non-identifier character
+            // (i.e., anything other than alphanumeric or underscore)
+            let needs_quoting = field.chars().any(|c| !c.is_alphanumeric() && c != '_');
+            if needs_quoting {
                 // Escape backticks by doubling them (PostgreSQL style)
                 let escaped = field.replace('`', "``");
                 format!("`{}`", escaped)

@@ -511,3 +511,59 @@ def test_json_filter_append_missing_json_cast(tmp_path: Path):
         "PLoS One",
         "Nature",
     ]
+
+
+def test_json_limit_offset_batch_transfer_preserves_extension_metadata(tmp_path: Path):
+    """Ensure JSON extension metadata survives limit/offset scans.
+
+    This covers recreating a table by reading a source dataset in chunks and
+    appending each chunk into a new dataset.
+    """
+
+    source_path = tmp_path / "json_source.lance"
+    dest_path = tmp_path / "json_dest.lance"
+
+    num_rows = 25
+    batch_size = 10
+
+    table = pa.table(
+        {
+            "id": pa.array(range(num_rows), type=pa.int32()),
+            "meta": pa.array(
+                [json.dumps({"i": i}) for i in range(num_rows)], type=pa.json_()
+            ),
+        }
+    )
+
+    lance.write_dataset(table, source_path)
+    source = lance.dataset(source_path)
+
+    first_batch = source.to_table(limit=batch_size)
+    meta_field = first_batch.schema.field("meta")
+    assert (
+        str(meta_field.type) == "extension<arrow.json>" or meta_field.type == pa.utf8()
+    )
+
+    lance.write_dataset(first_batch, dest_path, mode="overwrite")
+
+    offset = batch_size
+    while True:
+        batch = source.to_table(limit=batch_size, offset=offset)
+        if batch.num_rows == 0:
+            break
+
+        assert batch.schema == first_batch.schema
+        meta_field = batch.schema.field("meta")
+        assert (
+            str(meta_field.type) == "extension<arrow.json>"
+            or meta_field.type == pa.utf8()
+        )
+
+        lance.write_dataset(batch, dest_path, mode="append")
+        offset += batch_size
+
+    dest = lance.dataset(dest_path)
+    assert dest.count_rows() == num_rows
+
+    # Ensure JSON functions still recognize the column as JSON.
+    assert dest.to_table(filter="json_get(meta, 'i') IS NOT NULL").num_rows == num_rows

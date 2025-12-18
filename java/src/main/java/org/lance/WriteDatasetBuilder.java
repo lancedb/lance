@@ -79,6 +79,8 @@ public class WriteDatasetBuilder {
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
   private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+  private Optional<List<BasePath>> initialBases = Optional.empty();
+  private Optional<List<String>> targetBases = Optional.empty();
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -287,6 +289,16 @@ public class WriteDatasetBuilder {
     return this;
   }
 
+  public WriteDatasetBuilder initialBases(List<BasePath> bases) {
+    this.initialBases = Optional.of(bases);
+    return this;
+  }
+
+  public WriteDatasetBuilder targetBases(List<String> targetBases) {
+    this.targetBases = Optional.of(targetBases);
+    return this;
+  }
+
   /**
    * Executes the write operation and returns the created dataset.
    *
@@ -398,6 +410,9 @@ public class WriteDatasetBuilder {
     s3CredentialsRefreshOffsetSeconds.ifPresent(
         paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
+    initialBases.ifPresent(paramsBuilder::withInitialBases);
+    targetBases.ifPresent(paramsBuilder::withTargetBases);
+
     WriteParams params = paramsBuilder.build();
 
     // Create storage options provider for credential refresh during long-running writes
@@ -421,6 +436,8 @@ public class WriteDatasetBuilder {
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
     s3CredentialsRefreshOffsetSeconds.ifPresent(
         paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
+    initialBases.ifPresent(paramsBuilder::withInitialBases);
+    targetBases.ifPresent(paramsBuilder::withTargetBases);
 
     WriteParams params = paramsBuilder.build();
 

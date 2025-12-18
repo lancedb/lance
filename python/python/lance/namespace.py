@@ -448,18 +448,20 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         """Fetch storage options from the namespace.
 
         This calls namespace.describe_table() to get the latest storage options
-        and their expiration time.
+        and optionally their expiration time.
 
         Returns
         -------
         Dict[str, str]
-            Flat dictionary of string key-value pairs containing storage options
-            and expires_at_millis
+            Flat dictionary of string key-value pairs containing storage options.
+            May optionally include expires_at_millis. If expires_at_millis is not
+            provided, credentials are treated as non-expiring and will not be
+            automatically refreshed.
 
         Raises
         ------
         RuntimeError
-            If the namespace doesn't return storage options or expiration time
+            If the namespace doesn't return storage options
         """
         request = DescribeTableRequest(id=self._table_id, version=None)
         response = self._namespace.describe_table(request)
@@ -470,14 +472,9 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
                 "Ensure the namespace supports storage options providing."
             )
 
-        # Verify expires_at_millis is present
-        if "expires_at_millis" not in storage_options:
-            raise RuntimeError(
-                "Namespace storage_options missing 'expires_at_millis'. "
-                "Storage options refresh will not work properly."
-            )
-
         # Return the storage_options directly - it's already a flat Map<String, String>
+        # Note: expires_at_millis is optional. If not provided, credentials are treated
+        # as non-expiring and will not be automatically refreshed.
         return storage_options
 
     def provider_id(self) -> str:

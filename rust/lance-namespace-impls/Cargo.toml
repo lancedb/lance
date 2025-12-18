@@ -48,7 +48,7 @@ arrow-schema = { workspace = true }
 # REST adapter implementation dependencies (optional, enabled by "rest-adapter" feature)
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true, features = ["trace", "cors"] }
+tower-http = { workspace = true, optional = true, features = ["trace", "cors", "normalize-path"] }
 serde = { workspace = true, optional = true }
 
 # Common dependencies

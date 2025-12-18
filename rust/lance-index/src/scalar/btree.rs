@@ -62,7 +62,7 @@ use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
-use tracing::info;
+use tracing::{info, instrument};
 
 mod flat;
 
@@ -1044,6 +1044,7 @@ impl BTreeIndex {
             .await
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn read_page(
         &self,
         page_number: u32,
@@ -1090,6 +1091,7 @@ impl BTreeIndex {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,

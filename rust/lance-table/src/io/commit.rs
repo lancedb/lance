@@ -67,7 +67,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-const VERSIONS_DIR: &str = "_versions";
+pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 
@@ -318,23 +318,27 @@ async fn current_manifest_path(
                 e_tag: meta.e_tag,
             })
         }
-        // If the first valid manifest we see if V1, assume for now that we are
-        // using V1 naming scheme for all manifests. Since we are listing the
-        // directory anyways, we will assert there aren't any V2 manifests.
-        (Some((scheme, meta)), _) => {
-            let mut current_version = scheme
+        // If the list is not lexically ordered, we need to iterate all manifests
+        // to find the latest version. This works for both V1 and V2 schemes.
+        (Some((first_scheme, meta)), _) => {
+            let mut current_version = first_scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
             let mut current_meta = meta;
+            let scheme = first_scheme;
 
-            while let Some((scheme, meta)) = valid_manifests.next().await.transpose()? {
-                if matches!(scheme, ManifestNamingScheme::V2) {
+            while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
+                if entry_scheme != scheme {
                     return Err(Error::Internal {
-                        message: "Found V2 manifest in a V1 manifest directory".to_string(),
+                        message: format!(
+                            "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                             Use `migrate_manifest_paths_v2` to migrate the directory.",
+                            scheme, entry_scheme
+                        ),
                         location: location!(),
                     });
                 }
-                let version = scheme
+                let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
                     .unwrap();
                 if version > current_version {
@@ -1239,5 +1243,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_current_manifest_path(
+        #[values(true, false)] lexical_list_store: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        // Use memory store for both cases to avoid local FS special codepath.
+        // Modify list_is_lexically_ordered to simulate different object stores.
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = lexical_list_store;
+        let object_store = Box::new(object_store);
+        let base = Path::from("base");
+
+        // Write 12 manifest files in non-sequential order
+        for version in [5, 2, 11, 0, 8, 3, 10, 1, 7, 4, 9, 6] {
+            let path = naming_scheme.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+
+        assert_eq!(location.version, 11);
+        assert_eq!(location.naming_scheme, naming_scheme);
+        assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
     }
 }
