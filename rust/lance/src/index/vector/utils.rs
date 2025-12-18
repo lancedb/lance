@@ -542,7 +542,9 @@ mod tests {
             .await
             .unwrap();
 
-        let training_data = maybe_sample_training_data(&dataset, "mv", 1000).await.unwrap();
+        let training_data = maybe_sample_training_data(&dataset, "mv", 1000)
+            .await
+            .unwrap();
         assert_eq!(training_data.len(), 1000);
     }
 
