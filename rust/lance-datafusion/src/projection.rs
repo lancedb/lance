@@ -408,19 +408,24 @@ impl ProjectionPlan {
     }
 
     pub fn output_schema(&self) -> Result<ArrowSchema> {
-        let exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
         let physical_schema = self.physical_projection.to_arrow_schema();
+        let exprs = self.to_physical_exprs(&physical_schema)?;
         let fields = exprs
             .iter()
             .map(|(expr, name)| {
+                let metadata = expr.return_field(&physical_schema)?.metadata().clone();
                 Ok(ArrowField::new(
                     name,
                     expr.data_type(&physical_schema)?,
                     expr.nullable(&physical_schema)?,
-                ))
+                )
+                .with_metadata(metadata))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(ArrowSchema::new(fields))
+        Ok(ArrowSchema::new_with_metadata(
+            fields,
+            physical_schema.metadata().clone(),
+        ))
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -445,5 +450,31 @@ impl ProjectionPlan {
         } else {
             Ok(batches.into_iter().next().unwrap())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use lance_arrow::json::{is_json_field, json_field};
+
+    #[test]
+    fn test_output_schema_preserves_json_extension_metadata() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            json_field("meta", true),
+        ]);
+        let base_schema = Schema::try_from(&arrow_schema).unwrap();
+        let base = Arc::new(base_schema.clone());
+
+        let plan = ProjectionPlan::from_schema(base, &base_schema, BlobVersion::default()).unwrap();
+
+        let physical = plan.physical_projection.to_arrow_schema();
+        assert!(is_json_field(physical.field_with_name("meta").unwrap()));
+
+        let output = plan.output_schema().unwrap();
+        let output_field = output.field_with_name("meta").unwrap();
+        assert!(is_json_field(output_field));
     }
 }
