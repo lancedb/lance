@@ -45,11 +45,7 @@ jobs:
           python -m venv venv
           source venv/bin/activate
           pip install maturin duckdb requests pytest pytest-benchmark
-          maturin develop --locked --release --features datagen
-      - name: Build memtest
-        run: |
-          source venv/bin/activate
-          make -C ../memtest build-release
+          maturin develop --locked --release --features datagen,memtrace
       - name: Generate datasets
         run: |
           source venv/bin/activate
@@ -63,8 +59,7 @@ jobs:
       - name: Run IO/memory benchmarks
         run: |
           source venv/bin/activate
-          LIB_PATH=$(lance-memtest)
-          LD_PRELOAD=$LIB_PATH pytest python/ci_benchmarks \
+          pytest python/ci_benchmarks \
             -k "io_mem_" \
             --benchmark-stats-json io_mem_stats.json
       - name: Upload IO/memory stats to bencher
