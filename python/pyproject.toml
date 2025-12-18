@@ -108,6 +108,9 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
+    # TensorFlow import can emit NumPy deprecation FutureWarnings in some environments.
+    # We keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
