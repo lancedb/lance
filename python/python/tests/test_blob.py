@@ -255,3 +255,31 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
 def test_scan_blob(tmp_path, dataset_with_blobs):
     ds = dataset_with_blobs.scanner(filter="idx = 2").to_table()
     assert ds.num_rows == 1
+
+
+def test_blob_extension_write_inline(tmp_path):
+    table = pa.table({"blob": lance.blob_array([b"foo", b"bar"])})
+    ds = lance.write_dataset(table, tmp_path / "test_ds_v2", data_storage_version="2.2")
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert pa.types.is_struct(desc.type)
+
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+
+
+def test_blob_extension_write_external(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    uri = blob_path.as_uri()
+
+    table = pa.table({"blob": lance.blob_array([uri])})
+    ds = lance.write_dataset(
+        table, tmp_path / "test_ds_v2_external", data_storage_version="2.2"
+    )
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
