@@ -10,7 +10,7 @@ import pyarrow as pa
 from .lance import LanceBlobFile
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Blob:
     """
     A logical blob value for writing Lance blob columns.
