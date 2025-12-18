@@ -348,6 +348,7 @@ pub async fn check_round_trip_encoding_generated(
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -736,6 +737,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version: file_version,
             };
             let encoder = encoding_strategy
                 .create_field_encoder(

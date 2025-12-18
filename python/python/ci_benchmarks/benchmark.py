@@ -69,6 +69,15 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes:.1f} PB"
 
 
+def _format_count(count: int) -> str:
+    """Format a large count with commas."""
+    for unit in ["", "K"]:
+        if abs(count) < 1000.0:
+            return f"{count:.1f} {unit}"
+        count /= 1000.0
+    return f"{count:.1f} M"
+
+
 class IOMemoryBenchmark:
     """Benchmark fixture that tracks IO and memory during execution."""
 
@@ -204,14 +213,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             f"{'Read IOPS':>10}  {'Read Bytes':>12}  "
             f"{'Write IOPS':>10}  {'Write Bytes':>12}"
         )
-        terminalreporter.write_line("-" * (name_width + 72))
+        terminalreporter.write_line("-" * (name_width + 76))
     else:
         terminalreporter.write_line(
             f"{'Test':<{name_width}}  "
             f"{'Read IOPS':>10}  {'Read Bytes':>12}  "
             f"{'Write IOPS':>10}  {'Write Bytes':>12}"
         )
-        terminalreporter.write_line("-" * (name_width + 50))
+        terminalreporter.write_line("-" * (name_width + 52))
 
     # Results sorted by read bytes (descending)
     sorted_results = sorted(
@@ -224,7 +233,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             terminalreporter.write_line(
                 f"{result.name:<{name_width}}  "
                 f"{_format_bytes(s.peak_bytes):>10}  "
-                f"{s.total_allocations:>10,}  "
+                f"{_format_count(s.total_allocations):>10}  "
                 f"{s.read_iops:>10,}  "
                 f"{_format_bytes(s.read_bytes):>12}  "
                 f"{s.write_iops:>10,}  "

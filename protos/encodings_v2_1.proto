@@ -112,6 +112,9 @@ message MiniBlockLayout {
   // The page already records how many rows are in the page.  For mini-block we also need to know how
   // many "items" are in the page.  A row and an item are the same thing unless the page has lists.
   uint64 num_items = 9;
+
+  // Since Lance 2.2, miniblocks have larger chunk sizes (>= 64KB)
+  bool has_large_chunk = 10;
 }
 
 // A layout used for pages where the data is large

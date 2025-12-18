@@ -1048,7 +1048,9 @@ def test_analyze_vector_search(tmp_path: Path):
     plan = dataset.scanner(
         nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}
     ).analyze_plan()
-    assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
+    assert "KNNVectorDistance:" in plan
+    assert "metric=l2" in plan
+    assert "output_rows=10" in plan
 
 
 def test_get_fragments(tmp_path: Path):
