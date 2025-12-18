@@ -115,4 +115,7 @@ filterwarnings = [
     # Pytorch 2.2 on Python 2.12
     'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
     'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
+    # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
+    # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*np\.object.*:FutureWarning',
 ]
