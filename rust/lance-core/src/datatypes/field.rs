@@ -683,8 +683,8 @@ impl Field {
             }
             (DataType::Struct(_), DataType::Struct(_)) => {
                 // Blob v2 columns are special: they can have different struct layouts
-                // (logical input vs. descriptor struct). We treat blob v2 structs as opaque
-                // during schema set operations (union/subtract).
+                // (logical input vs. descriptor struct). We treat blob v2 structs like primitive
+                // fields (e.g. a binary column) during schema set operations (union/subtract).
                 if self.is_blob() {
                     return Ok(self.clone());
                 }
