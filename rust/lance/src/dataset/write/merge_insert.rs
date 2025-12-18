@@ -5146,4 +5146,94 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             error_message
         );
     }
+
+    /// Test that merge_insert works with mixed-case column names as keys.
+    /// This is a regression test for the fix in assign_action.rs that wraps
+    /// column names in double quotes to preserve case in DataFusion expressions.
+    #[tokio::test]
+    async fn test_merge_insert_mixed_case_key() {
+        // Create a schema with a mixed-case column name
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("userId", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+
+        // Initial data
+        let initial_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        // Write initial dataset
+        let test_uri = "memory://test_mixed_case.lance";
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // New data to merge (updates userId=2, inserts userId=4)
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2, 4])),
+                Arc::new(UInt32Array::from(vec![200, 400])),
+            ],
+        )
+        .unwrap();
+
+        // Perform merge_insert using "userId" as the key
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["userId".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_ds, _merge_stats) = job.execute(new_stream).await.unwrap();
+
+        // Verify the merge succeeded
+        let result = merged_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let result_batch = concat_batches(&schema, &result).unwrap();
+        assert_eq!(result_batch.num_rows(), 4); // 3 original + 1 inserted
+
+        // Verify that userId=2 was updated to value=200
+        let user_ids = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let values = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+
+        // Find the row with userId=2 and check its value
+        for i in 0..result_batch.num_rows() {
+            if user_ids.value(i) == 2 {
+                assert_eq!(
+                    values.value(i),
+                    200,
+                    "userId=2 should have been updated to value=200"
+                );
+            }
+        }
+    }
 }

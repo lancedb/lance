@@ -281,7 +281,8 @@ class TestSpecialCharacterColumnNames:
 
         indices = special_char_dataset.list_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["user-id"]
+        # Field with special chars is returned in quoted format for SQL compatibility
+        assert indices[0]["fields"] == ["`user-id`"]
 
         # Query using the indexed column (requires backticks in filter)
         result = special_char_dataset.to_table(filter="`user-id` = 50")
@@ -415,6 +416,33 @@ class TestNestedFieldColumnNames:
         plan = nested_mixed_case_dataset.scanner(filter="rowId = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
 
+    def test_scalar_index_with_lowercased_nested_path(self, nested_mixed_case_dataset):
+        """Scalar index creation should work even when path is lowercased.
+
+        This tests the case-insensitive resolution for nested field paths.
+        The schema has "MetaData.userId" but we pass "metadata.userid" (lowercased).
+        It should still resolve and create the index with the correct case.
+        """
+        # Schema has: MetaData.userId (mixed case)
+        # Pass lowercased path - should still resolve and create index
+        nested_mixed_case_dataset.create_scalar_index(
+            "metadata.userid", index_type="BTREE"
+        )
+
+        indices = nested_mixed_case_dataset.list_indices()
+        assert len(indices) == 1
+        # Should store with correct case from schema
+        assert indices[0]["fields"] == ["MetaData.userId"]
+
+        # Query should also work with correct case
+        result = nested_mixed_case_dataset.to_table(filter="MetaData.userId = 50")
+        assert result.num_rows == 1
+
+        plan = nested_mixed_case_dataset.scanner(
+            filter="MetaData.userId = 50"
+        ).explain_plan()
+        assert "ScalarIndexQuery" in plan
+
     @pytest.fixture
     def nested_special_char_table(self):
         """Create a table with special character column names at all levels."""
@@ -468,8 +496,8 @@ class TestNestedFieldColumnNames:
 
         indices = nested_special_char_dataset.list_indices()
         assert len(indices) == 1
-        # Backticks are stripped when storing the field path
-        assert indices[0]["fields"] == ["meta-data.user-id"]
+        # Fields with special chars are returned in quoted format for SQL compatibility
+        assert indices[0]["fields"] == ["`meta-data`.`user-id`"]
 
         # Query using the indexed column (backticks required in filter)
         result = nested_special_char_dataset.to_table(
@@ -489,7 +517,8 @@ class TestNestedFieldColumnNames:
 
         indices = nested_special_char_dataset.list_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["row-id"]
+        # Field with special chars is returned in quoted format for SQL compatibility
+        assert indices[0]["fields"] == ["`row-id`"]
 
         result = nested_special_char_dataset.to_table(filter="`row-id` = 50")
         assert result.num_rows == 1

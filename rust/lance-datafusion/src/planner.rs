@@ -862,11 +862,7 @@ impl Planner {
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
-        // Try exact match
-        if self.schema.field_with_name(expr).is_ok() {
-            return Ok(Expr::Column(Column::from_name(expr)));
-        }
-        // Try case-insensitive match for simple column reference
+        // resolve_column_name tries exact match first, then falls back to case-insensitive
         let resolved_name = self.resolve_column_name(expr);
         if self.schema.field_with_name(&resolved_name).is_ok() {
             return Ok(Expr::Column(Column::from_name(resolved_name)));

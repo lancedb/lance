@@ -482,7 +482,7 @@ impl Schema {
         })?;
 
         let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
-        if field.resolve(&mut split_refs, &mut fields) {
+        if field.resolve_case_insensitive(&mut split_refs, &mut fields) {
             Some(fields)
         } else {
             None
@@ -1499,17 +1499,23 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-/// Format a field path, quoting field names that contain dots or backticks.
+/// Format a field path, quoting field names that require escaping.
 ///
-/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Field names are quoted if they contain any character that is not alphanumeric
+/// or underscore, to ensure safe SQL parsing.
+///
+/// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
+/// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
+/// For example: ["field`with`backticks"] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
         .map(|field| {
-            if field.contains('.') || field.contains('`') {
-                // Quote this field
+            // Quote if the field contains any non-identifier character
+            // (i.e., anything other than alphanumeric or underscore)
+            let needs_quoting = field.chars().any(|c| !c.is_alphanumeric() && c != '_');
+            if needs_quoting {
                 // Escape backticks by doubling them (PostgreSQL style)
                 let escaped = field.replace('`', "``");
                 format!("`{}`", escaped)
