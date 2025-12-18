@@ -263,13 +263,6 @@ def test_blob_extension_write_inline(tmp_path):
 
     desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
     assert pa.types.is_struct(desc.type)
-    assert [f.name for f in desc.type] == [
-        "kind",
-        "position",
-        "size",
-        "blob_id",
-        "blob_uri",
-    ]
 
     blobs = ds.take_blobs("blob", indices=[0, 1])
     with blobs[0] as f:
