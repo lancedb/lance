@@ -864,17 +864,17 @@ impl ObjectStore {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
         let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
-            Some(provider) => provider.calculate_object_store_prefix(&location, storage_options).unwrap(),
+            Some(provider) => provider
+                .calculate_object_store_prefix(&location, storage_options)
+                .unwrap(),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
                 log::warn!("Guessing that object store prefix is {}, since object store scheme is not found in registry.", store_prefix);
                 store_prefix
-            },
+            }
         };
         let store = match wrapper {
-            Some(wrapper) => {
-                wrapper.wrap(&store_prefix, store)
-            }
+            Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
