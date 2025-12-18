@@ -134,8 +134,9 @@ class BlobArray(pa.ExtensionArray):
 
         data_arr = pa.array(data_values, type=pa.large_binary())
         uri_arr = pa.array(uri_values, type=pa.utf8())
+        mask_arr = pa.array(null_mask, type=pa.bool_())
         storage = pa.StructArray.from_arrays(
-            [data_arr, uri_arr], names=["data", "uri"], mask=null_mask
+            [data_arr, uri_arr], names=["data", "uri"], mask=mask_arr
         )
         return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]
 
