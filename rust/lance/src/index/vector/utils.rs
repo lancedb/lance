@@ -90,7 +90,7 @@ async fn estimate_multivector_vectors_per_row(
     num_rows: usize,
 ) -> Result<usize> {
     if num_rows == 0 {
-        return Ok(1);
+        return Ok(1030);
     }
 
     let projection = dataset.schema().project(&[column])?;
@@ -130,10 +130,10 @@ async fn estimate_multivector_vectors_per_row(
     }
 
     warn!(
-        "Could not find a non-empty multivector value for column {}, falling back to n=1",
+        "Could not find a non-empty multivector value for column {}, falling back to n=1030",
         column
     );
-    Ok(1)
+    Ok(1030)
 }
 
 /// Get the vector dimension of the given column in the schema.
@@ -493,7 +493,7 @@ mod tests {
     use super::*;
 
     use arrow_array::types::Float32Type;
-    use lance_datagen::{array, gen_batch, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
 
     use crate::dataset::InsertBuilder;
 
@@ -544,5 +544,33 @@ mod tests {
 
         let training_data = maybe_sample_training_data(&dataset, "mv", 1000).await.unwrap();
         assert_eq!(training_data.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_multivector_vectors_per_row_fallback_1030() {
+        let nrows: usize = 256;
+        let dims: u32 = 8;
+
+        let mv = array::cycle_vec_var(
+            array::rand_vec::<Float32Type>(Dimension::from(dims)),
+            Dimension::from(2),
+            Dimension::from(3),
+        )
+        .with_random_nulls(1.0);
+
+        let data = gen_batch()
+            .col("mv", mv)
+            .into_batch_rows(RowCount::from(nrows as u64))
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows)
+            .await
+            .unwrap();
+        assert_eq!(n, 1030);
     }
 }
