@@ -134,6 +134,84 @@ class TestMixedCaseColumnNames:
         assert result.num_rows == 150
 
 
+class TestCaseOnlyDifferentColumnNames:
+    """
+    Test that columns differing only in case can both be resolved correctly.
+
+    This tests the edge case where two column names are identical except for
+    casing (e.g., "camelCase" and "CamelCase"). The case-insensitive lookup
+    should still find the exact match when one exists.
+    """
+
+    @pytest.fixture
+    def case_variant_table(self):
+        """Create a table with columns that differ only in case."""
+        return pa.table(
+            {
+                "camelCase": range(100),
+                "CamelCase": range(100, 200),
+                "CAMELCASE": range(200, 300),
+            }
+        )
+
+    @pytest.fixture
+    def case_variant_dataset(self, tmp_path: Path, case_variant_table):
+        """Create a dataset with columns that differ only in case."""
+        return lance.write_dataset(case_variant_table, tmp_path / "case_variant")
+
+    def test_create_table_preserves_all_cases(self, case_variant_dataset):
+        """Verify all case variants are preserved as distinct columns."""
+        column_names = [f.name for f in case_variant_dataset.schema]
+        assert "camelCase" in column_names
+        assert "CamelCase" in column_names
+        assert "CAMELCASE" in column_names
+
+    def test_filter_resolves_exact_case_match(self, case_variant_dataset):
+        """Filter expressions resolve to exact case match when available."""
+        # Each column has distinct values, so we can verify correct resolution
+        result = case_variant_dataset.to_table(filter="camelCase < 10")
+        assert result.num_rows == 10
+
+        result = case_variant_dataset.to_table(filter="CamelCase < 110")
+        assert result.num_rows == 10
+
+        result = case_variant_dataset.to_table(filter="CAMELCASE < 210")
+        assert result.num_rows == 10
+
+    def test_scalar_index_on_each_case_variant(self, case_variant_dataset):
+        """Scalar index can be created on each case variant independently."""
+        case_variant_dataset.create_scalar_index("camelCase", index_type="BTREE")
+
+        indices = case_variant_dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["fields"] == ["camelCase"]
+
+        # Query using the indexed column
+        result = case_variant_dataset.to_table(filter="camelCase = 50")
+        assert result.num_rows == 1
+        assert result["camelCase"][0].as_py() == 50
+
+        plan = case_variant_dataset.scanner(filter="camelCase = 50").explain_plan()
+        assert "ScalarIndexQuery" in plan
+
+    def test_order_by_each_case_variant(self, case_variant_dataset):
+        """Order by works with each case variant independently."""
+        # Order by camelCase (values 0-99)
+        ordering = ColumnOrdering("camelCase", ascending=False)
+        result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
+        assert result["camelCase"][0].as_py() == 99
+
+        # Order by CamelCase (values 100-199)
+        ordering = ColumnOrdering("CamelCase", ascending=False)
+        result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
+        assert result["CamelCase"][0].as_py() == 199
+
+        # Order by CAMELCASE (values 200-299)
+        ordering = ColumnOrdering("CAMELCASE", ascending=False)
+        result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
+        assert result["CAMELCASE"][0].as_py() == 299
+
+
 class TestSpecialCharacterColumnNames:
     """
     Test that column names with special characters work properly.
@@ -259,17 +337,17 @@ class TestNestedFieldColumnNames:
     properly within nested (struct) fields.
 
     This tests nested field paths like:
-    - metadata.userId (mixed case in nested field)
-    - metadata.user-id (special chars in nested field)
+    - MetaData.userId (mixed case in both parent and nested field)
+    - `meta-data`.`user-id` (special chars in both parent and nested field)
     """
 
     @pytest.fixture
     def nested_mixed_case_table(self):
-        """Create a table with mixed-case nested column names."""
+        """Create a table with mixed-case column names at all levels."""
         return pa.table(
             {
-                "id": range(100),
-                "metadata": [{"userId": i, "itemCount": i * 10} for i in range(100)],
+                "rowId": range(100),
+                "MetaData": [{"userId": i, "itemCount": i * 10} for i in range(100)],
             }
         )
 
@@ -283,46 +361,66 @@ class TestNestedFieldColumnNames:
     def test_create_table_with_nested_mixed_case(self, nested_mixed_case_dataset):
         """Verify table creation with nested mixed-case columns preserves names."""
         schema = nested_mixed_case_dataset.schema
-        assert "metadata" in [f.name for f in schema]
-        metadata_field = schema.field("metadata")
+        assert "rowId" in [f.name for f in schema]
+        assert "MetaData" in [f.name for f in schema]
+        metadata_field = schema.field("MetaData")
         nested_names = [f.name for f in metadata_field.type]
         assert "userId" in nested_names
         assert "itemCount" in nested_names
 
     def test_filter_with_nested_mixed_case(self, nested_mixed_case_dataset):
-        """Filter expressions should work with mixed-case nested column names."""
-        result = nested_mixed_case_dataset.to_table(filter="metadata.userId > 50")
+        """Filter expressions should work with mixed-case column names at all levels."""
+        # Test top-level mixed case
+        result = nested_mixed_case_dataset.to_table(filter="rowId > 50")
         assert result.num_rows == 49
 
-        result = nested_mixed_case_dataset.to_table(filter="metadata.itemCount >= 500")
+        # Test nested mixed case (parent and child both mixed case)
+        result = nested_mixed_case_dataset.to_table(filter="MetaData.userId > 50")
+        assert result.num_rows == 49
+
+        result = nested_mixed_case_dataset.to_table(filter="MetaData.itemCount >= 500")
         assert result.num_rows == 50
 
     def test_scalar_index_with_nested_mixed_case(self, nested_mixed_case_dataset):
         """Scalar index creation should work with mixed-case nested column names."""
         nested_mixed_case_dataset.create_scalar_index(
-            "metadata.userId", index_type="BTREE"
+            "MetaData.userId", index_type="BTREE"
         )
 
         indices = nested_mixed_case_dataset.list_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["metadata.userId"]
+        assert indices[0]["fields"] == ["MetaData.userId"]
 
         # Query using the indexed column
-        result = nested_mixed_case_dataset.to_table(filter="metadata.userId = 50")
+        result = nested_mixed_case_dataset.to_table(filter="MetaData.userId = 50")
         assert result.num_rows == 1
 
         # Verify the index is actually used in the query plan
         plan = nested_mixed_case_dataset.scanner(
-            filter="metadata.userId = 50"
+            filter="MetaData.userId = 50"
         ).explain_plan()
+        assert "ScalarIndexQuery" in plan
+
+    def test_scalar_index_on_top_level_mixed_case(self, nested_mixed_case_dataset):
+        """Scalar index on top-level mixed-case column works."""
+        nested_mixed_case_dataset.create_scalar_index("rowId", index_type="BTREE")
+
+        indices = nested_mixed_case_dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["fields"] == ["rowId"]
+
+        result = nested_mixed_case_dataset.to_table(filter="rowId = 50")
+        assert result.num_rows == 1
+
+        plan = nested_mixed_case_dataset.scanner(filter="rowId = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
 
     @pytest.fixture
     def nested_special_char_table(self):
-        """Create a table with special character nested column names."""
+        """Create a table with special character column names at all levels."""
         return pa.table(
             {
-                "id": range(100),
+                "row-id": range(100),
                 "meta-data": [{"user-id": i, "item:count": i * 10} for i in range(100)],
             }
         )
@@ -337,6 +435,7 @@ class TestNestedFieldColumnNames:
     def test_create_table_with_nested_special_chars(self, nested_special_char_dataset):
         """Verify table creation with nested special char columns preserves names."""
         schema = nested_special_char_dataset.schema
+        assert "row-id" in [f.name for f in schema]
         assert "meta-data" in [f.name for f in schema]
         metadata_field = schema.field("meta-data")
         nested_names = [f.name for f in metadata_field.type]
@@ -344,7 +443,11 @@ class TestNestedFieldColumnNames:
         assert "item:count" in nested_names
 
     def test_filter_with_nested_special_chars(self, nested_special_char_dataset):
-        """Filter expressions work with special char nested columns using backticks."""
+        """Filter expressions work with special char columns at all levels."""
+        # Test top-level special char column
+        result = nested_special_char_dataset.to_table(filter="`row-id` > 50")
+        assert result.num_rows == 49
+
         # Both the parent and child need backticks when they contain special chars
         result = nested_special_char_dataset.to_table(
             filter="`meta-data`.`user-id` > 50"
@@ -377,5 +480,21 @@ class TestNestedFieldColumnNames:
         # Verify the index is actually used in the query plan
         plan = nested_special_char_dataset.scanner(
             filter="`meta-data`.`user-id` = 50"
+        ).explain_plan()
+        assert "ScalarIndexQuery" in plan
+
+    def test_scalar_index_on_top_level_special_chars(self, nested_special_char_dataset):
+        """Scalar index on top-level special char column works."""
+        nested_special_char_dataset.create_scalar_index("`row-id`", index_type="BTREE")
+
+        indices = nested_special_char_dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["fields"] == ["row-id"]
+
+        result = nested_special_char_dataset.to_table(filter="`row-id` = 50")
+        assert result.num_rows == 1
+
+        plan = nested_special_char_dataset.scanner(
+            filter="`row-id` = 50"
         ).explain_plan()
         assert "ScalarIndexQuery" in plan

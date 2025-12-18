@@ -1295,12 +1295,14 @@ impl Scanner {
         arrow_schema: &ArrowSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let lance_schema = dataset.schema();
-        let field_path = lance_schema.resolve(column_name).ok_or_else(|| {
-            Error::invalid_input(
-                format!("Field '{}' not found in schema", column_name),
-                location!(),
-            )
-        })?;
+        let field_path = lance_schema
+            .resolve_case_insensitive(column_name)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!("Field '{}' not found in schema", column_name),
+                    location!(),
+                )
+            })?;
 
         if field_path.len() == 1 {
             // Simple top-level column
@@ -1315,7 +1317,11 @@ impl Scanner {
             // Nested field - build a chain of GetFieldFunc calls
             let get_field_func = ScalarUDF::from(GetFieldFunc::default());
 
-            let mut expr = col(&field_path[0].name);
+            // Use Expr::Column with Column::new_unqualified to preserve exact case
+            // (col() normalizes identifiers to lowercase)
+            let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
+                &field_path[0].name,
+            ));
             for nested_field in &field_path[1..] {
                 expr = get_field_func.call(vec![expr, lit(&nested_field.name)]);
             }
