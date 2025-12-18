@@ -47,15 +47,15 @@ jobs:
             - Security concerns
             - Test coverage
 
-            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
-
-            Please note that the attention of contributors and maintainers is the MOSY valuable resource.
+            Please note that the attention of contributors and maintainers is the MOST valuable resource.
             Less is more: focus on the most important aspects.
 
             - Your review output SHOULD be concise and clear.
             - You SHOULD only highlight P0 and P1 level issues, such as severe bugs, performance degradation, or security concerns.
             - You MUST not reiterate detailed changes in your review.
             - You MUST not repeat aspects of the PR that are already well done.
+
+            Use the repository's CLAUDE.md for more guidance on style and conventions.
 
             Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
 
