@@ -145,12 +145,19 @@ class TestCaseOnlyDifferentColumnNames:
 
     @pytest.fixture
     def case_variant_table(self):
-        """Create a table with columns that differ only in case."""
+        """Create a table with columns that differ only in case.
+
+        Values are deliberately non-correlated to ensure tests catch
+        incorrect column resolution:
+        - camelCase: 0, 1, 2, ... (ascending)
+        - CamelCase: 99, 98, 97, ... (descending)
+        - CAMELCASE: 50, 51, 52, ..., 99, 0, 1, ... (rotated)
+        """
         return pa.table(
             {
-                "camelCase": range(100),
-                "CamelCase": range(100, 200),
-                "CAMELCASE": range(200, 300),
+                "camelCase": list(range(100)),
+                "CamelCase": list(range(99, -1, -1)),  # reversed
+                "CAMELCASE": list(range(50, 100)) + list(range(50)),  # rotated
             }
         )
 
@@ -168,48 +175,105 @@ class TestCaseOnlyDifferentColumnNames:
 
     def test_filter_resolves_exact_case_match(self, case_variant_dataset):
         """Filter expressions resolve to exact case match when available."""
-        # Each column has distinct values, so we can verify correct resolution
+        # camelCase has values 0-99 ascending, so camelCase < 10 matches rows 0-9
         result = case_variant_dataset.to_table(filter="camelCase < 10")
         assert result.num_rows == 10
+        # Verify we got the right rows by checking other column values
+        # Row 0 has: camelCase=0, CamelCase=99, CAMELCASE=50
+        assert result["CamelCase"][0].as_py() == 99
 
-        result = case_variant_dataset.to_table(filter="CamelCase < 110")
+        # CamelCase has values 99-0 descending, so CamelCase < 10 matches rows 90-99
+        result = case_variant_dataset.to_table(filter="CamelCase < 10")
         assert result.num_rows == 10
+        # These rows have camelCase values 90-99
+        camel_values = sorted([v.as_py() for v in result["camelCase"]])
+        assert camel_values == list(range(90, 100))
 
-        result = case_variant_dataset.to_table(filter="CAMELCASE < 210")
+        # CAMELCASE has values 50-99,0-49 (rotated), so CAMELCASE < 10
+        # matches rows 50-59 (which have CAMELCASE values 0-9)
+        result = case_variant_dataset.to_table(filter="CAMELCASE < 10")
         assert result.num_rows == 10
+        # These rows have camelCase values 50-59
+        camel_values = sorted([v.as_py() for v in result["camelCase"]])
+        assert camel_values == list(range(50, 60))
 
-    def test_scalar_index_on_each_case_variant(self, case_variant_dataset):
+    def test_scalar_index_on_each_case_variant(self, tmp_path, case_variant_table):
         """Scalar index can be created on each case variant independently."""
-        case_variant_dataset.create_scalar_index("camelCase", index_type="BTREE")
+        # Create separate datasets for each test to avoid index conflicts
+        ds1 = lance.write_dataset(case_variant_table, tmp_path / "ds1")
+        ds1.create_scalar_index("camelCase", index_type="BTREE")
+        assert ds1.list_indices()[0]["fields"] == ["camelCase"]
 
-        indices = case_variant_dataset.list_indices()
-        assert len(indices) == 1
-        assert indices[0]["fields"] == ["camelCase"]
-
-        # Query using the indexed column
-        result = case_variant_dataset.to_table(filter="camelCase = 50")
+        # Query camelCase=50 should return row 50 (where CamelCase=49, CAMELCASE=0)
+        result = ds1.to_table(filter="camelCase = 50")
         assert result.num_rows == 1
         assert result["camelCase"][0].as_py() == 50
+        assert result["CamelCase"][0].as_py() == 49  # 99 - 50
+        assert result["CAMELCASE"][0].as_py() == 0  # (50 + 50) % 100
 
-        plan = case_variant_dataset.scanner(filter="camelCase = 50").explain_plan()
+        plan = ds1.scanner(filter="camelCase = 50").explain_plan()
+        assert "ScalarIndexQuery" in plan
+
+        # Test CamelCase index
+        ds2 = lance.write_dataset(case_variant_table, tmp_path / "ds2")
+        ds2.create_scalar_index("CamelCase", index_type="BTREE")
+        assert ds2.list_indices()[0]["fields"] == ["CamelCase"]
+
+        # Query CamelCase=50 should return row 49 (where camelCase=49, CAMELCASE=99)
+        result = ds2.to_table(filter="CamelCase = 50")
+        assert result.num_rows == 1
+        assert result["CamelCase"][0].as_py() == 50
+        assert result["camelCase"][0].as_py() == 49  # row 49
+        assert result["CAMELCASE"][0].as_py() == 99  # (49 + 50) % 100
+
+        plan = ds2.scanner(filter="CamelCase = 50").explain_plan()
+        assert "ScalarIndexQuery" in plan
+
+        # Test CAMELCASE index
+        ds3 = lance.write_dataset(case_variant_table, tmp_path / "ds3")
+        ds3.create_scalar_index("CAMELCASE", index_type="BTREE")
+        assert ds3.list_indices()[0]["fields"] == ["CAMELCASE"]
+
+        # Query CAMELCASE=50 should return row 0 (where camelCase=0, CamelCase=99)
+        result = ds3.to_table(filter="CAMELCASE = 50")
+        assert result.num_rows == 1
+        assert result["CAMELCASE"][0].as_py() == 50
+        assert result["camelCase"][0].as_py() == 0  # row 0
+        assert result["CamelCase"][0].as_py() == 99  # 99 - 0
+
+        plan = ds3.scanner(filter="CAMELCASE = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
 
     def test_order_by_each_case_variant(self, case_variant_dataset):
-        """Order by works with each case variant independently."""
-        # Order by camelCase (values 0-99)
+        """Order by works with each case variant independently.
+
+        With our test data:
+        - camelCase: 0-99 ascending (row 99 has max value 99)
+        - CamelCase: 99-0 descending (row 0 has max value 99)
+        - CAMELCASE: 50-99,0-49 rotated (row 49 has max value 99)
+
+        Ordering by each column DESC should put a different row first.
+        """
+        # Order by camelCase DESC: row 99 comes first
         ordering = ColumnOrdering("camelCase", ascending=False)
         result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
         assert result["camelCase"][0].as_py() == 99
+        assert result["CamelCase"][0].as_py() == 0  # row 99 has CamelCase=0
+        assert result["CAMELCASE"][0].as_py() == 49  # row 99 has CAMELCASE=49
 
-        # Order by CamelCase (values 100-199)
+        # Order by CamelCase DESC: row 0 comes first
         ordering = ColumnOrdering("CamelCase", ascending=False)
         result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
-        assert result["CamelCase"][0].as_py() == 199
+        assert result["CamelCase"][0].as_py() == 99
+        assert result["camelCase"][0].as_py() == 0  # row 0 has camelCase=0
+        assert result["CAMELCASE"][0].as_py() == 50  # row 0 has CAMELCASE=50
 
-        # Order by CAMELCASE (values 200-299)
+        # Order by CAMELCASE DESC: row 49 comes first
         ordering = ColumnOrdering("CAMELCASE", ascending=False)
         result = case_variant_dataset.scanner(order_by=[ordering]).to_table()
-        assert result["CAMELCASE"][0].as_py() == 299
+        assert result["CAMELCASE"][0].as_py() == 99
+        assert result["camelCase"][0].as_py() == 49  # row 49 has camelCase=49
+        assert result["CamelCase"][0].as_py() == 50  # row 49 has CamelCase=50
 
 
 class TestSpecialCharacterColumnNames:
