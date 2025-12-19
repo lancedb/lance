@@ -3032,7 +3032,7 @@ mod tests {
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values(["user_0", "user_1", "user_2"])
         );
-        
+
         let mut genn = array::utf8_prefix_plus_counter("user_", true);
         assert_eq!(
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
