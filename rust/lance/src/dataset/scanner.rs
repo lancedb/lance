@@ -1563,7 +1563,7 @@ impl Scanner {
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));

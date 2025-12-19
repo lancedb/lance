@@ -1022,7 +1022,7 @@ impl ArrayGenerator for RandomBinaryGenerator {
 
 /// Generate a sequence of strings with a prefix and a counter
 ///
-/// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+/// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
 #[derive(Debug)]
 pub struct PrefixPlusCounterGenerator {
     prefix: String,
@@ -2598,7 +2598,7 @@ pub mod array {
 
     /// Creates a generator of strings with a prefix and a counter
     ///
-    /// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+    /// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
     pub fn utf8_prefix_plus_counter(
         prefix: impl Into<String>,
         is_large: bool,

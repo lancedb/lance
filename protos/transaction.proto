@@ -174,7 +174,7 @@ message Transaction {
     //          integrity guarantees provided by the storage backend.
     bool is_shallow = 1;
     // the reference name in the source dataset
-    // in most cases it should be the the branch or tag name in the source dataset
+    // in most cases it should be the branch or tag name in the source dataset
     optional string ref_name = 2;
     // the version of the source dataset for cloning
     uint64 ref_version = 3;
