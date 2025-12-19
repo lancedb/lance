@@ -39,7 +39,7 @@ jobs:
         uses: peter-evans/repository-dispatch@v2
         with:
           token: ${{ secrets.LANCE_BENCH_DISPATCH_TOKEN }}
-          repository: westonpace/lance-bench
+          repository: lancedb/lance-bench
           event-type: pr-comment
           client-payload: |
             {
