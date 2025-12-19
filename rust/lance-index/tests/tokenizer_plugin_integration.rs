@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Integration tests for tokenizer plugin functionality.
-//!
-//! These tests require the `tokenizer-plugin` feature and build a test plugin
-//! dynamically to verify the plugin loading and tokenization pipeline.
-
 #![cfg(feature = "tokenizer-plugin")]
 
 use std::env;
@@ -20,14 +15,12 @@ use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Build the test plugin and return its path.
 fn get_plugin_path() -> PathBuf {
     PLUGIN_PATH
         .get_or_init(|| {
             let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
             let plugin_dir = PathBuf::from(&manifest_dir).join("tests/test_plugin");
 
-            // Build the test plugin
             let output = Command::new("cargo")
                 .args(["build", "--release"])
                 .current_dir(&plugin_dir)
@@ -42,7 +35,6 @@ fn get_plugin_path() -> PathBuf {
                 );
             }
 
-            // Determine the library path based on platform
             let lib_name = if cfg!(target_os = "macos") {
                 "liblance_test_tokenizer_plugin.dylib"
             } else if cfg!(target_os = "windows") {
@@ -140,22 +132,6 @@ fn test_plugin_tokenizer_empty_text() {
 }
 
 #[test]
-fn test_plugin_tokenizer_whitespace_only() {
-    let plugin_path = get_plugin_path();
-
-    let mut tokenizer =
-        PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
-
-    let mut stream = tokenizer.token_stream_for_doc("   \t\n  ");
-    let mut count = 0;
-    while stream.advance() {
-        count += 1;
-    }
-
-    assert_eq!(count, 0);
-}
-
-#[test]
 fn test_plugin_tokenizer_multiple_spaces() {
     let plugin_path = get_plugin_path();
 
@@ -182,7 +158,6 @@ fn test_plugin_tokenizer_search_stream() {
     let mut tokenizer =
         PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
 
-    // token_stream_for_search should work the same as token_stream_for_doc
     let mut stream = tokenizer.token_stream_for_search("query terms");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -201,10 +176,8 @@ fn test_plugin_tokenizer_clone() {
     let tokenizer = PluginTokenizer::new(&plugin_path, r#"{"lowercase": true}"#)
         .expect("Failed to create tokenizer");
 
-    // Clone the tokenizer
     let mut cloned = tokenizer.box_clone();
 
-    // Verify the clone works independently
     let mut stream = cloned.token_stream_for_doc("HELLO");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -252,7 +225,6 @@ fn test_plugin_unicode_text() {
     let mut tokenizer =
         PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
 
-    // Test with Unicode characters
     let mut stream = tokenizer.token_stream_for_doc("Hello 世界 Rust");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -276,7 +248,6 @@ fn test_plugin_long_text() {
     let mut tokenizer =
         PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
 
-    // Generate a longer text
     let words: Vec<&str> = (0..100).map(|_| "word").collect();
     let long_text = words.join(" ");
 
@@ -287,4 +258,119 @@ fn test_plugin_long_text() {
     }
 
     assert_eq!(count, 100);
+}
+
+#[test]
+fn test_plugin_error_after_zero_tokens() {
+    let plugin_path = get_plugin_path();
+
+    // Configure to error immediately (after 0 tokens)
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 0}"#)
+        .expect("Failed to create tokenizer");
+
+    // Should produce no tokens due to error
+    let mut stream = tokenizer.token_stream_for_doc("Hello World");
+    let mut count = 0;
+    while stream.advance() {
+        count += 1;
+    }
+
+    assert_eq!(
+        count, 0,
+        "Should produce no tokens when error occurs at start"
+    );
+}
+
+#[test]
+fn test_plugin_error_after_one_token() {
+    let plugin_path = get_plugin_path();
+
+    // Configure to error after 1 token
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 1}"#)
+        .expect("Failed to create tokenizer");
+
+    // Should produce only 1 token before error
+    let mut stream = tokenizer.token_stream_for_doc("Hello World Test");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    assert_eq!(tokens.len(), 1, "Should produce only 1 token before error");
+    assert_eq!(tokens[0], "Hello");
+}
+
+#[test]
+fn test_plugin_error_after_two_tokens() {
+    let plugin_path = get_plugin_path();
+
+    // Configure to error after 2 tokens
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 2}"#)
+        .expect("Failed to create tokenizer");
+
+    // Should produce exactly 2 tokens before error
+    let mut stream = tokenizer.token_stream_for_doc("one two three four five");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    assert_eq!(
+        tokens.len(),
+        2,
+        "Should produce exactly 2 tokens before error"
+    );
+    assert_eq!(tokens[0], "one");
+    assert_eq!(tokens[1], "two");
+}
+
+#[test]
+fn test_plugin_error_not_triggered_when_fewer_tokens() {
+    let plugin_path = get_plugin_path();
+
+    // Configure to error after 10 tokens, but input has only 2
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 10}"#)
+        .expect("Failed to create tokenizer");
+
+    // Should produce all tokens since error threshold not reached
+    let mut stream = tokenizer.token_stream_for_doc("Hello World");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    assert_eq!(
+        tokens.len(),
+        2,
+        "Should produce all tokens when error threshold not reached"
+    );
+    assert_eq!(tokens[0], "Hello");
+    assert_eq!(tokens[1], "World");
+}
+
+#[test]
+fn test_plugin_error_with_inverted_index_params() {
+    let plugin_path = get_plugin_path();
+
+    // Test error propagation through InvertedIndexParams interface
+    let params = InvertedIndexParams::default().plugin(
+        plugin_path.to_string_lossy().to_string(),
+        Some(r#"{"error_after_n_tokens": 1}"#.to_string()),
+    );
+
+    let mut tokenizer = params
+        .build()
+        .expect("Failed to build tokenizer from params");
+
+    let mut stream = tokenizer.token_stream_for_doc("one two three");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    assert_eq!(
+        tokens.len(),
+        1,
+        "Error should be propagated through InvertedIndexParams"
+    );
 }

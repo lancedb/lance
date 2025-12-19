@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Dynamic library loader for tokenizer plugins.
-
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,15 +14,9 @@ use super::ffi::{
     ENTRY_POINT_SYMBOL, PLUGIN_API_VERSION,
 };
 
-/// A loaded tokenizer plugin library.
-///
-/// This struct manages the lifetime of a dynamically loaded plugin library.
-/// The library is kept alive as long as this struct exists.
 pub struct TokenizerPluginLibrary {
-    /// The loaded library (kept alive to prevent unloading)
     _library: Library,
 
-    /// Pointer to the plugin interface
     plugin: *const CTokenizerPlugin,
 }
 
@@ -278,9 +270,7 @@ pub struct PluginFactory<'a> {
 }
 
 impl<'a> PluginFactory<'a> {
-    /// Create a tokenizer instance from this factory.
     pub fn create_tokenizer(&self) -> Result<PluginTokenizerInstance<'a>> {
-        // SAFETY: factory was created by this library
         let tokenizer = unsafe { self.library.create_tokenizer(self.factory)? };
         Ok(PluginTokenizerInstance {
             library: self.library,
@@ -331,24 +321,38 @@ pub struct PluginTokenStream<'a> {
     stream: *mut LanceTokenStream,
 }
 
+/// Result of calling next_token on a plugin stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextTokenResult {
+    /// A token was produced and written to the output parameter.
+    Token,
+    /// The stream is exhausted, no more tokens available.
+    EndOfStream,
+    /// An error occurred during tokenization.
+    Error(i32),
+}
+
 impl PluginTokenStream<'_> {
     /// Get the next token from the stream.
     ///
-    /// Returns `Some(token)` if a token is available, `None` if the stream is exhausted.
-    pub fn next_token(&mut self, token: &mut CToken) -> Option<()> {
-        // SAFETY: stream was created by this library
+    /// Returns:
+    /// - `NextTokenResult::Token` if a token was produced
+    /// - `NextTokenResult::EndOfStream` if no more tokens are available
+    /// - `NextTokenResult::Error(code)` if an error occurred (code < 0)
+    pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
         let result = unsafe { self.library.next_token(self.stream, token) };
         if result > 0 {
-            Some(())
+            NextTokenResult::Token
+        } else if result == 0 {
+            NextTokenResult::EndOfStream
         } else {
-            None
+            NextTokenResult::Error(result)
         }
     }
 }
 
 impl Drop for PluginTokenStream<'_> {
     fn drop(&mut self) {
-        // SAFETY: stream was created by this library
         unsafe {
             self.library.destroy_stream(self.stream);
         }

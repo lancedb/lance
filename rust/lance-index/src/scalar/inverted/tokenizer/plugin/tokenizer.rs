@@ -10,7 +10,7 @@ use lance_core::Result;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 use super::ffi::CToken;
-use super::loader::TokenizerPluginLibrary;
+use super::loader::{NextTokenResult, TokenizerPluginLibrary};
 use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 
 /// A tokenizer that uses a dynamically loaded plugin.
@@ -114,14 +114,16 @@ struct PluginTokenStreamAdapter {
     /// Current index in tokens
     index: usize,
 
-    /// Whether initialization failed
-    error: bool,
+    /// Whether initialization failed (factory/tokenizer/stream creation)
+    /// Note: Tokenization errors during iteration do NOT set this flag,
+    /// allowing partial results to be returned.
+    initialization_error: bool,
 }
 
 impl PluginTokenStreamAdapter {
     fn new(library: Arc<TokenizerPluginLibrary>, config: &str, text: &str) -> Self {
         let mut tokens = Vec::new();
-        let mut error = false;
+        let mut initialization_error = false;
 
         // Create factory, tokenizer, and stream, then collect all tokens
         match library.create_factory(config) {
@@ -129,43 +131,59 @@ impl PluginTokenStreamAdapter {
                 Ok(tokenizer_instance) => match tokenizer_instance.create_stream(text) {
                     Ok(mut stream) => {
                         let mut c_token = CToken::default();
-                        while stream.next_token(&mut c_token).is_some() {
-                            // Convert CToken to tantivy Token
-                            let text = if c_token.text.is_null() {
-                                String::new()
-                            } else {
-                                // SAFETY: Plugin guarantees text is valid UTF-8
-                                unsafe {
-                                    let slice = std::slice::from_raw_parts(
-                                        c_token.text as *const u8,
-                                        c_token.text_len as usize,
-                                    );
-                                    String::from_utf8_lossy(slice).into_owned()
-                                }
-                            };
+                        loop {
+                            match stream.next_token(&mut c_token) {
+                                NextTokenResult::Token => {
+                                    // Convert CToken to tantivy Token
+                                    let text = if c_token.text.is_null() {
+                                        String::new()
+                                    } else {
+                                        // SAFETY: Plugin guarantees text is valid UTF-8
+                                        unsafe {
+                                            let slice = std::slice::from_raw_parts(
+                                                c_token.text as *const u8,
+                                                c_token.text_len as usize,
+                                            );
+                                            String::from_utf8_lossy(slice).into_owned()
+                                        }
+                                    };
 
-                            tokens.push(Token {
-                                offset_from: c_token.offset_from as usize,
-                                offset_to: c_token.offset_to as usize,
-                                position: c_token.position as usize,
-                                text,
-                                position_length: c_token.position_length as usize,
-                            });
+                                    tokens.push(Token {
+                                        offset_from: c_token.offset_from as usize,
+                                        offset_to: c_token.offset_to as usize,
+                                        position: c_token.position as usize,
+                                        text,
+                                        position_length: c_token.position_length as usize,
+                                    });
+                                }
+                                NextTokenResult::EndOfStream => {
+                                    break;
+                                }
+                                NextTokenResult::Error(code) => {
+                                    // Log the error but don't set initialization_error.
+                                    // Partial results collected so far are still valid and useful.
+                                    log::error!(
+                                        "Plugin tokenizer error during tokenization (code: {})",
+                                        code
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
                         log::error!("Failed to create plugin token stream: {}", e);
-                        error = true;
+                        initialization_error = true;
                     }
                 },
                 Err(e) => {
                     log::error!("Failed to create plugin tokenizer instance: {}", e);
-                    error = true;
+                    initialization_error = true;
                 }
             },
             Err(e) => {
                 log::error!("Failed to create plugin factory: {}", e);
-                error = true;
+                initialization_error = true;
             }
         }
 
@@ -173,14 +191,14 @@ impl PluginTokenStreamAdapter {
             current_token: Token::default(),
             tokens,
             index: 0,
-            error,
+            initialization_error,
         }
     }
 }
 
 impl TokenStream for PluginTokenStreamAdapter {
     fn advance(&mut self) -> bool {
-        if self.error || self.index >= self.tokens.len() {
+        if self.initialization_error || self.index >= self.tokens.len() {
             false
         } else {
             self.current_token = self.tokens[self.index].clone();
@@ -211,13 +229,13 @@ mod tests {
             current_token: Token::default(),
             tokens: vec![],
             index: 0,
-            error: false,
+            initialization_error: false,
         };
         assert_eq!(adapter.tokens.len(), 0);
     }
 
     #[test]
-    fn test_error_stream() {
+    fn test_initialization_error_stream() {
         let mut adapter = PluginTokenStreamAdapter {
             current_token: Token::default(),
             tokens: vec![Token {
@@ -228,9 +246,9 @@ mod tests {
                 position_length: 1,
             }],
             index: 0,
-            error: true,
+            initialization_error: true,
         };
-        // Error flag prevents advancement
+        // Initialization error flag prevents advancement
         assert!(!adapter.advance());
     }
 
@@ -255,7 +273,7 @@ mod tests {
                 },
             ],
             index: 0,
-            error: false,
+            initialization_error: false,
         };
 
         assert!(adapter.advance());

@@ -39,6 +39,9 @@ pub struct LanceTokenizerPlugin {
 #[derive(Default, Clone)]
 struct Config {
     lowercase: bool,
+    /// If set, returns an error after producing this many tokens.
+    /// Used for testing error propagation.
+    error_after_n_tokens: Option<usize>,
 }
 
 struct Factory {
@@ -54,14 +57,39 @@ struct TokenStream {
     tokens: Vec<(usize, usize, String)>,
     index: usize,
     current_token_text: CString,
+    /// If set, returns an error after producing this many tokens.
+    error_after_n_tokens: Option<usize>,
+    /// Number of tokens produced so far.
+    tokens_produced: usize,
 }
 
 impl Factory {
     fn new(config_json: &str) -> Self {
         let lowercase = config_json.contains("\"lowercase\":true")
             || config_json.contains("\"lowercase\": true");
+
+        // Parse error_after_n_tokens for testing error propagation
+        // Simple parsing: look for "error_after_n_tokens": N pattern
+        let error_after_n_tokens = if let Some(pos) = config_json.find("\"error_after_n_tokens\"") {
+            let rest = &config_json[pos..];
+            // Find the colon and then the number
+            if let Some(colon_pos) = rest.find(':') {
+                let after_colon = rest[colon_pos + 1..].trim_start();
+                // Parse the number (take digits until non-digit)
+                let num_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+                num_str.parse::<usize>().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
-            config: Config { lowercase },
+            config: Config {
+                lowercase,
+                error_after_n_tokens,
+            },
             last_error: Mutex::new(None),
         }
     }
@@ -113,10 +141,23 @@ impl Tokenizer {
     }
 }
 
+/// Return values for next():
+/// - positive (1): token produced
+/// - 0: end of stream
+/// - negative: error (e.g., -100 for simulated error)
+const SIMULATED_ERROR_CODE: i32 = -100;
+
 impl TokenStream {
-    fn next(&mut self, token: &mut LanceToken) -> bool {
+    fn next(&mut self, token: &mut LanceToken) -> i32 {
+        // Check if we should simulate an error
+        if let Some(limit) = self.error_after_n_tokens {
+            if self.tokens_produced >= limit {
+                return SIMULATED_ERROR_CODE;
+            }
+        }
+
         if self.index >= self.tokens.len() {
-            return false;
+            return 0; // End of stream
         }
 
         let (start, end, ref text) = self.tokens[self.index];
@@ -130,7 +171,8 @@ impl TokenStream {
         token.position_length = 1;
 
         self.index += 1;
-        true
+        self.tokens_produced += 1;
+        1 // Token produced
     }
 }
 
@@ -187,6 +229,8 @@ unsafe extern "C" fn create_stream(
         tokens,
         index: 0,
         current_token_text: CString::default(),
+        error_after_n_tokens: tokenizer.config.error_after_n_tokens,
+        tokens_produced: 0,
     };
     Box::into_raw(Box::new(stream)) as *mut c_void
 }
@@ -202,11 +246,7 @@ unsafe extern "C" fn next_token(stream: *mut c_void, token: *mut LanceToken) -> 
         return -1;
     }
     let stream = &mut *(stream as *mut TokenStream);
-    if stream.next(&mut *token) {
-        1
-    } else {
-        0
-    }
+    stream.next(&mut *token)
 }
 
 unsafe extern "C" fn get_error(factory: *mut c_void) -> *const c_char {

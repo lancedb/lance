@@ -126,12 +126,11 @@ pub struct InvertedIndexParams {
     /// When set, the plugin will be loaded and used instead of built-in tokenizers.
     /// Requires the `tokenizer-plugin` feature.
     #[serde(default)]
-    pub(crate) plugin_library: Option<String>,
+    pub(crate) tokenizer_plugin_library: Option<String>,
 
     /// JSON configuration for the tokenizer plugin.
-    /// The format depends on the specific plugin being used.
     #[serde(default)]
-    pub(crate) plugin_config: Option<String>,
+    pub(crate) tokenizer_plugin_config: Option<String>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -150,6 +149,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
+            tokenizer_plugin_library: params.tokenizer_plugin_library.clone(),
+            tokenizer_plugin_config: params.tokenizer_plugin_config.clone(),
         })
     }
 }
@@ -179,9 +180,8 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             prefix_only: details.prefix_only,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
-            // Plugin settings are not persisted in protobuf, use defaults
-            plugin_library: None,
-            plugin_config: None,
+            tokenizer_plugin_library: details.tokenizer_plugin_library.clone(),
+            tokenizer_plugin_config: details.tokenizer_plugin_config.clone(),
         })
     }
 }
@@ -235,8 +235,8 @@ impl InvertedIndexParams {
             prefix_only: false,
             memory_limit_mb: None,
             num_workers: None,
-            plugin_library: None,
-            plugin_config: None,
+            tokenizer_plugin_library: None,
+            tokenizer_plugin_config: None,
         }
     }
 
@@ -380,20 +380,20 @@ impl InvertedIndexParams {
     ///     );
     /// ```
     pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
-        self.plugin_library = Some(library_path);
-        self.plugin_config = config;
+        self.tokenizer_plugin_library = Some(library_path);
+        self.tokenizer_plugin_config = config;
         self
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         // Check if a plugin is configured
         #[cfg(feature = "tokenizer-plugin")]
-        if let Some(ref plugin_path) = self.plugin_library {
+        if let Some(ref plugin_path) = self.tokenizer_plugin_library {
             return self.build_plugin_tokenizer(plugin_path);
         }
 
         #[cfg(not(feature = "tokenizer-plugin"))]
-        if self.plugin_library.is_some() {
+        if self.tokenizer_plugin_library.is_some() {
             return Err(Error::invalid_input(
                 "tokenizer-plugin feature is not enabled, cannot use plugin tokenizers",
             ));
@@ -441,7 +441,7 @@ impl InvertedIndexParams {
     fn build_plugin_tokenizer(&self, plugin_path: &str) -> Result<Box<dyn LanceTokenizer>> {
         use plugin::PluginTokenizer;
 
-        let config = self.plugin_config.as_deref().unwrap_or("{}");
+        let config = self.tokenizer_plugin_config.as_deref().unwrap_or("{}");
         let tokenizer = PluginTokenizer::new(plugin_path, config)?;
         Ok(Box::new(tokenizer))
     }
