@@ -18,7 +18,7 @@ use super::address::RowAddress;
 
 mod nullable;
 
-pub use nullable::{NullableRowAddrSet, NullableRowIdMask};
+pub use nullable::{NullableRowAddrMask, NullableRowAddrSet};
 
 /// A mask that selects or deselects rows based on an allow-list or block-list.
 #[derive(Clone, Debug, DeepSizeOf, PartialEq)]
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_id_mask_construction() {
+    fn test_row_addr_mask_construction() {
         let full_mask = RowAddrMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
         assert_mask_selects(&full_mask, &[0, 1, 4 << 32 | 3], &[]);
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_id_mask_not() {
+    fn test_row_addr_mask_not() {
         let allow_list = RowAddrMask::from_allowed(rows(&[1, 2, 3]));
         let block_list = !allow_list.clone();
         assert_eq!(block_list, RowAddrMask::from_block(rows(&[1, 2, 3])));

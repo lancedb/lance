@@ -758,9 +758,10 @@ impl ANNIvfSubIndexExec {
                             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                         {
-                            let initial_ids = state.initial_ids.lock().unwrap();
-                            let found_addrs = HashSet::<_>::from_iter(initial_ids.iter().copied());
-                            drop(initial_ids);
+                            let initial_addrs = state.initial_ids.lock().unwrap();
+                            let found_addrs =
+                                HashSet::<_>::from_iter(initial_addrs.iter().copied());
+                            drop(initial_addrs);
                             let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
                             let not_found_addrs = mask_addrs.difference(&found_addrs);
                             let not_found_addrs =

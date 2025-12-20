@@ -23,7 +23,7 @@ use super::{
     SearchResult, TextQuery, TokenQuery,
 };
 use lance_core::{
-    utils::mask::{NullableRowIdMask, RowAddrMask},
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
@@ -907,17 +907,17 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 #[derive(Debug)]
 enum NullableIndexExprResult {
-    Exact(NullableRowIdMask),
-    AtMost(NullableRowIdMask),
-    AtLeast(NullableRowIdMask),
+    Exact(NullableRowAddrMask),
+    AtMost(NullableRowAddrMask),
+    AtLeast(NullableRowAddrMask),
 }
 
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
         match result {
-            SearchResult::Exact(mask) => Self::Exact(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::AtMost(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowIdMask::AllowList(mask)),
+            SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
         }
     }
 }
@@ -2213,7 +2213,7 @@ mod tests {
         }
 
         // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
-        let at_most = NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(
+        let at_most = NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
@@ -2223,7 +2223,7 @@ mod tests {
         ));
 
         // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
-        let at_least = NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(
+        let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
@@ -2233,7 +2233,7 @@ mod tests {
         ));
 
         // Exact should stay Exact
-        let exact = NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(
+        let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         assert!(matches!(
@@ -2248,21 +2248,25 @@ mod tests {
 
         // Test that AND/OR correctly propagate certainty
         let make_at_most = || {
-            NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[1, 2, 3]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_at_least = || {
-            NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[2, 3, 4]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_exact = || {
-            NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(&[1, 2]),
                 RowAddrTreeMap::new(),
             )))
