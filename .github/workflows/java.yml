@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        java-version: [8, 11, 17]
+        java-version: [11, 17, 21]
     name: Build and Test with Java ${{ matrix.java-version }}
     steps:
       - name: Checkout repository

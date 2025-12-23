@@ -530,6 +530,7 @@ public class TestUtils {
       }
       return fragmentMetas;
     }
+
     /**
      * Test method to update columns. Note that for simplicity, the updated column rowid is fixed
      * with [0, updateNum). Please only use this method to test the first fragment.
@@ -606,6 +607,7 @@ public class TestUtils {
 
     /** Lance blob metadata key required by Rust. */
     private static final String BLOB_META_KEY = "lance-encoding:blob";
+
     /** Lance blob metadata value. */
     private static final String BLOB_META_TRUE = "true";
 

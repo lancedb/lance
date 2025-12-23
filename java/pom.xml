@@ -31,8 +31,8 @@
         <arrow.version>18.3.0</arrow.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
-        <spotless.version>2.30.0</spotless.version>
-        <spotless.java.googlejavaformat.version>1.7</spotless.java.googlejavaformat.version>
+        <spotless.version>2.43.0</spotless.version>
+        <spotless.java.googlejavaformat.version>1.22.0</spotless.java.googlejavaformat.version>
         <scala.version>2.12.19</scala.version>
         <scala.binary.version>2.12</scala.binary.version>
         <!-- Please also update .scalafmt.conf when you change it here -->
