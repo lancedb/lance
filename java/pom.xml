@@ -419,8 +419,8 @@
                 <jdk>[11,)</jdk>
             </activation>
             <properties>
-                <!-- Ping release target to JDK8 to link only against Java 8 APIs -->
-                <maven.compiler.release>8</maven.compiler.release>
+                <!-- Ping release target to JDK11 to link only against Java 11 APIs -->
+                <maven.compiler.release>11</maven.compiler.release>
             </properties>
             <build>
                 <plugins>
