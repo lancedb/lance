@@ -674,7 +674,8 @@ impl KMeans {
                     kmeans.centroids.clone(),
                     kmeans.dimension,
                     kmeans.distance_type,
-                )?;
+                )
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
 
                 let balance_factor = adjusted_balance_factor.min(params.balance_factor);
                 let (membership, radius, losses) = Algo::compute_membership_and_loss(

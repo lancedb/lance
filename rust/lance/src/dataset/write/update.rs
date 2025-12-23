@@ -24,13 +24,13 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::error::{box_error, InvalidInputSnafu};
+
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
-use snafu::{location, ResultExt};
+use snafu::location;
 
 /// Build an update operation.
 ///
@@ -83,15 +83,12 @@ impl UpdateBuilder {
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
         let expr = planner
             .parse_filter(filter)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
-        self.condition = Some(planner.optimize_expr(expr).map_err(box_error).context(
-            InvalidInputSnafu {
-                location: location!(),
-            },
-        )?);
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.condition = Some(
+            planner
+                .optimize_expr(expr)
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+        );
         Ok(self)
     }
 
@@ -128,20 +125,14 @@ impl UpdateBuilder {
         let planner = Planner::new(schema.clone());
         let mut expr = planner
             .parse_expr(value)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
 
         // Cast expression to the column's data type if necessary.
         let dest_type = field.data_type();
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let src_type = expr
             .get_type(&df_schema)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
@@ -162,10 +153,7 @@ impl UpdateBuilder {
                 }
                 _ => expr
                     .cast_to(&dest_type, &df_schema)
-                    .map_err(box_error)
-                    .context(InvalidInputSnafu {
-                        location: location!(),
-                    })?,
+                    .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
             };
         }
 
@@ -174,10 +162,7 @@ impl UpdateBuilder {
         // it doesn't actually apply the cast to the literals.)
         let expr = planner
             .optimize_expr(expr)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
 
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)

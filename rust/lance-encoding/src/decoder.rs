@@ -1661,7 +1661,7 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     fn next(&mut self) -> Option<Self::Item> {
         self.next_batch_task()
             .transpose()
-            .map(|r| r.map_err(ArrowError::from))
+            .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))
     }
 }
 

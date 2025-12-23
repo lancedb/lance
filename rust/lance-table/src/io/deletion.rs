@@ -7,9 +7,9 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_ipc::reader::FileReader as ArrowFileReader;
 use arrow_ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
 use arrow_ipc::CompressionType;
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Buf;
-use lance_core::error::{box_error, CorruptFileSnafu};
+
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
@@ -17,12 +17,82 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, ResultExt};
+use snafu::location;
 use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType};
 
 pub const DELETIONS_DIR: &str = "_deletions";
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(visibility(pub))]
+pub enum DeletionError {
+    #[snafu(display("Arrow error: {error}, {location}"))]
+    ArrowError {
+        error: ArrowError,
+        location: snafu::Location,
+    },
+
+    #[snafu(display("Multiple Batches error. expected {expected}, but get {actual}, {location}"))]
+    MultipleBatches {
+        expected: usize,
+        actual: usize,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    #[snafu(display("Schema Mismatch. expected {expected}, but get {actual}, {location}"))]
+    SchemaMismatch {
+        expected: Schema,
+        actual: SchemaRef,
+        location: snafu::Location,
+    },
+    #[snafu(display("Null values not allowed at here {location}"))]
+    NullValuesNotAllowed { location: snafu::Location },
+    #[snafu(display("Bitmap deserialization error: {error}, {location}"))]
+    BitmapDeserialization {
+        error: std::io::Error,
+        location: snafu::Location,
+    },
+}
+
+impl From<DeletionError> for Error {
+    fn from(e: DeletionError) -> Self {
+        match e {
+            DeletionError::ArrowError {
+                error, location, ..
+            } => Self::corrupt_file("<deletion_file>", error.to_string(), location),
+            DeletionError::MultipleBatches {
+                expected,
+                actual,
+                location,
+                ..
+            } => Self::HasCorruptFile {
+                message: format!("Expected exactly one batch, got {actual} instead of {expected}"),
+                location,
+            },
+            DeletionError::SchemaMismatch {
+                expected,
+                actual,
+                location,
+                ..
+            } => Self::HasCorruptFile {
+                message: format!("Expected schema {:?}, got {:?}", expected, actual),
+                location,
+            },
+            DeletionError::NullValuesNotAllowed { location, .. } => Self::HasCorruptFile {
+                message: "Null values are not allowed in deletion files".to_string(),
+                location,
+            },
+            DeletionError::BitmapDeserialization {
+                error, location, ..
+            } => Self::HasCorruptFile {
+                message: format!("Bitmap deserialization failed: {}", error),
+                location,
+            },
+        }
+    }
+}
 
 /// Get the Arrow schema for an Arrow deletion file.
 fn deletion_arrow_schema() -> Arc<Schema> {
@@ -142,36 +212,32 @@ pub async fn read_deletion_file(
             let data = object_store.read_one_all(&path).await?;
             span.record("bytes_read", data.len());
             let data = std::io::Cursor::new(data);
+
+            // 使用专门的错误类型而不是通用错误
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
-                .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path: path.clone(),
+                .map_err(|e| DeletionError::ArrowError {
+                    error: e,
                     location: location!(),
                 })?;
 
             if batches.len() != 1 {
-                return Err(Error::corrupt_file(
-                    path,
-                    format!(
-                        "Expected exactly one batch in deletion file, got {}",
-                        batches.len()
-                    ),
-                    location!(),
-                ));
+                return Err(DeletionError::MultipleBatches {
+                    expected: 1,
+                    actual: batches.len(),
+                    location: location!(),
+                }
+                .into());
             }
 
             let batch = batches.pop().unwrap();
             if batch.schema() != deletion_arrow_schema() {
-                return Err(Error::corrupt_file(
-                    path,
-                    format!(
-                        "Expected schema {:?} in deletion file, got {:?}",
-                        deletion_arrow_schema(),
-                        batch.schema()
-                    ),
-                    location!(),
-                ));
+                return Err(DeletionError::SchemaMismatch {
+                    expected: deletion_arrow_schema().as_ref().clone(),
+                    actual: batch.schema(),
+                    location: location!(),
+                }
+                .into());
             }
 
             let array = batch.columns()[0]
@@ -184,11 +250,10 @@ pub async fn read_deletion_file(
                 if let Some(val) = val {
                     set.insert(val);
                 } else {
-                    return Err(Error::corrupt_file(
-                        path,
-                        "Null values are not allowed in deletion files",
-                        location!(),
-                    ));
+                    return Err(DeletionError::NullValuesNotAllowed {
+                        location: location!(),
+                    }
+                    .into());
                 }
             }
 
@@ -200,12 +265,14 @@ pub async fn read_deletion_file(
             let data = object_store.read_one_all(&path).await?;
             span.record("bytes_read", data.len());
             let reader = data.reader();
-            let bitmap = RoaringBitmap::deserialize_from(reader)
-                .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path,
+
+            // 使用专门的错误类型
+            let bitmap = RoaringBitmap::deserialize_from(reader).map_err(|e| {
+                DeletionError::BitmapDeserialization {
+                    error: e,
                     location: location!(),
-                })?;
+                }
+            })?;
 
             Ok(DeletionVector::Bitmap(bitmap))
         }
@@ -214,7 +281,6 @@ pub async fn read_deletion_file(
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[tokio::test]

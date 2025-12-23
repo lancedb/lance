@@ -75,7 +75,6 @@ use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
-    error::{box_error, InvalidInputSnafu},
     utils::{futures::Capacity, mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
@@ -96,7 +95,7 @@ use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
-use snafu::{location, ResultExt};
+use snafu::location;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
@@ -225,16 +224,10 @@ impl WhenNotMatchedBySource {
         let planner = Planner::new(Arc::new(dataset.schema().into()));
         let expr = planner
             .parse_filter(expr)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         let expr = planner
             .optimize_expr(expr)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         Ok(Self::DeleteIf(expr))
     }
 }
