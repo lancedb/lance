@@ -269,7 +269,7 @@ def main() -> None:
         if args.max_ngram_length is not None:
             index_kwargs["max_ngram_length"] = args.max_ngram_length
 
-        ds.create_index(
+        ds.create_scalar_index(
             args.text_column,
             index_type="INVERTED",
             replace=True,
