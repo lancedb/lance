@@ -93,6 +93,22 @@ def _current_rss_bytes() -> Optional[int]:
         return None
 
 
+def _baseline_rss_bytes(samples: int, interval_sec: float) -> Optional[int]:
+    if psutil is None:
+        return None
+    if samples <= 0:
+        return _current_rss_bytes()
+    values = []
+    for _ in range(samples):
+        rss = _current_rss_bytes()
+        if rss is not None:
+            values.append(rss)
+        time.sleep(interval_sec)
+    if not values:
+        return None
+    return min(values)
+
+
 def _run_queries(
     ds: lance.dataset.Dataset,
     text_column: str,
@@ -101,12 +117,21 @@ def _run_queries(
     limit: int,
     count: int,
     seed: int,
+    terms_per_query: int,
+    barrier: Optional[threading.Barrier] = None,
+    term_sequence: Optional[List[str]] = None,
 ) -> Tuple[int, float]:
     rng = random.Random(seed)
     total = 0
     total_latency = 0.0
-    for _ in range(count):
-        term = rng.choice(terms)
+    if barrier is not None:
+        barrier.wait()
+    for i in range(count):
+        if term_sequence is None:
+            query_terms = rng.choices(terms, k=terms_per_query)
+            term = " ".join(query_terms)
+        else:
+            term = term_sequence[i]
         start = time.perf_counter()
         ds.to_table(
             columns=project_columns,
@@ -129,12 +154,14 @@ def _prewarm(
     limit: int,
     count: int,
     seed: int,
+    terms_per_query: int,
 ) -> None:
     if count <= 0:
         return
     rng = random.Random(seed)
     for _ in range(count):
-        term = rng.choice(terms)
+        query_terms = rng.choices(terms, k=terms_per_query)
+        term = " ".join(query_terms)
         ds.to_table(
             columns=project_columns,
             full_text_query={
@@ -158,6 +185,12 @@ def main() -> None:
     parser.add_argument("--terms", nargs="*", default=[], help="Query terms")
     parser.add_argument("--terms-file", help="File with query terms (one per line)")
     parser.add_argument("--limit", type=int, default=1000, help="Per-query limit")
+    parser.add_argument(
+        "--terms-per-query",
+        type=int,
+        default=1,
+        help="Number of terms per query",
+    )
     parser.add_argument("--concurrency", type=int, default=100, help="Number of threads")
     parser.add_argument(
         "--total-queries",
@@ -182,6 +215,23 @@ def main() -> None:
         action="store_true",
         help="Prewarm all indices before measurement",
     )
+    parser.add_argument(
+        "--deterministic-queries",
+        action="store_true",
+        help="Use a deterministic query sequence (reduces variance)",
+    )
+    parser.add_argument(
+        "--baseline-samples",
+        type=int,
+        default=5,
+        help="Samples to take for baseline RSS (psutil only)",
+    )
+    parser.add_argument(
+        "--baseline-interval",
+        type=float,
+        default=0.2,
+        help="Seconds between baseline RSS samples",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--index-cache-bytes",
@@ -198,7 +248,7 @@ def main() -> None:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=0.1,
+        default=0.01,
         help="RSS polling interval in seconds (psutil only)",
     )
 
@@ -233,9 +283,10 @@ def main() -> None:
             args.limit,
             args.prewarm_queries,
             args.seed,
+            args.terms_per_query,
         )
 
-    baseline_rss = _current_rss_bytes()
+    baseline_rss = _baseline_rss_bytes(args.baseline_samples, args.baseline_interval)
 
     per_worker = args.total_queries // args.concurrency
     remainder = args.total_queries % args.concurrency
@@ -249,6 +300,28 @@ def main() -> None:
     import concurrent.futures as cf
 
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        worker_count = sum(
+            1
+            for i in range(args.concurrency)
+            if per_worker + (1 if i < remainder else 0) > 0
+        )
+        barrier = threading.Barrier(parties=max(1, worker_count))
+        term_sequences: Optional[List[List[str]]] = None
+        if args.deterministic_queries:
+            rng = random.Random(args.seed)
+            query_terms = []
+            for _ in range(args.total_queries):
+                terms_for_query = rng.choices(terms, k=args.terms_per_query)
+                query_terms.append(" ".join(terms_for_query))
+            term_sequences = []
+            offset = 0
+            for i in range(args.concurrency):
+                count = per_worker + (1 if i < remainder else 0)
+                if count == 0:
+                    term_sequences.append([])
+                    continue
+                term_sequences.append(query_terms[offset : offset + count])
+                offset += count
         futures = []
         for i in range(args.concurrency):
             count = per_worker + (1 if i < remainder else 0)
@@ -264,6 +337,9 @@ def main() -> None:
                     args.limit,
                     count,
                     args.seed + i,
+                    args.terms_per_query,
+                    barrier,
+                    term_sequences[i] if term_sequences is not None else None,
                 )
             )
         for fut in cf.as_completed(futures):
@@ -287,6 +363,8 @@ def main() -> None:
     print(f"Total queries: {total_queries}")
     print(f"Concurrency: {args.concurrency}")
     print(f"Limit: {args.limit}")
+    print(f"Terms per query: {args.terms_per_query}")
+    print(f"Deterministic queries: {args.deterministic_queries}")
     if prewarm_names:
         print(f"Prewarm indices: {sorted(set(prewarm_names))}")
     else:
