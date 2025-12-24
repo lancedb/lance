@@ -289,15 +289,18 @@ fn test_plugin_error_after_one_token() {
     let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 1}"#)
         .expect("Failed to create tokenizer");
 
-    // Should produce only 1 token before error
+    // Error discards all tokens
     let mut stream = tokenizer.token_stream_for_doc("Hello World Test");
     let mut tokens = Vec::new();
     while stream.advance() {
         tokens.push(stream.token().text.clone());
     }
 
-    assert_eq!(tokens.len(), 1, "Should produce only 1 token before error");
-    assert_eq!(tokens[0], "Hello");
+    assert_eq!(
+        tokens.len(),
+        0,
+        "Should produce no tokens when error occurs"
+    );
 }
 
 #[test]
@@ -308,7 +311,7 @@ fn test_plugin_error_after_two_tokens() {
     let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 2}"#)
         .expect("Failed to create tokenizer");
 
-    // Should produce exactly 2 tokens before error
+    // Error discards all tokens
     let mut stream = tokenizer.token_stream_for_doc("one two three four five");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -317,11 +320,9 @@ fn test_plugin_error_after_two_tokens() {
 
     assert_eq!(
         tokens.len(),
-        2,
-        "Should produce exactly 2 tokens before error"
+        0,
+        "Should produce no tokens when error occurs"
     );
-    assert_eq!(tokens[0], "one");
-    assert_eq!(tokens[1], "two");
 }
 
 #[test]
@@ -370,7 +371,7 @@ fn test_plugin_error_with_inverted_index_params() {
 
     assert_eq!(
         tokens.len(),
-        1,
+        0,
         "Error should be propagated through InvertedIndexParams"
     );
 }

@@ -1,39 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-/// Lance Tokenizer Plugin C API
-///
-/// This header defines the C ABI interface for implementing custom tokenizers
-/// as dynamically loadable plugins. Plugins can be implemented in any language
-/// that supports C ABI (Rust, C, C++, etc.).
-///
-/// ## Plugin Lifecycle
-///
-/// 1. Library is loaded, `lance_tokenizer_get_plugin()` is called to get plugin interface
-/// 2. `create_factory()` is called with JSON configuration
-/// 3. `create_tokenizer()` creates a tokenizer instance from the factory
-/// 4. For each text to tokenize:
-///    - `create_stream()` creates a token stream
-///    - `next_token()` is called repeatedly until it returns 0
-///    - `destroy_stream()` cleans up the stream
-/// 5. `destroy_tokenizer()` cleans up the tokenizer
-/// 6. `destroy_factory()` cleans up the factory
-///
-/// ## Error Handling
-///
-/// Functions that can fail return NULL (for pointers) or negative values (for int).
-/// Call `get_error()` with the relevant handle to get the error message.
-///
-/// ## Example Configuration (JSON)
-///
-/// ```json
-/// {
-///   "mode": "search",
-///   "dict_path": "/path/to/dictionary",
-///   "user_dict": "/path/to/user_dict.txt"
-/// }
-/// ```
-
 #ifndef LANCE_TOKENIZER_PLUGIN_H
 #define LANCE_TOKENIZER_PLUGIN_H
 
@@ -43,47 +10,30 @@
 extern "C" {
 #endif
 
-/// Plugin API version - increment when making breaking changes
 #define LANCE_TOKENIZER_PLUGIN_API_VERSION 1
 
-/// Token information produced by the tokenizer
-///
 /// The `text` pointer is valid only until the next call to `next_token()`
 /// or `destroy_stream()`. Callers should copy the text if needed.
 typedef struct LanceToken {
-    /// Start byte offset in the original text (UTF-8)
+    /// Start and end byte offsets in the original text (UTF-8)
     uint32_t offset_from;
-
-    /// End byte offset in the original text (UTF-8)
     uint32_t offset_to;
 
     /// Position of this token in the sequence (0-indexed)
     uint32_t position;
+    uint32_t position_length;
 
     /// Pointer to the token text (null-terminated UTF-8)
     /// Valid until next `next_token()` or `destroy_stream()` call
     const char* text;
-
-    /// Length of the token text in bytes (not including null terminator)
-    uint32_t text_len;
-
-    /// Position length (usually 1, but can be > 1 for synonyms)
-    uint32_t position_length;
+    uint32_t text_length;
 } LanceToken;
 
-/// Opaque factory handle - stores shared resources like dictionaries
 typedef struct LanceTokenizerFactory LanceTokenizerFactory;
-
-/// Opaque tokenizer handle - stateful tokenizer instance
 typedef struct LanceTokenizer LanceTokenizer;
-
-/// Opaque token stream handle - iterates over tokens for a single text
 typedef struct LanceTokenStream LanceTokenStream;
 
-/// Plugin interface - function pointers that plugins must implement
 typedef struct LanceTokenizerPlugin {
-    /// Returns the API version this plugin was built against.
-    /// Must return LANCE_TOKENIZER_PLUGIN_API_VERSION.
     uint32_t (*api_version)(void);
 
     /// Create a tokenizer factory with the given JSON configuration.
@@ -95,14 +45,14 @@ typedef struct LanceTokenizerPlugin {
 
     /// Destroy a factory and free its resources.
     ///
-    /// @param factory Factory handle (may be NULL, which is a no-op)
+    /// @param factory Factory handle
     void (*destroy_factory)(LanceTokenizerFactory* factory);
 
     /// Create a tokenizer instance from the factory.
     /// Multiple tokenizers can be created from a single factory.
     ///
     /// @param factory Factory handle
-    /// @return Tokenizer handle, or NULL on error
+    /// @return Tokenizer handle, or NULL on error (call get_error for details)
     LanceTokenizer* (*create_tokenizer)(LanceTokenizerFactory* factory);
 
     /// Destroy a tokenizer and free its resources.
@@ -115,9 +65,9 @@ typedef struct LanceTokenizerPlugin {
     ///
     /// @param tokenizer Tokenizer handle
     /// @param text Text to tokenize (UTF-8, not necessarily null-terminated)
-    /// @param text_len Length of text in bytes
-    /// @return Stream handle, or NULL on error
-    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, const char* text, uint32_t text_len);
+    /// @param text_length Length of text in bytes
+    /// @return Stream handle, or NULL on error (call get_error for details)
+    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, const char* text, uint32_t text_length);
 
     /// Destroy a token stream and free its resources.
     ///

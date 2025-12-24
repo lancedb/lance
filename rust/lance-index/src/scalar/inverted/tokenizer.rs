@@ -361,24 +361,8 @@ impl InvertedIndexParams {
     }
 
     /// Set a tokenizer plugin to use.
-    ///
-    /// When a plugin is set, it will be used instead of the built-in tokenizers.
-    /// Requires the `tokenizer-plugin` feature to be enabled.
-    ///
-    /// # Arguments
-    ///
-    /// * `library_path` - Path to the plugin shared library (.so, .dylib, or .dll)
-    /// * `config` - Optional JSON configuration for the plugin
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let params = InvertedIndexParams::default()
-    ///     .plugin(
-    ///         "/usr/local/lib/lance/libtokenizer_sudachi.so".to_string(),
-    ///         Some(r#"{"mode": "C"}"#.to_string()),
-    ///     );
-    /// ```
+    /// `library_path` is path to the plugin shared library (.so, .dylib, or .dll)
+    /// `config` is optional JSON configuration for the plugin
     pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
         self.tokenizer_plugin_library = Some(library_path);
         self.tokenizer_plugin_config = config;

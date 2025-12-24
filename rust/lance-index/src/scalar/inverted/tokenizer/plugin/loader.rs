@@ -20,36 +20,25 @@ pub struct TokenizerPluginLibrary {
     plugin: *const CTokenizerPlugin,
 }
 
-// SAFETY: The plugin interface is thread-safe as long as we don't share
-// mutable state across threads. Each tokenizer instance is independent.
+// SAFETY: TokenizerPluginLibrary can be shared across threads because:
+// 1. `_library` (libloading::Library) is Send + Sync
+// 2. `plugin` points to an immutable vtable of function pointers that
+//    remains valid as long as `_library` is alive
+// 3. The plugin functions themselves are stateless; mutable state is
+//    confined to Factory/Tokenizer/Stream instances which are NOT
+//    Send/Sync and must be used on a single thread
 unsafe impl Send for TokenizerPluginLibrary {}
 unsafe impl Sync for TokenizerPluginLibrary {}
 
 impl TokenizerPluginLibrary {
-    /// Load a tokenizer plugin from the given path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the dynamic library (.so, .dylib, or .dll)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The library cannot be loaded
-    /// - The entry point symbol is not found
-    /// - The plugin API version is incompatible
     pub fn load(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref();
 
-        // SAFETY: Loading a dynamic library is inherently unsafe.
-        // We trust that the library at the given path is a valid tokenizer plugin.
         let library = unsafe { Library::new(path) }.map_err(|e| Error::InvalidInput {
             source: format!("failed to load tokenizer plugin from {:?}: {}", path, e).into(),
             location: location!(),
         })?;
 
-        // Get the entry point function
-        // SAFETY: We trust the symbol exists and has the correct signature
         let get_plugin: libloading::Symbol<GetPluginFn> =
             unsafe { library.get(ENTRY_POINT_SYMBOL) }.map_err(|e| Error::InvalidInput {
                 source: format!(
@@ -62,8 +51,6 @@ impl TokenizerPluginLibrary {
                 location: location!(),
             })?;
 
-        // Get the plugin interface
-        // SAFETY: We trust the function returns a valid plugin pointer
         let plugin = unsafe { get_plugin() };
         if plugin.is_null() {
             return Err(Error::InvalidInput {
@@ -92,9 +79,7 @@ impl TokenizerPluginLibrary {
         }))
     }
 
-    /// Get the plugin name.
     pub fn name(&self) -> &str {
-        // SAFETY: plugin is valid and name() returns a static string
         unsafe {
             let name_ptr = ((*self.plugin).name)();
             if name_ptr.is_null() {
@@ -105,9 +90,7 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    /// Get the plugin version.
     pub fn version(&self) -> &str {
-        // SAFETY: plugin is valid and version() returns a static string
         unsafe {
             let version_ptr = ((*self.plugin).version)();
             if version_ptr.is_null() {
@@ -118,9 +101,7 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    /// Get the last error message from the factory.
     fn get_error(&self, factory: *mut LanceTokenizerFactory) -> Option<String> {
-        // SAFETY: plugin is valid
         unsafe {
             let error_ptr = ((*self.plugin).get_error)(factory);
             if error_ptr.is_null() {
@@ -131,22 +112,12 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    /// Create a tokenizer factory with the given configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config_json` - JSON configuration string
-    ///
-    /// # Returns
-    ///
-    /// A factory handle that can be used to create tokenizer instances.
     pub fn create_factory(&self, config_json: &str) -> Result<PluginFactory<'_>> {
         let config_cstring = CString::new(config_json).map_err(|e| Error::InvalidInput {
             source: format!("invalid config JSON (contains null byte): {}", e).into(),
             location: location!(),
         })?;
 
-        // SAFETY: plugin is valid and config_cstring is properly null-terminated
         let factory = unsafe {
             ((*self.plugin).create_factory)(config_cstring.as_ptr(), config_json.len() as u32)
         };
@@ -169,22 +140,12 @@ impl TokenizerPluginLibrary {
         })
     }
 
-    /// Destroy a factory.
-    ///
-    /// # Safety
-    ///
-    /// The factory must have been created by this library.
     unsafe fn destroy_factory(&self, factory: *mut LanceTokenizerFactory) {
         if !factory.is_null() {
             ((*self.plugin).destroy_factory)(factory);
         }
     }
 
-    /// Create a tokenizer from a factory.
-    ///
-    /// # Safety
-    ///
-    /// The factory must have been created by this library.
     unsafe fn create_tokenizer(
         &self,
         factory: *mut LanceTokenizerFactory,
@@ -204,22 +165,12 @@ impl TokenizerPluginLibrary {
         Ok(tokenizer)
     }
 
-    /// Destroy a tokenizer.
-    ///
-    /// # Safety
-    ///
-    /// The tokenizer must have been created by this library.
     unsafe fn destroy_tokenizer(&self, tokenizer: *mut LanceTokenizer) {
         if !tokenizer.is_null() {
             ((*self.plugin).destroy_tokenizer)(tokenizer);
         }
     }
 
-    /// Create a token stream.
-    ///
-    /// # Safety
-    ///
-    /// The tokenizer must have been created by this library.
     unsafe fn create_stream(
         &self,
         tokenizer: *mut LanceTokenizer,
@@ -239,30 +190,22 @@ impl TokenizerPluginLibrary {
         Ok(stream)
     }
 
-    /// Destroy a token stream.
-    ///
-    /// # Safety
-    ///
-    /// The stream must have been created by this library.
     unsafe fn destroy_stream(&self, stream: *mut LanceTokenStream) {
         if !stream.is_null() {
             ((*self.plugin).destroy_stream)(stream);
         }
     }
 
-    /// Get the next token from a stream.
-    ///
-    /// # Safety
-    ///
-    /// The stream must have been created by this library.
     unsafe fn next_token(&self, stream: *mut LanceTokenStream, token: &mut CToken) -> i32 {
         ((*self.plugin).next_token)(stream, token)
     }
 }
 
-/// A tokenizer factory created from a plugin.
-///
-/// The factory holds shared resources (like dictionaries) and can create
+// Note: PluginFactory, PluginTokenizerInstance, and PluginTokenStream
+//       are not Send/Sync because they hold raw pointers to plugin state.
+//       Each thread should create its own instances.
+
+/// PluginFactory holds shared resources (like dictionaries) and can create
 /// multiple tokenizer instances.
 pub struct PluginFactory<'a> {
     library: &'a TokenizerPluginLibrary,
@@ -281,7 +224,6 @@ impl<'a> PluginFactory<'a> {
 
 impl Drop for PluginFactory<'_> {
     fn drop(&mut self) {
-        // SAFETY: factory was created by this library
         unsafe {
             self.library.destroy_factory(self.factory);
         }
@@ -295,9 +237,7 @@ pub struct PluginTokenizerInstance<'a> {
 }
 
 impl<'a> PluginTokenizerInstance<'a> {
-    /// Create a token stream for the given text.
     pub fn create_stream(&self, text: &str) -> Result<PluginTokenStream<'a>> {
-        // SAFETY: tokenizer was created by this library
         let stream = unsafe { self.library.create_stream(self.tokenizer, text)? };
         Ok(PluginTokenStream {
             library: self.library,
@@ -308,7 +248,6 @@ impl<'a> PluginTokenizerInstance<'a> {
 
 impl Drop for PluginTokenizerInstance<'_> {
     fn drop(&mut self) {
-        // SAFETY: tokenizer was created by this library
         unsafe {
             self.library.destroy_tokenizer(self.tokenizer);
         }
@@ -321,24 +260,14 @@ pub struct PluginTokenStream<'a> {
     stream: *mut LanceTokenStream,
 }
 
-/// Result of calling next_token on a plugin stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextTokenResult {
-    /// A token was produced and written to the output parameter.
     Token,
-    /// The stream is exhausted, no more tokens available.
     EndOfStream,
-    /// An error occurred during tokenization.
     Error(i32),
 }
 
 impl PluginTokenStream<'_> {
-    /// Get the next token from the stream.
-    ///
-    /// Returns:
-    /// - `NextTokenResult::Token` if a token was produced
-    /// - `NextTokenResult::EndOfStream` if no more tokens are available
-    /// - `NextTokenResult::Error(code)` if an error occurred (code < 0)
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
         let result = unsafe { self.library.next_token(self.stream, token) };
         if result > 0 {
@@ -358,7 +287,3 @@ impl Drop for PluginTokenStream<'_> {
         }
     }
 }
-
-// Note: PluginFactory, PluginTokenizerInstance, and PluginTokenStream
-// are not Send/Sync because they hold raw pointers to plugin state.
-// This is intentional - each thread should create its own instances.

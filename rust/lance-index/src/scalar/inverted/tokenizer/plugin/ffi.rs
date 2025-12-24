@@ -7,12 +7,8 @@
 
 use std::ffi::{c_char, c_void};
 
-/// Plugin API version - must match LANCE_TOKENIZER_PLUGIN_API_VERSION in header
 pub const PLUGIN_API_VERSION: u32 = 1;
 
-/// Token information produced by the tokenizer.
-///
-/// This struct is `#[repr(C)]` to ensure C ABI compatibility.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CToken {
@@ -29,7 +25,7 @@ pub struct CToken {
     pub text: *const c_char,
 
     /// Length of the token text in bytes (not including null terminator)
-    pub text_len: u32,
+    pub text_length: u32,
 
     /// Position length (usually 1, but can be > 1 for synonyms)
     pub position_length: u32,
@@ -42,56 +38,32 @@ impl Default for CToken {
             offset_to: 0,
             position: 0,
             text: std::ptr::null(),
-            text_len: 0,
+            text_length: 0,
             position_length: 1,
         }
     }
 }
 
-// SAFETY: CToken only contains raw pointers which are Send
-unsafe impl Send for CToken {}
-
-/// Opaque factory handle type alias
 pub type LanceTokenizerFactory = c_void;
-
-/// Opaque tokenizer handle type alias
 pub type LanceTokenizer = c_void;
-
-/// Opaque token stream handle type alias
 pub type LanceTokenStream = c_void;
 
-/// Plugin interface - function pointers that plugins must implement.
-///
-/// This struct is `#[repr(C)]` to ensure C ABI compatibility.
 #[repr(C)]
 pub struct CTokenizerPlugin {
-    /// Returns the API version this plugin was built against.
     pub api_version: unsafe extern "C" fn() -> u32,
-
-    /// Create a tokenizer factory with the given JSON configuration.
     pub create_factory: unsafe extern "C" fn(
         config_json: *const c_char,
         config_len: u32,
     ) -> *mut LanceTokenizerFactory,
-
-    /// Destroy a factory and free its resources.
     pub destroy_factory: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory),
-
-    /// Create a tokenizer instance from the factory.
     pub create_tokenizer:
         unsafe extern "C" fn(factory: *mut LanceTokenizerFactory) -> *mut LanceTokenizer,
-
-    /// Destroy a tokenizer and free its resources.
     pub destroy_tokenizer: unsafe extern "C" fn(tokenizer: *mut LanceTokenizer),
-
-    /// Create a token stream for the given text.
     pub create_stream: unsafe extern "C" fn(
         tokenizer: *mut LanceTokenizer,
         text: *const c_char,
-        text_len: u32,
+        text_length: u32,
     ) -> *mut LanceTokenStream,
-
-    /// Destroy a token stream and free its resources.
     pub destroy_stream: unsafe extern "C" fn(stream: *mut LanceTokenStream),
 
     /// Get the next token from the stream.
@@ -101,17 +73,11 @@ pub struct CTokenizerPlugin {
     /// Get the last error message.
     pub get_error: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory) -> *const c_char,
 
-    /// Get the plugin name.
     pub name: unsafe extern "C" fn() -> *const c_char,
-
-    /// Get the plugin version.
     pub version: unsafe extern "C" fn() -> *const c_char,
 }
 
-/// Entry point function type signature
 pub type GetPluginFn = unsafe extern "C" fn() -> *const CTokenizerPlugin;
-
-/// Entry point symbol name
 pub const ENTRY_POINT_SYMBOL: &[u8] = b"lance_tokenizer_get_plugin";
 
 #[cfg(test)]
@@ -142,7 +108,7 @@ mod tests {
         assert_eq!(token.offset_to, 0);
         assert_eq!(token.position, 0);
         assert!(token.text.is_null());
-        assert_eq!(token.text_len, 0);
+        assert_eq!(token.text_length, 0);
         assert_eq!(token.position_length, 1);
     }
 }

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Test tokenizer plugin for integration tests.
-//!
-//! This is a simple whitespace tokenizer that can optionally lowercase tokens.
-
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::Mutex;
@@ -17,7 +13,7 @@ pub struct LanceToken {
     pub offset_to: u32,
     pub position: u32,
     pub text: *const c_char,
-    pub text_len: u32,
+    pub text_length: u32,
     pub position_length: u32,
 }
 
@@ -76,7 +72,10 @@ impl Factory {
             if let Some(colon_pos) = rest.find(':') {
                 let after_colon = rest[colon_pos + 1..].trim_start();
                 // Parse the number (take digits until non-digit)
-                let num_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let num_str: String = after_colon
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 num_str.parse::<usize>().ok()
             } else {
                 None
@@ -167,7 +166,7 @@ impl TokenStream {
         token.offset_to = end as u32;
         token.position = self.index as u32;
         token.text = self.current_token_text.as_ptr();
-        token.text_len = text.len() as u32;
+        token.text_length = text.len() as u32;
         token.position_length = 1;
 
         self.index += 1;
@@ -216,13 +215,13 @@ unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
 unsafe extern "C" fn create_stream(
     tokenizer: *mut c_void,
     text: *const c_char,
-    text_len: u32,
+    text_length: u32,
 ) -> *mut c_void {
     if tokenizer.is_null() || text.is_null() {
         return ptr::null_mut();
     }
     let tokenizer = &*(tokenizer as *const Tokenizer);
-    let text_slice = std::slice::from_raw_parts(text as *const u8, text_len as usize);
+    let text_slice = std::slice::from_raw_parts(text as *const u8, text_length as usize);
     let text_str = String::from_utf8_lossy(text_slice).into_owned();
     let tokens = tokenizer.tokenize(&text_str);
     let stream = TokenStream {
