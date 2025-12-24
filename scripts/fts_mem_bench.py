@@ -171,6 +171,17 @@ def main() -> None:
         default=0,
         help="Number of warmup queries before measurement",
     )
+    parser.add_argument(
+        "--prewarm-index",
+        action="append",
+        default=None,
+        help="Index name to prewarm (can be repeated)",
+    )
+    parser.add_argument(
+        "--prewarm-all",
+        action="store_true",
+        help="Prewarm all indices before measurement",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--index-cache-bytes",
@@ -202,7 +213,18 @@ def main() -> None:
     )
     ds = lance.dataset(args.uri, session=session)
 
-    if args.prewarm_queries > 0:
+    prewarm_names = []
+    if args.prewarm_index:
+        prewarm_names.extend(args.prewarm_index)
+    if args.prewarm_all:
+        try:
+            prewarm_names.extend([d.name for d in ds.describe_indices()])
+        except Exception:
+            prewarm_names.extend([idx.name for idx in ds.list_indices()])
+    if prewarm_names:
+        for name in sorted(set(prewarm_names)):
+            ds.prewarm_index(name)
+    elif args.prewarm_queries > 0:
         _prewarm(
             ds,
             args.text_column,
@@ -265,7 +287,10 @@ def main() -> None:
     print(f"Total queries: {total_queries}")
     print(f"Concurrency: {args.concurrency}")
     print(f"Limit: {args.limit}")
-    print(f"Prewarm queries: {args.prewarm_queries}")
+    if prewarm_names:
+        print(f"Prewarm indices: {sorted(set(prewarm_names))}")
+    else:
+        print(f"Prewarm queries: {args.prewarm_queries}")
     print(f"Elapsed: {elapsed:.2f}s")
     print(f"QPS: {total_queries / elapsed:.2f}")
     print(f"Avg latency: {avg_latency_ms:.2f} ms")
