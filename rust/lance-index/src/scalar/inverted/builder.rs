@@ -316,6 +316,46 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
+        if self.params.skip_merge {
+            let mut partitions =
+                Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
+            partitions.extend_from_slice(&self.partitions);
+            partitions.extend_from_slice(&self.new_partitions);
+            partitions.sort_unstable();
+
+            for part in self.partitions.iter() {
+                self.src_store
+                    .copy_index_file(&token_file_path(*part), dest_store)
+                    .await?;
+                self.src_store
+                    .copy_index_file(&posting_file_path(*part), dest_store)
+                    .await?;
+                self.src_store
+                    .copy_index_file(&doc_file_path(*part), dest_store)
+                    .await?;
+            }
+            for part in self.new_partitions.iter() {
+                self.local_store
+                    .copy_index_file(&token_file_path(*part), dest_store)
+                    .await?;
+                self.local_store
+                    .copy_index_file(&posting_file_path(*part), dest_store)
+                    .await?;
+                self.local_store
+                    .copy_index_file(&doc_file_path(*part), dest_store)
+                    .await?;
+            }
+
+            if self.fragment_mask.is_none() {
+                self.write_metadata(dest_store, &partitions).await?;
+            } else {
+                for &partition_id in &partitions {
+                    self.write_part_metadata(dest_store, partition_id).await?;
+                }
+            }
+            return Ok(());
+        }
+
         let no_cache = LanceCache::no_cache();
         let partitions = futures::future::try_join_all(
             self.partitions
@@ -1146,5 +1186,103 @@ pub fn document_input(
             .into(),
             location: location!(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{RecordBatch, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempDir;
+    use lance_core::ROW_ID;
+    use std::sync::atomic::AtomicU64;
+
+    fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let docs = Arc::new(StringArray::from(vec![Some(doc)]));
+        let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
+        RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_skip_merge_writes_partitions_as_is() -> Result<()> {
+        let src_dir = TempDir::default();
+        let dest_dir = TempDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let params = InvertedIndexParams::default();
+        let tokenizer = params.build()?;
+        let token_set_format = TokenSetFormat::default();
+        let id_alloc = Arc::new(AtomicU64::new(0));
+
+        let mut worker1 = IndexWorker::new(
+            src_store.clone(),
+            tokenizer.clone(),
+            params.with_position,
+            id_alloc.clone(),
+            None,
+            token_set_format,
+        )
+        .await?;
+        worker1
+            .process_batch(make_doc_batch("hello world", 0))
+            .await?;
+        let mut partitions = worker1.finish().await?;
+
+        let mut worker2 = IndexWorker::new(
+            src_store.clone(),
+            tokenizer.clone(),
+            params.with_position,
+            id_alloc.clone(),
+            None,
+            token_set_format,
+        )
+        .await?;
+        worker2
+            .process_batch(make_doc_batch("goodbye world", 1))
+            .await?;
+        partitions.extend(worker2.finish().await?);
+        partitions.sort_unstable();
+        assert_eq!(partitions.len(), 2);
+        assert_ne!(partitions[0], partitions[1]);
+
+        let builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default().skip_merge(true),
+            Some(src_store.clone()),
+            partitions.clone(),
+            token_set_format,
+            None,
+        );
+        builder.write(dest_store.as_ref()).await?;
+
+        let metadata_reader = dest_store.open_index_file(METADATA_FILE).await?;
+        let metadata = &metadata_reader.schema().metadata;
+        let partitions_str = metadata
+            .get("partitions")
+            .expect("partitions missing from metadata");
+        let written_partitions: Vec<u64> = serde_json::from_str(partitions_str).unwrap();
+        assert_eq!(written_partitions, partitions);
+
+        for id in &partitions {
+            dest_store.open_index_file(&token_file_path(*id)).await?;
+            dest_store.open_index_file(&posting_file_path(*id)).await?;
+            dest_store.open_index_file(&doc_file_path(*id)).await?;
+        }
+
+        Ok(())
     }
 }

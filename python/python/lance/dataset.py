@@ -2445,6 +2445,10 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        skip_merge: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will skip the
+            partition merge stage after indexing. This can be useful for
+            distributed/fragment-level indexing where a later merge is desired.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
