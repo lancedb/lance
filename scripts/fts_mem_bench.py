@@ -84,6 +84,15 @@ class RssMonitor:
             self._thread.join(timeout=1.0)
 
 
+def _current_rss_bytes() -> Optional[int]:
+    if psutil is None:
+        return None
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss
+    except Exception:
+        return None
+
+
 def _run_queries(
     ds: lance.dataset.Dataset,
     text_column: str,
@@ -112,6 +121,30 @@ def _run_queries(
     return total, total_latency
 
 
+def _prewarm(
+    ds: lance.dataset.Dataset,
+    text_column: str,
+    project_columns: Optional[List[str]],
+    terms: List[str],
+    limit: int,
+    count: int,
+    seed: int,
+) -> None:
+    if count <= 0:
+        return
+    rng = random.Random(seed)
+    for _ in range(count):
+        term = rng.choice(terms)
+        ds.to_table(
+            columns=project_columns,
+            full_text_query={
+                "query": term,
+                "columns": [text_column],
+            },
+            limit=limit,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Concurrent FTS query benchmark")
     parser.add_argument("--uri", required=True, help="Dataset URI")
@@ -131,6 +164,12 @@ def main() -> None:
         type=int,
         default=10000,
         help="Total number of queries across all threads",
+    )
+    parser.add_argument(
+        "--prewarm-queries",
+        type=int,
+        default=0,
+        help="Number of warmup queries before measurement",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -162,6 +201,19 @@ def main() -> None:
         metadata_cache_size_bytes=args.metadata_cache_bytes,
     )
     ds = lance.dataset(args.uri, session=session)
+
+    if args.prewarm_queries > 0:
+        _prewarm(
+            ds,
+            args.text_column,
+            args.project,
+            terms,
+            args.limit,
+            args.prewarm_queries,
+            args.seed,
+        )
+
+    baseline_rss = _current_rss_bytes()
 
     per_worker = args.total_queries // args.concurrency
     remainder = args.total_queries % args.concurrency
@@ -207,15 +259,27 @@ def main() -> None:
         peak_rss_bytes = _rss_bytes_from_resource(
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         )
+    end_rss = _current_rss_bytes()
 
     print("=== FTS Concurrency Benchmark ===")
     print(f"Total queries: {total_queries}")
     print(f"Concurrency: {args.concurrency}")
     print(f"Limit: {args.limit}")
+    print(f"Prewarm queries: {args.prewarm_queries}")
     print(f"Elapsed: {elapsed:.2f}s")
     print(f"QPS: {total_queries / elapsed:.2f}")
     print(f"Avg latency: {avg_latency_ms:.2f} ms")
     print(f"Peak RSS: {peak_rss_bytes / (1024 ** 2):.2f} MiB")
+    if baseline_rss is None:
+        print("Baseline RSS: unavailable (install psutil for deltas)")
+    else:
+        print(f"Baseline RSS: {baseline_rss / (1024 ** 2):.2f} MiB")
+        print(
+            f"Peak RSS delta: {(peak_rss_bytes - baseline_rss) / (1024 ** 2):.2f} MiB"
+        )
+        if end_rss is not None:
+            print(f"End RSS: {end_rss / (1024 ** 2):.2f} MiB")
+            print(f"End RSS delta: {(end_rss - baseline_rss) / (1024 ** 2):.2f} MiB")
 
 
 if __name__ == "__main__":
