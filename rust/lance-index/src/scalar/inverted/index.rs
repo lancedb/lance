@@ -276,9 +276,7 @@ impl InvertedIndex {
                     let mut tokens_by_position = vec![String::new(); postings.len()];
                     for posting in &postings {
                         let idx = posting.term_index() as usize;
-                        if idx < tokens_by_position.len() {
-                            tokens_by_position[idx] = posting.token().to_owned();
-                        }
+                        tokens_by_position[idx] = posting.token().to_owned();
                     }
                     let params = params.clone();
                     let mask = mask.clone();

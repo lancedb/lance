@@ -371,11 +371,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
-        let mut candidates = if limit <= BLOCK_SIZE * 10 {
-            BinaryHeap::with_capacity(limit)
-        } else {
-            BinaryHeap::new()
-        };
+        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
             if let Some(cur_doc) = self.cur_doc {
