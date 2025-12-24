@@ -99,10 +99,14 @@ def _run_queries(
     for _ in range(count):
         term = rng.choice(terms)
         start = time.perf_counter()
-        scanner = ds.scanner(columns=project_columns) if project_columns else ds.scanner()
-        scanner.full_text_search(term, columns=[text_column])
-        scanner.limit(limit)
-        scanner.to_table()
+        ds.to_table(
+            columns=project_columns,
+            full_text_query={
+                "query": term,
+                "columns": [text_column],
+            },
+            limit=limit,
+        )
         total_latency += time.perf_counter() - start
         total += 1
     return total, total_latency
