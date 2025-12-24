@@ -99,7 +99,7 @@ def _run_queries(
     for _ in range(count):
         term = rng.choice(terms)
         start = time.perf_counter()
-        scanner = ds.scan(columns=project_columns) if project_columns else ds.scan()
+        scanner = ds.scanner(columns=project_columns) if project_columns else ds.scanner()
         scanner.full_text_search(term, columns=[text_column])
         scanner.limit(limit)
         scanner.to_table()
