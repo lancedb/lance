@@ -364,24 +364,18 @@ impl InvertedIndexParams {
     /// `library_path` is path to the plugin shared library (.so, .dylib, or .dll)
     /// `config` is optional JSON configuration for the plugin
     pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
+        self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(library_path);
         self.tokenizer_plugin_config = config;
         self
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
-        // Check if a plugin is configured
-        #[cfg(feature = "tokenizer-plugin")]
-        if let Some(ref plugin_path) = self.tokenizer_plugin_library {
-            return self.build_plugin_tokenizer(plugin_path);
+        // Plugin tokenizer is handled separately as it returns LanceTokenizer directly
+        if self.base_tokenizer == "plugin" {
+            return self.build_plugin_tokenizer();
         }
 
-        #[cfg(not(feature = "tokenizer-plugin"))]
-        if self.tokenizer_plugin_library.is_some() {
-            return Err(Error::invalid_input(
-                "tokenizer-plugin feature is not enabled, cannot use plugin tokenizers",
-            ));
-        }
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -420,16 +414,6 @@ impl InvertedIndexParams {
         }
     }
 
-    /// Build a tokenizer from a plugin library.
-    #[cfg(feature = "tokenizer-plugin")]
-    fn build_plugin_tokenizer(&self, plugin_path: &str) -> Result<Box<dyn LanceTokenizer>> {
-        use plugin::PluginTokenizer;
-
-        let config = self.tokenizer_plugin_config.as_deref().unwrap_or("{}");
-        let tokenizer = PluginTokenizer::new(plugin_path, config)?;
-        Ok(Box::new(tokenizer))
-    }
-
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
@@ -465,11 +449,33 @@ impl InvertedIndexParams {
                 };
                 jieba::JiebaBuilder::load(&home.join(s))?.build()
             }
+            // "plugin" is handled in build() before calling this function
             _ => Err(Error::invalid_input(format!(
                 "unknown base tokenizer {}",
                 self.base_tokenizer
             ))),
         }
+    }
+
+    fn build_plugin_tokenizer(&self) -> Result<Box<dyn LanceTokenizer>> {
+        #[cfg(feature = "tokenizer-plugin")]
+        {
+            use plugin::PluginTokenizer;
+
+            let plugin_path = self.tokenizer_plugin_library.as_ref().ok_or_else(|| {
+                Error::invalid_input(
+                    "base_tokenizer is 'plugin' but tokenizer_plugin_library is not set",
+                )
+            })?;
+            let config = self.tokenizer_plugin_config.as_deref().unwrap_or("{}");
+            let tokenizer = PluginTokenizer::new(plugin_path, config)?;
+            Ok(Box::new(tokenizer))
+        }
+
+        #[cfg(not(feature = "tokenizer-plugin"))]
+        Err(Error::invalid_input(
+            "tokenizer-plugin feature is not enabled, cannot use plugin tokenizers",
+        ))
     }
 }
 
