@@ -103,7 +103,7 @@ use snafu::location;
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
-fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_hint: &str) -> Option<T>
+fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -113,11 +113,11 @@ where
             Ok(value) => Some(value),
             Err(e) => {
                 log::warn!(
-                    "Failed to parse {}='{}': {}. {}",
+                    "Failed to parse the environment variable {}='{}': {}, the default value is: {}.",
                     env_var_name,
                     val,
                     e,
-                    default_hint
+                    default_val
                 );
                 None
             }
