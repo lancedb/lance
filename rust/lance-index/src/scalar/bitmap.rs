@@ -725,10 +725,11 @@ impl BitmapIndexPlugin {
 
             let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
 
+            // Data arrives in row_address order, so row_ids are seen in ascending order.
             for i in 0..values.len() {
                 let row_id = row_id_column.value(i);
                 let key = ScalarValue::try_from_array(values.as_ref(), i)?;
-                state.entry(key.clone()).or_default().insert(row_id);
+                state.entry(key.clone()).or_default().push(row_id);
             }
         }
 

@@ -621,6 +621,47 @@ impl RowAddrTreeMap {
 
         Ok(Self { inner })
     }
+
+    /// Push a value that is greater than or equal to the current maximum.
+    ///
+    /// This is an O(1) operation when the value is greater than the current maximum.
+    /// Returns `true` if the value was added, `false` if it was already present
+    /// (which can only happen if value equals the current maximum).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is strictly less than the current maximum value within
+    /// the same fragment.
+    ///
+    /// ```rust
+    /// use lance_core::utils::mask::RowAddrTreeMap;
+    ///
+    /// let mut set = RowAddrTreeMap::new();
+    /// assert!(set.push(1));
+    /// assert!(set.push(2));
+    /// assert!(set.push(10));
+    /// assert!(set.contains(1));
+    /// assert!(set.contains(10));
+    /// ```
+    pub fn push(&mut self, value: u64) -> bool {
+        let fragment_id = (value >> 32) as u32;
+        let row_offset = value as u32;
+
+        match self.inner.get_mut(&fragment_id) {
+            None => {
+                let mut bitmap = RoaringBitmap::new();
+                bitmap.push(row_offset);
+                self.inner
+                    .insert(fragment_id, RowAddrSelection::Partial(bitmap));
+                true
+            }
+            Some(RowAddrSelection::Full) => {
+                // Fragment is already full, value is implicitly present
+                false
+            }
+            Some(RowAddrSelection::Partial(bitmap)) => bitmap.push(row_offset),
+        }
+    }
 }
 
 impl std::ops::BitOr<Self> for RowAddrTreeMap {
@@ -1370,6 +1411,45 @@ mod tests {
             assert!(map.contains(id), "Expected {} to be contained", id);
         }
         assert!(!map.contains(3));
+    }
+
+    #[test]
+    fn test_map_push() {
+        // Test pushing to empty map
+        let mut map = RowAddrTreeMap::default();
+        assert!(map.push(1));
+        assert!(map.push(2));
+        assert!(map.push(3));
+        assert!(map.contains(1));
+        assert!(map.contains(2));
+        assert!(map.contains(3));
+        assert!(!map.contains(0));
+
+        // Test pushing higher values
+        assert!(map.push(10));
+        assert!(map.push(20));
+        assert!(map.contains(10));
+        assert!(map.contains(20));
+
+        // Test pushing across fragment boundaries
+        let mut map2 = RowAddrTreeMap::default();
+        assert!(map2.push(1));
+        assert!(map2.push(2));
+        assert!(map2.push(1 << 32 | 5));
+        assert!(map2.push(1 << 32 | 10));
+        assert!(map2.contains(1));
+        assert!(map2.contains(2));
+        assert!(map2.contains(1 << 32 | 5));
+        assert!(map2.contains(1 << 32 | 10));
+    }
+
+    #[test]
+    fn test_map_push_to_full_fragment() {
+        // Test pushing to a full fragment (should return false)
+        let mut map = RowAddrTreeMap::default();
+        map.insert_fragment(0);
+        assert!(!map.push(1));
+        assert!(!map.push(2));
     }
 
     proptest::proptest! {
