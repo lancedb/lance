@@ -29,6 +29,7 @@ use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
+use crate::encodings::logical::fixed_size_list::FixedSizeListStructuralEncoder;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::map::MapStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
@@ -345,37 +346,39 @@ impl StructuralEncodingStrategy {
     }
 
     fn is_primitive_type(data_type: &DataType) -> bool {
-        matches!(
-            data_type,
-            DataType::Boolean
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-                | DataType::Duration(_)
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Int8
-                | DataType::Interval(_)
-                | DataType::Null
-                | DataType::Time32(_)
-                | DataType::Time64(_)
-                | DataType::Timestamp(_, _)
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::UInt8
-                | DataType::FixedSizeBinary(_)
-                | DataType::FixedSizeList(_, _)
-                | DataType::Binary
-                | DataType::LargeBinary
-                | DataType::Utf8
-                | DataType::LargeUtf8,
-        )
+        match data_type {
+            DataType::FixedSizeList(inner, _) => Self::is_primitive_type(inner.data_type()),
+            _ => matches!(
+                data_type,
+                DataType::Boolean
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _)
+                    | DataType::Duration(_)
+                    | DataType::Float16
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Int8
+                    | DataType::Interval(_)
+                    | DataType::Null
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::UInt8
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::Utf8
+                    | DataType::LargeUtf8,
+            ),
+        }
     }
 
     fn do_create_field_encoder(
@@ -446,6 +449,26 @@ impl StructuralEncodingStrategy {
                         root_field_metadata,
                     )?;
                     Ok(Box::new(ListStructuralEncoder::new(
+                        options.keep_original_array,
+                        child_encoder,
+                    )))
+                }
+                DataType::FixedSizeList(inner, _)
+                    if matches!(inner.data_type(), DataType::Struct(_)) =>
+                {
+                    // Complex FixedSizeList needs structural encoding
+                    let child = field
+                        .children
+                        .first()
+                        .expect("FixedSizeList should have a child");
+                    let child_encoder = self.do_create_field_encoder(
+                        _encoding_strategy_root,
+                        child,
+                        column_index,
+                        options,
+                        root_field_metadata,
+                    )?;
+                    Ok(Box::new(FixedSizeListStructuralEncoder::new(
                         options.keep_original_array,
                         child_encoder,
                     )))

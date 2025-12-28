@@ -238,6 +238,7 @@ use tracing::instrument;
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
+use crate::encodings::logical::fixed_size_list::StructuralFixedSizeListScheduler;
 use crate::encodings::logical::list::StructuralListScheduler;
 use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
@@ -773,6 +774,20 @@ impl CoreFieldDecoderStrategy {
                     self.create_structural_field_scheduler(child, column_infos)?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
+            }
+            DataType::FixedSizeList(inner, dimension)
+                if matches!(inner.data_type(), DataType::Struct(_)) =>
+            {
+                let child = field
+                    .children
+                    .first()
+                    .expect("FixedSizeList field must have a child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(child, column_infos)?;
+                Ok(Box::new(StructuralFixedSizeListScheduler::new(
+                    child_scheduler,
+                    *dimension,
+                )) as Box<dyn StructuralFieldScheduler>)
             }
             DataType::Map(_, keys_sorted) => {
                 // TODO: We only support keys_sorted=false for now,
