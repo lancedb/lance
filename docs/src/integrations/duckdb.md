@@ -122,10 +122,10 @@ q2 = [0.8, 0.7, 0.2]
 r2 = duckdb.sql(
     """
     SELECT animal, noise, vector
-    FROM lance_search(
+    FROM lance_vector_search(
         './lance_duck.lance',
+        'vector',
         q2::FLOAT[],
-        vector_column = 'vector',
         k = 1,
         prefilter = true
     )
@@ -154,10 +154,10 @@ is sorted in descending order to get the most relevant results.
 r3 = duckdb.sql(
     """
     SELECT animal, noise, vector
-    FROM lance_search(
+    FROM lance_fts(
         './lance_duck.lance',
+        'animal',
         'the brave knight faced the dragon',
-        text_column = 'animal',
         k = 1,
         prefilter = true)
     ORDER BY _score DESC;
@@ -187,12 +187,10 @@ q4 = [0.8, 0.7, 0.2]
 r4 = duckdb.sql(
     """
     SELECT animal, noise, vector
-    FROM lance_search(
+    FROM lance_hybrid_search(
         './lance_duck.lance',
-        q4::FLOAT[],
-        vector_column = 'vector',
-        'the duck surprised the dragon',
-        'animal',
+        'vector', q4::FLOAT[],
+        'animal', 'the duck surprised the dragon',        
         k = 2,
         prefilter = true
     )
