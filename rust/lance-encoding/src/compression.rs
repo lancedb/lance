@@ -173,7 +173,9 @@ fn try_rle_for_mini_block(
 
     let type_size = (bits / 8) as u64;
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
-    let threshold = params.rle_threshold.unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
+    let threshold = params
+        .rle_threshold
+        .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     // If the user explicitly provided a threshold then honor it as an additional guard.
     // A lower threshold makes RLE harder to trigger and can be used to avoid CPU overhead.

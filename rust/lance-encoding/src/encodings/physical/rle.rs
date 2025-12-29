@@ -271,7 +271,8 @@ impl RleMiniBlockEncoder {
             // Check if we reached a power-of-2 checkpoint.
             while checkpoint_log2 <= max_checkpoint_log2 {
                 let checkpoint_values = 1usize << checkpoint_log2;
-                if checkpoint_values > values_remaining || total_values_encoded < checkpoint_values {
+                if checkpoint_values > values_remaining || total_values_encoded < checkpoint_values
+                {
                     break;
                 }
                 last_checkpoint_state = Some((
