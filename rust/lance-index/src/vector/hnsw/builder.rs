@@ -966,10 +966,7 @@ mod tests {
         let metadata = hnsw.metadata();
         let batch = hnsw.to_batch().unwrap();
 
-        assert_eq!(
-            metadata.level_offsets.len(),
-            hnsw.max_level() as usize + 1
-        );
+        assert_eq!(metadata.level_offsets.len(), hnsw.max_level() as usize + 1);
         assert_eq!(*metadata.level_offsets.last().unwrap(), batch.num_rows());
     }
 }
