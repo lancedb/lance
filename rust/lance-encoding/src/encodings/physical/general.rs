@@ -244,6 +244,7 @@ mod tests {
         DataBlock::from_array(array)
     }
 
+
     fn run_round_trip_test(test_case: TestCase) {
         let compressor =
             GeneralMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
