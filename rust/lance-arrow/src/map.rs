@@ -109,7 +109,11 @@ mod tests {
             None,
         );
 
-        let entries_field = Arc::new(Field::new("entries", DataType::Struct(entries_fields), false));
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entries_fields),
+            false,
+        ));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 3, 5]));
         let validity = NullBuffer::from(vec![true, false, true]);
 
