@@ -415,7 +415,6 @@ impl HnswBuilder {
         node: u32,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
-        level_count: &mut [usize],
     ) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
@@ -443,8 +442,6 @@ impl HnswBuilder {
         {
             let mut current_node = nodes[node as usize].write().unwrap();
             for level in (0..=target_level).rev() {
-                level_count[level as usize] += 1;
-
                 let neighbors = self.search_level(&ep, level, &dist_calc, nodes, visited_generator);
                 for neighbor in &neighbors {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
@@ -522,6 +519,17 @@ impl HnswBuilder {
 
         *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
         builder_node.update_from_ranked_neighbors(level);
+    }
+
+    fn compute_level_count(&self) -> Vec<usize> {
+        let mut level_count = vec![0usize; self.max_level() as usize];
+        for node in self.nodes.iter() {
+            let levels = node.read().unwrap().level_neighbors.len();
+            for count in level_count.iter_mut().take(levels) {
+                *count += 1;
+            }
+        }
+        level_count
     }
 }
 
@@ -779,32 +787,13 @@ impl IvfSubIndex for HNSW {
         }
 
         let len = storage.len();
-        let max_level = inner.max_level() as usize;
-        let mut level_count = (1..len)
-            .into_par_iter()
-            .fold(
-                || (VisitedGenerator::new(len), vec![0usize; max_level]),
-                |(mut visited_generator, mut local_count), node| {
-                    inner.insert(node as u32, &mut visited_generator, storage, &mut local_count);
-                    (visited_generator, local_count)
-                },
-            )
-            .map(|(_, local_count)| local_count)
-            .reduce(
-                || vec![0usize; max_level],
-                |mut acc, local_count| {
-                    for (level, count) in local_count.into_iter().enumerate() {
-                        acc[level] += count;
-                    }
-                    acc
-                },
-            );
-
-        let entry_levels = inner.nodes[0].read().unwrap().level_neighbors.len();
-        for count in level_count.iter_mut().take(entry_levels) {
-            *count += 1;
-        }
-        inner.level_count = level_count;
+        (1..len).into_par_iter().for_each_init(
+            || VisitedGenerator::new(len),
+            |visited_generator, node| {
+                inner.insert(node as u32, visited_generator, storage);
+            },
+        );
+        inner.level_count = inner.compute_level_count();
 
         let hnsw = Self {
             inner: Arc::new(inner),
