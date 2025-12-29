@@ -128,12 +128,19 @@ pub fn multivec_distance(
         }
     }
 
-    let dists = vectors
-        .iter()
-        .map(|v| {
-            v.map(|v| {
+    let mut dists = Vec::with_capacity(vectors.len());
+    for (row_idx, v) in vectors.iter().enumerate() {
+        match v {
+            None => dists.push(f32::NAN),
+            Some(v) => {
                 let multivector = v.as_fixed_size_list();
-                match distance_type {
+                if multivector.len() == 0 {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "vectors row {row_idx} is an empty list; multi-vector distances require at least one sub-vector"
+                    )));
+                }
+
+                let sim = match distance_type {
                     DistanceType::Hamming => {
                         let query = query.as_primitive::<UInt8Type>().values();
                         query
@@ -151,32 +158,23 @@ pub fn multivec_distance(
                             .sum()
                     }
                     _ => match query.data_type() {
-                        DataType::Float16 => multivec_distance_impl::<Float16Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type,
-                        ),
-                        DataType::Float32 => multivec_distance_impl::<Float32Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type,
-                        ),
-                        DataType::Float64 => multivec_distance_impl::<Float64Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type,
-                        ),
+                        DataType::Float16 => {
+                            multivec_distance_impl::<Float16Type>(query, multivector, dim, distance_type)
+                        }
+                        DataType::Float32 => {
+                            multivec_distance_impl::<Float32Type>(query, multivector, dim, distance_type)
+                        }
+                        DataType::Float64 => {
+                            multivec_distance_impl::<Float64Type>(query, multivector, dim, distance_type)
+                        }
                         _ => unreachable!("missed to check query type"),
                     },
-                }
-            })
-            .unwrap_or(f32::NAN)
-        })
-        .map(|sim| 1.0 - sim)
-        .collect();
+                };
+
+                dists.push(1.0 - sim);
+            }
+        }
+    }
     Ok(dists)
 }
 
@@ -203,4 +201,38 @@ where
                 .unwrap()
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float32Array, ListArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+
+    #[test]
+    fn test_multivec_distance_empty_row_returns_error() {
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from_iter_values([1.0_f32, 2.0]));
+
+        let dim = 2;
+        let values = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![Some(vec![Some(1.0_f32), Some(2.0)])],
+            dim,
+        );
+
+        // Two rows: first is empty list, second has one sub-vector.
+        let offsets = OffsetBuffer::from_lengths([0_usize, 1]);
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let vectors = ListArray::try_new(field, offsets, Arc::new(values), None).unwrap();
+
+        let err = multivec_distance(query.as_ref(), &vectors, DistanceType::Dot).unwrap_err();
+        assert!(
+            err.to_string().contains("empty list"),
+            "unexpected error: {err}"
+        );
+    }
 }
