@@ -171,7 +171,7 @@ fn try_rle_for_mini_block(
         return None;
     }
 
-    let type_size = (bits / 8) as u64;
+    let type_size = bits / 8;
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
     let threshold = params
         .rle_threshold
