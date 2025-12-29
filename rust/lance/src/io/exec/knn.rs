@@ -750,7 +750,7 @@ impl ANNIvfSubIndexExec {
                     // just return the prefilter ids and don't bother searching any further
 
                     // This next if check should be true, because we wouldn't get max_results otherwise
-                    if let Some(iter_ids) = prefilter_mask.iter_ids() {
+                    if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
                         // We only run this on the first delta because the prefilter mask is shared
                         // by all deltas and we don't want to duplicate the rows.
                         if state
@@ -758,18 +758,19 @@ impl ANNIvfSubIndexExec {
                             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                         {
-                            let initial_ids = state.initial_ids.lock().unwrap();
-                            let found_ids = HashSet::<_>::from_iter(initial_ids.iter().copied());
-                            drop(initial_ids);
-                            let mask_ids = HashSet::from_iter(iter_ids.map(u64::from));
-                            let not_found_ids = mask_ids.difference(&found_ids);
-                            let not_found_ids =
-                                UInt64Array::from_iter_values(not_found_ids.copied());
+                            let initial_addrs = state.initial_ids.lock().unwrap();
+                            let found_addrs =
+                                HashSet::<_>::from_iter(initial_addrs.iter().copied());
+                            drop(initial_addrs);
+                            let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
+                            let not_found_addrs = mask_addrs.difference(&found_addrs);
+                            let not_found_addrs =
+                                UInt64Array::from_iter_values(not_found_addrs.copied());
                             let not_found_distance =
-                                Float32Array::from_value(f32::INFINITY, not_found_ids.len());
+                                Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
                             let not_found_batch = RecordBatch::try_new(
                                 KNN_INDEX_SCHEMA.clone(),
-                                vec![Arc::new(not_found_distance), Arc::new(not_found_ids)],
+                                vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
                             )
                             .unwrap();
                             return futures::stream::once(async move { Ok(not_found_batch) })

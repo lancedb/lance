@@ -23,7 +23,7 @@ use super::{
     SearchResult, TextQuery, TokenQuery,
 };
 use lance_core::{
-    utils::mask::{NullableRowIdMask, RowIdMask},
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
@@ -907,17 +907,17 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 #[derive(Debug)]
 enum NullableIndexExprResult {
-    Exact(NullableRowIdMask),
-    AtMost(NullableRowIdMask),
-    AtLeast(NullableRowIdMask),
+    Exact(NullableRowAddrMask),
+    AtMost(NullableRowAddrMask),
+    AtLeast(NullableRowAddrMask),
 }
 
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
         match result {
-            SearchResult::Exact(mask) => Self::Exact(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::AtMost(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowIdMask::AllowList(mask)),
+            SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
         }
     }
 }
@@ -983,19 +983,19 @@ impl NullableIndexExprResult {
 #[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowIdMask),
+    Exact(RowAddrMask),
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowIdMask),
+    AtMost(RowAddrMask),
     // The answer is at least the rows in the allow list minus the rows in the block list
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
-    AtLeast(RowIdMask),
+    AtLeast(RowAddrMask),
 }
 
 impl IndexExprResult {
-    pub fn row_id_mask(&self) -> &RowIdMask {
+    pub fn row_addr_mask(&self) -> &RowAddrMask {
         match self {
             Self::Exact(mask) => mask,
             Self::AtMost(mask) => mask,
@@ -1011,7 +1011,7 @@ impl IndexExprResult {
         }
     }
 
-    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
         match discriminant {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
@@ -1028,8 +1028,8 @@ impl IndexExprResult {
         &self,
         fragments_covered_by_result: &RoaringBitmap,
     ) -> Result<RecordBatch> {
-        let row_id_mask = self.row_id_mask();
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let row_addr_mask = self.row_addr_mask();
+        let row_addr_mask_arr = row_addr_mask.into_arrow()?;
         let discriminant = self.discriminant();
         let discriminant_arr =
             Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
@@ -1043,7 +1043,7 @@ impl IndexExprResult {
         Ok(RecordBatch::try_new(
             INDEX_EXPR_RESULT_SCHEMA.clone(),
             vec![
-                Arc::new(row_id_mask_arr),
+                Arc::new(row_addr_mask_arr),
                 Arc::new(discriminant_arr),
                 Arc::new(fragments_covered_arr),
             ],
@@ -2213,7 +2213,7 @@ mod tests {
         }
 
         // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
-        let at_most = NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(
+        let at_most = NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
@@ -2223,7 +2223,7 @@ mod tests {
         ));
 
         // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
-        let at_least = NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(
+        let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
@@ -2233,7 +2233,7 @@ mod tests {
         ));
 
         // Exact should stay Exact
-        let exact = NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(
+        let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         assert!(matches!(
@@ -2248,21 +2248,25 @@ mod tests {
 
         // Test that AND/OR correctly propagate certainty
         let make_at_most = || {
-            NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[1, 2, 3]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_at_least = || {
-            NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[2, 3, 4]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_exact = || {
-            NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(&[1, 2]),
                 RowAddrTreeMap::new(),
             )))

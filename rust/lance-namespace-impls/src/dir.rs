@@ -33,6 +33,10 @@ use lance_core::{box_error, Error, Result};
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
 
+use crate::credentials::{
+    create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
+};
+
 /// Builder for creating a DirectoryNamespace.
 ///
 /// This builder provides a fluent API for configuring and establishing
@@ -75,6 +79,7 @@ pub struct DirectoryNamespaceBuilder {
     manifest_enabled: bool,
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
+    credential_vendor_properties: HashMap<String, String>,
 }
 
 impl DirectoryNamespaceBuilder {
@@ -91,6 +96,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: true,
+            credential_vendor_properties: HashMap::new(),
         }
     }
 
@@ -131,6 +137,29 @@ impl DirectoryNamespaceBuilder {
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
     /// - `inline_optimization_enabled`: Enable inline optimization of __manifest table (optional, default: true)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
+    ///
+    /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
+    /// - `credential_vendor.enabled`: Set to "true" to enable credential vending (required)
+    /// - `credential_vendor.permission`: Permission level: read, write, or admin (default: read)
+    ///
+    /// AWS-specific properties (for s3:// locations):
+    /// - `credential_vendor.aws_role_arn`: AWS IAM role ARN (required for AWS)
+    /// - `credential_vendor.aws_external_id`: AWS external ID (optional)
+    /// - `credential_vendor.aws_region`: AWS region (optional)
+    /// - `credential_vendor.aws_role_session_name`: AWS role session name (optional)
+    /// - `credential_vendor.aws_duration_millis`: Credential duration in ms (default: 3600000, range: 15min-12hrs)
+    ///
+    /// GCP-specific properties (for gs:// locations):
+    /// - `credential_vendor.gcp_service_account`: Service account to impersonate (optional)
+    ///
+    /// Note: GCP uses Application Default Credentials (ADC). To use a service account key file,
+    /// set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable before starting.
+    /// GCP token duration cannot be configured; it's determined by the STS endpoint (typically 1 hour).
+    ///
+    /// Azure-specific properties (for az:// locations):
+    /// - `credential_vendor.azure_account_name`: Azure storage account name (required for Azure)
+    /// - `credential_vendor.azure_tenant_id`: Azure tenant ID (optional)
+    /// - `credential_vendor.azure_duration_millis`: Credential duration in ms (default: 3600000, up to 7 days)
     ///
     /// # Arguments
     ///
@@ -209,6 +238,17 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
+        // Extract credential vendor properties (properties prefixed with "credential_vendor.")
+        // The prefix is stripped to get short property names
+        // The build() method will check if enabled=true before creating the vendor
+        let credential_vendor_properties: HashMap<String, String> = properties
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("credential_vendor.")
+                    .map(|key| (key.to_string(), v.clone()))
+            })
+            .collect();
+
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
             storage_options,
@@ -216,6 +256,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled,
             dir_listing_enabled,
             inline_optimization_enabled,
+            credential_vendor_properties,
         })
     }
 
@@ -255,6 +296,55 @@ impl DirectoryNamespaceBuilder {
     /// * `session` - Arc-wrapped Lance session
     pub fn session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Add a credential vendor property.
+    ///
+    /// Use short property names without the `credential_vendor.` prefix.
+    /// Common properties: `enabled`, `permission`.
+    /// AWS properties: `aws_role_arn`, `aws_external_id`, `aws_region`, `aws_role_session_name`, `aws_duration_millis`.
+    /// GCP properties: `gcp_service_account`.
+    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_duration_millis`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key (e.g., "enabled", "aws_role_arn")
+    /// * `value` - Property value
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let namespace = DirectoryNamespaceBuilder::new("s3://my-bucket/data")
+    ///     .credential_vendor_property("enabled", "true")
+    ///     .credential_vendor_property("aws_role_arn", "arn:aws:iam::123456789012:role/MyRole")
+    ///     .credential_vendor_property("permission", "read")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn credential_vendor_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.credential_vendor_properties
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Add multiple credential vendor properties.
+    ///
+    /// Use short property names without the `credential_vendor.` prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - HashMap of credential vendor properties to add
+    pub fn credential_vendor_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.credential_vendor_properties.extend(properties);
         self
     }
 
@@ -300,6 +390,16 @@ impl DirectoryNamespaceBuilder {
             None
         };
 
+        // Create credential vendor once during initialization if enabled
+        let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
+        {
+            create_credential_vendor_for_location(&self.root, &self.credential_vendor_properties)
+                .await?
+                .map(Arc::from)
+        } else {
+            None
+        };
+
         Ok(DirectoryNamespace {
             root: self.root,
             storage_options: self.storage_options,
@@ -308,6 +408,7 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
+            credential_vendor,
         })
     }
 
@@ -357,6 +458,14 @@ impl DirectoryNamespaceBuilder {
 ///
 /// When `dir_listing_enabled=true`, the namespace falls back to directory scanning for tables not
 /// found in the manifest, enabling gradual migration.
+///
+/// ## Credential Vending
+///
+/// When credential vendor properties are configured, `describe_table` will vend temporary
+/// credentials based on the table location URI. The vendor type is auto-selected:
+/// - `s3://` locations use AWS STS AssumeRole
+/// - `gs://` locations use GCP OAuth2 tokens
+/// - `az://` locations use Azure SAS tokens
 pub struct DirectoryNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
@@ -366,6 +475,9 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
     dir_listing_enabled: bool,
+    /// Credential vendor created once during initialization.
+    /// Used to vend temporary credentials for table access.
+    credential_vendor: Option<Arc<dyn CredentialVendor>>,
 }
 
 impl std::fmt::Debug for DirectoryNamespace {
@@ -494,6 +606,35 @@ impl DirectoryNamespace {
         self.base_path
             .child(format!("{}.lance", table_name).as_str())
             .child(".lance-reserved")
+    }
+
+    /// Get storage options for a table, using credential vending if configured.
+    ///
+    /// If credential vendor properties are configured and the table location matches
+    /// a supported cloud provider, this will create an appropriate vendor and vend
+    /// temporary credentials scoped to the table location. Otherwise, returns the
+    /// static storage options.
+    ///
+    /// The vendor type is auto-selected based on the table URI:
+    /// - `s3://` locations use AWS STS AssumeRole
+    /// - `gs://` locations use GCP OAuth2 tokens
+    /// - `az://` locations use Azure SAS tokens
+    ///
+    /// The permission level (Read, Write, Admin) is configured at namespace
+    /// initialization time via the `credential_vendor_permission` property.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_uri` - The full URI of the table
+    async fn get_storage_options_for_table(
+        &self,
+        table_uri: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
+        if let Some(ref vendor) = self.credential_vendor {
+            let vended = vendor.vend_credentials(table_uri).await?;
+            return Ok(Some(vended.storage_options));
+        }
+        Ok(self.storage_options.clone())
     }
 
     /// Migrate directory-based tables to the manifest.
@@ -776,6 +917,8 @@ impl LanceNamespace for DirectoryNamespace {
                 let lance_schema = dataset.schema();
                 let arrow_schema: arrow_schema::Schema = lance_schema.into();
                 let json_schema = arrow_schema_to_json(&arrow_schema)?;
+                let storage_options = self.get_storage_options_for_table(&table_uri).await?;
+
                 Ok(DescribeTableResponse {
                     table: Some(table_name),
                     namespace: request.id.as_ref().map(|id| {
@@ -789,7 +932,7 @@ impl LanceNamespace for DirectoryNamespace {
                     location: Some(table_uri.clone()),
                     table_uri: Some(table_uri),
                     schema: Some(Box::new(json_schema)),
-                    storage_options: self.storage_options.clone(),
+                    storage_options,
                     stats: None,
                 })
             }
@@ -801,6 +944,7 @@ impl LanceNamespace for DirectoryNamespace {
                     .await
                     .unwrap_or(false)
                 {
+                    let storage_options = self.get_storage_options_for_table(&table_uri).await?;
                     Ok(DescribeTableResponse {
                         table: Some(table_name),
                         namespace: request.id.as_ref().map(|id| {
@@ -814,7 +958,7 @@ impl LanceNamespace for DirectoryNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         schema: None,
-                        storage_options: self.storage_options.clone(),
+                        storage_options,
                         stats: None,
                     })
                 } else {

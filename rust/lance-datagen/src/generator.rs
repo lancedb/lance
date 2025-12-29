@@ -1023,7 +1023,7 @@ impl ArrayGenerator for RandomBinaryGenerator {
 
 /// Generate a sequence of strings with a prefix and a counter
 ///
-/// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+/// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
 #[derive(Debug)]
 pub struct PrefixPlusCounterGenerator {
     prefix: String,
@@ -2704,7 +2704,7 @@ pub mod array {
 
     /// Creates a generator of strings with a prefix and a counter
     ///
-    /// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+    /// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
     pub fn utf8_prefix_plus_counter(
         prefix: impl Into<String>,
         is_large: bool,
@@ -3031,6 +3031,12 @@ mod tests {
         assert_eq!(
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values(["user_0", "user_1", "user_2"])
+        );
+
+        let mut genn = array::utf8_prefix_plus_counter("user_", true);
+        assert_eq!(
+            *genn.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::LargeStringArray::from_iter_values(["user_0", "user_1", "user_2"])
         );
     }
 

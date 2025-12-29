@@ -50,7 +50,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -1569,7 +1569,7 @@ impl Scanner {
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
@@ -2342,9 +2342,9 @@ impl Scanner {
     }
 
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids = RowAddrTreeMap::from_iter(u64s);
-        let row_id_mask = RowIdMask::from_allowed(row_ids);
-        let index_result = IndexExprResult::Exact(row_id_mask);
+        let row_addrs = RowAddrTreeMap::from_iter(u64s);
+        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
+        let index_result = IndexExprResult::Exact(row_addr_mask);
         let fragments_covered =
             RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
         let batch = index_result.serialize_to_arrow(&fragments_covered)?;

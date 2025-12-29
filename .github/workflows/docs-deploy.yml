@@ -40,6 +40,11 @@ jobs:
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-namespace-impls
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-namespace-impls
+          path: lance-namespace-impls
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -59,6 +64,14 @@ jobs:
             - Namespace Spec: namespace
           EOF
           cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
+      - name: Copy lance-namespace-impls docs
+        run: |
+          # Copy implementation specs to the integrations folder
+          cp lance-namespace-impls/docs/src/*.md docs/src/format/namespace/integrations/
+
+          # Copy .pages from lance-namespace-impls and append template entry
+          cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
+          echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
@@ -86,6 +99,7 @@ jobs:
           cp lance-ray/CONTRIBUTING.md docs/src/community/project-specific/ray.md
           cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
           cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
+          cp lance-namespace-impls/CONTRIBUTING.md docs/src/community/project-specific/namespace-impls.md || true
 
           # Create .pages for project-specific
           cat > docs/src/community/project-specific/.pages << 'EOF'
@@ -93,6 +107,7 @@ jobs:
             - index.md
             - Lance: lance
             - Lance Namespace: namespace.md
+            - Lance Namespace Impls: namespace-impls.md
             - Lance Ray: ray.md
             - Lance Spark: spark.md
           EOF

@@ -86,7 +86,7 @@ pub struct Query {
     pub upper_bound: Option<f32>,
 
     /// The minimum number of probes to load and search.  More partitions
-    /// will only be loaded if we have not found k results, or the the algorithm
+    /// will only be loaded if we have not found k results, or the algorithm
     /// determines more partitions are needed to satisfy recall requirements.
     ///
     /// The planner will always search at least this many partitions. Defaults to 1.

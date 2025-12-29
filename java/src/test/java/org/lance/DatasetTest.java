@@ -256,7 +256,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetTags(@TempDir Path tempDir) {
+  void testTags(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_tags").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -265,7 +265,7 @@ public class DatasetTest {
       // version 1, empty dataset
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
-        dataset.tags().create("tag1", 1);
+        dataset.tags().create("tag1", Ref.ofMain());
         assertEquals(1, dataset.tags().list().size());
         assertEquals(1, dataset.tags().list().get(0).getVersion());
         assertEquals(1, dataset.tags().getVersion("tag1"));
@@ -277,11 +277,11 @@ public class DatasetTest {
         assertEquals(1, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
-        dataset2.tags().create("tag2", 2);
+        dataset2.tags().create("tag2", Ref.ofMain(2));
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
         assertEquals(2, dataset2.tags().getVersion("tag2"));
-        dataset2.tags().update("tag2", 1);
+        dataset2.tags().update("tag2", Ref.ofMain(1));
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
         assertEquals(1, dataset2.tags().list().get(1).getVersion());
@@ -302,6 +302,35 @@ public class DatasetTest {
           assertEquals(1, checkoutV1.tags().list().get(0).getVersion());
           assertEquals(1, checkoutV1.tags().getVersion("tag1"));
         }
+
+        try (Dataset branch = dataset2.createBranch("branch", Ref.ofMain(2))) {
+          branch.tags().create("tag_on_branch", Ref.ofBranch("branch"));
+          assertEquals(2, dataset2.tags().getVersion("tag_on_branch"));
+          List<Tag> tags = dataset2.tags().list();
+          Optional<Tag> tagOptional =
+              dataset2.tags().list().stream()
+                  .filter(t -> t.getName().equals("tag_on_branch"))
+                  .findFirst();
+          assertEquals(2, tags.size());
+          assertTrue(tagOptional.isPresent());
+          assertEquals(2, tagOptional.get().getVersion());
+          assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
+
+          dataset2.tags().update("tag1", Ref.ofBranch("branch"));
+          tags = dataset2.tags().list();
+          tagOptional =
+              dataset2.tags().list().stream()
+                  .filter(t -> t.getName().equals("tag_on_branch"))
+                  .findFirst();
+          assertEquals(2, tags.size());
+          assertTrue(tagOptional.isPresent());
+          assertEquals(2, tagOptional.get().getVersion());
+          assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
+        }
+
+        assertEquals(2, dataset2.tags().list().size());
+        dataset2.tags().delete("tag_on_branch");
+        assertEquals(1, dataset2.tags().list().size());
       }
     }
   }
@@ -1519,7 +1548,7 @@ public class DatasetTest {
           assertEquals(5, mainV2.countRows());
 
           // Step2. create branch2 based on main:2
-          try (Dataset branch1V2 = mainV2.branches().create("branch1", 2)) {
+          try (Dataset branch1V2 = mainV2.createBranch("branch1", Ref.ofMain(2))) {
             assertEquals(2, branch1V2.version());
 
             // Write batch B on branch1: 3 rows -> global@3
@@ -1531,15 +1560,16 @@ public class DatasetTest {
               assertEquals(8, branch1V3.countRows()); // A(5) + B(3)
 
               // Step 3. Create branch2 based on branch1's latest version (simulate tag 't1')
-              mainV1.tags().create("tag", 3, "branch1");
+              mainV1.tags().create("tag", Ref.ofBranch("branch1", 3));
 
-              try (Dataset branch2V3 = branch1V2.branches().create("branch2", "tag")) {
+              try (Dataset branch2V3 = branch1V2.createBranch("branch2", Ref.ofTag("tag"))) {
                 assertEquals(3, branch2V3.version());
                 assertEquals(8, branch2V3.countRows()); // A(5) + B(3)
 
                 // Step 4. Write batch C on branch2: 2 rows -> branch2:4
                 FragmentMetadata fragC = suite.createNewFragment(2);
-                Append appendC = Append.builder().fragments(Arrays.asList(fragC)).build();
+                Append appendC =
+                    Append.builder().fragments(Collections.singletonList(fragC)).build();
                 try (Dataset branch2V4 =
                     branch2V3.newTransactionBuilder().operation(appendC).build().commit()) {
                   assertEquals(4, branch2V4.version());

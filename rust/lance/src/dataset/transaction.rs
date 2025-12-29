@@ -1530,6 +1530,7 @@ impl Transaction {
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
+        current_manifest: &Manifest,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
@@ -1538,6 +1539,9 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        manifest.max_fragment_id = manifest
+            .max_fragment_id
+            .max(current_manifest.max_fragment_id);
         Ok((manifest, indices))
     }
 

@@ -1569,9 +1569,10 @@ impl Dataset {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
                 let dict = PyDict::new(py);
-                dict.set_item("version", v.version).unwrap();
-                dict.set_item("manifest_size", v.manifest_size).unwrap();
-                pytags.set_item(k, dict.into_py_any(py)?).unwrap();
+                dict.set_item("branch", v.branch.clone())?;
+                dict.set_item("version", v.version)?;
+                dict.set_item("manifest_size", v.manifest_size)?;
+                pytags.set_item(k, dict.into_py_any(py)?)?;
             }
             pytags.into_py_any(py)
         })
@@ -1591,13 +1592,11 @@ impl Dataset {
         })
     }
 
-    fn create_tag(&mut self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+    fn create_tag(&mut self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
+        let reference = self.transform_ref(py, reference)?;
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .create_on_branch(tag.as_str(), version, branch.as_deref()),
+            self.ds.as_ref().tags().create(tag.as_str(), reference),
         )?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -1619,31 +1618,14 @@ impl Dataset {
         Ok(())
     }
 
-    fn update_tag(&self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+    fn update_tag(&self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
+        let reference = self.transform_ref(py, reference)?;
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .update_on_branch(tag.as_str(), version, branch.as_deref()),
+            self.ds.as_ref().tags().update(tag.as_str(), reference),
         )?
         .infer_error()?;
         Ok(())
-    }
-
-    /// Check out the latest version of the given branch
-    fn checkout_branch(&self, branch: String) -> PyResult<Self> {
-        let ds = rt()
-            .block_on(None, self.ds.checkout_branch(branch.as_str()))?
-            .map_err(|err| match err {
-                Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                _ => PyIOError::new_err(err.to_string()),
-            })?;
-        let uri_str = ds.uri().to_string();
-        Ok(Self {
-            ds: Arc::new(ds),
-            uri: uri_str,
-        })
     }
 
     /// Check out the latest version of the current branch
@@ -1668,7 +1650,6 @@ impl Dataset {
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
-        // Build Ref from python object
         let reference = self.transform_ref(py, reference)?;
         let store_params = storage_options.map(|opts| ObjectStoreParams {
             storage_options: Some(opts),
@@ -1898,6 +1879,9 @@ impl Dataset {
                     }
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
+                    }
+                    if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
+                        params = params.skip_merge(skip_merge.extract()?);
                     }
                 }
                 Box::new(params)
@@ -2855,29 +2839,18 @@ impl Dataset {
         if let Some(reference) = reference {
             if let Ok(i) = reference.downcast_bound::<PyInt>(py) {
                 let version_number: u64 = i.extract()?;
-                Ok(Ref::from(version_number))
+                Ok(version_number.into())
             } else if let Ok(tag_name) = reference.downcast_bound::<PyString>(py) {
                 let tag: &str = &tag_name.to_string_lossy();
-                Ok(Ref::from(tag))
+                Ok(tag.into())
             } else if let Ok(tuple) = reference.downcast_bound::<PyTuple>(py) {
-                let len = tuple.len();
-                if len == 1 {
-                    let elem = tuple.get_item(0)?;
-                    if let Ok(version_number) = elem.extract::<u64>() {
-                        Ok(Ref::from(version_number))
-                    } else if let Ok(branch_name) = elem.extract::<String>() {
-                        Ok(Ref::Version(Some(branch_name), None))
-                    } else {
-                        Err(PyValueError::new_err(
-                            "Version tuple must contain integer or string",
-                        ))
-                    }
-                } else if len == 2 {
-                    let (branch_name, version_number) = tuple.extract::<(String, u64)>()?;
-                    Ok(Ref::Version(Some(branch_name), Some(version_number)))
+                if tuple.len() == 2 {
+                    let (branch_name, version_number) =
+                        tuple.extract::<(Option<String>, Option<u64>)>()?;
+                    Ok((branch_name.as_deref(), version_number).into())
                 } else {
                     Err(PyValueError::new_err(
-                        "Version tuple must have 1 or 2 elements",
+                        "Version tuple should be Tuple[Optional[str], Optional[int]]",
                     ))
                 }
             } else {

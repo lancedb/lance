@@ -37,7 +37,11 @@ use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 
 use futures::TryStreamExt;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::{DatasetIndexExt, IndexType};
+use lance_io::object_store::ObjectStore;
 use lance_table::io::manifest::read_manifest;
+use object_store::path::Path;
 use rstest::rstest;
 
 #[rstest]
@@ -479,6 +483,167 @@ async fn append_dataset(
             .collect::<Vec<_>>(),
         (0..2).collect::<Vec<_>>()
     )
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_deep_clone(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // Setup source and target dirs
+    let test_dir = TempStdDir::default();
+    let base_dir = test_dir.join("base_ds");
+    let test_uri = base_dir.to_str().unwrap();
+    let clone_dir = test_dir.join("clone_ds");
+    let cloned_uri = clone_dir.to_str().unwrap();
+
+    // Generate test data
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("val", array::fill_utf8("deep".to_string()))
+        .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+
+    // Create source dataset
+    let mut dataset = Dataset::write(
+        data_reader,
+        test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 64,
+            max_rows_per_group: 16,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut branch = dataset
+        .create_branch("branch", dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // Create a scalar index to validate index copy
+    branch
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Create a deletion file by deleting some rows
+    branch.delete("id < 10").await.unwrap();
+
+    let original_version = branch.version().version;
+    branch
+        .tags()
+        .create("tag", ("branch", original_version))
+        .await
+        .unwrap();
+
+    // Perform deep clone
+    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+
+    // Validate target dataset rows
+    let batches = cloned_dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+    assert_eq!(cloned_dataset.version().version, original_version);
+    assert!(cloned_dataset.manifest().base_paths.is_empty());
+
+    // Validate internal file counts are equal between source and cloned datasets
+    let store = branch.object_store();
+    let src_root = dataset.base.clone();
+    let branch_root = branch.base.clone();
+    let dst_root = cloned_dataset.base.clone();
+
+    let src_data = count_files(store, &src_root, "data").await;
+    let dst_data = count_files(store, &dst_root, "data").await;
+    assert_eq!(src_data, dst_data);
+
+    let src_idx = count_files(store, &branch_root, "_indices").await;
+    let dst_idx = count_files(store, &dst_root, "_indices").await;
+    assert_eq!(src_idx, dst_idx);
+
+    let src_del = count_files(store, &branch_root, "_deletions").await;
+    let dst_del = count_files(store, &dst_root, "_deletions").await;
+    assert_eq!(src_del, dst_del);
+
+    // Validate index exists in cloned dataset
+    let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+    assert!(!cloned_indices.is_empty());
+    assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+
+    // Verify base_id cleared in cloned manifest and indices
+    for frag in cloned_dataset.manifest().fragments.iter() {
+        for df in &frag.files {
+            assert!(df.base_id.is_none());
+        }
+        if let Some(del) = &frag.deletion_file {
+            assert!(del.base_id.is_none());
+        }
+    }
+    for idx in cloned_indices.iter() {
+        assert!(idx.base_id.is_none());
+    }
+
+    // Attempt cloning again to the same target should error
+    let res = dataset.deep_clone(cloned_uri, "tag", None).await;
+    assert!(matches!(res, Err(Error::DatasetAlreadyExists { .. })));
+
+    // Invalid tag should error
+    let res_invalid = dataset
+        .deep_clone(&format!("{}/clone_invalid", test_uri), "no_such_tag", None)
+        .await;
+    assert!(matches!(res_invalid, Err(Error::RefNotFound { .. })));
+
+    // deep_clone version before the deletion
+    let clone_dir = test_dir.join("clone_ds_old_ver");
+    let cloned_ds = clone_dir.to_str().unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .await
+        .unwrap();
+    let store = branch.object_store();
+    let dst_root = cloned_dataset.base.clone();
+
+    // Validate target dataset rows
+    let batches = cloned_dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 64);
+    assert_eq!(cloned_dataset.version().version, original_version - 1);
+    assert!(cloned_dataset.manifest().base_paths.is_empty());
+    assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+}
+
+// Helper: count files under a dataset directory (data/_indices/_deletions)
+async fn count_files(store: &ObjectStore, root: &Path, prefix: &str) -> usize {
+    use futures::StreamExt;
+    let dir = root.child(prefix);
+    let mut stream = store.read_dir_all(&dir, None);
+    let mut count: usize = 0;
+    while stream.next().await.transpose().unwrap().is_some() {
+        count += 1;
+    }
+    count
 }
 
 #[rstest]

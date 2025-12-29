@@ -21,6 +21,10 @@ dir-aws = ["lance-io/aws", "lance/aws"]
 dir-azure = ["lance-io/azure", "lance/azure"]
 dir-oss = ["lance-io/oss", "lance/oss"]
 dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
+# Credential vending features
+credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:aws-credential-types"]
+credential-vendor-gcp = ["dep:google-cloud-auth", "dep:reqwest", "dep:serde"]
+credential-vendor-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage", "dep:azure_storage_blobs", "dep:time"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -60,6 +64,22 @@ serde_json = { workspace = true }
 futures.workspace = true
 log.workspace = true
 rand.workspace = true
+chrono.workspace = true
+
+# AWS credential vending dependencies (optional, enabled by "dir-aws" feature)
+aws-sdk-sts = { version = "1.38.0", optional = true }
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+
+# GCP credential vending dependencies (optional, enabled by "dir-gcp" feature)
+google-cloud-auth = { version = "0.18", optional = true }
+
+# Azure credential vending dependencies (optional, enabled by "dir-azure" feature)
+azure_core = { version = "0.21", optional = true }
+azure_identity = { version = "0.21", optional = true }
+azure_storage = { version = "0.21", optional = true }
+azure_storage_blobs = { version = "0.21", optional = true }
+time = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

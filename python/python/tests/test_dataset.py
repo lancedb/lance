@@ -449,7 +449,7 @@ def test_tag(tmp_path: Path):
     ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
-    ds.tags.create("tag2", 1, None)
+    ds.tags.create("tag2", 1)
 
     assert len(ds.tags.list()) == 2
 
@@ -466,16 +466,16 @@ def test_tag(tmp_path: Path):
 
     # test tag update
     with pytest.raises(
-        ValueError, match="Version not found error: version 3 does not exist"
+        ValueError, match="Version not found error: version main:3 does not exist"
     ):
         ds.tags.update("tag1", 3)
 
     with pytest.raises(
         ValueError, match="Ref not found error: tag tag3 does not exist"
     ):
-        ds.tags.update("tag3", 1, None)
+        ds.tags.update("tag3", 1)
 
-    ds.tags.update("tag1", 2, None)
+    ds.tags.update("tag1", 2)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
 
@@ -485,6 +485,33 @@ def test_tag(tmp_path: Path):
 
     version = ds.tags.get_version("tag1")
     assert version == 1
+
+    ds.create_branch("branch", "tag1")
+    ds.tags.create("tag3", ("branch", None))
+    target_tag = ds.tags.list().get("tag3")
+    assert ds.tags.get_version("tag3") == 1
+    assert len(ds.tags.list()) == 3
+    assert target_tag is not None
+    assert target_tag["version"] == 1
+    assert target_tag["branch"] == "branch"
+
+    ds.tags.update("tag3", (None, 2))
+    target_tag = ds.tags.list()["tag3"]
+    assert ds.tags.get_version("tag3") == 2
+    assert target_tag is not None
+    assert target_tag["version"] == 2
+    assert target_tag["branch"] is None
+
+    ds.create_branch("branch2", 2)
+    ds.tags.update("tag3", ("branch2", 2))
+    target_tag = ds.tags.list()["tag3"]
+    assert ds.tags.get_version("tag3") == 2
+    assert target_tag is not None
+    assert target_tag["version"] == 2
+    assert target_tag["branch"] == "branch2"
+
+    ds.tags.delete("tag3")
+    assert len(ds.tags.list()) == 2
 
 
 def test_tag_order(tmp_path: Path):
@@ -1129,8 +1156,8 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1, None)
-    dataset.tags.create("another-old-tag", 2, None)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
 
     with pytest.raises(OSError):
         dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
@@ -1158,9 +1185,9 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1, None)
-    dataset.tags.create("another-old-tag", 2, None)
-    dataset.tags.create("tag-latest", 3, None)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("tag-latest", 3)
 
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
@@ -4780,19 +4807,27 @@ def test_shallow_clone(tmp_path: Path):
     ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
 
     # Create a tag pointing to version 1
-    ds.tags.create("v1", 1, None)
+    ds.tags.create("v1", 1)
 
     # Clone by numeric version (v2) and assert equality
     clone_v2_dir = tmp_path / "clone_v2"
-    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, version=2)
+    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, 2)
     assert ds_clone_v2.to_table() == table_v2
     assert lance.dataset(clone_v2_dir).to_table() == table_v2
 
     # Clone by tag (v1) and assert equality
     clone_v1_tag_dir = tmp_path / "clone_v1_tag"
-    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, version="v1")
+    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, "v1")
     assert ds_clone_v1_tag.to_table() == table_v1
     assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1
+
+    table_v3 = pa.table({"a": [7, 8, 9], "b": [40, 50, 60]})
+    branch = ds.create_branch("branch", 2)
+    lance.write_dataset(table_v3, branch.uri, mode="overwrite")
+    clone_branch_v3 = tmp_path / "clone_branch_v3"
+    cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
+    assert cloned_by_branch.to_table() == table_v3
+    assert lance.dataset(clone_branch_v3).to_table() == table_v3
 
 
 def test_branches(tmp_path: Path):
@@ -4812,10 +4847,23 @@ def test_branches(tmp_path: Path):
     )
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
 
-    # Step 2: tag latest of branch1 → create branch2 from that tag
-    tag_name = "branch1_latest"
-    branch1.tags.create(tag_name, branch1.latest_version, "branch1")
-    branch2 = branch1.create_branch("branch2", tag_name)
+    # Step 2:
+    # tag latest of branch1 → create branch2 from that tag
+    # test create tag on the main branch by different ways
+    # test create branch from the main branch by specifying "main"
+    branch1.tags.create("branch1_latest", ("branch1", None))
+    branch1.tags.create("main_latest", (None, None))
+    branch1.tags.create("main_latest2", ("main", None))
+    branch1.create_branch("branch_from_main", ("main", None))
+    assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
+    assert branch1.tags.list()["main_latest"]["branch"] is None
+    assert branch1.tags.list()["main_latest2"]["branch"] is None
+    assert branch1.branches.list()["branch_from_main"]["parent_branch"] is None
+    assert branch1.branches.list()["branch_from_main"]["parent_version"] == 1
+    assert branch1.checkout_version("main_latest").latest_version == 1
+    assert branch1.checkout_version("main_latest2").latest_version == 1
+    assert branch1.checkout_version(("branch_from_main", None)).latest_version == 1
+    branch2 = branch1.create_branch("branch2", "branch1_latest")
     assert branch2.version == 2
 
     # Step 3: append more data to branch2 → verify contains branch1 data + new
@@ -4840,20 +4888,23 @@ def test_branches(tmp_path: Path):
     assert "create_at" in b1_meta
 
     try:
-        ds_main.branches.delete("branch1")
+        ds_main.checkout_version("branch_not_exists")
+        assert False, "Expected OSError was not raised"
     except OSError as e:
-        if "Not found" not in str(e):
+        if "does not exist" not in str(e):
             raise
-    branches_after = ds_main.branches.list()
-    assert "branch1" not in branches_after
-    assert "branch2" in branches_after
 
-    branch2 = ds_main.checkout_branch("branch2")
-    assert branch2.version == 3
-    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
-    branch2 = ds_main.checkout_version(("branch2", 2))
-    assert branch2.version == 2
-    assert branch2.to_table().combine_chunks() == expected_branch1.combine_chunks()
-    branch2.checkout_latest()
-    assert branch2.version == 3
-    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+    ds_main.branches.delete("branch2")
+    branches_after = ds_main.branches.list()
+    assert "branch2" not in branches_after
+    assert "branch1" in branches_after
+
+    branch1 = ds_main.checkout_version(("branch1", None))
+    assert branch1.version == 2
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+    branch1 = ds_main.checkout_version(("branch1", 1))
+    assert branch1.version == 1
+    assert branch1.to_table().combine_chunks() == main_table.combine_chunks()
+    branch1.checkout_latest()
+    assert branch1.version == 2
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()

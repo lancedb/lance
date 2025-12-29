@@ -51,6 +51,43 @@ import java.util.Map;
  *       for S3, storage.account_name=myaccount for Azure)
  * </ul>
  *
+ * <p>Credential vending properties (requires credential-vendor-* features to be enabled):
+ *
+ * <p>When credential vendor properties are configured, describeTable() will return vended temporary
+ * credentials. The vendor type is auto-selected based on the table location URI: s3:// for AWS,
+ * gs:// for GCP, az:// for Azure.
+ *
+ * <ul>
+ *   <li>Common properties:
+ *       <ul>
+ *         <li>credential_vendor.enabled (required): Set to "true" to enable credential vending
+ *         <li>credential_vendor.permission (optional): read, write, or admin (default: read)
+ *       </ul>
+ *   <li>AWS-specific properties (for s3:// locations):
+ *       <ul>
+ *         <li>credential_vendor.aws_role_arn (required): IAM role ARN to assume
+ *         <li>credential_vendor.aws_external_id (optional): External ID for assume role
+ *         <li>credential_vendor.aws_region (optional): AWS region
+ *         <li>credential_vendor.aws_role_session_name (optional): Role session name
+ *         <li>credential_vendor.aws_duration_millis (optional): Duration in ms (default: 3600000,
+ *             range: 15min-12hrs)
+ *       </ul>
+ *   <li>GCP-specific properties (for gs:// locations):
+ *       <ul>
+ *         <li>credential_vendor.gcp_service_account (optional): Service account to impersonate
+ *         <li>Note: GCP uses Application Default Credentials (ADC). To use a service account key
+ *             file, set the GOOGLE_APPLICATION_CREDENTIALS environment variable before starting.
+ *         <li>Note: GCP token duration cannot be configured; it's determined by the STS endpoint
+ *       </ul>
+ *   <li>Azure-specific properties (for az:// locations):
+ *       <ul>
+ *         <li>credential_vendor.azure_account_name (required): Azure storage account name
+ *         <li>credential_vendor.azure_tenant_id (optional): Azure tenant ID
+ *         <li>credential_vendor.azure_duration_millis (optional): Duration in ms (default: 3600000,
+ *             up to 7 days)
+ *       </ul>
+ * </ul>
+ *
  * <p>Example usage (local filesystem):
  *
  * <pre>{@code
@@ -79,6 +116,21 @@ import java.util.Map;
  * DirectoryNamespace namespace = new DirectoryNamespace();
  * namespace.initialize(properties, allocator);
  * // Use namespace...
+ * namespace.close();
+ * }</pre>
+ *
+ * <p>Example usage (AWS S3 with credential vending):
+ *
+ * <pre>{@code
+ * Map<String, String> properties = new HashMap<>();
+ * properties.put("root", "s3://my-bucket/lance-data");
+ * properties.put("credential_vendor.enabled", "true");
+ * properties.put("credential_vendor.aws_role_arn", "arn:aws:iam::123456789012:role/MyRole");
+ * properties.put("credential_vendor.aws_duration_millis", "3600000");  // 1 hour
+ *
+ * DirectoryNamespace namespace = new DirectoryNamespace();
+ * namespace.initialize(properties, allocator);
+ * // describeTable() will now return vended credentials (AWS vendor auto-selected from s3:// URI)
  * namespace.close();
  * }</pre>
  */

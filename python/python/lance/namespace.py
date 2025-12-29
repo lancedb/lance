@@ -86,6 +86,40 @@ class DirectoryNamespace(LanceNamespace):
           (e.g., storage.region="us-west-2" becomes region="us-west-2" in
           storage options)
 
+        Credential vendor properties (vendor is auto-selected based on table location):
+            When credential vendor properties are configured, describe_table() will
+            return vended temporary credentials. The vendor type is auto-selected
+            based on table location URI: s3:// for AWS, gs:// for GCP, az:// for
+            Azure. Requires the corresponding credential-vendor-* feature.
+
+            Common properties:
+                - credential_vendor.enabled (required): Set to "true" to enable
+                - credential_vendor.permission (optional): read, write, or admin
+
+            AWS-specific properties (for s3:// locations):
+                - credential_vendor.aws_role_arn (required): IAM role ARN to assume
+                - credential_vendor.aws_external_id (optional): External ID
+                - credential_vendor.aws_region (optional): AWS region
+                - credential_vendor.aws_role_session_name (optional): Session name
+                - credential_vendor.aws_duration_millis (optional): Duration in ms
+                  (default: 3600000, range: 15min-12hrs)
+
+            GCP-specific properties (for gs:// locations):
+                - credential_vendor.gcp_service_account (optional): Service account
+                  to impersonate using IAM Credentials API
+
+                Note: GCP uses Application Default Credentials (ADC). To use a service
+                account key file, set the GOOGLE_APPLICATION_CREDENTIALS environment
+                variable before starting. GCP token duration cannot be configured;
+                it's determined by the STS endpoint (typically 1 hour).
+
+            Azure-specific properties (for az:// locations):
+                - credential_vendor.azure_account_name (required): Azure storage
+                  account name
+                - credential_vendor.azure_tenant_id (optional): Azure tenant ID
+                - credential_vendor.azure_duration_millis (optional): Duration in ms
+                  (default: 3600000, up to 7 days)
+
     Examples
     --------
     >>> import lance.namespace
@@ -95,6 +129,15 @@ class DirectoryNamespace(LanceNamespace):
     >>> # Using the connect() factory function from lance_namespace
     >>> import lance_namespace
     >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
+    >>>
+    >>> # With AWS credential vending (requires credential-vendor-aws feature)
+    >>> # Use **dict to pass property names with dots
+    >>> ns = lance.namespace.DirectoryNamespace(**{
+    ...     "root": "s3://my-bucket/data",
+    ...     "credential_vendor.enabled": "true",
+    ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
+    ...     "credential_vendor.aws_duration_millis": "3600000",
+    ... })
     """
 
     def __init__(self, session=None, **properties):

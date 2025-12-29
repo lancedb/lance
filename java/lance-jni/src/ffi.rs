@@ -9,6 +9,7 @@ use crate::Error;
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
+use lance_index::scalar::inverted::query::{Occur, Operator};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -97,6 +98,8 @@ pub trait JNIEnvExt {
         obj: &JObject,
         method_name: &str,
     ) -> Result<Option<u32>>;
+    // Get f32 from Java Float with given method name.
+    fn get_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<f32>;
 
     fn get_optional_integer_from_method<T>(
         &mut self,
@@ -146,6 +149,10 @@ pub trait JNIEnvExt {
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
         F: FnOnce(&mut JNIEnv, JObject) -> Result<T>;
+
+    fn get_fts_operator_from_method(&mut self, obj: &JObject) -> Result<Operator>;
+
+    fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
@@ -278,6 +285,34 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_fts_operator_from_method(&mut self, obj: &JObject) -> Result<Operator> {
+        let operator_obj = self
+            .call_method(
+                obj,
+                "getOperator",
+                "()Lorg/lance/ipc/FullTextQuery$Operator;",
+                &[],
+            )?
+            .l()?;
+        let operator_str = self.get_string_from_method(&operator_obj, "name")?;
+        Operator::try_from(operator_str.as_str())
+            .map_err(|e| Error::io_error(format!("Invalid operator: {:?}", e)))
+    }
+
+    fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur> {
+        let occur_obj = self
+            .call_method(
+                obj,
+                "getOccur",
+                "()Lorg/lance/ipc/FullTextQuery$Occur;",
+                &[],
+            )?
+            .l()?;
+        let occur_str = self.get_string_from_method(&occur_obj, "name")?;
+        Occur::try_from(occur_str.as_str())
+            .map_err(|e| Error::io_error(format!("Invalid occur: {:?}", e)))
+    }
+
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
         let string_obj = self
             .call_method(obj, method_name, "()Ljava/lang/String;", &[])?
@@ -333,6 +368,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         method_name: &str,
     ) -> Result<Option<u32>> {
         self.get_optional_integer_from_method(obj, method_name)
+    }
+
+    fn get_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<f32> {
+        let float_obj = self.call_method(obj, method_name, "()F", &[])?;
+        let float_value = float_obj.f()?;
+        Ok(float_value)
     }
 
     fn get_optional_integer_from_method<T>(
