@@ -129,15 +129,14 @@ pub fn multivec_distance(
     }
 
     let mut dists = Vec::with_capacity(vectors.len());
-    for (row_idx, v) in vectors.iter().enumerate() {
+    for v in vectors.iter() {
         match v {
             None => dists.push(f32::NAN),
             Some(v) => {
                 let multivector = v.as_fixed_size_list();
                 if multivector.len() == 0 {
-                    return Err(ArrowError::InvalidArgumentError(format!(
-                        "vectors row {row_idx} is an empty list; multi-vector distances require at least one sub-vector"
-                    )));
+                    dists.push(f32::NAN);
+                    continue;
                 }
 
                 let sim = match distance_type {
@@ -224,7 +223,7 @@ mod tests {
     use arrow_schema::Field;
 
     #[test]
-    fn test_multivec_distance_empty_row_returns_error() {
+    fn test_multivec_distance_empty_row_is_nan() {
         let query: Arc<dyn Array> = Arc::new(Float32Array::from_iter_values([1.0_f32, 2.0]));
 
         let dim = 2;
@@ -238,10 +237,9 @@ mod tests {
         let field = Arc::new(Field::new("item", values.data_type().clone(), true));
         let vectors = ListArray::try_new(field, offsets, Arc::new(values), None).unwrap();
 
-        let err = multivec_distance(query.as_ref(), &vectors, DistanceType::Dot).unwrap_err();
-        assert!(
-            err.to_string().contains("empty list"),
-            "unexpected error: {err}"
-        );
+        let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::Dot).unwrap();
+        assert_eq!(dists.len(), 2);
+        assert!(dists[0].is_nan());
+        assert_eq!(dists[1], -4.0);
     }
 }
