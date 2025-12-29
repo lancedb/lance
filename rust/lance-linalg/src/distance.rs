@@ -158,15 +158,24 @@ pub fn multivec_distance(
                             .sum()
                     }
                     _ => match query.data_type() {
-                        DataType::Float16 => {
-                            multivec_distance_impl::<Float16Type>(query, multivector, dim, distance_type)
-                        }
-                        DataType::Float32 => {
-                            multivec_distance_impl::<Float32Type>(query, multivector, dim, distance_type)
-                        }
-                        DataType::Float64 => {
-                            multivec_distance_impl::<Float64Type>(query, multivector, dim, distance_type)
-                        }
+                        DataType::Float16 => multivec_distance_impl::<Float16Type>(
+                            query,
+                            multivector,
+                            dim,
+                            distance_type,
+                        ),
+                        DataType::Float32 => multivec_distance_impl::<Float32Type>(
+                            query,
+                            multivector,
+                            dim,
+                            distance_type,
+                        ),
+                        DataType::Float64 => multivec_distance_impl::<Float64Type>(
+                            query,
+                            multivector,
+                            dim,
+                            distance_type,
+                        ),
                         _ => unreachable!("missed to check query type"),
                     },
                 };
