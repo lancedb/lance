@@ -57,25 +57,6 @@ fn dot_scalar<
     sum + sums.iter().copied().sum::<Output>()
 }
 
-#[inline]
-fn dot_u8_scalar<const LANES: usize>(from: &[u8], to: &[u8]) -> u32 {
-    let x_chunks = to.chunks_exact(LANES);
-    let y_chunks = from.chunks_exact(LANES);
-    let remainder_sum = x_chunks
-        .remainder()
-        .iter()
-        .zip(y_chunks.remainder().iter())
-        .map(|(&x, &y)| x as u32 * y as u32)
-        .sum::<u32>();
-    let mut sums = [0_u32; LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
-        for i in 0..LANES {
-            sums[i] += x[i] as u32 * y[i] as u32;
-        }
-    }
-    remainder_sum + sums.iter().copied().sum::<u32>()
-}
-
 /// Dot product.
 #[inline]
 pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
@@ -171,7 +152,11 @@ impl Dot for f64 {
 impl Dot for u8 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        dot_u8_scalar::<16>(x, y) as f32
+        // TODO: this is not optimized for auto vectorization yet.
+        x.iter()
+            .zip(y.iter())
+            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
+            .sum::<u32>() as f32
     }
 }
 
@@ -271,15 +256,6 @@ mod tests {
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
 
         assert_eq!(f32::dot(&x, &y), dot(&x, &y));
-
-        let x: Vec<u8> = (0..20).map(|v| v as u8).collect();
-        let y: Vec<u8> = (100..120).map(|v| v as u8).collect();
-        let expected = x
-            .iter()
-            .zip(y.iter())
-            .map(|(&x, &y)| x as u32 * y as u32)
-            .sum::<u32>() as f32;
-        assert_eq!(expected, dot(&x, &y));
 
         let x: Vec<f32> = (0..512).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..612).map(|v| v as f32).collect();
