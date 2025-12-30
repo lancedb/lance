@@ -387,17 +387,27 @@ impl VectorStore for ScalarQuantizationStorage {
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let (offset, chunk) = self.chunk(id);
         let query_sq_code = chunk.sq_code_slice(id - offset).to_vec();
+        let bounds = self.quantizer.bounds();
+        let scale = sq_distance_scale(&bounds);
         SQDistCalculator {
             query_sq_code,
-            bounds: self.quantizer.bounds(),
+            bounds,
+            scale,
             storage: self,
         }
     }
 }
 
+#[inline]
+fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
+    let range = (bounds.end - bounds.start) as f32;
+    (range * range) / (255.0_f32 * 255.0_f32)
+}
+
 pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
     bounds: Range<f64>,
+    scale: f32,
     storage: &'a ScalarQuantizationStorage,
 }
 
@@ -421,9 +431,11 @@ impl<'a> SQDistCalculator<'a> {
                 panic!("Unsupported data type for ScalarQuantizationStorage");
             }
         };
+        let scale = sq_distance_scale(&bounds);
         Self {
             query_sq_code,
             bounds,
+            scale,
             storage,
         }
     }
@@ -440,7 +452,7 @@ impl DistCalculator for SQDistCalculator<'_> {
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         };
-        inverse_scalar_dist(std::iter::once(dist), &self.bounds)[0]
+        dist * self.scale
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
