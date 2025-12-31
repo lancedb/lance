@@ -33,7 +33,6 @@ pub use floats::*;
 pub mod cast;
 pub mod json;
 pub mod list;
-pub mod map;
 pub mod memory;
 pub mod r#struct;
 

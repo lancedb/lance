@@ -3,11 +3,11 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, MapArray};
+use arrow_array::{Array, ArrayRef, ListArray, MapArray};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
-use lance_arrow::map::MapArrayExt;
+use lance_arrow::list::ListArrayExt;
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -61,11 +61,12 @@ impl FieldEncoder for MapStructuralEncoder {
             repdef.add_offsets(map_array.offsets().clone(), deep_copy_nulls(array.nulls()))
         };
 
-        // Get entries, filtering garbage if needed (similar to ListStructuralEncoder)
+        // MapArray is physically a ListArray, so convert and use ListArrayExt
+        let list_array: ListArray = map_array.clone().into();
         let entries = if has_garbage_values {
-            map_array.filter_garbage_nulls().trimmed_entries()
+            list_array.filter_garbage_nulls().trimmed_values()
         } else {
-            map_array.trimmed_entries()
+            list_array.trimmed_values()
         };
 
         self.child
