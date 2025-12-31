@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>2.0.0-beta.3</version>
+    <version>2.0.0-beta.5</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -28,11 +28,11 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <arrow.version>15.0.0</arrow.version>
+        <arrow.version>18.3.0</arrow.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
-        <spotless.version>2.30.0</spotless.version>
-        <spotless.java.googlejavaformat.version>1.7</spotless.java.googlejavaformat.version>
+        <spotless.version>2.43.0</spotless.version>
+        <spotless.java.googlejavaformat.version>1.22.0</spotless.java.googlejavaformat.version>
         <scala.version>2.12.19</scala.version>
         <scala.binary.version>2.12</scala.binary.version>
         <!-- Please also update .scalafmt.conf when you change it here -->
@@ -108,12 +108,12 @@
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
-            <version>0.3.1</version>
+            <version>0.4.0</version>
         </dependency>
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-apache-client</artifactId>
-            <version>0.3.1</version>
+            <version>0.4.0</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -419,8 +419,8 @@
                 <jdk>[11,)</jdk>
             </activation>
             <properties>
-                <!-- Ping release target to JDK8 to link only against Java 8 APIs -->
-                <maven.compiler.release>8</maven.compiler.release>
+                <!-- Ping release target to JDK11 to link only against Java 11 APIs -->
+                <maven.compiler.release>11</maven.compiler.release>
             </properties>
             <build>
                 <plugins>

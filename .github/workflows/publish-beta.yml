@@ -65,10 +65,7 @@ jobs:
 
         if [ -n "${RELEASE_NOTES_FROM}" ]; then
           echo "Generating release notes from ${RELEASE_NOTES_FROM} to ${BETA_TAG}"
-          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
-            -f tag_name="${BETA_TAG}" \
-            -f previous_tag_name="${RELEASE_NOTES_FROM}" \
-            --jq .body)
+          NOTES=$(python ci/generate_release_notes.py ${RELEASE_NOTES_FROM} ${BETA_TAG})
         else
           echo "No release-root tag found, using automatic generation"
           NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \

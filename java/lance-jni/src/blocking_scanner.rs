@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::traits::{import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
@@ -12,6 +13,12 @@ use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
+    MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
+    PhraseQuery as FtsPhraseQuery,
+};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
@@ -51,6 +58,141 @@ impl BlockingScanner {
     }
 }
 
+fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> Result<FtsQuery> {
+    let type_obj = env
+        .call_method(
+            &java_obj,
+            "getType",
+            "()Lorg/lance/ipc/FullTextQuery$Type;",
+            &[],
+        )?
+        .l()?;
+    let type_name = env.get_string_from_method(&type_obj, "name")?;
+
+    match type_name.as_str() {
+        "MATCH" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let column = env.get_string_from_method(&java_obj, "getColumn")?;
+            let boost = env.get_f32_from_method(&java_obj, "getBoost")?;
+            let fuzziness = env.get_optional_u32_from_method(&java_obj, "getFuzziness")?;
+            let max_expansions = env.get_int_as_usize_from_method(&java_obj, "getMaxExpansions")?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+            let prefix_length = env.get_u32_from_method(&java_obj, "getPrefixLength")?;
+
+            let mut query = FtsMatchQuery::new(query_text);
+            query = query.with_column(Some(column));
+            query = query
+                .with_boost(boost)
+                .with_fuzziness(fuzziness)
+                .with_max_expansions(max_expansions)
+                .with_operator(operator)
+                .with_prefix_length(prefix_length);
+
+            Ok(FtsQuery::Match(query))
+        }
+        "MATCH_PHRASE" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let column = env.get_string_from_method(&java_obj, "getColumn")?;
+            let slop = env.get_u32_from_method(&java_obj, "getSlop")?;
+
+            let mut query = FtsPhraseQuery::new(query_text);
+            query = query.with_column(Some(column));
+            query = query.with_slop(slop);
+
+            Ok(FtsQuery::Phrase(query))
+        }
+        "MULTI_MATCH" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
+
+            let boosts: Option<Vec<f32>> =
+                env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
+                    import_vec_to_rust(env, &list_obj, |env, elem| {
+                        env.get_f32_from_method(&elem, "floatValue")
+                    })
+                })?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+
+            let mut query = FtsMultiMatchQuery::try_new(query_text, columns)?;
+            if let Some(boosts) = boosts {
+                query = query.try_with_boosts(boosts)?;
+            }
+            query = query.with_operator(operator);
+
+            Ok(FtsQuery::MultiMatch(query))
+        }
+        "BOOST" => {
+            let positive_obj = env
+                .call_method(
+                    &java_obj,
+                    "getPositive",
+                    "()Lorg/lance/ipc/FullTextQuery;",
+                    &[],
+                )?
+                .l()?;
+            if positive_obj.is_null() {
+                return Err(Error::input_error(
+                    "positive query must not be null in BOOST FullTextQuery".to_string(),
+                ));
+            }
+            let negative_obj = env
+                .call_method(
+                    &java_obj,
+                    "getNegative",
+                    "()Lorg/lance/ipc/FullTextQuery;",
+                    &[],
+                )?
+                .l()?;
+            if negative_obj.is_null() {
+                return Err(Error::input_error(
+                    "negative query must not be null in BOOST FullTextQuery".to_string(),
+                ));
+            }
+
+            let positive = build_full_text_search_query(env, positive_obj)?;
+            let negative = build_full_text_search_query(env, negative_obj)?;
+            let negative_boost = env.get_f32_from_method(&java_obj, "getNegativeBoost")?;
+
+            let query = FtsBoostQuery::new(positive, negative, Some(negative_boost));
+            Ok(FtsQuery::Boost(query))
+        }
+        "BOOLEAN" => {
+            let clauses: Vec<(FtsOccur, FtsQuery)> =
+                import_vec_from_method(env, &java_obj, "getClauses", |env, clause_obj| {
+                    let occur = env.get_occur_from_method(&clause_obj)?;
+
+                    let query_obj = env
+                        .call_method(
+                            &clause_obj,
+                            "getQuery",
+                            "()Lorg/lance/ipc/FullTextQuery;",
+                            &[],
+                        )?
+                        .l()?;
+                    if query_obj.is_null() {
+                        return Err(Error::input_error(
+                            "BooleanClause query must not be null".to_string(),
+                        ));
+                    }
+                    let query = build_full_text_search_query(env, query_obj)?;
+                    Ok((occur, query))
+                })?;
+
+            let boolean_query = FtsBooleanQuery::new(clauses);
+            Ok(FtsQuery::Boolean(boolean_query))
+        }
+        other => Err(Error::input_error(format!(
+            "Unsupported FullTextQuery type: {}",
+            other
+        ))),
+    }
+}
+
 ///////////////////
 // Write Methods //
 ///////////////////
@@ -67,6 +209,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     limit_obj: JObject,            // Optional<Integer>
     offset_obj: JObject,           // Optional<Integer>
     query_obj: JObject,            // Optional<Query>
+    fts_query_obj: JObject,        // Optional<FullTextQuery>
     with_row_id: jboolean,         // boolean
     with_row_address: jboolean,    // boolean
     batch_readahead: jint,         // int
@@ -85,6 +228,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             limit_obj,
             offset_obj,
             query_obj,
+            fts_query_obj,
             with_row_id,
             with_row_address,
             batch_readahead,
@@ -105,6 +249,7 @@ fn inner_create_scanner<'local>(
     limit_obj: JObject,
     offset_obj: JObject,
     query_obj: JObject,
+    fts_query_obj: JObject,
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
@@ -201,6 +346,13 @@ fn inner_create_scanner<'local>(
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
         scanner.use_index(use_index);
+        Ok(())
+    })?;
+
+    env.get_optional(&fts_query_obj, |env, java_obj| {
+        let fts_query = build_full_text_search_query(env, java_obj)?;
+        let full_text_query = FullTextSearchQuery::new_query(fts_query);
+        scanner.full_text_search(full_text_query)?;
         Ok(())
     })?;
 

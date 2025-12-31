@@ -119,6 +119,7 @@ async fn do_commit_new_dataset(
     };
 
     let (mut manifest, indices) = if let Operation::Clone {
+        is_shallow,
         ref_name,
         ref_version,
         ref_path,
@@ -139,37 +140,74 @@ async fn do_commit_new_dataset(
         )
         .await?;
 
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
-        let new_manifest = source_manifest.shallow_clone(
-            ref_name.clone(),
-            ref_path.clone(),
-            new_base_id,
-            branch_name.clone(),
-            transaction_file,
-        );
+        if *is_shallow {
+            let new_base_id = source_manifest
+                .base_paths
+                .keys()
+                .max()
+                .map(|id| *id + 1)
+                .unwrap_or(0);
+            let new_manifest = source_manifest.shallow_clone(
+                ref_name.clone(),
+                ref_path.clone(),
+                new_base_id,
+                branch_name.clone(),
+                transaction_file,
+            );
 
-        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-            let reader = object_store.open(&source_manifest_location.path).await?;
-            let section: pb::IndexSection =
-                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-            section
-                .indices
-                .into_iter()
-                .map(|index_pb| {
-                    let mut index = IndexMetadata::try_from(index_pb)?;
-                    index.base_id = Some(new_base_id);
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = Some(new_base_id);
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            (new_manifest, updated_indices)
         } else {
-            vec![]
-        };
-        (new_manifest, updated_indices)
+            // Deep clone: build a manifest that references local files (no external bases)
+            let mut new_manifest = source_manifest.clone();
+            new_manifest.base_paths.clear();
+            new_manifest.branch = None;
+            new_manifest.tag = None;
+            new_manifest.index_section = None; // will be rewritten below
+            let mut new_frags = new_manifest.fragments.as_ref().clone();
+            for f in &mut new_frags {
+                for df in &mut f.files {
+                    df.base_id = None;
+                }
+                if let Some(d) = f.deletion_file.as_mut() {
+                    d.base_id = None;
+                }
+            }
+            new_manifest.fragments = Arc::new(new_frags);
+
+            // Indices: keep metadata but normalize base to local
+            let mut updated_indices = Vec::new();
+            if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                updated_indices = section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = None;
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (new_manifest, updated_indices)
+        }
     } else {
         let (manifest, indices) =
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
@@ -635,6 +673,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -824,6 +863,7 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -957,6 +997,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1326,6 +1367,37 @@ mod tests {
 
             dataset.validate().await.unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn test_restore_does_not_decrease_max_fragment_id() {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Append a few times to advance max_fragment_id and create newer versions.
+        for _ in 0..2 {
+            let reader = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+            dataset.append(reader, None).await.unwrap();
+        }
+
+        let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Restore an earlier version (version 1) as the latest.
+        let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        dataset_v1.restore().await.unwrap();
+
+        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
+        let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
+        assert!(
+            restored_max >= latest_max,
+            "max_fragment_id should not decrease on restore: before={}, after={}",
+            latest_max,
+            restored_max
+        );
     }
 
     async fn get_empty_dataset() -> (TempStrDir, Dataset) {

@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "2.0.0-beta.3"
+version = "2.0.0-beta.5"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
@@ -73,11 +73,15 @@ url = "2.5.0"
 bytes = "1.4"
 
 [features]
-default = ["rest", "rest-adapter"]
+default = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
 rest = ["lance-namespace-impls/rest"]
 rest-adapter = ["lance-namespace-impls/rest-adapter"]
+# Credential vending features for DirectoryNamespace
+credential-vendor-aws = ["lance-namespace-impls/credential-vendor-aws"]
+credential-vendor-gcp = ["lance-namespace-impls/credential-vendor-gcp"]
+credential-vendor-azure = ["lance-namespace-impls/credential-vendor-azure"]
 
 [profile.ci]
 debug = "line-tables-only"

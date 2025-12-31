@@ -183,10 +183,19 @@ impl PyDirectoryNamespace {
         Ok(pythonize(py, &response)?.into())
     }
 
+    #[allow(deprecated)]
     fn create_empty_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_empty_table(request))?
+            .infer_error()?;
+        Ok(pythonize(py, &response)?.into())
+    }
+
+    fn declare_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.declare_table(request))?
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }
@@ -341,10 +350,19 @@ impl PyRestNamespace {
         Ok(pythonize(py, &response)?.into())
     }
 
+    #[allow(deprecated)]
     fn create_empty_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_empty_table(request))?
+            .infer_error()?;
+        Ok(pythonize(py, &response)?.into())
+    }
+
+    fn declare_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.declare_table(request))?
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }

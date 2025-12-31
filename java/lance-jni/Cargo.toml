@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "2.0.0-beta.3"
+version = "2.0.0-beta.5"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
@@ -12,6 +12,13 @@ description = "JNI bindings for Lance Columnar format"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Credential vending features for DirectoryNamespace
+credential-vendor-aws = ["lance-namespace-impls/credential-vendor-aws"]
+credential-vendor-gcp = ["lance-namespace-impls/credential-vendor-gcp"]
+credential-vendor-azure = ["lance-namespace-impls/credential-vendor-azure"]
+
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }
 lance-datafusion = { path = "../../rust/lance-datafusion" }
@@ -20,7 +27,7 @@ lance-linalg = { path = "../../rust/lance-linalg" }
 lance-index = { path = "../../rust/lance-index" }
 lance-io = { path = "../../rust/lance-io" }
 lance-namespace = { path = "../../rust/lance-namespace" }
-lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
+lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 arrow = { version = "56.1", features = ["ffi"] }

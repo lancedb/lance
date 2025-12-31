@@ -143,6 +143,5 @@ pub async fn compute_distance(
                 location: location!(),
             })
     })
-    .await
-    .unwrap()
+    .await?
 }

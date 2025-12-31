@@ -128,12 +128,18 @@ pub fn multivec_distance(
         }
     }
 
-    let dists = vectors
-        .iter()
-        .map(|v| {
-            v.map(|v| {
+    let mut dists = Vec::with_capacity(vectors.len());
+    for v in vectors.iter() {
+        match v {
+            None => dists.push(f32::NAN),
+            Some(v) => {
                 let multivector = v.as_fixed_size_list();
-                match distance_type {
+                if multivector.len() == 0 {
+                    dists.push(f32::NAN);
+                    continue;
+                }
+
+                let sim = match distance_type {
                     DistanceType::Hamming => {
                         let query = query.as_primitive::<UInt8Type>().values();
                         query
@@ -171,12 +177,12 @@ pub fn multivec_distance(
                         ),
                         _ => unreachable!("missed to check query type"),
                     },
-                }
-            })
-            .unwrap_or(f32::NAN)
-        })
-        .map(|sim| 1.0 - sim)
-        .collect();
+                };
+
+                dists.push(1.0 - sim);
+            }
+        }
+    }
     Ok(dists)
 }
 
@@ -203,4 +209,37 @@ where
                 .unwrap()
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float32Array, ListArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+
+    #[test]
+    fn test_multivec_distance_empty_row_is_nan() {
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from_iter_values([1.0_f32, 2.0]));
+
+        let dim = 2;
+        let values = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![Some(vec![Some(1.0_f32), Some(2.0)])],
+            dim,
+        );
+
+        // Two rows: first is empty list, second has one sub-vector.
+        let offsets = OffsetBuffer::from_lengths([0_usize, 1]);
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let vectors = ListArray::try_new(field, offsets, Arc::new(values), None).unwrap();
+
+        let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::Dot).unwrap();
+        assert_eq!(dists.len(), 2);
+        assert!(dists[0].is_nan());
+        assert_eq!(dists[1], -4.0);
+    }
 }

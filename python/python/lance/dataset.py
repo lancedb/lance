@@ -2445,6 +2445,10 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        skip_merge: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will skip the
+            partition merge stage after indexing. This can be useful for
+            distributed/fragment-level indexing where a later merge is desired.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
@@ -5520,16 +5524,48 @@ def write_dataset(
 
         from .namespace import (
             CreateEmptyTableRequest,
+            DeclareTableRequest,
             DescribeTableRequest,
             LanceNamespaceStorageOptionsProvider,
         )
 
         # Determine which namespace method to call based on mode
         if mode == "create":
-            request = CreateEmptyTableRequest(
-                id=table_id, location=None, properties=None
-            )
-            response = namespace.create_empty_table(request)
+            # Try declare_table first, fall back to deprecated create_empty_table
+            # for backward compatibility with older namespace implementations.
+            # create_empty_table support will be removed in 3.0.0.
+            if hasattr(namespace, "declare_table"):
+                try:
+                    from lance_namespace.errors import UnsupportedOperationError
+
+                    declare_request = DeclareTableRequest(id=table_id, location=None)
+                    response = namespace.declare_table(declare_request)
+                except (UnsupportedOperationError, NotImplementedError):
+                    # Fall back to deprecated create_empty_table
+                    import warnings
+
+                    warnings.warn(
+                        "create_empty_table is deprecated, use declare_table instead. "
+                        "Support will be removed in 3.0.0.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    fallback_request = CreateEmptyTableRequest(
+                        id=table_id, location=None
+                    )
+                    response = namespace.create_empty_table(fallback_request)
+            else:
+                # Namespace doesn't have declare_table, fall back to create_empty_table
+                import warnings
+
+                warnings.warn(
+                    "create_empty_table is deprecated, use declare_table instead. "
+                    "Support will be removed in 3.0.0.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                fallback_request = CreateEmptyTableRequest(id=table_id, location=None)
+                response = namespace.create_empty_table(fallback_request)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
             response = namespace.describe_table(request)

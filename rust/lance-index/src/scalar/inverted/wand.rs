@@ -167,6 +167,16 @@ impl PostingIterator {
     }
 
     #[inline]
+    pub(crate) fn term_index(&self) -> u32 {
+        self.position
+    }
+
+    #[inline]
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[inline]
     fn approximate_upper_bound(&self) -> f32 {
         self.approximate_upper_bound
     }
@@ -293,9 +303,11 @@ impl PostingIterator {
     }
 }
 
+#[derive(Debug)]
 pub struct DocCandidate {
     pub row_id: u64,
-    pub freqs: Vec<(String, u32)>,
+    /// (term_index, freq)
+    pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
 }
 
@@ -359,7 +371,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
-        let mut candidates = BinaryHeap::new();
+        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
             if let Some(cur_doc) = self.cur_doc {
@@ -394,10 +406,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             let score = self.score(pivot, doc_length);
-            let freqs = self
-                .iter_token_freqs(pivot)
-                .map(|(token, freq)| (token.to_owned(), freq))
-                .collect();
+            let freqs = self.iter_term_freqs(pivot).collect();
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
@@ -522,10 +531,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             };
 
             let score = self.score(max_pivot, doc_length);
-            let freqs = self
-                .iter_token_freqs(max_pivot)
-                .map(|(token, freq)| (token.to_owned(), freq))
-                .collect();
+            let freqs = self.iter_term_freqs(max_pivot).collect();
 
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
@@ -565,6 +571,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
             posting
                 .doc()
                 .map(|doc| (posting.token.as_str(), doc.frequency()))
+        })
+    }
+
+    // iterate over all the preceding terms and collect the term index and frequency
+    fn iter_term_freqs(&self, pivot: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.postings[..=pivot].iter().filter_map(|posting| {
+            posting
+                .doc()
+                .map(|doc| (posting.term_index(), doc.frequency()))
         })
     }
 

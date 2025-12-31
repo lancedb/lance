@@ -69,8 +69,11 @@ use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
-/// Default threshold for RLE compression selection.
-/// RLE is chosen when the run count is less than this fraction of total values.
+/// Default threshold for RLE compression selection when the user explicitly provides a threshold.
+///
+/// If no threshold is provided, we use a size model instead of a fixed run ratio.
+/// This preserves existing behavior for users relying on the default, while making
+/// the default selection more type-aware.
 const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 // Minimum block size (32kb) to trigger general block compression
@@ -168,12 +171,35 @@ fn try_rle_for_mini_block(
         return None;
     }
 
+    let type_size = bits / 8;
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
     let threshold = params
         .rle_threshold
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
-    if (run_count as f64) < (data.num_values as f64) * threshold {
+    // If the user explicitly provided a threshold then honor it as an additional guard.
+    // A lower threshold makes RLE harder to trigger and can be used to avoid CPU overhead.
+    let passes_threshold = match params.rle_threshold {
+        Some(_) => (run_count as f64) < (data.num_values as f64) * threshold,
+        None => true,
+    };
+
+    if !passes_threshold {
+        return None;
+    }
+
+    // Estimate the encoded size.
+    //
+    // RLE stores (value, run_length) pairs. Run lengths are u8 and long runs are split into
+    // multiple entries of up to 255 values. We don't know the run length distribution here,
+    // so we conservatively account for splitting with an upper bound.
+    let num_values = data.num_values;
+    let estimated_pairs = (run_count + (num_values / 255)).min(num_values);
+
+    let raw_bytes = (num_values as u128) * (type_size as u128);
+    let rle_bytes = (estimated_pairs as u128) * ((type_size + 1) as u128);
+
+    if rle_bytes < raw_bytes {
         return Some(Box::new(RleMiniBlockEncoder::new()));
     }
     None

@@ -19,13 +19,13 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
-    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
-    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -545,6 +545,14 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
         table_api::create_empty_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::declare_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
             .await
             .map_err(convert_api_error)
     }
