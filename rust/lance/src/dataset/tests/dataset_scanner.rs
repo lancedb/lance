@@ -45,7 +45,7 @@ async fn test_vector_filter_fts_search() {
         maximum_nprobes: None,
         ef: None,
         refine_factor: None,
-        metric_type: MetricType::L2,
+        metric_type: Some(MetricType::L2),
         use_index: true,
         dist_q_c: 0.0,
     };

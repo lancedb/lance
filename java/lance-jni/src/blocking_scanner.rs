@@ -336,13 +336,12 @@ fn inner_create_scanner<'local>(
             scanner.refine(refine_factor);
         }
 
-        let distance_type_jstr: JString = env
-            .call_method(&java_obj, "getDistanceType", "()Ljava/lang/String;", &[])?
-            .l()?
-            .into();
-        let distance_type_str: String = env.get_string(&distance_type_jstr)?.into();
-        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
-        scanner.distance_metric(distance_type);
+        if let Some(distance_type_str) =
+            env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
+        {
+            let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
+            scanner.distance_metric(distance_type);
+        }
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
         scanner.use_index(use_index);

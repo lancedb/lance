@@ -1231,7 +1231,7 @@ impl Scanner {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: default_distance_type_for(&element_type),
+            metric_type: None,
             use_index: true,
             dist_q_c: 0.0,
         });
@@ -1361,7 +1361,7 @@ impl Scanner {
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.metric_type = metric_type
+            q.metric_type = Some(metric_type)
         }
         self
     }
@@ -3034,20 +3034,39 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+        // Find an index for the column and check if metric is compatible
+        let matching_index =
+            if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                let idx = self
+                    .dataset
+                    .open_vector_index(
+                        q.column.as_str(),
+                        &index.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                let index_metric = idx.metric_type();
+
+                // Check if user's requested metric is compatible with index
+                let use_this_index = match q.metric_type {
+                    Some(user_metric) => user_metric == index_metric,
+                    None => true, // No preference, use index's metric
+                };
+
+                if use_this_index {
+                    Some((index, idx, index_metric))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some((index, _idx, index_metric)) = matching_index {
             log::trace!("index found for vector search");
-            // There is an index built for the column.
-            // We will use the index.
-            let idx = self
-                .dataset
-                .open_vector_index(
-                    q.column.as_str(),
-                    &index.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-            q.metric_type = idx.metric_type();
-            validate_distance_type_for(q.metric_type, &element_type)?;
+            // Use the index's metric type
+            q.metric_type = Some(index_metric);
+            validate_distance_type_for(index_metric, &element_type)?;
 
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
@@ -3082,7 +3101,12 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
-            validate_distance_type_for(q.metric_type, &element_type)?;
+            // Resolve metric type for flat search (use default if not specified)
+            let metric = q
+                .metric_type
+                .unwrap_or_else(|| default_distance_type_for(&element_type));
+            q.metric_type = Some(metric);
+            validate_distance_type_for(metric, &element_type)?;
             // No index found. use flat search.
             let mut columns = vec![q.column.clone()];
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -3137,7 +3161,7 @@ impl Scanner {
                 )
                 .await?;
             let mut q = q.clone();
-            q.metric_type = idx.metric_type();
+            q.metric_type = Some(idx.metric_type());
 
             // If the vector column is not present, we need to take the vector column, so
             // that the distance value is comparable with the flat search ones.
@@ -3589,11 +3613,19 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+        // Resolve metric_type if not set (use default for the column's element type)
+        let metric_type = match q.metric_type {
+            Some(m) => m,
+            None => {
+                let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+                default_distance_type_for(&element_type)
+            }
+        };
         let flat_dist = Arc::new(KNNVectorDistanceExec::try_new(
             input,
             &q.column,
             q.key.clone(),
-            q.metric_type,
+            metric_type,
         )?);
 
         let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
@@ -5122,10 +5154,8 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("bin", &query, 3).unwrap();
 
-        assert_eq!(
-            scan.nearest.as_ref().unwrap().metric_type,
-            DistanceType::Hamming
-        );
+        // metric_type is None initially; it will be resolved to Hamming during search
+        assert_eq!(scan.nearest.as_ref().unwrap().metric_type, None);
 
         let batch = scan.try_into_batch().await.unwrap();
         let ids = batch
@@ -5157,6 +5187,102 @@ mod test {
         assert!(
             message.contains("l2") && message.contains("UInt8"),
             "unexpected message: {message}"
+        );
+    }
+
+    /// Test that when query specifies a metric different from the index,
+    /// we fall back to flat search and return correct distances.
+    /// Regression test for https://github.com/lance-format/lance/issues/5608
+    #[tokio::test]
+    async fn test_knn_metric_mismatch_falls_back_to_flat_search() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        // Create IVF_PQ index with L2 metric
+        test_ds.make_vector_index().await.unwrap();
+
+        let dataset = &test_ds.dataset;
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        // Query with Dot metric (different from the L2 index)
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.distance_metric(DistanceType::Dot);
+
+        // Verify the explain plan does NOT show ANNSubIndex (should use flat search)
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNSubIndex"),
+            "Expected flat search, but got ANN index in plan:\n{}",
+            plan
+        );
+        // Should show flat KNN with Dot metric (metric is displayed lowercase)
+        assert!(
+            plan.contains("KNNVectorDistance") && plan.to_lowercase().contains("dot"),
+            "Expected flat KNN with Dot metric in plan:\n{}",
+            plan
+        );
+
+        // Also verify the distances are different from L2 results
+        let dot_batch = dataset
+            .scan()
+            .nearest("vec", &key, 5)
+            .unwrap()
+            .distance_metric(DistanceType::Dot)
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let l2_batch = dataset
+            .scan()
+            .nearest("vec", &key, 5)
+            .unwrap()
+            .distance_metric(DistanceType::L2)
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let dot_distances: Vec<f32> = dot_batch
+            .column_by_name(DIST_COL)
+            .unwrap()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let l2_distances: Vec<f32> = l2_batch
+            .column_by_name(DIST_COL)
+            .unwrap()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+
+        // Dot and L2 distances should be different (this verifies we're using the correct metric)
+        assert_ne!(dot_distances, l2_distances);
+    }
+
+    /// Test that when query does not specify a metric, we use the index's metric.
+    /// Regression test for https://github.com/lance-format/lance/issues/5608
+    #[tokio::test]
+    async fn test_knn_no_metric_uses_index_metric() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        // Create IVF_PQ index with L2 metric
+        test_ds.make_vector_index().await.unwrap();
+
+        let dataset = &test_ds.dataset;
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        // Query without specifying metric
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        // Don't call distance_metric() - should use index's L2
+
+        // Verify the explain plan shows ANNSubIndex with L2 metric
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex") && plan.to_lowercase().contains("l2"),
+            "Expected ANN index with L2 metric in plan:\n{}",
+            plan
         );
     }
 
@@ -7251,7 +7377,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
-        ANNSubIndex: name=..., k=42, deltas=1
+        ANNSubIndex: name=..., k=42, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
@@ -7271,7 +7397,7 @@ mod test {
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
-                  ANNSubIndex: name=..., k=40, deltas=1
+                  ANNSubIndex: name=..., k=40, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
@@ -7315,7 +7441,7 @@ mod test {
         Take: columns=\"_distance, _rowid, (i)\"
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
-              ANNSubIndex: name=..., k=17, deltas=1
+              ANNSubIndex: name=..., k=17, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
@@ -7336,7 +7462,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
-        ANNSubIndex: name=..., k=17, deltas=1
+        ANNSubIndex: name=..., k=17, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
@@ -7345,7 +7471,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
-        ANNSubIndex: name=..., k=17, deltas=1
+        ANNSubIndex: name=..., k=17, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
           row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
@@ -7381,7 +7507,7 @@ mod test {
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
-                      ANNSubIndex: name=..., k=6, deltas=1
+                      ANNSubIndex: name=..., k=6, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
@@ -7413,7 +7539,7 @@ mod test {
                       Take: columns=\"_distance, _rowid, (vec)\"
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
-                            ANNSubIndex: name=..., k=15, deltas=1
+                            ANNSubIndex: name=..., k=15, deltas=1, metric=L2
                               ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
@@ -7442,7 +7568,7 @@ mod test {
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
-                      ANNSubIndex: name=..., k=5, deltas=1
+                      ANNSubIndex: name=..., k=5, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         FilterExec: i@0 > 10
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
@@ -7464,7 +7590,7 @@ mod test {
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
-                      ANNSubIndex: name=..., k=5, deltas=1
+                      ANNSubIndex: name=..., k=5, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
                           row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
@@ -7495,7 +7621,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1
+        ANNSubIndex: name=..., k=5, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
@@ -7516,7 +7642,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1
+        ANNSubIndex: name=..., k=5, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
@@ -7525,7 +7651,7 @@ mod test {
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1
+        ANNSubIndex: name=..., k=5, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=3, range_before=None, \
           range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
@@ -7563,7 +7689,7 @@ mod test {
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
-                      ANNSubIndex: name=..., k=8, deltas=1
+                      ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
@@ -7599,7 +7725,7 @@ mod test {
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
-                      ANNSubIndex: name=..., k=11, deltas=1
+                      ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx";
         dataset.make_scalar_index().await?;
@@ -7939,7 +8065,7 @@ mod test {
                     .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-    ANNSubIndex: name=idx, k=32, deltas=1
+    ANNSubIndex: name=idx, k=32, deltas=1, metric=L2
       ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await
@@ -7954,7 +8080,7 @@ mod test {
                     .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-    ANNSubIndex: name=idx, k=33, deltas=1
+    ANNSubIndex: name=idx, k=33, deltas=1, metric=L2
       ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await
@@ -7982,7 +8108,7 @@ mod test {
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-                  ANNSubIndex: name=idx, k=34, deltas=1
+                  ANNSubIndex: name=idx, k=34, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await

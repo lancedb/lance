@@ -643,23 +643,30 @@ impl ANNIvfSubIndexExec {
 
 impl DisplayAs for ANNIvfSubIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let metric_str = self
+            .query
+            .metric_type
+            .map(|m| format!("{:?}", m))
+            .unwrap_or_else(|| "default".to_string());
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNSubIndex: name={}, k={}, deltas={}",
+                    "ANNSubIndex: name={}, k={}, deltas={}, metric={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
-                    self.indices.len()
+                    self.indices.len(),
+                    metric_str
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNSubIndex\nname={}\nk={}\ndeltas={}",
+                    "ANNSubIndex\nname={}\nk={}\ndeltas={}\nmetric={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
-                    self.indices.len()
+                    self.indices.len(),
+                    metric_str
                 )
             }
         }
@@ -1375,7 +1382,7 @@ mod tests {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: DistanceType::L2,
+            metric_type: Some(DistanceType::L2),
             use_index: true,
             dist_q_c: 0.0,
         }
@@ -1552,7 +1559,7 @@ mod tests {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: DistanceType::Cosine,
+            metric_type: Some(DistanceType::Cosine),
             use_index: true,
             dist_q_c: 0.0,
         };
