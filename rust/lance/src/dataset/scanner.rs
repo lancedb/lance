@@ -4008,9 +4008,7 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
-            }
+            Poll::Ready(result) => Poll::Ready(result.map(|r| Ok(r?))),
             Poll::Pending => Poll::Pending,
         }
     }

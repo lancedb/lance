@@ -240,7 +240,7 @@ impl NGramPostingListReader {
                     )
                     .await?;
                 NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))
+        }).await
     }
 }
 

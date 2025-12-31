@@ -233,7 +233,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 async move {
                     let batch = compute_distance(key, dt, &column, batch?)
                         .await
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let mask = BooleanArray::from_iter(
@@ -242,7 +242,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                             .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
                     );
                     arrow::compute::filter_record_batch(&batch, &mask)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
             })
             .buffer_unordered(get_num_compute_intensive_cpus());

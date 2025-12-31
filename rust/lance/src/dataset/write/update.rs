@@ -300,7 +300,7 @@ impl UpdateJob {
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(e) => Err(DataFusionError::Execution(e.to_string())),
+                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
