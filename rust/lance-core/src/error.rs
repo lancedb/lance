@@ -118,6 +118,13 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    /// External error passed through from user code.
+    ///
+    /// This variant preserves errors that users pass into Lance APIs (e.g., via streams
+    /// with custom error types). The original error can be recovered using [`Error::into_external`]
+    /// or inspected using [`Error::external_source`].
+    #[snafu(transparent)]
+    External { source: BoxedError },
 }
 
 impl Error {
@@ -184,6 +191,31 @@ impl Error {
             location,
         }
     }
+
+    /// Create an External error from a boxed error source.
+    pub fn external(source: BoxedError) -> Self {
+        Self::External { source }
+    }
+
+    /// Returns a reference to the external error source if this is an `External` variant.
+    ///
+    /// This allows downcasting to recover the original error type.
+    pub fn external_source(&self) -> Option<&BoxedError> {
+        match self {
+            Self::External { source } => Some(source),
+            _ => None,
+        }
+    }
+
+    /// Consumes the error and returns the external source if this is an `External` variant.
+    ///
+    /// Returns `Err(self)` if this is not an `External` variant, allowing for chained handling.
+    pub fn into_external(self) -> std::result::Result<BoxedError, Self> {
+        match self {
+            Self::External { source } => Ok(source),
+            other => Err(other),
+        }
+    }
 }
 
 pub trait LanceOptionExt<T> {
@@ -222,9 +254,12 @@ pub type DataFusionResult<T> = std::result::Result<T, datafusion_common::DataFus
 impl From<ArrowError> for Error {
     #[track_caller]
     fn from(e: ArrowError) -> Self {
-        Self::Arrow {
-            message: e.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+        match e {
+            ArrowError::ExternalError(source) => Self::External { source },
+            other => Self::Arrow {
+                message: other.to_string(),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
         }
     }
 }
@@ -342,6 +377,7 @@ impl From<Error> for ArrowError {
             Error::Schema { message, .. } => Self::SchemaError(message),
             Error::Index { message, .. } => arrow_io_error_from_msg(message),
             Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
+            Error::External { source } => Self::ExternalError(source),
             e => arrow_io_error_from_msg(e.to_string()), // Find a more scalable way of doing this
         }
     }
@@ -393,10 +429,16 @@ impl From<datafusion_common::DataFusionError> for Error {
                 message: e.to_string(),
                 location,
             },
-            datafusion_common::DataFusionError::ArrowError(..) => Self::Arrow {
-                message: e.to_string(),
-                location,
-            },
+            datafusion_common::DataFusionError::ArrowError(arrow_err, _) => {
+                // Check if the ArrowError wraps an external error and extract it
+                match *arrow_err {
+                    ArrowError::ExternalError(source) => Self::External { source },
+                    other => Self::Arrow {
+                        message: other.to_string(),
+                        location,
+                    },
+                }
+            }
             datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
                 source: box_error(e),
                 location,
@@ -405,6 +447,7 @@ impl From<datafusion_common::DataFusionError> for Error {
                 message: e.to_string(),
                 location,
             },
+            datafusion_common::DataFusionError::External(source) => Self::External { source },
             _ => Self::IO {
                 source: box_error(e),
                 location,
@@ -459,6 +502,7 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::fmt;
 
     #[test]
     fn test_caller_location_capture() {
@@ -479,6 +523,155 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct MyCustomError {
+        code: i32,
+        message: String,
+    }
+
+    impl fmt::Display for MyCustomError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "MyCustomError({}): {}", self.code, self.message)
+        }
+    }
+
+    impl std::error::Error for MyCustomError {}
+
+    #[test]
+    fn test_external_error_creation() {
+        let custom_err = MyCustomError {
+            code: 42,
+            message: "test error".to_string(),
+        };
+        let err = Error::external(Box::new(custom_err));
+
+        match &err {
+            Error::External { source } => {
+                let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 42);
+                assert_eq!(recovered.message, "test error");
+            }
+            _ => panic!("Expected External variant"),
+        }
+    }
+
+    #[test]
+    fn test_external_source_method() {
+        let custom_err = MyCustomError {
+            code: 123,
+            message: "source test".to_string(),
+        };
+        let err = Error::external(Box::new(custom_err));
+
+        let source = err.external_source().expect("should have external source");
+        let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+        assert_eq!(recovered.code, 123);
+
+        // Test that non-External variants return None
+        let io_err = Error::io("test", snafu::Location::new("test", 1, 1));
+        assert!(io_err.external_source().is_none());
+    }
+
+    #[test]
+    fn test_into_external_method() {
+        let custom_err = MyCustomError {
+            code: 456,
+            message: "into test".to_string(),
+        };
+        let err = Error::external(Box::new(custom_err));
+
+        match err.into_external() {
+            Ok(source) => {
+                let recovered = source.downcast::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 456);
+            }
+            Err(_) => panic!("Expected Ok"),
+        }
+
+        // Test that non-External variants return Err(self)
+        let io_err = Error::io("test", snafu::Location::new("test", 1, 1));
+        match io_err.into_external() {
+            Err(Error::IO { .. }) => {}
+            _ => panic!("Expected Err with IO variant"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_external_error_conversion() {
+        let custom_err = MyCustomError {
+            code: 789,
+            message: "arrow test".to_string(),
+        };
+        let arrow_err = ArrowError::ExternalError(Box::new(custom_err));
+        let lance_err: Error = arrow_err.into();
+
+        match lance_err {
+            Error::External { source } => {
+                let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 789);
+            }
+            _ => panic!("Expected External variant, got {:?}", lance_err),
+        }
+    }
+
+    #[test]
+    fn test_external_to_arrow_roundtrip() {
+        let custom_err = MyCustomError {
+            code: 999,
+            message: "roundtrip".to_string(),
+        };
+        let lance_err = Error::external(Box::new(custom_err));
+        let arrow_err: ArrowError = lance_err.into();
+
+        match arrow_err {
+            ArrowError::ExternalError(source) => {
+                let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 999);
+            }
+            _ => panic!("Expected ExternalError variant"),
+        }
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_external_error_conversion() {
+        let custom_err = MyCustomError {
+            code: 111,
+            message: "datafusion test".to_string(),
+        };
+        let df_err = datafusion_common::DataFusionError::External(Box::new(custom_err));
+        let lance_err: Error = df_err.into();
+
+        match lance_err {
+            Error::External { source } => {
+                let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 111);
+            }
+            _ => panic!("Expected External variant"),
+        }
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_arrow_external_error_conversion() {
+        // Test the nested case: ArrowError::ExternalError inside DataFusionError::ArrowError
+        let custom_err = MyCustomError {
+            code: 222,
+            message: "nested test".to_string(),
+        };
+        let arrow_err = ArrowError::ExternalError(Box::new(custom_err));
+        let df_err = datafusion_common::DataFusionError::ArrowError(Box::new(arrow_err), None);
+        let lance_err: Error = df_err.into();
+
+        match lance_err {
+            Error::External { source } => {
+                let recovered = source.downcast_ref::<MyCustomError>().unwrap();
+                assert_eq!(recovered.code, 222);
+            }
+            _ => panic!("Expected External variant, got {:?}", lance_err),
         }
     }
 }

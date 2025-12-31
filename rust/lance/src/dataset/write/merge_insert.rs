@@ -6494,4 +6494,72 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             err
         );
     }
+
+    mod external_error {
+        use super::*;
+        use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct MyTestError {
+            code: i32,
+            details: String,
+        }
+
+        impl fmt::Display for MyTestError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "MyTestError({}): {}", self.code, self.details)
+            }
+        }
+
+        impl std::error::Error for MyTestError {}
+
+        #[tokio::test]
+        async fn test_merge_insert_execute_reader_preserves_external_error() {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                ArrowField::new("value", DataType::Int32, false),
+            ]));
+
+            // Create initial dataset
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Arc::new(
+                Dataset::write(reader, "memory://test_merge_external", None)
+                    .await
+                    .unwrap(),
+            );
+
+            // Try merge insert with failing source
+            let error_code = 789;
+            let iter = std::iter::once(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                code: error_code,
+                details: "merge insert failure".to_string(),
+            }))));
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+                .unwrap()
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source.downcast_ref::<MyTestError>().unwrap();
+                    assert_eq!(original.code, error_code);
+                }
+                Err(other) => panic!("Expected External, got: {:?}", other),
+                Ok(_) => panic!("Expected error"),
+            }
+        }
+    }
 }

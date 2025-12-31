@@ -434,8 +434,8 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, StructArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, RecordBatchReader, StructArray};
+    use arrow_schema::{ArrowError, DataType, Field, Schema};
 
     use crate::session::Session;
 
@@ -514,5 +514,101 @@ mod test {
             .await;
 
         assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    mod external_error {
+        use super::*;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct MyTestError {
+            code: i32,
+            details: String,
+        }
+
+        impl fmt::Display for MyTestError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "MyTestError({}): {}", self.code, self.details)
+            }
+        }
+
+        impl std::error::Error for MyTestError {}
+
+        fn create_failing_iterator(
+            schema: Arc<Schema>,
+            fail_at_batch: usize,
+            error_code: i32,
+        ) -> impl Iterator<Item = std::result::Result<RecordBatch, ArrowError>> {
+            let mut batch_count = 0;
+            std::iter::from_fn(move || {
+                if batch_count >= 5 {
+                    return None;
+                }
+                batch_count += 1;
+                if batch_count == fail_at_batch {
+                    Some(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                        code: error_code,
+                        details: format!("Failed at batch {}", batch_count),
+                    }))))
+                } else {
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![batch_count as i32; 10]))],
+                    )
+                    .unwrap();
+                    Some(Ok(batch))
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_preserves_external_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 42;
+            let iter = create_failing_iterator(schema.clone(), 3, error_code);
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_external_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source
+                        .downcast_ref::<MyTestError>()
+                        .expect("Should be able to downcast to MyTestError");
+                    assert_eq!(original.code, error_code);
+                    assert!(original.details.contains("batch 3"));
+                }
+                Err(other) => panic!("Expected Error::External variant, got: {:?}", other),
+                Ok(_) => panic!("Expected error, got success"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_first_batch_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 999;
+            let iter = std::iter::once(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                code: error_code,
+                details: "immediate failure".to_string(),
+            }))));
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_first_batch_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source.downcast_ref::<MyTestError>().unwrap();
+                    assert_eq!(original.code, error_code);
+                }
+                Err(other) => panic!("Expected External, got: {:?}", other),
+                Ok(_) => panic!("Expected error"),
+            }
+        }
     }
 }
