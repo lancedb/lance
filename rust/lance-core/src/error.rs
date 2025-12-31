@@ -255,7 +255,13 @@ impl From<ArrowError> for Error {
     #[track_caller]
     fn from(e: ArrowError) -> Self {
         match e {
-            ArrowError::ExternalError(source) => Self::External { source },
+            ArrowError::ExternalError(source) => {
+                // Try to downcast to lance_core::Error first to recover the original
+                match source.downcast::<Self>() {
+                    Ok(lance_err) => *lance_err,
+                    Err(source) => Self::External { source },
+                }
+            }
             other => Self::Arrow {
                 message: other.to_string(),
                 location: std::panic::Location::caller().to_snafu_location(),
@@ -364,21 +370,15 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[track_caller]
-fn arrow_io_error_from_msg(message: String) -> ArrowError {
-    ArrowError::IoError(message.clone(), std::io::Error::other(message))
-}
-
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
-            Error::Arrow { message, .. } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
-            Error::IO { source, .. } => arrow_io_error_from_msg(source.to_string()),
-            Error::Schema { message, .. } => Self::SchemaError(message),
-            Error::Index { message, .. } => arrow_io_error_from_msg(message),
-            Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
+            // Pass through external errors directly
             Error::External { source } => Self::ExternalError(source),
-            e => arrow_io_error_from_msg(e.to_string()), // Find a more scalable way of doing this
+            // Preserve schema errors with their specific type
+            Error::Schema { message, .. } => Self::SchemaError(message),
+            // Wrap all other lance errors so they can be recovered
+            e => Self::ExternalError(Box::new(e)),
         }
     }
 }
@@ -409,7 +409,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
 impl From<Error> for datafusion_common::DataFusionError {
     #[track_caller]
     fn from(e: Error) -> Self {
-        Self::Execution(e.to_string())
+        Self::External(Box::new(e))
     }
 }
 
@@ -432,7 +432,13 @@ impl From<datafusion_common::DataFusionError> for Error {
             datafusion_common::DataFusionError::ArrowError(arrow_err, _) => {
                 // Check if the ArrowError wraps an external error and extract it
                 match *arrow_err {
-                    ArrowError::ExternalError(source) => Self::External { source },
+                    ArrowError::ExternalError(source) => {
+                        // Try to downcast to lance_core::Error first
+                        match source.downcast::<Self>() {
+                            Ok(lance_err) => *lance_err,
+                            Err(source) => Self::External { source },
+                        }
+                    }
                     other => Self::Arrow {
                         message: other.to_string(),
                         location,
@@ -447,7 +453,13 @@ impl From<datafusion_common::DataFusionError> for Error {
                 message: e.to_string(),
                 location,
             },
-            datafusion_common::DataFusionError::External(source) => Self::External { source },
+            datafusion_common::DataFusionError::External(source) => {
+                // Try to downcast to lance_core::Error first
+                match source.downcast::<Self>() {
+                    Ok(lance_err) => *lance_err,
+                    Err(source) => Self::External { source },
+                }
+            }
             _ => Self::IO {
                 source: box_error(e),
                 location,
@@ -672,6 +684,61 @@ mod test {
                 assert_eq!(recovered.code, 222);
             }
             _ => panic!("Expected External variant, got {:?}", lance_err),
+        }
+    }
+
+    /// Test that lance_core::Error round-trips through ArrowError.
+    ///
+    /// This simulates the case where a user defines an iterator in terms of
+    /// lance_core::Error, and the error goes through Arrow's error type
+    /// (e.g., via RecordBatchIterator) before being converted back.
+    #[test]
+    fn test_lance_error_roundtrip_through_arrow() {
+        let original = Error::invalid_input(
+            "test validation error",
+            snafu::Location::new("test.rs", 10, 1),
+        );
+
+        // Simulate what happens when using ? in an Arrow context
+        let arrow_err: ArrowError = original.into();
+
+        // Convert back to lance error (as happens when Lance consumes the stream)
+        let recovered: Error = arrow_err.into();
+
+        // Should get back the original lance error directly (not wrapped in External)
+        match recovered {
+            Error::InvalidInput { .. } => {
+                assert!(recovered.to_string().contains("test validation error"));
+            }
+            _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
+        }
+    }
+
+    /// Test that lance_core::Error round-trips through DataFusionError.
+    ///
+    /// This simulates the case where a user defines a stream in terms of
+    /// lance_core::Error, and the error goes through DataFusion's error type
+    /// (e.g., via SendableRecordBatchStream) before being converted back.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_lance_error_roundtrip_through_datafusion() {
+        let original = Error::invalid_input(
+            "test validation error",
+            snafu::Location::new("test.rs", 10, 1),
+        );
+
+        // Simulate what happens when using ? in a DataFusion context
+        let df_err: datafusion_common::DataFusionError = original.into();
+
+        // Convert back to lance error (as happens when Lance consumes the stream)
+        let recovered: Error = df_err.into();
+
+        // Should get back the original lance error directly (not wrapped in External)
+        match recovered {
+            Error::InvalidInput { .. } => {
+                assert!(recovered.to_string().contains("test validation error"));
+            }
+            _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
     }
 }
