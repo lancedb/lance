@@ -183,12 +183,12 @@ pub fn default_distance_type_for(element_type: &arrow_schema::DataType) -> Dista
     }
 }
 
-/// Validate that the distance type is supported by the vector element type.
-pub fn validate_distance_type_for(
+/// Check if a distance type is supported for the given vector element type.
+pub fn is_distance_type_supported_for(
     distance_type: DistanceType,
     element_type: &arrow_schema::DataType,
-) -> Result<()> {
-    let supported = match element_type {
+) -> bool {
+    match element_type {
         arrow_schema::DataType::UInt8 => matches!(distance_type, DistanceType::Hamming),
         arrow_schema::DataType::Int8
         | arrow_schema::DataType::Float16
@@ -200,9 +200,15 @@ pub fn validate_distance_type_for(
             )
         }
         _ => false,
-    };
+    }
+}
 
-    if supported {
+/// Validate that the distance type is supported by the vector element type.
+pub fn validate_distance_type_for(
+    distance_type: DistanceType,
+    element_type: &arrow_schema::DataType,
+) -> Result<()> {
+    if is_distance_type_supported_for(distance_type, element_type) {
         Ok(())
     } else {
         Err(Error::invalid_input(
