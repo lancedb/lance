@@ -45,16 +45,31 @@ jobs:
           python -m venv venv
           source venv/bin/activate
           pip install maturin duckdb requests pytest pytest-benchmark
-          maturin develop --locked --release
+          maturin develop --locked --release --features datagen
+      - name: Build memtest
+        run: |
+          source venv/bin/activate
+          make -C ../memtest build-release
       - name: Generate datasets
         run: |
-          python -m venv venv
           source venv/bin/activate
           python python/ci_benchmarks/datagen/gen_all.py
       - name: Run benchmarks
         run: |
-          python -m venv venv
           source venv/bin/activate
           bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest \
                       --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
                       results.json python/ci_benchmarks"
+      - name: Run IO/memory benchmarks
+        run: |
+          source venv/bin/activate
+          LIB_PATH=$(lance-memtest)
+          LD_PRELOAD=$LIB_PATH pytest python/ci_benchmarks \
+            -k "io_mem_" \
+            --benchmark-stats-json io_mem_stats.json
+      - name: Upload IO/memory stats to bencher
+        run: |
+          source venv/bin/activate
+          bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} \
+            --adapter json --branch main --testbed google-genoa \
+            --err --file io_mem_stats.json

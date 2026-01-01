@@ -103,6 +103,8 @@ impl ObjectStoreProvider for OssStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&url, params.storage_options.as_ref())?,
         })
     }
 }

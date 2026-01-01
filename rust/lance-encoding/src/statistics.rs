@@ -102,10 +102,9 @@ impl ComputeStat for FixedWidthDataBlock {
         let max_len = self.bits_per_value / 8;
         let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
 
-        let cardidinality_array = if self.bits_per_value == 128 {
-            Some(self.cardinality())
-        } else {
-            None
+        let cardidinality_array = match self.bits_per_value {
+            64 | 128 => Some(self.cardinality()),
+            _ => None,
         };
 
         // compute run count
@@ -382,6 +381,20 @@ impl FixedWidthDataBlock {
 
     fn cardinality(&mut self) -> Arc<dyn Array> {
         match self.bits_per_value {
+            64 => {
+                let u64_slice_ref = self.data.borrow_to_typed_slice::<u64>();
+                let u64_slice = u64_slice_ref.as_ref();
+
+                const PRECISION: u8 = 4;
+                let mut hll: HyperLogLogPlus<u64, xxhash_rust::xxh3::Xxh3Builder> =
+                    HyperLogLogPlus::new(PRECISION, xxhash_rust::xxh3::Xxh3Builder::default())
+                        .unwrap();
+                for val in u64_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
             128 => {
                 let u128_slice_ref = self.data.borrow_to_typed_slice::<u128>();
                 let u128_slice = u128_slice_ref.as_ref();

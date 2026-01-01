@@ -59,17 +59,19 @@ pub fn merge_insert_action(
 ) -> Result<Expr> {
     // Check that at least one key column is non-null in the source
     // This ensures we only process rows that have valid join keys
+    // Note: Column names are wrapped in double quotes to preserve case
+    // (DataFusion's col() function lowercases unquoted identifiers)
     let source_has_key: Expr = if params.on.len() == 1 {
         // Single key column case - check if the source key column is not null
         // Need to qualify the column to avoid ambiguity between target.key and source.key
-        col(format!("source.{}", &params.on[0])).is_not_null()
+        col(format!("source.\"{}\"", &params.on[0])).is_not_null()
     } else {
         // Multiple key columns - require that ALL key columns are non-null
         // This is a stricter requirement than "at least one" to ensure proper joins
         let key_conditions: Vec<Expr> = params
             .on
             .iter()
-            .map(|key| col(format!("source.{}", key)).is_not_null())
+            .map(|key| col(format!("source.\"{}\"", key)).is_not_null())
             .collect();
 
         // Use AND to combine all key column checks (all must be non-null)

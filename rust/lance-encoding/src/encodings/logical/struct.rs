@@ -7,6 +7,10 @@ use std::{
     sync::Arc,
 };
 
+use super::{
+    list::StructuralListDecoder, map::StructuralMapDecoder,
+    primitive::StructuralPrimitiveFieldDecoder,
+};
 use crate::{
     decoder::{
         DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
@@ -27,10 +31,9 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use log::trace;
-
-use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
+use snafu::location;
 
 #[derive(Debug)]
 struct StructuralSchedulingJobWithStatus<'a> {
@@ -237,46 +240,63 @@ pub struct StructuralStructDecoder {
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Result<Self> {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let data_type = DataType::Struct(fields.clone());
-        Self {
+        Ok(Self {
             data_type,
             children,
             child_fields: fields,
             is_root,
-        }
+        })
     }
 
     fn field_to_decoder(
         field: &Arc<arrow_schema::Field>,
         should_validate: bool,
-    ) -> Box<dyn StructuralFieldDecoder> {
+    ) -> Result<Box<dyn StructuralFieldDecoder>> {
         match field.data_type() {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() || field.is_blob() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
-                    Box::new(decoder)
+                    Ok(Box::new(decoder))
                 } else {
-                    Box::new(Self::new(fields.clone(), should_validate, false))
+                    Ok(Box::new(Self::new(fields.clone(), should_validate, false)?))
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
-                let child_decoder = Self::field_to_decoder(child_field, should_validate);
-                Box::new(StructuralListDecoder::new(
+                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                Ok(Box::new(StructuralListDecoder::new(
                     child_decoder,
                     field.data_type().clone(),
-                ))
+                )))
+            }
+            DataType::Map(entries_field, keys_sorted) => {
+                if *keys_sorted {
+                    return Err(Error::NotSupported {
+                        source: "Map data type with keys_sorted=true is not supported yet"
+                            .to_string()
+                            .into(),
+                        location: location!(),
+                    });
+                }
+                let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
+                Ok(Box::new(StructuralMapDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                )))
             }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
-            DataType::Map(_, _) => todo!(),
             DataType::Union(_, _) => todo!(),
-            _ => Box::new(StructuralPrimitiveFieldDecoder::new(field, should_validate)),
+            _ => Ok(Box::new(StructuralPrimitiveFieldDecoder::new(
+                field,
+                should_validate,
+            ))),
         }
     }
 

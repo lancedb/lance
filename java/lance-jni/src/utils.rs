@@ -79,12 +79,10 @@ pub fn extract_write_params(
         extract_storage_options(env, storage_options_obj)?;
 
     // Extract storage options provider if present
-    let storage_options_provider = env.get_optional(storage_options_provider_obj, |env, obj| {
-        let provider_obj = env
-            .call_method(obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        JavaStorageOptionsProvider::new(env, provider_obj)
-    })?;
+    let storage_options_provider = env
+        .get_optional(storage_options_provider_obj, |env, provider_obj| {
+            JavaStorageOptionsProvider::new(env, provider_obj)
+        })?;
 
     let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
@@ -160,10 +158,7 @@ pub fn build_compaction_options(
 
 // Convert from Java Optional<Query> to Rust Option<Query>
 pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> {
-    let query = env.get_optional(&query_obj, |env, obj| {
-        let java_obj_gen = env.call_method(obj, "get", "()Ljava/lang/Object;", &[])?;
-        let java_obj = java_obj_gen.l()?;
-
+    let query = env.get_optional(&query_obj, |env, java_obj| {
         let column = env.get_string_from_method(&java_obj, "getColumn")?;
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Arc::new(Float32Array::from(key_array));
@@ -208,151 +203,134 @@ pub fn get_vector_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
 ) -> Result<Box<dyn IndexParams>> {
-    let vector_index_params_option_object = env
-        .call_method(
-            index_params_obj,
-            "getVectorIndexParams",
-            "()Ljava/util/Optional;",
-            &[],
-        )?
-        .l()?;
+    let vector_index_params_option = env.get_optional_from_method(
+        &index_params_obj,
+        "getVectorIndexParams",
+        |env, vector_index_params_obj| {
+            // Get distance type from VectorIndexParams
+            let distance_type_obj: JString = env
+                .call_method(
+                    &vector_index_params_obj,
+                    "getDistanceTypeString",
+                    "()Ljava/lang/String;",
+                    &[],
+                )?
+                .l()?
+                .into();
+            let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
+            let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
 
-    let vector_index_params_option = if env
-        .call_method(&vector_index_params_option_object, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let vector_index_params_obj = env
-            .call_method(
-                &vector_index_params_option_object,
-                "get",
-                "()Ljava/lang/Object;",
-                &[],
-            )?
-            .l()?;
+            let ivf_params_obj = env
+                .call_method(
+                    &vector_index_params_obj,
+                    "getIvfParams",
+                    "()Lorg/lance/index/vector/IvfBuildParams;",
+                    &[],
+                )?
+                .l()?;
 
-        // Get distance type from VectorIndexParams
-        let distance_type_obj: JString = env
-            .call_method(
+            let mut stages = Vec::new();
+
+            // Parse IvfBuildParams
+            let num_partitions =
+                env.get_int_as_usize_from_method(&ivf_params_obj, "getNumPartitions")?;
+            let max_iters = env.get_int_as_usize_from_method(&ivf_params_obj, "getMaxIters")?;
+            let sample_rate = env.get_int_as_usize_from_method(&ivf_params_obj, "getSampleRate")?;
+            let shuffle_partition_batches =
+                env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionBatches")?;
+            let shuffle_partition_concurrency = env
+                .get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
+
+            let ivf_params = IvfBuildParams {
+                num_partitions: Some(num_partitions),
+                max_iters,
+                sample_rate,
+                shuffle_partition_batches,
+                shuffle_partition_concurrency,
+                ..Default::default()
+            };
+            stages.push(StageParams::Ivf(ivf_params));
+
+            // Parse HnswBuildParams
+            let hnsw_params = env.get_optional_from_method(
                 &vector_index_params_obj,
-                "getDistanceTypeString",
-                "()Ljava/lang/String;",
-                &[],
-            )?
-            .l()?
-            .into();
-        let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
-        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
+                "getHnswParams",
+                |env, hnsw_obj| {
+                    let max_level =
+                        env.call_method(&hnsw_obj, "getMaxLevel", "()S", &[])?.s()? as u16;
+                    let m = env.get_int_as_usize_from_method(&hnsw_obj, "getM")?;
+                    let ef_construction =
+                        env.get_int_as_usize_from_method(&hnsw_obj, "getEfConstruction")?;
+                    let prefetch_distance =
+                        env.get_optional_usize_from_method(&hnsw_obj, "getPrefetchDistance")?;
 
-        let ivf_params_obj = env
-            .call_method(
+                    Ok(HnswBuildParams {
+                        max_level,
+                        m,
+                        ef_construction,
+                        prefetch_distance,
+                    })
+                },
+            )?;
+
+            if let Some(hnsw_params) = hnsw_params {
+                stages.push(StageParams::Hnsw(hnsw_params));
+            }
+
+            // Parse PQBuildParams
+            let pq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
-                "getIvfParams",
-                "()Lorg/lance/index/vector/IvfBuildParams;",
-                &[],
-            )?
-            .l()?;
+                "getPqParams",
+                |env, pq_obj| {
+                    let num_sub_vectors =
+                        env.get_int_as_usize_from_method(&pq_obj, "getNumSubVectors")?;
+                    let num_bits = env.get_int_as_usize_from_method(&pq_obj, "getNumBits")?;
+                    let max_iters = env.get_int_as_usize_from_method(&pq_obj, "getMaxIters")?;
+                    let kmeans_redos =
+                        env.get_int_as_usize_from_method(&pq_obj, "getKmeansRedos")?;
+                    let sample_rate = env.get_int_as_usize_from_method(&pq_obj, "getSampleRate")?;
 
-        let mut stages = Vec::new();
+                    Ok(PQBuildParams {
+                        num_sub_vectors,
+                        num_bits,
+                        max_iters,
+                        kmeans_redos,
+                        sample_rate,
+                        ..Default::default()
+                    })
+                },
+            )?;
 
-        // Parse IvfBuildParams
-        let num_partitions =
-            env.get_int_as_usize_from_method(&ivf_params_obj, "getNumPartitions")?;
-        let max_iters = env.get_int_as_usize_from_method(&ivf_params_obj, "getMaxIters")?;
-        let sample_rate = env.get_int_as_usize_from_method(&ivf_params_obj, "getSampleRate")?;
-        let shuffle_partition_batches =
-            env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionBatches")?;
-        let shuffle_partition_concurrency =
-            env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
+            if let Some(pq_params) = pq_params {
+                stages.push(StageParams::PQ(pq_params));
+            }
 
-        let ivf_params = IvfBuildParams {
-            num_partitions: Some(num_partitions),
-            max_iters,
-            sample_rate,
-            shuffle_partition_batches,
-            shuffle_partition_concurrency,
-            ..Default::default()
-        };
-        stages.push(StageParams::Ivf(ivf_params));
+            // Parse SQBuildParams
+            let sq_params = env.get_optional_from_method(
+                &vector_index_params_obj,
+                "getSqParams",
+                |env, sq_obj| {
+                    let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
+                    let sample_rate = env.get_int_as_usize_from_method(&sq_obj, "getSampleRate")?;
 
-        // Parse HnswBuildParams
-        let hnsw_params = env.get_optional_from_method(
-            &vector_index_params_obj,
-            "getHnswParams",
-            |env, hnsw_obj| {
-                let max_level = env.call_method(&hnsw_obj, "getMaxLevel", "()S", &[])?.s()? as u16;
-                let m = env.get_int_as_usize_from_method(&hnsw_obj, "getM")?;
-                let ef_construction =
-                    env.get_int_as_usize_from_method(&hnsw_obj, "getEfConstruction")?;
-                let prefetch_distance =
-                    env.get_optional_usize_from_method(&hnsw_obj, "getPrefetchDistance")?;
+                    Ok(SQBuildParams {
+                        num_bits,
+                        sample_rate,
+                    })
+                },
+            )?;
 
-                Ok(HnswBuildParams {
-                    max_level,
-                    m,
-                    ef_construction,
-                    prefetch_distance,
-                })
-            },
-        )?;
+            if let Some(sq_params) = sq_params {
+                stages.push(StageParams::SQ(sq_params));
+            }
 
-        if let Some(hnsw_params) = hnsw_params {
-            stages.push(StageParams::Hnsw(hnsw_params));
-        }
-
-        // Parse PQBuildParams
-        let pq_params = env.get_optional_from_method(
-            &vector_index_params_obj,
-            "getPqParams",
-            |env, pq_obj| {
-                let num_sub_vectors =
-                    env.get_int_as_usize_from_method(&pq_obj, "getNumSubVectors")?;
-                let num_bits = env.get_int_as_usize_from_method(&pq_obj, "getNumBits")?;
-                let max_iters = env.get_int_as_usize_from_method(&pq_obj, "getMaxIters")?;
-                let kmeans_redos = env.get_int_as_usize_from_method(&pq_obj, "getKmeansRedos")?;
-                let sample_rate = env.get_int_as_usize_from_method(&pq_obj, "getSampleRate")?;
-
-                Ok(PQBuildParams {
-                    num_sub_vectors,
-                    num_bits,
-                    max_iters,
-                    kmeans_redos,
-                    sample_rate,
-                    ..Default::default()
-                })
-            },
-        )?;
-
-        if let Some(pq_params) = pq_params {
-            stages.push(StageParams::PQ(pq_params));
-        }
-
-        // Parse SQBuildParams
-        let sq_params = env.get_optional_from_method(
-            &vector_index_params_obj,
-            "getSqParams",
-            |env, sq_obj| {
-                let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
-                let sample_rate = env.get_int_as_usize_from_method(&sq_obj, "getSampleRate")?;
-
-                Ok(SQBuildParams {
-                    num_bits,
-                    sample_rate,
-                })
-            },
-        )?;
-
-        if let Some(sq_params) = sq_params {
-            stages.push(StageParams::SQ(sq_params));
-        }
-
-        Some(VectorIndexParams {
-            metric_type: distance_type,
-            stages,
-            version: IndexFileVersion::V3,
-        })
-    } else {
-        None
-    };
+            Ok(VectorIndexParams {
+                metric_type: distance_type,
+                stages,
+                version: IndexFileVersion::V3,
+            })
+        },
+    )?;
 
     match vector_index_params_option {
         Some(params) => Ok(Box::new(params) as Box<dyn IndexParams>),
@@ -366,46 +344,26 @@ pub fn get_scalar_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
 ) -> Result<(String, Option<String>)> {
-    let scalar_params_option_object = env
-        .call_method(
-            index_params_obj,
-            "getScalarIndexParams",
-            "()Ljava/util/Optional;",
-            &[],
-        )?
-        .l()?;
+    env.get_optional_from_method(
+        &index_params_obj,
+        "getScalarIndexParams",
+        |env, scalar_params_obj| {
+            let index_type = env.get_string_from_method(&scalar_params_obj, "getIndexType")?;
 
-    if env
-        .call_method(&scalar_params_option_object, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let scalar_params_obj = env
-            .call_method(
-                &scalar_params_option_object,
-                "get",
-                "()Ljava/lang/Object;",
-                &[],
-            )?
-            .l()?;
+            let params = env.get_optional_from_method(
+                &scalar_params_obj,
+                "getJsonParams",
+                |env, params_obj| {
+                    let params_str: JString = params_obj.into();
+                    let params_string: String = env.get_string(&params_str)?.into();
+                    Ok(params_string)
+                },
+            )?;
 
-        let index_type = env.get_string_from_method(&scalar_params_obj, "getIndexType")?;
-
-        let params = env.get_optional_from_method(
-            &scalar_params_obj,
-            "getJsonParams",
-            |env, params_obj| {
-                let params_str: JString = params_obj.into();
-                let params_string: String = env.get_string(&params_str)?.into();
-                Ok(params_string)
-            },
-        )?;
-
-        Ok((index_type, params))
-    } else {
-        Err(Error::input_error(
-            "ScalarIndexParams not present".to_string(),
-        ))
-    }
+            Ok((index_type, params))
+        },
+    )?
+    .ok_or_else(|| Error::input_error("ScalarIndexParams not present".to_string()))
 }
 
 pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, String>> {

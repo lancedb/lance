@@ -171,6 +171,8 @@ impl ObjectStoreProvider for AwsStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?,
         })
     }
 }
@@ -300,45 +302,24 @@ async fn build_aws_credential_with_storage_options_provider(
     storage_options_credentials: Option<StaticCredentialProvider<ObjectStoreAwsCredential>>,
     expires_at_millis: Option<u64>,
 ) -> Result<AwsCredentialProvider> {
-    match (expires_at_millis, credentials, storage_options_credentials) {
-        // Case 1: provider + credentials + expiration time
-        (Some(expires_at), Some(cred), _) => {
-            Ok(Arc::new(
-                DynamicStorageOptionsCredentialProvider::new_with_initial_credential(
-                    storage_options_provider,
-                    credentials_refresh_offset,
-                    cred.get_credential().await?,
-                    expires_at,
-                ),
-            ))
-        }
-        // Case 2: provider + storage_options (with valid credentials) + expiration time
-        (Some(expires_at), None, Some(cred)) => {
-            Ok(Arc::new(
-                DynamicStorageOptionsCredentialProvider::new_with_initial_credential(
-                    storage_options_provider,
-                    credentials_refresh_offset,
-                    cred.get_credential().await?,
-                    expires_at,
-                ),
-            ))
-        }
-        // Case 3: provider + storage_options without expiration - FAIL
-        (None, None, Some(_)) => Err(Error::IO {
-            source: Box::new(std::io::Error::other(
-                "expires_at_millis is required when using storage_options_provider with storage_options",
-            )),
-            location: location!(),
-        }),
-        // Case 4: provider + credentials without expiration - FAIL
-        (None, Some(_), _) => Err(Error::IO {
-            source: Box::new(std::io::Error::other(
-                "expires_at_millis is required when using storage_options_provider with credentials",
-            )),
-            location: location!(),
-        }),
-        // Case 5: provider without credentials/storage_options, or with expiration but no creds/opts
-        (_, None, None) => Ok(Arc::new(DynamicStorageOptionsCredentialProvider::new(
+    match (credentials, storage_options_credentials) {
+        // Case 1: Explicit aws_credentials provider takes precedence - use it directly
+        // without wrapping in DynamicStorageOptionsCredentialProvider, as the user's
+        // provider should handle its own credential refresh logic.
+        (Some(cred), _) => Ok(cred),
+        // Case 2: storage_options credentials - wrap with DynamicStorageOptionsCredentialProvider
+        // to enable auto-refresh from the namespace
+        (None, Some(cred)) => Ok(Arc::new(
+            DynamicStorageOptionsCredentialProvider::new_with_initial_credential(
+                storage_options_provider,
+                credentials_refresh_offset,
+                cred.get_credential().await?,
+                expires_at_millis,
+            ),
+        )),
+        // Case 3: No initial credentials - DynamicStorageOptionsCredentialProvider will
+        // fetch credentials from the namespace on first use
+        (None, None) => Ok(Arc::new(DynamicStorageOptionsCredentialProvider::new(
             storage_options_provider,
             credentials_refresh_offset,
         ))),
@@ -550,18 +531,19 @@ impl DynamicStorageOptionsCredentialProvider {
     /// * `provider` - The storage options provider
     /// * `refresh_offset` - Duration before expiry to refresh credentials
     /// * `credential` - Initial credential to cache
-    /// * `expires_at_millis` - Expiration time in milliseconds since epoch (required for refresh)
+    /// * `expires_at_millis` - Expiration time in milliseconds since epoch. If None, credentials
+    ///   are treated as non-expiring and will not be automatically refreshed.
     pub fn new_with_initial_credential(
         provider: Arc<dyn StorageOptionsProvider>,
         refresh_offset: Duration,
         credential: Arc<ObjectStoreAwsCredential>,
-        expires_at_millis: u64,
+        expires_at_millis: Option<u64>,
     ) -> Self {
         Self {
             provider,
             cache: Arc::new(RwLock::new(Some(CachedCredential {
                 credential,
-                expires_at_millis: Some(expires_at_millis),
+                expires_at_millis,
             }))),
             refresh_offset,
         }
@@ -908,7 +890,7 @@ mod tests {
             mock.clone(),
             Duration::from_secs(300), // 5 minute refresh offset
             initial_cred,
-            expires_at,
+            Some(expires_at),
         );
 
         // First call should use cached credentials (not expired yet)
@@ -944,7 +926,7 @@ mod tests {
             mock.clone(),
             Duration::from_secs(300), // 5 minute refresh offset
             initial_cred,
-            expired_time,
+            Some(expired_time),
         );
 
         // First call should fetch new credentials because cached ones are expired
@@ -1055,7 +1037,7 @@ mod tests {
             mock.clone(),
             Duration::from_secs(300), // 5 minute refresh offset
             initial_cred,
-            expires_at,
+            Some(expires_at),
         );
 
         // First call should use the initial credential (not expired yet)
@@ -1171,7 +1153,7 @@ mod tests {
                 mock.clone(),
                 Duration::from_secs(300),
                 initial_cred,
-                expires_at,
+                Some(expires_at),
             ),
         );
 
@@ -1216,5 +1198,93 @@ mod tests {
             "Provider should not be called too many times due to lock contention, was called {} times",
             call_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_aws_credentials_takes_precedence_over_storage_options_provider() {
+        // Create a mock storage options provider that should NOT be called
+        let mock_storage_provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000)));
+
+        // Create an explicit AWS credentials provider
+        let explicit_cred_provider = Arc::new(MockAwsCredentialsProvider::default());
+
+        // Build credentials with both aws_credentials AND storage_options_provider
+        // The explicit aws_credentials should take precedence
+        let result = build_aws_credential_with_storage_options_provider(
+            mock_storage_provider.clone(),
+            Duration::from_secs(300),
+            Some(explicit_cred_provider.clone() as AwsCredentialProvider),
+            None, // no storage_options credentials
+            Some(1000),
+        )
+        .await
+        .unwrap();
+
+        // Get credential from the result
+        let cred = result.get_credential().await.unwrap();
+
+        // The explicit provider should have been called (it returns empty strings)
+        assert!(explicit_cred_provider.called.load(Ordering::Relaxed));
+
+        // The storage options provider should NOT have been called
+        assert_eq!(
+            mock_storage_provider.get_call_count().await,
+            0,
+            "Storage options provider should not be called when explicit aws_credentials is provided"
+        );
+
+        // Verify we got credentials from the explicit provider (empty strings)
+        assert_eq!(cred.key_id, "");
+        assert_eq!(cred.secret_key, "");
+    }
+
+    #[tokio::test]
+    async fn test_storage_options_credentials_uses_dynamic_provider_when_no_explicit_aws_credentials(
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+
+        let now_ms = MockClock::system_time().as_millis() as u64;
+
+        // Create a mock storage options provider
+        let mock_storage_provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000)));
+
+        // Create storage_options credentials (simulating credentials from storage_options map)
+        let storage_options_cred = StaticCredentialProvider::new(ObjectStoreAwsCredential {
+            key_id: "AKID_FROM_STORAGE_OPTIONS".to_string(),
+            secret_key: "SECRET_FROM_STORAGE_OPTIONS".to_string(),
+            token: Some("TOKEN_FROM_STORAGE_OPTIONS".to_string()),
+        });
+
+        let expires_at = now_ms + 600_000; // 10 minutes from now
+
+        // Build credentials with storage_options_credentials but NO explicit aws_credentials
+        let result = build_aws_credential_with_storage_options_provider(
+            mock_storage_provider.clone(),
+            Duration::from_secs(300),
+            None, // no explicit aws_credentials
+            Some(storage_options_cred),
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
+
+        // Get credential - should use the initial storage_options credentials
+        let cred = result.get_credential().await.unwrap();
+        assert_eq!(cred.key_id, "AKID_FROM_STORAGE_OPTIONS");
+        assert_eq!(cred.secret_key, "SECRET_FROM_STORAGE_OPTIONS");
+
+        // Storage options provider should NOT have been called yet (using cached initial creds)
+        assert_eq!(mock_storage_provider.get_call_count().await, 0);
+
+        // Advance time to trigger refresh (past the 5 minute refresh offset)
+        MockClock::set_system_time(Duration::from_secs(100_000 + 360));
+
+        // Get credential again - should now fetch from provider
+        let cred = result.get_credential().await.unwrap();
+        assert_eq!(cred.key_id, "AKID_1");
+        assert_eq!(cred.secret_key, "SECRET_1");
+
+        // Storage options provider should have been called once
+        assert_eq!(mock_storage_provider.get_call_count().await, 1);
     }
 }

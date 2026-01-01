@@ -22,6 +22,8 @@ import pytest
 from lance.namespace import (
     CreateEmptyTableRequest,
     CreateEmptyTableResponse,
+    DeclareTableRequest,
+    DeclareTableResponse,
     DescribeTableRequest,
     DescribeTableResponse,
     LanceNamespace,
@@ -137,6 +139,18 @@ class TrackingNamespace(LanceNamespace):
             count = self.create_call_count
 
         response = self.inner.create_empty_table(request)
+        response.storage_options = self._modify_storage_options(
+            response.storage_options, count
+        )
+
+        return response
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        with self.lock:
+            self.create_call_count += 1
+            count = self.create_call_count
+
+        response = self.inner.declare_table(request)
         response.storage_options = self._modify_storage_options(
             response.storage_options, count
         )
@@ -434,8 +448,8 @@ def test_namespace_distributed_write(s3_bucket: str):
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    request = CreateEmptyTableRequest(id=table_id, location=None, properties=None)
-    response = namespace.create_empty_table(request)
+    request = DeclareTableRequest(id=table_id, location=None)
+    response = namespace.declare_table(request)
 
     assert namespace.get_create_call_count() == 1
     assert namespace.get_describe_call_count() == 0

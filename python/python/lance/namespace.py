@@ -20,6 +20,8 @@ from lance_namespace import (
     CreateNamespaceResponse,
     CreateTableRequest,
     CreateTableResponse,
+    DeclareTableRequest,
+    DeclareTableResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
@@ -86,6 +88,40 @@ class DirectoryNamespace(LanceNamespace):
           (e.g., storage.region="us-west-2" becomes region="us-west-2" in
           storage options)
 
+        Credential vendor properties (vendor is auto-selected based on table location):
+            When credential vendor properties are configured, describe_table() will
+            return vended temporary credentials. The vendor type is auto-selected
+            based on table location URI: s3:// for AWS, gs:// for GCP, az:// for
+            Azure. Requires the corresponding credential-vendor-* feature.
+
+            Common properties:
+                - credential_vendor.enabled (required): Set to "true" to enable
+                - credential_vendor.permission (optional): read, write, or admin
+
+            AWS-specific properties (for s3:// locations):
+                - credential_vendor.aws_role_arn (required): IAM role ARN to assume
+                - credential_vendor.aws_external_id (optional): External ID
+                - credential_vendor.aws_region (optional): AWS region
+                - credential_vendor.aws_role_session_name (optional): Session name
+                - credential_vendor.aws_duration_millis (optional): Duration in ms
+                  (default: 3600000, range: 15min-12hrs)
+
+            GCP-specific properties (for gs:// locations):
+                - credential_vendor.gcp_service_account (optional): Service account
+                  to impersonate using IAM Credentials API
+
+                Note: GCP uses Application Default Credentials (ADC). To use a service
+                account key file, set the GOOGLE_APPLICATION_CREDENTIALS environment
+                variable before starting. GCP token duration cannot be configured;
+                it's determined by the STS endpoint (typically 1 hour).
+
+            Azure-specific properties (for az:// locations):
+                - credential_vendor.azure_account_name (required): Azure storage
+                  account name
+                - credential_vendor.azure_tenant_id (optional): Azure tenant ID
+                - credential_vendor.azure_duration_millis (optional): Duration in ms
+                  (default: 3600000, up to 7 days)
+
     Examples
     --------
     >>> import lance.namespace
@@ -95,6 +131,15 @@ class DirectoryNamespace(LanceNamespace):
     >>> # Using the connect() factory function from lance_namespace
     >>> import lance_namespace
     >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
+    >>>
+    >>> # With AWS credential vending (requires credential-vendor-aws feature)
+    >>> # Use **dict to pass property names with dots
+    >>> ns = lance.namespace.DirectoryNamespace(**{
+    ...     "root": "s3://my-bucket/data",
+    ...     "credential_vendor.enabled": "true",
+    ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
+    ...     "credential_vendor.aws_duration_millis": "3600000",
+    ... })
     """
 
     def __init__(self, session=None, **properties):
@@ -174,6 +219,10 @@ class DirectoryNamespace(LanceNamespace):
     ) -> CreateEmptyTableResponse:
         response_dict = self._inner.create_empty_table(request.model_dump())
         return CreateEmptyTableResponse.from_dict(response_dict)
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
 
 
 class RestNamespace(LanceNamespace):
@@ -290,6 +339,10 @@ class RestNamespace(LanceNamespace):
     ) -> CreateEmptyTableResponse:
         response_dict = self._inner.create_empty_table(request.model_dump())
         return CreateEmptyTableResponse.from_dict(response_dict)
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
 
 
 class RestAdapter:
@@ -448,18 +501,20 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         """Fetch storage options from the namespace.
 
         This calls namespace.describe_table() to get the latest storage options
-        and their expiration time.
+        and optionally their expiration time.
 
         Returns
         -------
         Dict[str, str]
-            Flat dictionary of string key-value pairs containing storage options
-            and expires_at_millis
+            Flat dictionary of string key-value pairs containing storage options.
+            May optionally include expires_at_millis. If expires_at_millis is not
+            provided, credentials are treated as non-expiring and will not be
+            automatically refreshed.
 
         Raises
         ------
         RuntimeError
-            If the namespace doesn't return storage options or expiration time
+            If the namespace doesn't return storage options
         """
         request = DescribeTableRequest(id=self._table_id, version=None)
         response = self._namespace.describe_table(request)
@@ -470,14 +525,9 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
                 "Ensure the namespace supports storage options providing."
             )
 
-        # Verify expires_at_millis is present
-        if "expires_at_millis" not in storage_options:
-            raise RuntimeError(
-                "Namespace storage_options missing 'expires_at_millis'. "
-                "Storage options refresh will not work properly."
-            )
-
         # Return the storage_options directly - it's already a flat Map<String, String>
+        # Note: expires_at_millis is optional. If not provided, credentials are treated
+        # as non-expiring and will not be automatically refreshed.
         return storage_options
 
     def provider_id(self) -> str:

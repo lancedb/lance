@@ -257,8 +257,18 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 let (size, e_tag) = if let Some(size) = size {
                     (size, e_tag)
                 } else {
-                    let meta = object_store.inner.head(&path).await?;
-                    (meta.size, meta.e_tag)
+                    match object_store.inner.head(&path).await {
+                        Ok(meta) => (meta.size, meta.e_tag),
+                        Err(ObjectStoreError::NotFound { .. }) => {
+                            // there may be other threads that have finished executing finalize_manifest.
+                            let new_location = self
+                                .external_manifest_store
+                                .get_manifest_location(base_path.as_ref(), version)
+                                .await?;
+                            return Ok(new_location);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 };
 
                 let final_location = self

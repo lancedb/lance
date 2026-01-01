@@ -181,11 +181,36 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
             arrow_type_to_json(value_type)
         }
 
+        DataType::Map(entries_field, keys_sorted) => {
+            if *keys_sorted {
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Map types with keys_sorted=true are not yet supported for JSON conversion: {:?}",
+                        data_type
+                    )
+                        .into(),
+                    location: Location::new(file!(), line!(), column!()),
+                });
+            }
+            let inner_type = arrow_type_to_json(entries_field.data_type())?;
+            let inner_field = JsonArrowField {
+                name: entries_field.name().clone(),
+                nullable: entries_field.is_nullable(),
+                r#type: Box::new(inner_type),
+                metadata: if entries_field.metadata().is_empty() {
+                    None
+                } else {
+                    Some(entries_field.metadata().clone())
+                },
+            };
+            Ok(JsonArrowDataType {
+                r#type: "map".to_string(),
+                fields: Some(vec![inner_field]),
+                length: None,
+            })
+        }
+
         // Unsupported types
-        DataType::Map(_, _) => Err(Error::Namespace {
-            source: "Map type is not supported by Lance".into(),
-            location: Location::new(file!(), line!(), column!()),
-        }),
         DataType::RunEndEncoded(_, _) => Err(Error::Namespace {
             source: format!(
                 "RunEndEncoded type is not yet supported for JSON conversion: {:?}",
@@ -231,7 +256,11 @@ pub fn convert_json_arrow_field(json_field: &JsonArrowField) -> Result<Field> {
     let data_type = convert_json_arrow_type(&json_field.r#type)?;
     let nullable = json_field.nullable;
 
-    Ok(Field::new(&json_field.name, data_type, nullable))
+    let field = Field::new(&json_field.name, data_type, nullable);
+    Ok(match json_field.metadata.as_ref() {
+        Some(metadata) => field.with_metadata(metadata.clone()),
+        None => field,
+    })
 }
 
 /// Convert JsonArrowDataType to Arrow DataType
@@ -265,6 +294,39 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn test_extension_metadata_preserved_in_json_roundtrip() {
+        const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+        const LANCE_JSON_EXT_NAME: &str = "lance.json";
+
+        let meta_field =
+            Field::new("meta", DataType::Binary, true).with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                LANCE_JSON_EXT_NAME.to_string(),
+            )]));
+        let arrow_schema =
+            ArrowSchema::new(vec![Field::new("id", DataType::Int32, false), meta_field]);
+
+        let json_schema = arrow_schema_to_json(&arrow_schema).unwrap();
+        let meta_json_field = json_schema
+            .fields
+            .iter()
+            .find(|f| f.name == "meta")
+            .unwrap();
+        assert!(meta_json_field
+            .metadata
+            .as_ref()
+            .unwrap()
+            .contains_key(ARROW_EXT_NAME_KEY));
+
+        let roundtrip = convert_json_arrow_schema(&json_schema).unwrap();
+        let meta_field = roundtrip.field_with_name("meta").unwrap();
+        assert_eq!(
+            meta_field.metadata().get(ARROW_EXT_NAME_KEY),
+            Some(&LANCE_JSON_EXT_NAME.to_string())
+        );
+    }
 
     #[test]
     fn test_convert_basic_types() {
@@ -431,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_type_unsupported() {
+    fn test_map_type_supported() {
         use arrow::datatypes::Field;
 
         let key_field = Field::new("keys", DataType::Utf8, false);
@@ -446,11 +508,15 @@ mod tests {
         );
 
         let result = arrow_type_to_json(&map_type);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Map type is not supported"));
+        assert!(result.is_ok());
+        let json_type = result.unwrap();
+        assert_eq!(json_type.r#type, "map");
+        assert!(json_type.fields.is_some());
+
+        let fields = json_type.fields.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "entries");
+        assert_eq!(fields[0].r#type.r#type, "struct");
     }
 
     #[test]

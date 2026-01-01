@@ -127,6 +127,10 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    /// The datastore prefix that uniquely identifies this object store. It encodes information
+    /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
+    /// path uniquely identifies any object inside the store.
+    pub store_prefix: String,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -429,6 +433,7 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
+                store_prefix,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -858,14 +863,18 @@ impl ObjectStore {
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-
-        let store = match wrapper {
-            Some(wrapper) => {
-                let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
-                    .calculate_object_store_prefix(location.as_ref(), storage_options)
-                    .unwrap();
-                wrapper.wrap(&store_prefix, store)
+        let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
+            Some(provider) => provider
+                .calculate_object_store_prefix(&location, storage_options)
+                .unwrap(),
+            None => {
+                let store_prefix = format!("{}${}", location.scheme(), location.authority());
+                log::warn!("Guessing that object store prefix is {}, since object store scheme is not found in registry.", store_prefix);
+                store_prefix
             }
+        };
+        let store = match wrapper {
+            Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
@@ -883,6 +892,7 @@ impl ObjectStore {
             io_parallelism,
             download_retry_count,
             io_tracker,
+            store_prefix,
         }
     }
 }

@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "lance-memtest"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lance Developers"]
+description = "Memory allocation testing utilities for Python"
+license = "Apache-2.0"
+
+[lints.clippy]
+arithmetic_side_effects = "deny"
+
+[lib]
+name = "memtest"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1

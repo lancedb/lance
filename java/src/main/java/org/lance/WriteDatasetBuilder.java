@@ -18,6 +18,8 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -365,18 +367,33 @@ public class WriteDatasetBuilder {
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
-      // Call namespace.createEmptyTable() to create new table
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
-      request.setId(tableId);
+      // Try declareTable first, fall back to deprecated createEmptyTable
+      // for backward compatibility with older namespace implementations.
+      // createEmptyTable support will be removed in 3.0.0.
+      String location;
+      Map<String, String> responseStorageOptions;
 
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      try {
+        DeclareTableRequest declareRequest = new DeclareTableRequest();
+        declareRequest.setId(tableId);
+        DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
+        location = declareResponse.getLocation();
+        responseStorageOptions = declareResponse.getStorageOptions();
+      } catch (UnsupportedOperationException e) {
+        // Fall back to deprecated createEmptyTable
+        CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
+        fallbackRequest.setId(tableId);
+        CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
+        location = fallbackResponse.getLocation();
+        responseStorageOptions = fallbackResponse.getStorageOptions();
+      }
 
-      tableUri = response.getLocation();
+      tableUri = location;
       if (tableUri == null || tableUri.isEmpty()) {
         throw new IllegalArgumentException("Namespace did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : responseStorageOptions;
     } else {
       // For APPEND/OVERWRITE modes, call namespace.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();

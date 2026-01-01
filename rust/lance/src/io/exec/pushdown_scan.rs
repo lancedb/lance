@@ -541,7 +541,7 @@ impl FragmentScanner {
             .project_by_schema(&self.projection.as_ref().into())
             .map_err(|err| Error::Internal {
                 message: format!(
-                    "Failed to to select schema {} from batch with schema {}\nInner error: {}",
+                    "Failed to select schema {} from batch with schema {}\nInner error: {}",
                     self.projection,
                     batch.schema(),
                     err

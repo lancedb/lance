@@ -30,6 +30,7 @@ use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
 use crate::encodings::logical::list::ListStructuralEncoder;
+use crate::encodings::logical::map::MapStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::repdef::RepDefBuilder;
@@ -233,6 +234,9 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
+
+    /// The Lance file version being written
+    pub version: LanceFileVersion,
 }
 
 impl Default for EncodingOptions {
@@ -242,7 +246,17 @@ impl Default for EncodingOptions {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
+            version: LanceFileVersion::default(),
         }
+    }
+}
+
+impl EncodingOptions {
+    /// If true (for Lance file version 2.2+), miniblock chunk sizes are u32,
+    /// to allow storing larger chunks and their sizes for better compression.
+    /// For Lance file version 2.1, miniblock chunk sizes are u16.
+    pub fn support_large_chunk(&self) -> bool {
+        self.version >= LanceFileVersion::V2_2
     }
 }
 
@@ -432,6 +446,65 @@ impl StructuralEncodingStrategy {
                         root_field_metadata,
                     )?;
                     Ok(Box::new(ListStructuralEncoder::new(
+                        options.keep_original_array,
+                        child_encoder,
+                    )))
+                }
+                DataType::Map(_, keys_sorted) => {
+                    // TODO: We only support keys_sorted=false for now,
+                    //  because converting a rust arrow map field to the python arrow field will
+                    //  lose the keys_sorted property.
+                    if keys_sorted {
+                        return Err(Error::NotSupported {
+                            source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into(),
+                            location: location!(),
+                        });
+                    }
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::NotSupported {
+                            source: format!(
+                                "Map data type is only supported in Lance file format 2.2+, current version: {}",
+                                self.version
+                            )
+                            .into(),
+                            location: location!(),
+                        });
+                    }
+                    let entries_child = field.children.first().ok_or_else(|| Error::Schema {
+                        message: "Map should have an entries child".to_string(),
+                        location: location!(),
+                    })?;
+                    let DataType::Struct(struct_fields) = entries_child.data_type() else {
+                        return Err(Error::Schema {
+                            message: "Map entries field must be a Struct<key, value>".to_string(),
+                            location: location!(),
+                        });
+                    };
+                    if struct_fields.len() < 2 {
+                        return Err(Error::Schema {
+                            message: "Map entries struct must contain both key and value fields"
+                                .to_string(),
+                            location: location!(),
+                        });
+                    }
+                    let key_field = &struct_fields[0];
+                    if key_field.is_nullable() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                                key_field.name()
+                            ),
+                            location: location!(),
+                        });
+                    }
+                    let child_encoder = self.do_create_field_encoder(
+                        _encoding_strategy_root,
+                        entries_child,
+                        column_index,
+                        options,
+                        root_field_metadata,
+                    )?;
+                    Ok(Box::new(MapStructuralEncoder::new(
                         options.keep_original_array,
                         child_encoder,
                     )))
@@ -698,6 +771,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                minichunk_size: None,
             },
         );
 

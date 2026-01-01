@@ -126,6 +126,14 @@ fn column_indices_from_schema_helper(
                     is_structural_encoding,
                 );
             }
+            DataType::Map(entries, _) => {
+                column_indices_from_schema_helper(
+                    std::slice::from_ref(entries),
+                    column_indices,
+                    column_counter,
+                    is_structural_encoding,
+                );
+            }
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
@@ -209,7 +217,8 @@ async fn test_decode(
         is_structural_encoding,
         /*should_validate=*/ true,
         rx,
-    );
+    )
+    .unwrap();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
@@ -339,6 +348,7 @@ pub async fn check_round_trip_encoding_generated(
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -630,6 +640,9 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
+                if mini_block.dictionary.is_some() {
+                    actual_chain.push("dictionary".to_string());
+                }
                 // Check value compression
                 if let Some(ref value_comp) = mini_block.value_compression {
                     let chain = extract_array_encoding_chain(value_comp);
@@ -727,6 +740,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version: file_version,
             };
             let encoder = encoding_strategy
                 .create_field_encoder(

@@ -26,6 +26,7 @@ use crate::{
 use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
+use bytes::Bytes;
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -65,9 +66,8 @@ use crate::{
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::constants::DICT_SIZE_RATIO_META_KEY;
-use crate::encodings::logical::primitive::dict::{
-    DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-};
+use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
+use crate::version::LanceFileVersion;
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
@@ -154,6 +154,7 @@ struct DecodeMiniBlockTask {
     num_buffers: u64,
     max_visible_level: u16,
     instructions: Vec<(ChunkDrainInstructions, LoadedChunk)>,
+    has_large_chunk: bool,
 }
 
 impl DecodeMiniBlockTask {
@@ -425,6 +426,28 @@ impl DecodeMiniBlockTask {
         }
     }
 
+    // read `num_buffers` buffer sizes from `buf` starting at `offset`
+    fn read_buffer_sizes<const LARGE: bool>(
+        buf: &[u8],
+        offset: &mut usize,
+        num_buffers: u64,
+    ) -> Vec<u32> {
+        let read_size = if LARGE { 4 } else { 2 };
+        (0..num_buffers)
+            .map(|_| {
+                let bytes = &buf[*offset..*offset + read_size];
+                let size = if LARGE {
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    // the buffer size is read from u16 but is stored as u32 after decoding for consistency
+                    u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+                };
+                *offset += read_size;
+                size
+            })
+            .collect()
+    }
+
     // Unserialize a miniblock into a collection of vectors
     fn decode_miniblock_chunk(
         &self,
@@ -449,13 +472,12 @@ impl DecodeMiniBlockTask {
         } else {
             None
         };
-        let buffer_sizes = (0..self.num_buffers)
-            .map(|_| {
-                let size = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                offset += 2;
-                size
-            })
-            .collect::<Vec<_>>();
+
+        let buffer_sizes = if self.has_large_chunk {
+            Self::read_buffer_sizes::<true>(buf, &mut offset, self.num_buffers)
+        } else {
+            Self::read_buffer_sizes::<false>(buf, &mut offset, self.num_buffers)
+        };
 
         offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
 
@@ -664,6 +686,7 @@ struct MiniBlockDecoder {
     num_rows: u64,
     num_buffers: u64,
     dictionary: Option<Arc<DataBlock>>,
+    has_large_chunk: bool,
 }
 
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
@@ -711,6 +734,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             def_meaning: self.def_meaning.clone(),
             num_buffers: self.num_buffers,
             max_visible_level,
+            has_large_chunk: self.has_large_chunk,
         }))
     }
 
@@ -1212,6 +1236,7 @@ pub struct MiniBlockScheduler {
     dictionary: Option<MiniBlockSchedulerDictionary>,
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
+    has_large_chunk: bool,
 }
 
 impl MiniBlockScheduler {
@@ -1297,6 +1322,7 @@ impl MiniBlockScheduler {
             dictionary,
             def_meaning: def_meaning.into(),
             page_meta: None,
+            has_large_chunk: layout.has_large_chunk,
         })
     }
 
@@ -1622,6 +1648,54 @@ impl ChunkInstructions {
     }
 }
 
+enum Words {
+    U16(ScalarBuffer<u16>),
+    U32(ScalarBuffer<u32>),
+}
+
+struct WordsIter<'a> {
+    iter: Box<dyn Iterator<Item = u32> + 'a>,
+}
+
+impl Words {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::U16(b) => b.len(),
+            Self::U32(b) => b.len(),
+        }
+    }
+
+    pub fn iter(&self) -> WordsIter<'_> {
+        match self {
+            Self::U16(buf) => WordsIter {
+                iter: Box::new(buf.iter().map(|&x| x as u32)),
+            },
+            Self::U32(buf) => WordsIter {
+                iter: Box::new(buf.iter().copied()),
+            },
+        }
+    }
+
+    pub fn from_bytes(bytes: Bytes, has_large_chunk: bool) -> Result<Self> {
+        let bytes_per_value = if has_large_chunk { 4 } else { 2 };
+        assert_eq!(bytes.len() % bytes_per_value, 0);
+        let buffer = LanceBuffer::from_bytes(bytes, bytes_per_value as u64);
+        if has_large_chunk {
+            Ok(Self::U32(buffer.borrow_to_typed_slice::<u32>()))
+        } else {
+            Ok(Self::U16(buffer.borrow_to_typed_slice::<u16>()))
+        }
+    }
+}
+
+impl<'a> Iterator for WordsIter<'a> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
 impl StructuralPageScheduler for MiniBlockScheduler {
     fn initialize<'a>(
         &'a mut self,
@@ -1661,11 +1735,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let rep_index_bytes = buffers.next();
 
             // Parse the metadata and build the chunk meta
-            assert!(meta_bytes.len() % 2 == 0);
-            let bytes = LanceBuffer::from_bytes(meta_bytes, 2);
-            let words = bytes.borrow_to_typed_slice::<u16>();
-            let words = words.as_ref();
-
+            let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
             let mut chunk_meta = Vec::with_capacity(words.len());
 
             let mut rows_counter = 0;
@@ -1775,6 +1845,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
         let num_buffers = self.num_buffers;
+        let has_large_chunk = self.has_large_chunk;
         let dictionary = page_meta
             .dictionary
             .as_ref()
@@ -1798,6 +1869,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 dictionary,
                 num_rows,
                 num_buffers,
+                has_large_chunk,
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed();
@@ -3339,12 +3411,14 @@ pub struct PrimitiveStructuralEncoder {
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
+    support_large_chunk: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
     // The compression strategy we will use to compress the data
     compression_strategy: Arc<dyn CompressionStrategy>,
     column_index: u32,
     field: Field,
     encoding_metadata: Arc<HashMap<String, String>>,
+    version: LanceFileVersion,
 }
 
 struct CompressedLevelsChunk {
@@ -3378,12 +3452,14 @@ impl PrimitiveStructuralEncoder {
                 column_index,
                 options.keep_original_array,
             ),
+            support_large_chunk: options.support_large_chunk(),
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
             column_index,
             compression_strategy,
             field,
             encoding_metadata,
+            version: options.version,
         })
     }
 
@@ -3481,6 +3557,7 @@ impl PrimitiveStructuralEncoder {
         miniblocks: MiniBlockCompressed,
         rep: Option<Vec<CompressedLevelsChunk>>,
         def: Option<Vec<CompressedLevelsChunk>>,
+        support_large_chunk: bool,
     ) -> SerializedMiniBlockPage {
         let bytes_rep = rep
             .as_ref()
@@ -3501,7 +3578,8 @@ impl PrimitiveStructuralEncoder {
         // 2 bytes for the length of each buffer and up to 7 bytes of padding per buffer
         let max_extra = 9 * num_buffers;
         let mut data_buffer = Vec::with_capacity(bytes_rep + bytes_def + bytes_data + max_extra);
-        let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * 2);
+        let chunk_size_bytes = if support_large_chunk { 4 } else { 2 };
+        let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * chunk_size_bytes);
 
         let mut rep_iter = rep.map(|r| r.into_iter());
         let mut def_iter = def.map(|d| d.into_iter());
@@ -3532,9 +3610,14 @@ impl PrimitiveStructuralEncoder {
                 data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             }
 
-            for buffer_size in &chunk.buffer_sizes {
-                let bytes = *buffer_size;
-                data_buffer.extend_from_slice(&bytes.to_le_bytes());
+            if support_large_chunk {
+                for &buffer_size in &chunk.buffer_sizes {
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
+                }
+            } else {
+                for &buffer_size in &chunk.buffer_sizes {
+                    data_buffer.extend_from_slice(&(buffer_size as u16).to_le_bytes());
+                }
             }
 
             // Pad
@@ -3566,17 +3649,28 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            assert!(chunk_bytes <= 32 * 1024);
+            let max_chunk_size = if support_large_chunk {
+                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+            } else {
+                32 * 1024 // 32KiB limit with u16 metadata
+            };
+            assert!(chunk_bytes <= max_chunk_size);
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
+            // 4Ki values max
+            assert!(chunk.log_num_values <= 12);
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
             let divided_bytes = chunk_bytes / MINIBLOCK_ALIGNMENT;
             let divided_bytes_minus_one = (divided_bytes - 1) as u64;
 
-            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u16;
-            meta_buffer.extend_from_slice(&metadata.to_le_bytes());
+            let metadata = (divided_bytes_minus_one << 4) | chunk.log_num_values as u64;
+            if support_large_chunk {
+                meta_buffer.extend_from_slice(&(metadata as u32).to_le_bytes());
+            } else {
+                meta_buffer.extend_from_slice(&(metadata as u16).to_le_bytes());
+            }
         }
 
         let data_buffer = LanceBuffer::from(data_buffer);
@@ -3771,6 +3865,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         dictionary_data: Option<DataBlock>,
         num_rows: u64,
+        support_large_chunk: bool,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
@@ -3831,7 +3926,8 @@ impl PrimitiveStructuralEncoder {
             .as_mut()
             .map(|cd| std::mem::take(&mut cd.data));
 
-        let serialized = Self::serialize_miniblocks(compressed_data, rep_data, def_data);
+        let serialized =
+            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk);
 
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
@@ -3861,6 +3957,7 @@ impl PrimitiveStructuralEncoder {
                 Some((dictionary_encoding, num_dictionary_items)),
                 &repdef.def_meaning,
                 num_items,
+                support_large_chunk,
             );
             Ok(EncodedPage {
                 num_rows,
@@ -3879,6 +3976,7 @@ impl PrimitiveStructuralEncoder {
                 None,
                 &repdef.def_meaning,
                 num_items,
+                support_large_chunk,
             );
 
             if let Some(rep_index) = rep_index {
@@ -4187,7 +4285,7 @@ impl PrimitiveStructuralEncoder {
     /// - Dictionary values: cardinality × avg_value_size (actual data)
     /// - Dictionary offsets: cardinality × offset_size (32 or 64 bits)
     /// - Indices: num_values × offset_size (same as dictionary offsets)
-    fn estimate_dict_size(data_block: &DataBlock) -> Option<u64> {
+    fn estimate_dict_size(data_block: &DataBlock, version: LanceFileVersion) -> Option<u64> {
         let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
             cardinality_array.as_primitive::<UInt64Type>().value(0)
         } else {
@@ -4197,9 +4295,23 @@ impl PrimitiveStructuralEncoder {
         let num_values = data_block.num_values();
 
         match data_block {
-            DataBlock::FixedWidth(_) => {
-                // Dictionary: cardinality unique values at 128 bits each
-                let dict_size = cardinality * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+            DataBlock::FixedWidth(fixed) => {
+                if fixed.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
+                    return None;
+                }
+                // The current fixed-width dictionary encoding uses i32 indices.
+                if cardinality > i32::MAX as u64 {
+                    return None;
+                }
+                // We currently only support dictionary encoding for 64-bit and 128-bit fixed-width values.
+                if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
+                    return None;
+                }
+                if fixed.bits_per_value % 8 != 0 {
+                    return None;
+                }
+                // Dictionary: cardinality unique values at value bit width
+                let dict_size = cardinality * (fixed.bits_per_value / 8);
                 // Indices: num_values indices at 32 bits each
                 let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
                 Some(dict_size + indices_size)
@@ -4210,6 +4322,11 @@ impl PrimitiveStructuralEncoder {
                     return None;
                 }
                 let bits_per_offset = var.bits_per_offset as u64;
+                if (bits_per_offset == 32 && cardinality > i32::MAX as u64)
+                    || (bits_per_offset == 64 && cardinality > i64::MAX as u64)
+                {
+                    return None;
+                }
 
                 let data_size = data_block.data_size();
                 let avg_value_size = data_size / num_values;
@@ -4227,14 +4344,24 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
+    fn should_dictionary_encode(
+        data_block: &DataBlock,
+        field: &Field,
+        version: LanceFileVersion,
+    ) -> bool {
         // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
         // estimating the size
-        if !matches!(
-            data_block,
-            DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_)
-        ) {
-            return false;
+        match data_block {
+            DataBlock::FixedWidth(fixed) => {
+                if fixed.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
+                    return false;
+                }
+                if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
+                    return false;
+                }
+            }
+            DataBlock::VariableWidth(_) => {}
+            _ => return false,
         }
 
         // Don't dictionary encode tiny arrays
@@ -4270,7 +4397,7 @@ impl PrimitiveStructuralEncoder {
         let data_size = data_block.data_size();
 
         // Estimate dictionary-encoded size
-        let Some(encoded_size) = Self::estimate_dict_size(data_block) else {
+        let Some(encoded_size) = Self::estimate_dict_size(data_block, version) else {
             return false;
         };
 
@@ -4294,8 +4421,10 @@ impl PrimitiveStructuralEncoder {
         let compression_strategy = self.compression_strategy.clone();
         let field = self.field.clone();
         let encoding_metadata = self.encoding_metadata.clone();
+        let support_large_chunk = self.support_large_chunk;
+        let version = self.version;
         let task = spawn_cpu(move || {
-            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+                let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
             if num_values == 0 {
                 // We should not encode empty arrays.  So if we get here that should mean that we
@@ -4384,9 +4513,10 @@ impl PrimitiveStructuralEncoder {
                     repdefs,
                     row_number,
                     Some(dictionary_data_block),
-                    num_rows
+                    num_rows,
+                    support_large_chunk,
                 )
-            } else if Self::should_dictionary_encode(&data_block, &field) {
+            } else if Self::should_dictionary_encode(&data_block, &field, version) {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,
@@ -4403,6 +4533,7 @@ impl PrimitiveStructuralEncoder {
                     row_number,
                     Some(dictionary_data_block),
                     num_rows,
+                    support_large_chunk,
                 )
             } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
                 log::debug!(
@@ -4419,6 +4550,7 @@ impl PrimitiveStructuralEncoder {
                     row_number,
                     None,
                     num_rows,
+                    support_large_chunk,
                 )
             } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
                 log::debug!(
@@ -5523,6 +5655,67 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 
+    async fn test_minichunk_size_helper(
+        string_data: Vec<Option<String>>,
+        minichunk_size: u64,
+        file_version: LanceFileVersion,
+    ) {
+        use crate::constants::MINICHUNK_SIZE_META_KEY;
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            MINICHUNK_SIZE_META_KEY.to_string(),
+            minichunk_size.to_string(),
+        );
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(file_version)
+            .with_batch_size(1000);
+
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_minichunk_size_roundtrip() {
+        // Test that minichunk size can be configured and works correctly in round-trip encoding
+        let mut string_data = Vec::new();
+        for i in 0..100 {
+            string_data.push(Some(format!("test_string_{}", i).repeat(50)));
+        }
+        // configure minichunk size to 64 bytes (smaller than the default 4kb) for Lance 2.1
+        test_minichunk_size_helper(string_data, 64, LanceFileVersion::V2_1).await;
+    }
+
+    #[tokio::test]
+    async fn test_minichunk_size_128kb_v2_2() {
+        // Test that minichunk size can be configured to 128KB and works correctly with Lance 2.2
+        let mut string_data = Vec::new();
+        // create a 500kb string array
+        for i in 0..10000 {
+            string_data.push(Some(format!("test_string_{}", i).repeat(50)));
+        }
+        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+    }
+
+    #[tokio::test]
+    async fn test_binary_large_minichunk_size_over_max_miniblock_values() {
+        let mut string_data = Vec::new();
+        // 128kb/chunk / 6 bytes (t_9999) = 21845 > max 4096 items per chunk
+        for i in 0..10000 {
+            string_data.push(Some(format!("t_{}", i)));
+        }
+        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+    }
+
     #[tokio::test]
     async fn test_large_dictionary_general_compression() {
         use arrow_array::{ArrayRef, StringArray};
@@ -5577,10 +5770,86 @@ mod tests {
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
     }
 
+    #[tokio::test]
+    async fn test_dictionary_encode_int64() {
+        use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::version::LanceFileVersion;
+        use arrow_array::{ArrayRef, Int64Array};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Low cardinality with poor RLE opportunity.
+        let values = (0..1000)
+            .map(|i| match i % 3 {
+                0 => 10i64,
+                1 => 20i64,
+                _ => 30i64,
+            })
+            .collect::<Vec<_>>();
+        let array = Arc::new(Int64Array::from(values)) as ArrayRef;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.99".to_string());
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(1000)
+            .with_range(0..1000)
+            .with_indices(vec![0, 1, 10, 999])
+            .with_expected_encoding("dictionary");
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_encode_float64() {
+        use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::version::LanceFileVersion;
+        use arrow_array::{ArrayRef, Float64Array};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Low cardinality with poor RLE opportunity.
+        let values = (0..1000)
+            .map(|i| match i % 3 {
+                0 => 0.1f64,
+                1 => 0.2f64,
+                _ => 0.3f64,
+            })
+            .collect::<Vec<_>>();
+        let array = Arc::new(Float64Array::from(values)) as ArrayRef;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.99".to_string());
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(1000)
+            .with_range(0..1000)
+            .with_indices(vec![0, 1, 10, 999])
+            .with_expected_encoding("dictionary");
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
     // Dictionary encoding decision tests
     /// Helper to create FixedWidth test data block with exact cardinality stat injected
     /// to ensure consistent test behavior (avoids HLL estimation error)
-    fn create_test_fixed_data_block(num_values: u64, cardinality: u64) -> DataBlock {
+    fn create_test_fixed_data_block(
+        num_values: u64,
+        cardinality: u64,
+        bits_per_value: u64,
+    ) -> DataBlock {
         use crate::statistics::Stat;
 
         let block_info = BlockInfo::default();
@@ -5593,9 +5862,14 @@ mod tests {
             .unwrap()
             .insert(Stat::Cardinality, cardinality_array);
 
+        assert_eq!(bits_per_value % 8, 0);
+        let bytes_per_value = bits_per_value / 8;
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 32,
-            data: crate::buffer::LanceBuffer::from(vec![0u8; (num_values * 4) as usize]),
+            bits_per_value,
+            data: crate::buffer::LanceBuffer::from(vec![
+                0u8;
+                (num_values * bytes_per_value) as usize
+            ]),
             num_values,
             block_info,
         })
@@ -5631,16 +5905,16 @@ mod tests {
 
     #[test]
     fn test_estimate_dict_size_fixed_width() {
-        use crate::encodings::logical::primitive::dict::{
-            DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-        };
+        use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
 
-        let block = create_test_fixed_data_block(1000, 400);
-        let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
+        let bits_per_value = 128;
+        let block = create_test_fixed_data_block(1000, 400, bits_per_value);
+        let estimated_size =
+            PrimitiveStructuralEncoder::estimate_dict_size(&block, LanceFileVersion::V2_1).unwrap();
 
         // Dictionary: 400 * 16 bytes (128-bit values)
         // Indices: 1000 * 4 bytes (32-bit i32)
-        let expected_dict_size = 400 * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+        let expected_dict_size = 400 * (bits_per_value / 8);
         let expected_indices_size = 1000 * (DICT_INDICES_BITS_PER_VALUE / 8);
         let expected_total = expected_dict_size + expected_indices_size;
 
@@ -5650,7 +5924,8 @@ mod tests {
     #[test]
     fn test_estimate_dict_size_variable_width() {
         let block = create_test_variable_width_block(1000, 400);
-        let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
+        let estimated_size =
+            PrimitiveStructuralEncoder::estimate_dict_size(&block, LanceFileVersion::V2_1).unwrap();
 
         // Get actual data size
         let data_size = block.data_size();
@@ -5675,7 +5950,11 @@ mod tests {
             arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
         let field = LanceField::try_from(&arrow_field).unwrap();
 
-        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_1,
+        );
 
         assert!(result, "Should use dictionary encode based on size");
     }
@@ -5685,7 +5964,7 @@ mod tests {
         use crate::constants::DICT_SIZE_RATIO_META_KEY;
         use lance_core::datatypes::Field as LanceField;
 
-        let block = create_test_fixed_data_block(1000, 10);
+        let block = create_test_fixed_data_block(1000, 1000, 128);
 
         let mut metadata = HashMap::new();
         metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
@@ -5693,7 +5972,11 @@ mod tests {
             arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
         let field = LanceField::try_from(&arrow_field).unwrap();
 
-        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_1,
+        );
 
         assert!(!result, "Should not use dictionary encode based on size");
     }

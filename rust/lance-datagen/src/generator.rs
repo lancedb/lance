@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::LazyLock};
 
 use arrow::{
     array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
@@ -21,6 +21,7 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
 use rand::{distr::Uniform, Rng, RngCore, SeedableRng};
+use rand_distr::Zipf;
 use random_word;
 
 use self::array::rand_with_distribution;
@@ -1022,7 +1023,7 @@ impl ArrayGenerator for RandomBinaryGenerator {
 
 /// Generate a sequence of strings with a prefix and a counter
 ///
-/// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+/// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
 #[derive(Debug)]
 pub struct PrefixPlusCounterGenerator {
     prefix: String,
@@ -1172,21 +1173,55 @@ impl ArrayGenerator for BinaryPrefixPlusCounterGenerator {
     }
 }
 
-#[derive(Debug)]
+// Common English stop words placed at the front to be sampled more frequently
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
+];
+
+/// Word list with stop words at the front for Zipf sampling, computed once.
+static SENTENCE_WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let all_words = random_word::all(random_word::Lang::En);
+    let mut words = Vec::with_capacity(STOP_WORDS.len() + all_words.len());
+    words.extend(STOP_WORDS.iter().copied());
+    words.extend(
+        all_words
+            .iter()
+            .filter(|w| !STOP_WORDS.contains(w))
+            .copied(),
+    );
+    words
+});
+
 struct RandomSentenceGenerator {
     min_words: usize,
     max_words: usize,
-    words: &'static [&'static str],
+    /// Zipf distribution for word selection (favors lower indices)
+    zipf: Zipf<f64>,
     is_large: bool,
+}
+
+impl std::fmt::Debug for RandomSentenceGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RandomSentenceGenerator")
+            .field("min_words", &self.min_words)
+            .field("max_words", &self.max_words)
+            .field("num_words", &SENTENCE_WORDS.len())
+            .field("is_large", &self.is_large)
+            .finish()
+    }
 }
 
 impl RandomSentenceGenerator {
     pub fn new(min_words: usize, max_words: usize, is_large: bool) -> Self {
-        let words = random_word::all(random_word::Lang::En);
+        // Zipf distribution with exponent ~1.0 approximates natural language
+        let zipf = Zipf::new(SENTENCE_WORDS.len() as f64, 1.0).unwrap();
+
         Self {
             min_words,
             max_words,
-            words,
+            zipf,
             is_large,
         }
     }
@@ -1203,7 +1238,11 @@ impl ArrayGenerator for RandomSentenceGenerator {
         for _ in 0..length.0 {
             let num_words = rng.random_range(self.min_words..=self.max_words);
             let sentence: String = (0..num_words)
-                .map(|_| self.words[rng.random_range(0..self.words.len())])
+                .map(|_| {
+                    // Zipf returns 1-indexed values, subtract 1 for 0-indexed array
+                    let idx = rng.sample(self.zipf) as usize - 1;
+                    SENTENCE_WORDS[idx]
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             values.push(sentence);
@@ -1527,6 +1566,72 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> ArrayGenerator for DictionaryGener
         self.generator
             .element_size_bytes()
             .map(|size_bytes| ByteCount::from(size_bytes.0 + self.key_width))
+    }
+}
+
+/// Generator that produces low-cardinality data by generating a fixed set of
+/// unique values and then randomly selecting from them.
+struct LowCardinalityGenerator {
+    inner: Box<dyn ArrayGenerator>,
+    cardinality: usize,
+    /// Cached unique values, generated on first call
+    unique_values: Option<Arc<dyn Array>>,
+}
+
+impl std::fmt::Debug for LowCardinalityGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LowCardinalityGenerator")
+            .field("inner", &self.inner)
+            .field("cardinality", &self.cardinality)
+            .field("initialized", &self.unique_values.is_some())
+            .finish()
+    }
+}
+
+impl LowCardinalityGenerator {
+    fn new(inner: Box<dyn ArrayGenerator>, cardinality: usize) -> Self {
+        Self {
+            inner,
+            cardinality,
+            unique_values: None,
+        }
+    }
+}
+
+impl ArrayGenerator for LowCardinalityGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        // Generate unique values on first call
+        if self.unique_values.is_none() {
+            self.unique_values = Some(
+                self.inner
+                    .generate(RowCount::from(self.cardinality as u64), rng)?,
+            );
+        }
+
+        let unique_values = self.unique_values.as_ref().unwrap();
+
+        // Generate random indices into the unique values
+        let indices: Vec<usize> = (0..length.0)
+            .map(|_| rng.random_range(0..self.cardinality))
+            .collect();
+
+        // Use arrow's take to select values
+        let indices_array =
+            arrow_array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        arrow::compute::take(unique_values.as_ref(), &indices_array, None)
+            .map(|arr| arr as Arc<dyn Array>)
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.inner.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.inner.element_size_bytes()
     }
 }
 
@@ -2083,7 +2188,8 @@ pub mod array {
     use arrow_array::{
         ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
         Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
@@ -2518,7 +2624,7 @@ pub mod array {
                 ))
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                Box::new(FnGen::<i64, TimestampMillisecondArray, _>::new_known_size(
                     data_type, sample_fn, 1, width,
                 ))
             }
@@ -2598,7 +2704,7 @@ pub mod array {
 
     /// Creates a generator of strings with a prefix and a counter
     ///
-    /// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+    /// For example, if the prefix is "user_" the strings will be "user_0", "user_1", ...
     pub fn utf8_prefix_plus_counter(
         prefix: impl Into<String>,
         is_large: bool,
@@ -2737,6 +2843,17 @@ pub mod array {
             _ => unimplemented!(),
         }
     }
+
+    /// Wraps a generator to produce low-cardinality data.
+    ///
+    /// Generates `cardinality` unique values on first call, then randomly
+    /// selects from them for all subsequent rows.
+    pub fn low_cardinality(
+        generator: Box<dyn ArrayGenerator>,
+        cardinality: usize,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(LowCardinalityGenerator::new(generator, cardinality))
+    }
 }
 
 /// Create a BatchGeneratorBuilder to start generating batch data
@@ -2749,13 +2866,56 @@ pub fn gen_array(genn: Box<dyn ArrayGenerator>) -> ArrayGeneratorBuilder {
     ArrayGeneratorBuilder::new(genn)
 }
 
+/// Metadata key to specify content type for string generation.
+/// Set to "sentence" to use the sentence generator with Zipf distribution.
+pub const CONTENT_TYPE_KEY: &str = "lance-datagen:content-type";
+
+/// Metadata key to specify cardinality for low-cardinality data generation.
+/// Set to a numeric string (e.g., "100") to limit unique values.
+pub const CARDINALITY_KEY: &str = "lance-datagen:cardinality";
+
+/// Create a generator for a field, checking metadata for content type hints.
+///
+/// Supported metadata keys:
+/// - `lance-datagen:content-type`: Set to "sentence" for Utf8/LargeUtf8 fields
+///   to use the sentence generator with Zipf distribution.
+/// - `lance-datagen:cardinality`: Set to a number to limit unique values.
+///   The generator will produce only that many unique values and randomly
+///   select from them.
+pub fn rand_field(field: &Field) -> Box<dyn ArrayGenerator> {
+    let mut generator = if let Some(content_type) = field.metadata().get(CONTENT_TYPE_KEY) {
+        match (content_type.as_str(), field.data_type()) {
+            ("sentence", DataType::Utf8) => array::random_sentence(1, 10, false),
+            ("sentence", DataType::LargeUtf8) => array::random_sentence(1, 10, true),
+            _ => array::rand_type(field.data_type()),
+        }
+    } else {
+        array::rand_type(field.data_type())
+    };
+
+    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY) {
+        if let Ok(cardinality) = cardinality_str.parse::<usize>() {
+            if cardinality > 0 {
+                generator = array::low_cardinality(generator, cardinality);
+            }
+        }
+    }
+
+    generator
+}
+
 /// Create a BatchGeneratorBuilder with the given schema
 ///
-/// You can add more columns or convert this into a reader immediately
+/// You can add more columns or convert this into a reader immediately.
+///
+/// Supported field metadata:
+/// - `lance-datagen:content-type` = `"sentence"`: Use sentence generator with
+///   Zipf distribution for more realistic text (Utf8/LargeUtf8 only).
+/// - `lance-datagen:cardinality` = `"<number>"`: Limit to N unique values.
 pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
     let mut builder = BatchGeneratorBuilder::default();
     for field in schema.fields() {
-        builder = builder.col(field.name(), array::rand_type(field.data_type()));
+        builder = builder.col(field.name(), rand_field(field));
     }
     builder
 }
@@ -2872,6 +3032,12 @@ mod tests {
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values(["user_0", "user_1", "user_2"])
         );
+
+        let mut genn = array::utf8_prefix_plus_counter("user_", true);
+        assert_eq!(
+            *genn.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::LargeStringArray::from_iter_values(["user_0", "user_1", "user_2"])
+        );
     }
 
     #[test]
@@ -2931,9 +3097,9 @@ mod tests {
         assert_eq!(
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
-                vec![234, 107],
-                vec![220, 152],
-                vec![21, 16, 184, 220]
+                vec![174, 178],
+                vec![64, 122, 207, 248],
+                vec![124, 3, 58]
             ])
         );
     }

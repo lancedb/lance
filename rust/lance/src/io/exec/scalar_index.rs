@@ -28,7 +28,7 @@ use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
     utils::{
         address::RowAddress,
-        mask::{RowAddrTreeMap, RowIdMask},
+        mask::{RowAddrMask, RowAddrTreeMap},
     },
     Error, Result, ROW_ID_FIELD,
 };
@@ -295,7 +295,7 @@ impl MapIndexExec {
         column_name: String,
         index_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowIdMask>>,
+        deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -310,16 +310,16 @@ impl MapIndexExec {
             needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        let IndexExprResult::Exact(mut row_id_mask) = query_result else {
+        let IndexExprResult::Exact(mut row_addr_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
         };
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_id_mask = row_id_mask & deletion_mask.as_ref().clone();
+            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
         }
 
-        let row_id_iter = row_id_mask
-            .iter_ids()
+        let row_id_iter = row_addr_mask
+            .iter_addrs()
             .ok_or(datafusion::error::DataFusionError::Internal(
                 "IndexedLookupExec: Cannot iterate over row addresses (BlockList or contains full fragments)".to_string(),
             ))?;
@@ -572,12 +572,12 @@ impl MaterializeIndexExec {
 
 #[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
 async fn row_ids_for_mask(
-    mask: RowIdMask,
+    mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
     match mask {
-        RowIdMask::BlockList(block_list) if block_list.is_empty() => {
+        RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
             // Matches all row ids in the given fragments.
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
@@ -595,7 +595,7 @@ async fn row_ids_for_mask(
                 Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
             }
         }
-        RowIdMask::AllowList(mut allow_list) => {
+        RowAddrMask::AllowList(mut allow_list) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
             if let Some(allow_list_iter) = allow_list.row_addrs() {
@@ -608,7 +608,7 @@ async fn row_ids_for_mask(
                     .collect())
             }
         }
-        RowIdMask::BlockList(block_list) => {
+        RowAddrMask::BlockList(block_list) => {
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)

@@ -239,6 +239,7 @@ use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
 use crate::encodings::logical::list::StructuralListScheduler;
+use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
@@ -771,6 +772,25 @@ impl CoreFieldDecoderStrategy {
                 let child_scheduler =
                     self.create_structural_field_scheduler(child, column_infos)?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
+                    as Box<dyn StructuralFieldScheduler>)
+            }
+            DataType::Map(_, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::NotSupported {
+                        source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into(),
+                        location: location!(),
+                    });
+                }
+                let entries_child = field
+                    .children
+                    .first()
+                    .expect("Map field must have an entries child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
             _ => todo!("create_structural_field_scheduler for {}", data_type),
@@ -1860,21 +1880,24 @@ pub fn create_decode_stream(
     is_structural: bool,
     should_validate: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
-) -> BoxStream<'static, ReadBatchTask> {
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
         let structural_decoder = StructuralStructDecoder::new(
             arrow_schema.fields,
             should_validate,
             /*is_root=*/ true,
-        );
-        StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
+        )?;
+        Ok(
+            StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder)
+                .into_stream(),
+        )
     } else {
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream()
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
     }
 }
 
@@ -1888,28 +1911,28 @@ pub fn create_decode_iterator(
     should_validate: bool,
     is_structural: bool,
     messages: VecDeque<Result<DecoderMessage>>,
-) -> Box<dyn RecordBatchReader + Send + 'static> {
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
         let simple_struct_decoder =
-            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true);
-        Box::new(BatchDecodeIterator::new(
+            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true)?;
+        Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
             num_rows,
             simple_struct_decoder,
             arrow_schema,
-        ))
+        )))
     } else {
         let root_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        Box::new(BatchDecodeIterator::new(
+        Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
             num_rows,
             root_decoder,
             arrow_schema,
-        ))
+        )))
     }
 }
 
@@ -1934,7 +1957,7 @@ fn create_scheduler_decoder(
         is_structural,
         config.decoder_config.validate_on_decode,
         rx,
-    );
+    )?;
 
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
@@ -2097,7 +2120,7 @@ pub fn schedule_and_decode_blocking(
         config.decoder_config.validate_on_decode,
         is_structural,
         messages.into(),
-    );
+    )?;
 
     Ok(decode_iterator)
 }
@@ -2639,7 +2662,7 @@ pub async fn decode_batch(
         is_structural,
         should_validate,
         rx,
-    );
+    )?;
     decode_stream.next().await.unwrap().task.await
 }
 

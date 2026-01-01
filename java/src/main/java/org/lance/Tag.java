@@ -16,20 +16,27 @@ package org.lance;
 import com.google.common.base.MoreObjects;
 
 import java.util.Objects;
+import java.util.Optional;
 
 public class Tag {
   private final String name;
+  private final Optional<String> branch;
   private final long version;
   private final int manifestSize;
 
-  public Tag(String name, long version, int manifestSize) {
+  public Tag(String name, String branch, long version, int manifestSize) {
     this.name = name;
+    this.branch = Optional.ofNullable(branch);
     this.version = version;
     this.manifestSize = manifestSize;
   }
 
   public String getName() {
     return name;
+  }
+
+  public Optional<String> getBranch() {
+    return branch;
   }
 
   public long getVersion() {
@@ -44,6 +51,7 @@ public class Tag {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("name", name)
+        .add("branch", branch)
         .add("version", version)
         .add("manifestSize", manifestSize)
         .toString();
@@ -59,12 +67,13 @@ public class Tag {
     }
     Tag tag = (Tag) o;
     return version == tag.version
+        && Objects.equals(branch, tag.branch)
         && manifestSize == tag.manifestSize
         && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, version, manifestSize);
+    return Objects.hash(name, branch, version, manifestSize);
   }
 }

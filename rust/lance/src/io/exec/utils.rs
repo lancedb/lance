@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
-use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::{Result, ROW_ID};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
@@ -75,7 +75,7 @@ pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
         let mut allow_list = RowAddrTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
@@ -89,7 +89,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
                 .expect("row id column in input batch had incorrect type");
             allow_list.extend(row_ids.iter().flatten())
         }
-        Ok(RowIdMask::from_allowed(allow_list))
+        Ok(RowAddrMask::from_allowed(allow_list))
     }
 }
 
@@ -98,7 +98,7 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
         let batch = self
             .0
             .try_next()
@@ -108,7 +108,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
                 location: location!(),
             })
             .unwrap();
-        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+        RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
             Error::Internal {
                 message: format!(
                     "Expected selection vector input to yield binary arrays but got {}",

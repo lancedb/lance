@@ -24,12 +24,13 @@ use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableRequest, DropTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest,
-    RegisterTableResponse, TableExistsRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
+    DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
+    DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
+    ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
+    TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
@@ -1624,7 +1625,101 @@ impl LanceNamespace for ManifestNamespace {
         Ok(CreateEmptyTableResponse {
             transaction_id: None,
             location: Some(table_uri),
-            properties: None,
+            storage_options: self.storage_options.clone(),
+        })
+    }
+
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Table ID is required".into(),
+            location: location!(),
+        })?;
+
+        if table_id.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "Table ID cannot be empty".into(),
+                location: location!(),
+            });
+        }
+
+        let (namespace, table_name) = Self::split_object_id(table_id);
+        let object_id = Self::build_object_id(&namespace, &table_name);
+
+        // Check if table already exists in manifest
+        let existing = self.query_manifest_for_table(&object_id).await?;
+        if existing.is_some() {
+            return Err(Error::Namespace {
+                source: format!("Table '{}' already exists", table_name).into(),
+                location: location!(),
+            });
+        }
+
+        // Create table location path with hash-based naming
+        // When dir_listing_enabled is true and it's a root table, use directory-style naming: {table_name}.lance
+        // Otherwise, use hash-based naming: {hash}_{object_id}
+        let dir_name = if namespace.is_empty() && self.dir_listing_enabled {
+            // Root table with directory listing enabled: use {table_name}.lance
+            format!("{}.lance", table_name)
+        } else {
+            // Child namespace table or dir listing disabled: use hash-based naming
+            Self::generate_dir_name(&object_id)
+        };
+        let table_path = self.base_path.child(dir_name.as_str());
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
+
+        // Validate location if provided
+        if let Some(req_location) = &request.location {
+            let req_location = req_location.trim_end_matches('/');
+            if req_location != table_uri {
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Cannot declare table {} at location {}, must be at location {}",
+                        table_name, req_location, table_uri
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        }
+
+        // Create the .lance-reserved file to mark the table as existing
+        let reserved_file_path = table_path.child(".lance-reserved");
+
+        self.object_store
+            .create(&reserved_file_path)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to create .lance-reserved file for table {}: {}",
+                    table_name, e
+                )
+                .into(),
+                location: location!(),
+            })?
+            .shutdown()
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to finalize .lance-reserved file for table {}: {}",
+                    table_name, e
+                )
+                .into(),
+                location: location!(),
+            })?;
+
+        // Add entry to manifest marking this as a declared table (store dir_name, not full path)
+        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
+            .await?;
+
+        log::info!(
+            "Declared table '{}' in manifest at {}",
+            table_name,
+            table_uri
+        );
+
+        Ok(DeclareTableResponse {
+            transaction_id: None,
+            location: Some(table_uri),
             storage_options: self.storage_options.clone(),
         })
     }

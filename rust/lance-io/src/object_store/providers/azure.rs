@@ -123,6 +123,8 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?,
         })
     }
 

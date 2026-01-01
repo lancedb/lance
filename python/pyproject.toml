@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.3.1"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.4.0"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -108,6 +108,9 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
+    # TensorFlow import can emit NumPy deprecation FutureWarnings in some environments.
+    # We keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
@@ -115,4 +118,7 @@ filterwarnings = [
     # Pytorch 2.2 on Python 2.12
     'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
     'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
+    # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
+    # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*np\.object.*:FutureWarning',
 ]

@@ -30,6 +30,7 @@ public class ScanOptions {
   private final Optional<Long> limit;
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
+  private final Optional<FullTextQuery> fullTextQuery;
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
@@ -61,6 +62,7 @@ public class ScanOptions {
       Optional<Long> limit,
       Optional<Long> offset,
       Optional<Query> nearest,
+      Optional<FullTextQuery> fullTextQuery,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
@@ -76,6 +78,7 @@ public class ScanOptions {
     this.limit = limit;
     this.offset = offset;
     this.nearest = nearest;
+    this.fullTextQuery = fullTextQuery;
     this.withRowId = withRowId;
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
@@ -155,6 +158,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get the full text search query.
+   *
+   * @return Optional containing the full text search query if specified, otherwise empty.
+   */
+  public Optional<FullTextQuery> getFullTextQuery() {
+    return fullTextQuery;
+  }
+
+  /**
    * Get whether to include the row ID.
    *
    * @return true if row ID should be included, false otherwise.
@@ -198,6 +210,7 @@ public class ScanOptions {
         .add("limit", limit.orElse(null))
         .add("offset", offset.orElse(null))
         .add("nearest", nearest.orElse(null))
+        .add("fullTextQuery", fullTextQuery.orElse(null))
         .add("withRowId", withRowId)
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
@@ -215,6 +228,7 @@ public class ScanOptions {
     private Optional<Long> limit = Optional.empty();
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
+    private Optional<FullTextQuery> fullTextQuery = Optional.empty();
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
@@ -236,6 +250,7 @@ public class ScanOptions {
       this.limit = options.getLimit();
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
+      this.fullTextQuery = options.getFullTextQuery();
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
@@ -331,6 +346,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set the full text search query.
+     *
+     * @param fullTextQuery full text search query definition.
+     * @return Builder instance for method chaining.
+     */
+    public Builder fullTextQuery(FullTextQuery fullTextQuery) {
+      this.fullTextQuery = Optional.ofNullable(fullTextQuery);
+      return this;
+    }
+
+    /**
      * Set whether to include the row ID.
      *
      * @param withRowId true to include row ID, false otherwise.
@@ -383,6 +409,7 @@ public class ScanOptions {
           limit,
           offset,
           nearest,
+          fullTextQuery,
           withRowId,
           withRowAddress,
           batchReadahead,

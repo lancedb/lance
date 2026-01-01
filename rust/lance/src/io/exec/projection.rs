@@ -120,7 +120,7 @@ fn project_field(field: &FieldRef, selection: &Selection) -> FieldRef {
     match selection {
         Selection::FullField(_) => {
             // If we project, it's always null (for some reason).
-            Arc::new(Field::new(field.name(), field.data_type().clone(), true))
+            Arc::new(field.as_ref().clone().with_nullable(true))
         }
         Selection::StructProjection(_, sub_selections) => {
             if let DataType::Struct(fields) = field.data_type() {
@@ -131,11 +131,14 @@ fn project_field(field: &FieldRef, selection: &Selection) -> FieldRef {
                     let projected_field = project_field(field, sub_selection);
                     projected_fields.push(projected_field);
                 }
-                Arc::new(Field::new(
-                    field.name(),
-                    DataType::Struct(projected_fields.into()),
-                    true,
-                ))
+                Arc::new(
+                    Field::new(
+                        field.name(),
+                        DataType::Struct(projected_fields.into()),
+                        true,
+                    )
+                    .with_metadata(field.metadata().clone()),
+                )
             } else {
                 panic!("Expected struct")
             }
@@ -309,6 +312,45 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await?;
         assert_eq!(batches.len(), 1);
         Ok(batches.into_iter().next().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_project_preserves_field_metadata() {
+        use arrow_array::LargeBinaryArray;
+
+        let meta_field = Field::new("meta", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                "lance.json".to_string(),
+            )]),
+        );
+        let x_field = Field::new("x", DataType::Int32, true);
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Struct(vec![meta_field.clone(), x_field.clone()].into()),
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(meta_field.clone()),
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"{}".as_slice())])) as ArrayRef,
+                ),
+                (Arc::new(x_field), Arc::new(Int32Array::from(vec![1]))),
+            ]))],
+        )
+        .unwrap();
+
+        let projection = ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Struct(vec![meta_field].into()),
+            true,
+        )]);
+        let result = apply_to_batch(batch, &projection).await.unwrap();
+        assert_eq!(result.schema().as_ref(), &projection);
     }
 
     #[tokio::test]

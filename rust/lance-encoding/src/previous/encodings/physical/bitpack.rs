@@ -621,7 +621,7 @@ pub fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
     }
 }
 
-// Compute the number bits to to use for bitpacking generically.
+// Compute the number bits to use for bitpacking generically.
 // returns None if the array is empty or all nulls
 fn bitpack_params_for_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
 where

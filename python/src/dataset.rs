@@ -15,7 +15,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::{Duration, TimeDelta};
+use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
 use log::error;
@@ -33,6 +33,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
@@ -388,7 +389,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
 }
 
 /// Python binding for BasePath
-#[pyclass(name = "DatasetBasePath", module = "lance")]
+#[pyclass(name = "DatasetBasePath", module = "_lib")]
 #[derive(Clone)]
 pub struct DatasetBasePath {
     #[pyo3(get)]
@@ -1208,13 +1209,26 @@ impl Dataset {
 
     fn take_blobs(
         self_: PyRef<'_, Self>,
-        row_indices: Vec<u64>,
+        row_ids: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = rt()
+            .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    fn take_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_blobs(&row_indices, blob_column),
+                self_
+                    .ds
+                    .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
@@ -1530,23 +1544,33 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
         &self,
-        older_than_micros: i64,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> PyResult<CleanupStats> {
-        let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = rt()
-            .block_on(
-                None,
-                self.ds.cleanup_old_versions(
-                    older_than,
-                    delete_unverified,
-                    error_if_tagged_old_versions,
-                ),
-            )?
+            .block_on(None, async {
+                let mut builder = CleanupPolicyBuilder::default();
+                if let Some(v) = older_than_micros {
+                    let older_than = Duration::microseconds(v);
+                    builder = builder.before_timestamp(Utc::now() - older_than);
+                }
+                if let Some(v) = retain_versions {
+                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+                }
+                if let Some(v) = delete_unverified {
+                    builder = builder.delete_unverified(v);
+                }
+                if let Some(v) = error_if_tagged_old_versions {
+                    builder = builder.error_if_tagged_old_versions(v);
+                }
+
+                self.ds.cleanup_with_policy(builder.build()).await
+            })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
@@ -1579,9 +1603,10 @@ impl Dataset {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
                 let dict = PyDict::new(py);
-                dict.set_item("version", v.version).unwrap();
-                dict.set_item("manifest_size", v.manifest_size).unwrap();
-                pytags.set_item(k, dict.into_py_any(py)?).unwrap();
+                dict.set_item("branch", v.branch.clone())?;
+                dict.set_item("version", v.version)?;
+                dict.set_item("manifest_size", v.manifest_size)?;
+                pytags.set_item(k, dict.into_py_any(py)?)?;
             }
             pytags.into_py_any(py)
         })
@@ -1601,13 +1626,11 @@ impl Dataset {
         })
     }
 
-    fn create_tag(&mut self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+    fn create_tag(&mut self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
+        let reference = self.transform_ref(py, reference)?;
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .create_on_branch(tag.as_str(), version, branch.as_deref()),
+            self.ds.as_ref().tags().create(tag.as_str(), reference),
         )?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -1629,31 +1652,14 @@ impl Dataset {
         Ok(())
     }
 
-    fn update_tag(&self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+    fn update_tag(&self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
+        let reference = self.transform_ref(py, reference)?;
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .update_on_branch(tag.as_str(), version, branch.as_deref()),
+            self.ds.as_ref().tags().update(tag.as_str(), reference),
         )?
         .infer_error()?;
         Ok(())
-    }
-
-    /// Check out the latest version of the given branch
-    fn checkout_branch(&self, branch: String) -> PyResult<Self> {
-        let ds = rt()
-            .block_on(None, self.ds.checkout_branch(branch.as_str()))?
-            .map_err(|err| match err {
-                Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                _ => PyIOError::new_err(err.to_string()),
-            })?;
-        let uri_str = ds.uri().to_string();
-        Ok(Self {
-            ds: Arc::new(ds),
-            uri: uri_str,
-        })
     }
 
     /// Check out the latest version of the current branch
@@ -1678,7 +1684,6 @@ impl Dataset {
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
-        // Build Ref from python object
         let reference = self.transform_ref(py, reference)?;
         let store_params = storage_options.map(|opts| ObjectStoreParams {
             storage_options: Some(opts),
@@ -1810,7 +1815,7 @@ impl Dataset {
             "ZONEMAP" => IndexType::ZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
-            "INVERTED" | "FTS" => IndexType::Inverted,
+            "INVERTED" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -1863,7 +1868,7 @@ impl Dataset {
                     params: Some(config.config.clone()),
                 })
             }
-            "INVERTED" | "FTS" => {
+            "INVERTED" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
@@ -1908,6 +1913,9 @@ impl Dataset {
                     }
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
+                    }
+                    if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
+                        params = params.skip_merge(skip_merge.extract()?);
                     }
                 }
                 Box::new(params)
@@ -2865,29 +2873,18 @@ impl Dataset {
         if let Some(reference) = reference {
             if let Ok(i) = reference.downcast_bound::<PyInt>(py) {
                 let version_number: u64 = i.extract()?;
-                Ok(Ref::from(version_number))
+                Ok(version_number.into())
             } else if let Ok(tag_name) = reference.downcast_bound::<PyString>(py) {
                 let tag: &str = &tag_name.to_string_lossy();
-                Ok(Ref::from(tag))
+                Ok(tag.into())
             } else if let Ok(tuple) = reference.downcast_bound::<PyTuple>(py) {
-                let len = tuple.len();
-                if len == 1 {
-                    let elem = tuple.get_item(0)?;
-                    if let Ok(version_number) = elem.extract::<u64>() {
-                        Ok(Ref::from(version_number))
-                    } else if let Ok(branch_name) = elem.extract::<String>() {
-                        Ok(Ref::Version(Some(branch_name), None))
-                    } else {
-                        Err(PyValueError::new_err(
-                            "Version tuple must contain integer or string",
-                        ))
-                    }
-                } else if len == 2 {
-                    let (branch_name, version_number) = tuple.extract::<(String, u64)>()?;
-                    Ok(Ref::Version(Some(branch_name), Some(version_number)))
+                if tuple.len() == 2 {
+                    let (branch_name, version_number) =
+                        tuple.extract::<(Option<String>, Option<u64>)>()?;
+                    Ok((branch_name.as_deref(), version_number).into())
                 } else {
                     Err(PyValueError::new_err(
-                        "Version tuple must have 1 or 2 elements",
+                        "Version tuple should be Tuple[Optional[str], Optional[int]]",
                     ))
                 }
             } else {

@@ -267,7 +267,7 @@ async fn test_tag(
     let bad_tag_creation = dataset.tags().create("tag1", 3).await;
     assert_eq!(
         bad_tag_creation.err().unwrap().to_string(),
-        "Version not found error: version Main::3 does not exist"
+        "Version not found error: version main:3 does not exist"
     );
 
     let bad_tag_deletion = dataset.tags().delete("tag1").await;
@@ -354,7 +354,7 @@ async fn test_tag(
     let another_bad_tag_update = dataset.tags().update("tag1", 3).await;
     assert_eq!(
         another_bad_tag_update.err().unwrap().to_string(),
-        "Version not found error: version 3 does not exist"
+        "Version not found error: version main:3 does not exist"
     );
 
     dataset.tags().update("tag1", 2).await.unwrap();
@@ -595,11 +595,7 @@ async fn test_branch() {
     // create branch3 based on that tag, write data batch 4
     branch2_dataset
         .tags()
-        .create_on_branch(
-            "tag1",
-            branch2_dataset.version().version,
-            Some("dev/branch2"),
-        )
+        .create("tag1", ("dev/branch2", branch2_dataset.version().version))
         .await
         .unwrap();
 

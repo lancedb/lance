@@ -194,11 +194,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - uses: Swatinem/rust-cache@v2
-      - name: Set up Java 8
+      - name: Set up Java 11
         uses: actions/setup-java@v4
         with:
           distribution: corretto
-          java-version: 8
+          java-version: 11
           cache: "maven"
           server-id: ossrh
           server-username: SONATYPE_USER
@@ -228,7 +228,7 @@ jobs:
         working-directory: java
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
-      - name: Publish with Java 8
+      - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
           inputs.mode == 'release'

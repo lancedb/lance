@@ -98,6 +98,10 @@ impl LogicalType {
     fn is_blob(&self) -> bool {
         self.0 == BLOB_LOGICAL_TYPE
     }
+
+    fn is_map(&self) -> bool {
+        self.0 == "map"
+    }
 }
 
 impl From<&str> for LogicalType {
@@ -196,6 +200,21 @@ impl TryFrom<&DataType> for LogicalType {
                 }
             }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
+            DataType::Map(_, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Unsupported map data type with keys_sorted=true: {:?}",
+                            dt
+                        ),
+                        location: location!(),
+                    });
+                }
+                "map".to_string()
+            }
             _ => {
                 return Err(Error::Schema {
                     message: format!("Unsupported data type: {:?}", dt),

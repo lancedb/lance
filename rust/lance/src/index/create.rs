@@ -16,6 +16,7 @@ use crate::{
     Error, Result,
 };
 use futures::future::BoxFuture;
+use lance_core::datatypes::format_field_path;
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
@@ -104,13 +105,21 @@ impl<'a> CreateIndexBuilder<'a> {
                 location: location!(),
             });
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
+        let column_input = &self.columns[0];
+        // Use case-insensitive lookup for both simple and nested paths.
+        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
             return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
+                message: format!("CreateIndex: column '{column_input}' does not exist"),
                 location: location!(),
             });
         };
+        let field = *field_path.last().unwrap();
+        // Reconstruct the column path with correct case from schema
+        // Use quoted format for SQL parsing (special chars are quoted)
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        let quoted_column: String = format_field_path(&names);
+        let column = quoted_column.as_str();
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {

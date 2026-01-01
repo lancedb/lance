@@ -40,13 +40,13 @@ use lance_io::object_store::{
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
-    CommitLock, ManifestLocation, ManifestNamingScheme,
+    CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
 };
-use lance_table::io::manifest::read_manifest;
+use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -110,8 +110,11 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
-use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
+use lance_namespace::models::{
+    CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
+};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::io::deletion::{relative_deletion_file_path, DELETIONS_DIR};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -128,9 +131,10 @@ pub use write::{
     WriteDestination, WriteMode, WriteParams,
 };
 
-const INDICES_DIR: &str = "_indices";
+pub(crate) const INDICES_DIR: &str = "_indices";
+pub(crate) const DATA_DIR: &str = "data";
+pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 
-pub const DATA_DIR: &str = "data";
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -447,14 +451,19 @@ impl Dataset {
 
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        match ref_ {
+        let reference: refs::Ref = version.into();
+        match reference {
             refs::Ref::Version(branch, version_number) => {
-                self.checkout_by_ref(version_number, branch).await
+                self.checkout_by_ref(version_number, branch.as_deref())
+                    .await
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                self.checkout_by_ref(Some(version_number), self.manifest.branch.as_deref())
+                    .await
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
-                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch)
+                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch.as_deref())
                     .await
             }
         }
@@ -485,7 +494,7 @@ impl Dataset {
 
     /// Check out the latest version of the branch
     pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
-        self.checkout_by_ref(None, Some(branch.to_string())).await
+        self.checkout_by_ref(None, Some(branch)).await
     }
 
     /// This is a two-phase operation:
@@ -548,14 +557,10 @@ impl Dataset {
         self.branches().list().await
     }
 
-    fn already_checked_out(
-        &self,
-        location: &ManifestLocation,
-        branch_name: Option<String>,
-    ) -> bool {
+    fn already_checked_out(&self, location: &ManifestLocation, branch_name: Option<&str>) -> bool {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
-        self.manifest.branch == branch_name
+        self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
@@ -569,17 +574,9 @@ impl Dataset {
     async fn checkout_by_ref(
         &self,
         version_number: Option<u64>,
-        branch: Option<String>,
+        branch: Option<&str>,
     ) -> Result<Self> {
-        let new_location = if self.manifest.branch.as_ref() != branch.as_ref() {
-            if let Some(branch_name) = branch.as_deref() {
-                self.find_branch_location(branch_name)?
-            } else {
-                self.branch_location().find_main()?
-            }
-        } else {
-            self.branch_location()
-        };
+        let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -595,7 +592,7 @@ impl Dataset {
                 .await?
         };
 
-        if self.already_checked_out(&manifest_location, branch.clone()) {
+        if self.already_checked_out(&manifest_location, branch) {
             return Ok(self.clone());
         }
 
@@ -825,23 +822,45 @@ impl Dataset {
 
         match write_params.mode {
             WriteMode::Create => {
-                let request = CreateEmptyTableRequest {
+                let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
                     location: None,
-                    properties: None,
                 };
-                let response =
-                    namespace
-                        .create_empty_table(request)
-                        .await
-                        .map_err(|e| Error::Namespace {
+                // Try declare_table first, fall back to deprecated create_empty_table
+                // for backward compatibility with older namespace implementations.
+                // create_empty_table support will be removed in 3.0.0.
+                #[allow(deprecated)]
+                let response = match namespace.declare_table(declare_request).await {
+                    Ok(resp) => resp,
+                    Err(Error::NotSupported { .. }) => {
+                        let fallback_request = CreateEmptyTableRequest {
+                            id: Some(table_id.clone()),
+                            location: None,
+                        };
+                        let fallback_resp = namespace
+                            .create_empty_table(fallback_request)
+                            .await
+                            .map_err(|e| Error::Namespace {
+                                source: Box::new(e),
+                                location: location!(),
+                            })?;
+                        DeclareTableResponse {
+                            transaction_id: fallback_resp.transaction_id,
+                            location: fallback_resp.location,
+                            storage_options: fallback_resp.storage_options,
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::Namespace {
                             source: Box::new(e),
                             location: location!(),
-                        })?;
+                        });
+                    }
+                };
 
                 let uri = response.location.ok_or_else(|| Error::Namespace {
                     source: Box::new(std::io::Error::other(
-                        "Table location not found in create_empty_table response",
+                        "Table location not found in declare_table response",
                     )),
                     location: location!(),
                 })?;
@@ -980,7 +999,7 @@ impl Dataset {
             uri: self.uri.clone(),
             branch: self.manifest.branch.clone(),
         };
-        current_location.find_branch(Some(branch_name.to_string()))
+        current_location.find_branch(Some(branch_name))
     }
 
     /// Get the full manifest of the dataset version.
@@ -1035,7 +1054,7 @@ impl Dataset {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location, self.manifest.branch.clone()) {
+        if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -1082,7 +1101,7 @@ impl Dataset {
             Transaction::try_from(tx).map(Some)?
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
-            let path = self.base.child("_transactions").child(path.as_str());
+            let path = self.transactions_dir().child(path.as_str());
             let data = self.object_store.inner.get(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)?
@@ -1484,7 +1503,7 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
-    /// Take [BlobFile] by row ids (row address).
+    /// Take [BlobFile] by row IDs.
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
@@ -1611,6 +1630,18 @@ impl Dataset {
 
     pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
+    }
+
+    pub fn transactions_dir(&self) -> Path {
+        self.base.child(TRANSACTIONS_DIR)
+    }
+
+    pub fn deletions_dir(&self) -> Path {
+        self.base.child(DELETIONS_DIR)
+    }
+
+    pub fn versions_dir(&self) -> Path {
+        self.base.child(VERSIONS_DIR)
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
@@ -2123,8 +2154,7 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_ = version.into();
-        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
+        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -2135,11 +2165,109 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params.unwrap_or_default())
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         builder.execute(transaction).await
+    }
+
+    /// Deep clone the target version into a new dataset at target_path.
+    /// This performs a server-side copy of all relevant dataset files (data files,
+    /// deletion files, and any external row-id files) into the target dataset
+    /// without loading data into memory.
+    ///
+    /// Parameters:
+    /// - `target_path`: the URI string to clone the dataset into.
+    /// - `version`: the version cloned from, could be a version number, branch head, or tag.
+    /// - `store_params`: the object store params to use for the new dataset.
+    pub async fn deep_clone(
+        &mut self,
+        target_path: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        use futures::StreamExt;
+
+        // Resolve source dataset and its manifest using checkout_version
+        let src_ds = self.checkout_version(version).await?;
+        let src_paths = src_ds.collect_paths().await?;
+
+        // Prepare target object store and base path
+        let (target_store, target_base) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+
+        // Prevent cloning into an existing target dataset
+        if self
+            .commit_handler
+            .resolve_latest_location(&target_base, &target_store)
+            .await
+            .is_ok()
+        {
+            return Err(Error::DatasetAlreadyExists {
+                uri: target_path.to_string(),
+                location: location!(),
+            });
+        }
+
+        let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
+            let mut path = base.clone();
+            for seg in relative_path.split('/') {
+                if !seg.is_empty() {
+                    path = path.child(seg);
+                }
+            }
+            path
+        };
+
+        // TODO: Leverage object store bulk copy for efficient deep_clone
+        //
+        // All cloud storage providers support batch copy APIs that would provide significant
+        // performance improvements. We use single file copy before we have upstream support.
+        //
+        // Tracked by: https://github.com/lance-format/lance/issues/5435
+        let io_parallelism = self.object_store.io_parallelism();
+        let copy_futures = src_paths
+            .iter()
+            .map(|(relative_path, base)| {
+                let store = Arc::clone(&target_store);
+                let src_path = build_absolute_path(relative_path, base);
+                let target_path = build_absolute_path(relative_path, &target_base);
+                async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
+            })
+            .collect::<Vec<_>>();
+
+        futures::stream::iter(copy_futures)
+            .buffer_unordered(io_parallelism)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        // Record a Clone operation and commit via CommitBuilder
+        let ref_name = src_ds.manifest.branch.clone();
+        let ref_version = src_ds.manifest_location.version;
+        let clone_op = Operation::Clone {
+            is_shallow: false,
+            ref_name,
+            ref_version,
+            ref_path: src_ds.uri().to_string(),
+            branch_name: None,
+        };
+        let txn = Transaction::new(ref_version, clone_op, None);
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_store_params(store_params.clone().unwrap_or_default())
+            .with_object_store(target_store.clone())
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        let new_ds = builder.execute(txn).await?;
+        Ok(new_ds)
     }
 
     async fn resolve_reference(&self, reference: refs::Ref) -> Result<(Option<String>, u64)> {
@@ -2148,19 +2276,111 @@ impl Dataset {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
                 } else {
+                    let branch_location = self.branch_location().find_branch(branch.as_deref())?;
                     let version_number = self
                         .commit_handler
-                        .resolve_latest_location(&self.base, &self.object_store)
+                        .resolve_latest_location(&branch_location.path, &self.object_store)
                         .await?
                         .version;
                     Ok((branch, version_number))
                 }
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                Ok((self.manifest.branch.clone(), version_number))
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
                 Ok((tag_contents.branch, tag_contents.version))
             }
         }
+    }
+
+    /// Collect all (relative_path, path) of the dataset files.
+    async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
+        let mut file_paths: Vec<(String, Path)> = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+                return Err(Error::Internal {
+                    message: format!(
+                        "External row_id_meta is not supported yet. external file path: {}",
+                        external_file.path
+                    ),
+                    location: location!(),
+                });
+            }
+            for data_file in fragment.files.iter() {
+                let base_root = if let Some(base_id) = data_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((
+                    format!("{}/{}", DATA_DIR, data_file.path.clone()),
+                    base_root,
+                ));
+            }
+            if let Some(deletion_file) = &fragment.deletion_file {
+                let base_root = if let Some(base_id) = deletion_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((
+                    relative_deletion_file_path(fragment.id, deletion_file),
+                    base_root,
+                ));
+            }
+        }
+
+        let indices = read_manifest_indexes(
+            self.object_store.as_ref(),
+            &self.manifest_location,
+            &self.manifest,
+        )
+        .await?;
+
+        for index in &indices {
+            let base_root = if let Some(base_id) = index.base_id {
+                let base_path =
+                    self.manifest
+                        .base_paths
+                        .get(&base_id)
+                        .ok_or_else(|| Error::Internal {
+                            message: format!("base_id {} not found", base_id),
+                            location: location!(),
+                        })?;
+                Path::parse(base_path.path.as_str())?
+            } else {
+                self.base.clone()
+            };
+            let index_root = base_root.child(INDICES_DIR).child(index.uuid.to_string());
+            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            while let Some(meta) = stream.next().await.transpose()? {
+                if let Some(filename) = meta.location.filename() {
+                    file_paths.push((
+                        format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
+                        base_root.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(file_paths)
     }
 
     /// Run a SQL query against the dataset.

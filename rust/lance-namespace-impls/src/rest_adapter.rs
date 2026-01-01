@@ -11,14 +11,16 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Json, Router, ServiceExt,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
+use tower::Layer;
+use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
@@ -78,6 +80,7 @@ impl RestAdapter {
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
             .route("/v1/table/:id/create-empty", post(create_empty_table))
+            .route("/v1/table/:id/declare", post(declare_table))
             .route("/v1/table/:id/insert", post(insert_into_table))
             .route("/v1/table/:id/merge_insert", post(merge_insert_into_table))
             .route("/v1/table/:id/update", post(update_table))
@@ -154,9 +157,10 @@ impl RestAdapter {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let router = self.router();
+        let app = NormalizePathLayer::trim_trailing_slash().layer(router);
 
         tokio::spawn(async move {
-            let result = axum::serve(listener, router)
+            let result = axum::serve(listener, ServiceExt::<Request>::into_make_service(app))
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
                 })
@@ -498,6 +502,7 @@ async fn create_table(
     }
 }
 
+#[allow(deprecated)]
 async fn create_empty_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     Path(id): Path<String>,
@@ -507,6 +512,20 @@ async fn create_empty_table(
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
 
     match backend.create_empty_table(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn declare_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DeclareTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.declare_table(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -1169,6 +1188,60 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_trailing_slash_handling() {
+            let fixture = RestServerFixture::new().await;
+            let port = fixture.server_handle.port();
+
+            // Create a namespace using the normal API (without trailing slash)
+            let create_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_req)
+                .await
+                .unwrap();
+
+            // Test that a request with trailing slash works (using direct HTTP)
+            let client = reqwest::Client::new();
+
+            // Test POST endpoint with trailing slash
+            let response = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/namespace/test_namespace/exists/",
+                    port
+                ))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                204,
+                "POST request with trailing slash should succeed with 204 No Content"
+            );
+
+            // Test GET endpoint with trailing slash
+            let response = client
+                .get(format!(
+                    "http://127.0.0.1:{}/v1/namespace/test_namespace/list/",
+                    port
+                ))
+                .send()
+                .await
+                .unwrap();
+
+            assert!(
+                response.status().is_success(),
+                "GET request with trailing slash should succeed, got status: {}",
+                response.status()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_create_and_list_child_namespaces() {
             let fixture = RestServerFixture::new().await;
 
@@ -1383,6 +1456,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(deprecated)]
         async fn test_empty_table_exists_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
@@ -1554,6 +1628,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(deprecated)]
         async fn test_create_empty_table_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
@@ -1608,6 +1683,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(deprecated)]
         async fn test_describe_empty_table_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
@@ -1663,6 +1739,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(deprecated)]
         async fn test_drop_empty_table_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
@@ -1708,6 +1785,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(deprecated)]
         async fn test_deeply_nested_namespace_with_empty_table() {
             let fixture = RestServerFixture::new().await;
 

@@ -261,6 +261,16 @@ class _Dataset:
     ) -> pa.RecordBatch: ...
     def take_blobs(
         self,
+        row_ids: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_addresses(
+        self,
+        row_addresses: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_indices(
+        self,
         row_indices: List[int],
         blob_column: str,
     ) -> List[LanceBlobFile]: ...
@@ -282,13 +292,14 @@ class _Dataset:
     def versions(self) -> List[Version]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
-    def checkout_version(self, version: int | str | Tuple[str, int]) -> _Dataset: ...
-    def checkout_branch(self, branch: str) -> _Dataset: ...
+    def checkout_version(
+        self, version: int | str | Tuple[Optional[str], Optional[int]]
+    ) -> _Dataset: ...
     def checkout_latest(self) -> _Dataset: ...
     def shallow_clone(
         self,
         target_path: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> _Dataset: ...
     def restore(self): ...
@@ -303,17 +314,23 @@ class _Dataset:
     def tags(self) -> Dict[str, Tag]: ...
     def tags_ordered(self, order: Optional[str]) -> List[Tuple[str, Tag]]: ...
     def create_tag(
-        self, tag: str, version: int, branch: Optional[str] = None
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
     ) -> Tag: ...
     def delete_tag(self, tag: str): ...
-    def update_tag(self, tag: str, version: int, branch: Optional[str] = None): ...
+    def update_tag(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ): ...
     # Branch operations
     def branches(self) -> Dict[str, Branch]: ...
     def branches_ordered(self, order: Optional[str]) -> List[Tuple[str, Branch]]: ...
     def create_branch(
         self,
         branch: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> _Dataset: ...
@@ -571,6 +588,15 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+
+class DatasetBasePath:
+    def __init__(
+        self,
+        path: str,
+        name: Optional[str] = None,
+        is_dataset_root: bool = False,
+        id: Optional[int] = None,
+    ) -> None: ...
 
 __version__: str
 language_model_home: Callable[[], str]

@@ -374,10 +374,29 @@ impl MergeInsertBuilder {
                 location!(),
             ));
         }
+
+        // Resolve column names using case-insensitive matching to handle
+        // lowercased column names from SQL parsing or user input
+        let resolved_on = on
+            .iter()
+            .map(|col| {
+                dataset
+                    .schema()
+                    .field_case_insensitive(col)
+                    .map(|f| f.name.clone())
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            format!("Merge insert key column '{}' does not exist in schema", col),
+                            location!(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
             dataset,
             params: MergeInsertParams {
-                on,
+                on: resolved_on,
                 when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
@@ -1273,12 +1292,14 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
+        // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
             .params
             .on
             .iter()
-            .map(|name| name.as_str())
+            .map(|name| format!("\"{}\"", name))
             .collect::<Vec<_>>();
+        let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
@@ -1289,7 +1310,13 @@ impl MergeInsertJob {
         };
         let dataset_schema: Schema = self.dataset.schema().into();
         let df = scan_aliased
-            .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
+            .join(
+                source_df_aliased,
+                join_type,
+                &on_cols_refs,
+                &on_cols_refs,
+                None,
+            )?
             .with_column(
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
@@ -1402,6 +1429,8 @@ impl MergeInsertJob {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
                 compare_nullability: NullabilityComparison::Ignore,
+                // Allow columns to be in a different order; they will be matched by name.
+                ignore_field_order: true,
                 ..Default::default()
             },
         );
@@ -4312,9 +4341,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         );
 
         // Also validate the full string structure with pattern matching
-        let expected_pattern = "[...MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1], cumulative_cpu=...
+        let expected_pattern = "[...MergeInsert: elapsed=..., on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]
     ...
-    StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[], cumulative_cpu=...]";
+    StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]...]";
         assert_string_matches(&analysis, expected_pattern).unwrap();
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
@@ -5118,5 +5147,171 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             "Error message should NOT complain about missing fields for a subschema check, but was: {}",
             error_message
         );
+    }
+
+    /// Test that merge_insert works with mixed-case column names as keys.
+    /// This is a regression test for the fix in assign_action.rs that wraps
+    /// column names in double quotes to preserve case in DataFusion expressions.
+    #[tokio::test]
+    async fn test_merge_insert_mixed_case_key() {
+        // Create a schema with a mixed-case column name
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("userId", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+
+        // Initial data
+        let initial_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        // Write initial dataset
+        let test_uri = "memory://test_mixed_case.lance";
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // New data to merge (updates userId=2, inserts userId=4)
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2, 4])),
+                Arc::new(UInt32Array::from(vec![200, 400])),
+            ],
+        )
+        .unwrap();
+
+        // Perform merge_insert using "userId" as the key
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["userId".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_ds, _merge_stats) = job.execute(new_stream).await.unwrap();
+
+        // Verify the merge succeeded
+        let result = merged_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let result_batch = concat_batches(&schema, &result).unwrap();
+        assert_eq!(result_batch.num_rows(), 4); // 3 original + 1 inserted
+
+        // Verify that userId=2 was updated to value=200
+        let user_ids = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let values = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+
+        // Find the row with userId=2 and check its value
+        for i in 0..result_batch.num_rows() {
+            if user_ids.value(i) == 2 {
+                assert_eq!(
+                    values.value(i),
+                    200,
+                    "userId=2 should have been updated to value=200"
+                );
+            }
+        }
+    }
+
+    /// Test case for Issue #5323: merge_insert should use the full schema path
+    /// when columns are provided in a different order than the dataset schema.
+    #[tokio::test]
+    async fn test_merge_insert_reordered_columns() {
+        use arrow_array::record_batch;
+
+        let initial_data = record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            ("value", Float64, [1.1, 2.2, 3.3]),
+            ("extra", Utf8, ["a", "b", "c"])
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
+            "memory://test_issue_5323",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Source data with reordered columns: [extra, id, value] instead of [id, value, extra]
+        let new_data = record_batch!(
+            ("extra", Utf8, ["x", "y"]),
+            ("id", Int32, [2, 4]), // id 2 exists, 4 is new
+            ("value", Float64, [22.2, 44.4])
+        )
+        .unwrap();
+
+        // Verify reordered columns can use the fast path
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        assert!(
+            job.can_use_create_plan(&new_data.schema()).await.unwrap(),
+            "Reordered schema should be able to use fast path"
+        );
+
+        // Execute and verify data correctness
+        let (merged_dataset, _) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(new_data.clone())],
+                    new_data.schema(),
+                )))
+                .await
+                .unwrap();
+
+        let result = merged_dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "id".to_string(),
+            )]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let expected = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Float64, [1.1, 22.2, 3.3, 44.4]),
+            ("extra", Utf8, ["a", "x", "c", "y"])
+        )
+        .unwrap();
+
+        assert_eq!(result, expected);
     }
 }

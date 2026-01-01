@@ -319,6 +319,7 @@ impl FileWriter {
             max_page_bytes,
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
+            version: self.version(),
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -1052,6 +1053,7 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                minichunk_size: None,
             },
         );
 
