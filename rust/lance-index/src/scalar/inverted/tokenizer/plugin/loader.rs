@@ -112,8 +112,8 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    pub fn create_factory(&self, config_json: &str) -> Result<PluginFactory<'_>> {
-        let factory = unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config_json)) };
+    pub fn create_factory(&self, config: &str) -> Result<PluginFactory<'_>> {
+        let factory = unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config)) };
 
         if factory.is_null() {
             let error = self.get_error(std::ptr::null_mut());

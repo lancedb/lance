@@ -128,7 +128,7 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
-    /// JSON configuration for the tokenizer plugin.
+    /// Configuration string for the tokenizer plugin (format defined by plugin).
     #[serde(default)]
     pub(crate) tokenizer_plugin_config: Option<String>,
 }
@@ -362,7 +362,7 @@ impl InvertedIndexParams {
 
     /// Set a tokenizer plugin to use.
     /// `library_path` is path to the plugin shared library (.so, .dylib, or .dll)
-    /// `config` is optional JSON configuration for the plugin
+    /// `config` is optional configuration string for the plugin (format defined by plugin)
     pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(library_path);

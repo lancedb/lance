@@ -78,14 +78,14 @@ struct TokenStream {
 }
 
 impl Factory {
-    fn new(config_json: &str) -> Self {
-        let lowercase = config_json.contains("\"lowercase\":true")
-            || config_json.contains("\"lowercase\": true");
+    fn new(config: &str) -> Self {
+        let lowercase =
+            config.contains("\"lowercase\":true") || config.contains("\"lowercase\": true");
 
         // Parse error_after_n_tokens for testing error propagation
         // Simple parsing: look for "error_after_n_tokens": N pattern
-        let error_after_n_tokens = if let Some(pos) = config_json.find("\"error_after_n_tokens\"") {
-            let rest = &config_json[pos..];
+        let error_after_n_tokens = if let Some(pos) = config.find("\"error_after_n_tokens\"") {
+            let rest = &config[pos..];
             // Find the colon and then the number
             if let Some(colon_pos) = rest.find(':') {
                 let after_colon = rest[colon_pos + 1..].trim_start();

@@ -35,12 +35,30 @@
 //!     );
 //! ```
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::Mutex;
 
 /// Plugin API version - must match LANCE_TOKENIZER_PLUGIN_API_VERSION
 const PLUGIN_API_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceStringRef {
+    pub data: *const c_char,
+    pub length: u32,
+}
+
+impl LanceStringRef {
+    unsafe fn as_str(&self) -> &str {
+        if self.data.is_null() || self.length == 0 {
+            ""
+        } else {
+            let slice = std::slice::from_raw_parts(self.data as *const u8, self.length as usize);
+            std::str::from_utf8_unchecked(slice)
+        }
+    }
+}
 
 /// Token structure matching the C ABI
 #[repr(C)]
@@ -48,20 +66,19 @@ pub struct LanceToken {
     pub offset_from: u32,
     pub offset_to: u32,
     pub position: u32,
-    pub text: *const c_char,
-    pub text_length: u32,
     pub position_length: u32,
+    pub text: LanceStringRef,
 }
 
 /// Plugin interface structure
 #[repr(C)]
 pub struct LanceTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
+    pub create_factory: unsafe extern "C" fn(LanceStringRef) -> *mut c_void,
     pub destroy_factory: unsafe extern "C" fn(*mut c_void),
     pub create_tokenizer: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     pub destroy_tokenizer: unsafe extern "C" fn(*mut c_void),
-    pub create_stream: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_void,
+    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef) -> *mut c_void,
     pub destroy_stream: unsafe extern "C" fn(*mut c_void),
     pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken) -> i32,
     pub get_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
@@ -88,25 +105,24 @@ struct Tokenizer {
 
 /// Token stream for iterating over tokens
 struct TokenStream {
-    text: String,
     tokens: Vec<(usize, usize, String)>, // (start, end, text)
     index: usize,
-    current_token_text: CString,
+    current_token_text: String,
 }
 
 impl Factory {
-    fn new(config_json: &str) -> Result<Self, String> {
-        let config = if config_json.is_empty() || config_json == "{}" {
+    fn new(config: &str) -> Result<Self, String> {
+        let cfg = if config.is_empty() || config == "{}" {
             Config::default()
         } else {
-            // Simple JSON parsing (in production, use serde_json)
-            let lowercase = config_json.contains("\"lowercase\":true")
-                || config_json.contains("\"lowercase\": true");
+            // Simple config parsing (in this test, JSON format is used)
+            let lowercase =
+                config.contains("\"lowercase\":true") || config.contains("\"lowercase\": true");
             Config { lowercase }
         };
 
         Ok(Self {
-            config,
+            config: cfg,
             last_error: Mutex::new(None),
         })
     }
@@ -169,12 +185,11 @@ impl Tokenizer {
 }
 
 impl TokenStream {
-    fn new(text: String, tokens: Vec<(usize, usize, String)>) -> Self {
+    fn new(tokens: Vec<(usize, usize, String)>) -> Self {
         Self {
-            text,
             tokens,
             index: 0,
-            current_token_text: CString::default(),
+            current_token_text: String::new(),
         }
     }
 
@@ -184,16 +199,16 @@ impl TokenStream {
         }
 
         let (start, end, ref text) = self.tokens[self.index];
-
-        // Store the CString to keep it alive
-        self.current_token_text = CString::new(text.as_str()).unwrap_or_default();
+        self.current_token_text = text.clone();
 
         token.offset_from = start as u32;
         token.offset_to = end as u32;
         token.position = self.index as u32;
-        token.text = self.current_token_text.as_ptr();
-        token.text_length = text.len() as u32;
         token.position_length = 1;
+        token.text = LanceStringRef {
+            data: self.current_token_text.as_ptr() as *const c_char,
+            length: self.current_token_text.len() as u32,
+        };
 
         self.index += 1;
         true
@@ -206,13 +221,8 @@ unsafe extern "C" fn api_version() -> u32 {
     PLUGIN_API_VERSION
 }
 
-unsafe extern "C" fn create_factory(config_json: *const c_char, config_len: u32) -> *mut c_void {
-    let config_str = if config_json.is_null() || config_len == 0 {
-        ""
-    } else {
-        let slice = std::slice::from_raw_parts(config_json as *const u8, config_len as usize);
-        std::str::from_utf8(slice).unwrap_or("{}")
-    };
+unsafe extern "C" fn create_factory(config: LanceStringRef) -> *mut c_void {
+    let config_str = config.as_str();
 
     match Factory::new(config_str) {
         Ok(factory) => Box::into_raw(Box::new(factory)) as *mut c_void,
@@ -244,21 +254,16 @@ unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_stream(
-    tokenizer: *mut c_void,
-    text: *const c_char,
-    text_length: u32,
-) -> *mut c_void {
-    if tokenizer.is_null() || text.is_null() {
+unsafe extern "C" fn create_stream(tokenizer: *mut c_void, text: LanceStringRef) -> *mut c_void {
+    if tokenizer.is_null() {
         return ptr::null_mut();
     }
 
     let tokenizer = &*(tokenizer as *const Tokenizer);
-    let text_slice = std::slice::from_raw_parts(text as *const u8, text_length as usize);
-    let text_str = String::from_utf8_lossy(text_slice).into_owned();
+    let text_str = text.as_str().to_owned();
 
     let tokens = tokenizer.tokenize(&text_str);
-    let stream = TokenStream::new(text_str, tokens);
+    let stream = TokenStream::new(tokens);
 
     Box::into_raw(Box::new(stream)) as *mut c_void
 }

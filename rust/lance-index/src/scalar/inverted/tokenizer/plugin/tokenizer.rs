@@ -17,7 +17,7 @@ pub struct PluginTokenizer {
     /// The loaded plugin library (shared across clones)
     library: Arc<TokenizerPluginLibrary>,
 
-    /// JSON configuration for creating factories
+    /// Configuration string for creating factories (format defined by plugin)
     config: String,
 }
 

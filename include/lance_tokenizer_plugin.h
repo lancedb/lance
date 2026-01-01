@@ -48,9 +48,11 @@ typedef struct LanceTokenStream LanceTokenStream;
 typedef struct LanceTokenizerPlugin {
     uint32_t (*api_version)(void);
 
-    /// Create a tokenizer factory with the given JSON configuration.
+    /// Create a tokenizer factory with the given configuration.
     ///
-    /// @param config JSON configuration string (UTF-8)
+    /// @param config Configuration string in a plugin-defined format (UTF-8).
+    ///               Lance passes this string unchanged from user configuration.
+    ///               Plugins may use any format (JSON, YAML, custom DSL, etc.).
     /// @return Factory handle, or NULL on error (call get_error for details)
     LanceTokenizerFactory* (*create_factory)(LanceStringRef config);
 
