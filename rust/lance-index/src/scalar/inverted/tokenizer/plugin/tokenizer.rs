@@ -127,10 +127,11 @@ impl PluginTokenStreamAdapter {
                                 NextTokenResult::EndOfStream => {
                                     break;
                                 }
-                                NextTokenResult::Error(code) => {
+                                NextTokenResult::Error(code, msg) => {
                                     log::error!(
-                                        "Plugin tokenizer error during tokenization (code: {})",
-                                        code
+                                        "Plugin tokenizer error during tokenization (code: {}): {}",
+                                        code,
+                                        msg
                                     );
                                     has_error = true;
                                     tokens.clear();

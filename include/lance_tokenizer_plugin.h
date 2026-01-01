@@ -18,6 +18,12 @@ typedef struct LanceStringRef {
     uint32_t length;
 } LanceStringRef;
 
+/// Error information returned by plugin functions.
+/// The message is valid until the next call on the same object or until destruction.
+typedef struct Error {
+    LanceStringRef message;
+} Error;
+
 typedef struct LanceToken {
     /// Start and end byte offsets in the original text (UTF-8)
     uint32_t offset_from;
@@ -53,20 +59,22 @@ typedef struct LanceTokenizerPlugin {
     /// @param config Configuration string in a plugin-defined format (UTF-8).
     ///               Lance passes this string unchanged from user configuration.
     ///               Plugins may use any format (JSON, YAML, custom DSL, etc.).
-    /// @return Factory handle, or NULL on error (call get_error for details)
-    LanceTokenizerFactory* (*create_factory)(LanceStringRef config);
+    /// @param error Output parameter for error details (may be NULL if not needed)
+    /// @return Factory handle, or NULL on error
+    LanceTokenizerFactory* (*create_factory)(LanceStringRef config, Error* error);
 
     /// Destroy a factory and free its resources.
     ///
-    /// @param factory Factory handle
+    /// @param factory Factory handle (may be NULL, which is a no-op)
     void (*destroy_factory)(LanceTokenizerFactory* factory);
 
     /// Create a tokenizer instance from the factory.
     /// Multiple tokenizers can be created from a single factory.
     ///
     /// @param factory Factory handle
-    /// @return Tokenizer handle, or NULL on error (call get_error for details)
-    LanceTokenizer* (*create_tokenizer)(LanceTokenizerFactory* factory);
+    /// @param error Output parameter for error details (may be NULL if not needed)
+    /// @return Tokenizer handle, or NULL on error
+    LanceTokenizer* (*create_tokenizer)(LanceTokenizerFactory* factory, Error* error);
 
     /// Destroy a tokenizer and free its resources.
     ///
@@ -78,8 +86,9 @@ typedef struct LanceTokenizerPlugin {
     ///
     /// @param tokenizer Tokenizer handle
     /// @param text Text to tokenize (UTF-8)
-    /// @return Stream handle, or NULL on error (call get_error for details)
-    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, LanceStringRef text);
+    /// @param error Output parameter for error details (may be NULL if not needed)
+    /// @return Stream handle, or NULL on error
+    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, LanceStringRef text, Error* error);
 
     /// Destroy a token stream and free its resources.
     ///
@@ -90,15 +99,9 @@ typedef struct LanceTokenizerPlugin {
     ///
     /// @param stream Stream handle
     /// @param token Output parameter - filled with token data if a token is available
+    /// @param error Output parameter for error details (may be NULL if not needed)
     /// @return 1 if a token was produced, 0 if no more tokens, negative on error
-    int32_t (*next_token)(LanceTokenStream* stream, LanceToken* token);
-
-    /// Get the last error message.
-    ///
-    /// @param factory Factory handle (can be NULL to get global/loading errors)
-    /// @return Error message (null-terminated), or NULL if no error
-    ///         The returned string is valid until the next error-generating call
-    const char* (*get_error)(LanceTokenizerFactory* factory);
+    int32_t (*next_token)(LanceTokenStream* stream, LanceToken* token, Error* error);
 
     /// Get the plugin name.
     ///

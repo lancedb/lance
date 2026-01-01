@@ -35,13 +35,13 @@
 //!     );
 //! ```
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void};
 use std::ptr;
-use std::sync::Mutex;
 
 /// Plugin API version - must match LANCE_TOKENIZER_PLUGIN_API_VERSION
 const PLUGIN_API_VERSION: u32 = 1;
 
+/// A reference to a UTF-8 string (not necessarily null-terminated).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LanceStringRef {
@@ -50,6 +50,13 @@ pub struct LanceStringRef {
 }
 
 impl LanceStringRef {
+    fn from_str(s: &str) -> Self {
+        Self {
+            data: s.as_ptr() as *const c_char,
+            length: s.len() as u32,
+        }
+    }
+
     unsafe fn as_str(&self) -> &str {
         if self.data.is_null() || self.length == 0 {
             ""
@@ -58,6 +65,22 @@ impl LanceStringRef {
             std::str::from_utf8_unchecked(slice)
         }
     }
+}
+
+impl Default for LanceStringRef {
+    fn default() -> Self {
+        Self {
+            data: ptr::null(),
+            length: 0,
+        }
+    }
+}
+
+/// Error information returned by plugin functions.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Error {
+    pub message: LanceStringRef,
 }
 
 /// Token structure matching the C ABI
@@ -74,14 +97,13 @@ pub struct LanceToken {
 #[repr(C)]
 pub struct LanceTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(LanceStringRef) -> *mut c_void,
+    pub create_factory: unsafe extern "C" fn(LanceStringRef, *mut Error) -> *mut c_void,
     pub destroy_factory: unsafe extern "C" fn(*mut c_void),
-    pub create_tokenizer: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    pub create_tokenizer: unsafe extern "C" fn(*mut c_void, *mut Error) -> *mut c_void,
     pub destroy_tokenizer: unsafe extern "C" fn(*mut c_void),
-    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef) -> *mut c_void,
+    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef, *mut Error) -> *mut c_void,
     pub destroy_stream: unsafe extern "C" fn(*mut c_void),
-    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken) -> i32,
-    pub get_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken, *mut Error) -> i32,
     pub name: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
 }
@@ -95,7 +117,6 @@ struct Config {
 /// Factory that creates tokenizers with shared configuration
 struct Factory {
     config: Config,
-    last_error: Mutex<Option<CString>>,
 }
 
 /// Tokenizer instance
@@ -111,33 +132,17 @@ struct TokenStream {
 }
 
 impl Factory {
-    fn new(config: &str) -> Result<Self, String> {
+    fn new(config: &str) -> Self {
         let cfg = if config.is_empty() || config == "{}" {
             Config::default()
         } else {
-            // Simple config parsing (in this test, JSON format is used)
+            // Simple config parsing (in this example, JSON format is used)
             let lowercase =
                 config.contains("\"lowercase\":true") || config.contains("\"lowercase\": true");
             Config { lowercase }
         };
 
-        Ok(Self {
-            config: cfg,
-            last_error: Mutex::new(None),
-        })
-    }
-
-    fn set_error(&self, error: &str) {
-        let mut guard = self.last_error.lock().unwrap();
-        *guard = Some(CString::new(error).unwrap_or_default());
-    }
-
-    fn get_error(&self) -> *const c_char {
-        let guard = self.last_error.lock().unwrap();
-        match &*guard {
-            Some(s) => s.as_ptr(),
-            None => ptr::null(),
-        }
+        Self { config: cfg }
     }
 }
 
@@ -221,13 +226,9 @@ unsafe extern "C" fn api_version() -> u32 {
     PLUGIN_API_VERSION
 }
 
-unsafe extern "C" fn create_factory(config: LanceStringRef) -> *mut c_void {
+unsafe extern "C" fn create_factory(config: LanceStringRef, _error: *mut Error) -> *mut c_void {
     let config_str = config.as_str();
-
-    match Factory::new(config_str) {
-        Ok(factory) => Box::into_raw(Box::new(factory)) as *mut c_void,
-        Err(_) => ptr::null_mut(),
-    }
+    Box::into_raw(Box::new(Factory::new(config_str))) as *mut c_void
 }
 
 unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
@@ -236,7 +237,7 @@ unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_tokenizer(factory: *mut c_void) -> *mut c_void {
+unsafe extern "C" fn create_tokenizer(factory: *mut c_void, _error: *mut Error) -> *mut c_void {
     if factory.is_null() {
         return ptr::null_mut();
     }
@@ -254,7 +255,11 @@ unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_stream(tokenizer: *mut c_void, text: LanceStringRef) -> *mut c_void {
+unsafe extern "C" fn create_stream(
+    tokenizer: *mut c_void,
+    text: LanceStringRef,
+    _error: *mut Error,
+) -> *mut c_void {
     if tokenizer.is_null() {
         return ptr::null_mut();
     }
@@ -274,7 +279,11 @@ unsafe extern "C" fn destroy_stream(stream: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn next_token(stream: *mut c_void, token: *mut LanceToken) -> i32 {
+unsafe extern "C" fn next_token(
+    stream: *mut c_void,
+    token: *mut LanceToken,
+    _error: *mut Error,
+) -> i32 {
     if stream.is_null() || token.is_null() {
         return -1;
     }
@@ -287,15 +296,6 @@ unsafe extern "C" fn next_token(stream: *mut c_void, token: *mut LanceToken) -> 
     } else {
         0
     }
-}
-
-unsafe extern "C" fn get_error(factory: *mut c_void) -> *const c_char {
-    if factory.is_null() {
-        return ptr::null();
-    }
-
-    let factory = &*(factory as *const Factory);
-    factory.get_error()
 }
 
 unsafe extern "C" fn name() -> *const c_char {
@@ -318,7 +318,6 @@ static PLUGIN: LanceTokenizerPlugin = LanceTokenizerPlugin {
     create_stream,
     destroy_stream,
     next_token,
-    get_error,
     name,
     version,
 };

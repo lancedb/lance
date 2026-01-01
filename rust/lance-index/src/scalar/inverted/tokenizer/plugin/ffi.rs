@@ -5,6 +5,7 @@
 //!
 //! These types mirror the C header file `include/lance_tokenizer_plugin.h`.
 
+use std::borrow::Cow;
 use std::ffi::{c_char, c_void};
 
 pub const PLUGIN_API_VERSION: u32 = 1;
@@ -28,16 +29,20 @@ impl CStringRef {
         }
     }
 
-    /// Convert to a Rust string slice.
+    /// Convert to a Rust string, safely handling invalid UTF-8.
+    ///
+    /// This method uses lossy conversion, replacing invalid UTF-8 sequences
+    /// with the Unicode replacement character (U+FFFD). Use this when reading
+    /// data from untrusted sources (e.g., plugin error messages).
     ///
     /// # Safety
-    /// The caller must ensure the data pointer is valid and points to valid UTF-8.
-    pub unsafe fn as_str(&self) -> &str {
+    /// The caller must ensure the data pointer is valid and points to allocated memory.
+    pub unsafe fn to_string_lossy(&self) -> Cow<'_, str> {
         if self.data.is_null() || self.length == 0 {
-            ""
+            Cow::Borrowed("")
         } else {
             let slice = std::slice::from_raw_parts(self.data as *const u8, self.length as usize);
-            std::str::from_utf8_unchecked(slice)
+            String::from_utf8_lossy(slice)
         }
     }
 }
@@ -48,6 +53,32 @@ impl Default for CStringRef {
             data: std::ptr::null(),
             length: 0,
         }
+    }
+}
+
+/// Error information returned by plugin functions.
+/// The message is valid until the next call on the same object or until destruction.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CError {
+    pub message: CStringRef,
+}
+
+impl CError {
+    /// Check if this error contains a message.
+    pub fn has_message(&self) -> bool {
+        !self.message.data.is_null() && self.message.length > 0
+    }
+
+    /// Get the error message as a string, safely handling invalid UTF-8.
+    ///
+    /// Since error messages come from plugins (untrusted sources),
+    /// invalid UTF-8 sequences are replaced with the replacement character.
+    ///
+    /// # Safety
+    /// The caller must ensure the message data pointer is valid.
+    pub unsafe fn message_str(&self) -> Cow<'_, str> {
+        self.message.to_string_lossy()
     }
 }
 
@@ -90,23 +121,28 @@ pub type LanceTokenStream = c_void;
 #[repr(C)]
 pub struct CTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(config: CStringRef) -> *mut LanceTokenizerFactory,
+    pub create_factory:
+        unsafe extern "C" fn(config: CStringRef, error: *mut CError) -> *mut LanceTokenizerFactory,
     pub destroy_factory: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory),
-    pub create_tokenizer:
-        unsafe extern "C" fn(factory: *mut LanceTokenizerFactory) -> *mut LanceTokenizer,
+    pub create_tokenizer: unsafe extern "C" fn(
+        factory: *mut LanceTokenizerFactory,
+        error: *mut CError,
+    ) -> *mut LanceTokenizer,
     pub destroy_tokenizer: unsafe extern "C" fn(tokenizer: *mut LanceTokenizer),
     pub create_stream: unsafe extern "C" fn(
         tokenizer: *mut LanceTokenizer,
         text: CStringRef,
+        error: *mut CError,
     ) -> *mut LanceTokenStream,
     pub destroy_stream: unsafe extern "C" fn(stream: *mut LanceTokenStream),
 
     /// Get the next token from the stream.
     /// Returns 1 if a token was produced, 0 if no more tokens, negative on error.
-    pub next_token: unsafe extern "C" fn(stream: *mut LanceTokenStream, token: *mut CToken) -> i32,
-
-    /// Get the last error message.
-    pub get_error: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory) -> *const c_char,
+    pub next_token: unsafe extern "C" fn(
+        stream: *mut LanceTokenStream,
+        token: *mut CToken,
+        error: *mut CError,
+    ) -> i32,
 
     pub name: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
@@ -128,7 +164,7 @@ mod tests {
         assert!(!sr.data.is_null());
 
         unsafe {
-            assert_eq!(sr.as_str(), "hello");
+            assert_eq!(sr.to_string_lossy(), "hello");
         }
     }
 
@@ -139,7 +175,7 @@ mod tests {
         assert_eq!(sr.length, 0);
 
         unsafe {
-            assert_eq!(sr.as_str(), "");
+            assert_eq!(sr.to_string_lossy(), "");
         }
     }
 
@@ -167,5 +203,60 @@ mod tests {
         assert_eq!(token.position_length, 1);
         assert!(token.text.data.is_null());
         assert_eq!(token.text.length, 0);
+    }
+
+    #[test]
+    fn test_cerror_default() {
+        let error = CError::default();
+        assert!(!error.has_message());
+        unsafe {
+            assert_eq!(error.message_str(), "");
+        }
+    }
+
+    #[test]
+    fn test_cerror_with_message() {
+        let msg = "test error";
+        let error = CError {
+            message: CStringRef::from_str(msg),
+        };
+        assert!(error.has_message());
+        unsafe {
+            assert_eq!(error.message_str(), "test error");
+        }
+    }
+
+    #[test]
+    fn test_cstringref_to_string_lossy_with_invalid_utf8() {
+        // Create a byte array with invalid UTF-8 (0xFF is not valid in UTF-8)
+        let invalid_utf8: [u8; 6] = [0x68, 0x65, 0x6c, 0x6c, 0x6F, 0xFF]; // "hello" + invalid byte
+        let sr = CStringRef {
+            data: invalid_utf8.as_ptr() as *const c_char,
+            length: 6,
+        };
+
+        unsafe {
+            let result = sr.to_string_lossy();
+            // Invalid byte should be replaced with U+FFFD
+            assert_eq!(result, "hello\u{FFFD}");
+        }
+    }
+
+    #[test]
+    fn test_cerror_with_invalid_utf8() {
+        // Simulate plugin returning invalid UTF-8 in error message
+        let invalid_utf8: [u8; 5] = [0x65, 0x72, 0x72, 0x6F, 0xFF]; // "error" + invalid byte
+        let error = CError {
+            message: CStringRef {
+                data: invalid_utf8.as_ptr() as *const c_char,
+                length: 5,
+            },
+        };
+        assert!(error.has_message());
+        unsafe {
+            let msg = error.message_str();
+            // Invalid byte should be replaced with U+FFFD
+            assert_eq!(msg, "error\u{FFFD}");
+        }
     }
 }

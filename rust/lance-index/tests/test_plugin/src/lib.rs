@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void};
 use std::ptr;
-use std::sync::Mutex;
 
 const PLUGIN_API_VERSION: u32 = 1;
 
@@ -16,6 +15,13 @@ pub struct LanceStringRef {
 }
 
 impl LanceStringRef {
+    fn from_str(s: &str) -> Self {
+        Self {
+            data: s.as_ptr() as *const c_char,
+            length: s.len() as u32,
+        }
+    }
+
     unsafe fn as_str(&self) -> &str {
         if self.data.is_null() || self.length == 0 {
             ""
@@ -24,6 +30,22 @@ impl LanceStringRef {
             std::str::from_utf8_unchecked(slice)
         }
     }
+}
+
+impl Default for LanceStringRef {
+    fn default() -> Self {
+        Self {
+            data: ptr::null(),
+            length: 0,
+        }
+    }
+}
+
+/// Error information returned by plugin functions.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Error {
+    pub message: LanceStringRef,
 }
 
 #[repr(C)]
@@ -38,14 +60,13 @@ pub struct LanceToken {
 #[repr(C)]
 pub struct LanceTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(LanceStringRef) -> *mut c_void,
+    pub create_factory: unsafe extern "C" fn(LanceStringRef, *mut Error) -> *mut c_void,
     pub destroy_factory: unsafe extern "C" fn(*mut c_void),
-    pub create_tokenizer: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    pub create_tokenizer: unsafe extern "C" fn(*mut c_void, *mut Error) -> *mut c_void,
     pub destroy_tokenizer: unsafe extern "C" fn(*mut c_void),
-    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef) -> *mut c_void,
+    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef, *mut Error) -> *mut c_void,
     pub destroy_stream: unsafe extern "C" fn(*mut c_void),
-    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken) -> i32,
-    pub get_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken, *mut Error) -> i32,
     pub name: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
 }
@@ -60,7 +81,6 @@ struct Config {
 
 struct Factory {
     config: Config,
-    last_error: Mutex<Option<CString>>,
 }
 
 struct Tokenizer {
@@ -75,6 +95,8 @@ struct TokenStream {
     error_after_n_tokens: Option<usize>,
     /// Number of tokens produced so far.
     tokens_produced: usize,
+    /// Error message for simulated errors.
+    error_message: String,
 }
 
 impl Factory {
@@ -107,15 +129,6 @@ impl Factory {
                 lowercase,
                 error_after_n_tokens,
             },
-            last_error: Mutex::new(None),
-        }
-    }
-
-    fn get_error(&self) -> *const c_char {
-        let guard = self.last_error.lock().unwrap();
-        match &*guard {
-            Some(s) => s.as_ptr(),
-            None => ptr::null(),
         }
     }
 }
@@ -165,10 +178,17 @@ impl Tokenizer {
 const SIMULATED_ERROR_CODE: i32 = -100;
 
 impl TokenStream {
-    fn next(&mut self, token: &mut LanceToken) -> i32 {
+    fn next(&mut self, token: &mut LanceToken, error: *mut Error) -> i32 {
         // Check if we should simulate an error
         if let Some(limit) = self.error_after_n_tokens {
             if self.tokens_produced >= limit {
+                self.error_message =
+                    format!("simulated error after {} tokens", self.tokens_produced);
+                if !error.is_null() {
+                    unsafe {
+                        (*error).message = LanceStringRef::from_str(&self.error_message);
+                    }
+                }
                 return SIMULATED_ERROR_CODE;
             }
         }
@@ -199,7 +219,7 @@ unsafe extern "C" fn api_version() -> u32 {
     PLUGIN_API_VERSION
 }
 
-unsafe extern "C" fn create_factory(config: LanceStringRef) -> *mut c_void {
+unsafe extern "C" fn create_factory(config: LanceStringRef, _error: *mut Error) -> *mut c_void {
     let config_str = config.as_str();
     Box::into_raw(Box::new(Factory::new(config_str))) as *mut c_void
 }
@@ -210,7 +230,7 @@ unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_tokenizer(factory: *mut c_void) -> *mut c_void {
+unsafe extern "C" fn create_tokenizer(factory: *mut c_void, _error: *mut Error) -> *mut c_void {
     if factory.is_null() {
         return ptr::null_mut();
     }
@@ -227,7 +247,11 @@ unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_stream(tokenizer: *mut c_void, text: LanceStringRef) -> *mut c_void {
+unsafe extern "C" fn create_stream(
+    tokenizer: *mut c_void,
+    text: LanceStringRef,
+    _error: *mut Error,
+) -> *mut c_void {
     if tokenizer.is_null() {
         return ptr::null_mut();
     }
@@ -240,6 +264,7 @@ unsafe extern "C" fn create_stream(tokenizer: *mut c_void, text: LanceStringRef)
         current_token_text: String::new(),
         error_after_n_tokens: tokenizer.config.error_after_n_tokens,
         tokens_produced: 0,
+        error_message: String::new(),
     };
     Box::into_raw(Box::new(stream)) as *mut c_void
 }
@@ -250,20 +275,16 @@ unsafe extern "C" fn destroy_stream(stream: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn next_token(stream: *mut c_void, token: *mut LanceToken) -> i32 {
+unsafe extern "C" fn next_token(
+    stream: *mut c_void,
+    token: *mut LanceToken,
+    error: *mut Error,
+) -> i32 {
     if stream.is_null() || token.is_null() {
         return -1;
     }
     let stream = &mut *(stream as *mut TokenStream);
-    stream.next(&mut *token)
-}
-
-unsafe extern "C" fn get_error(factory: *mut c_void) -> *const c_char {
-    if factory.is_null() {
-        return ptr::null();
-    }
-    let factory = &*(factory as *const Factory);
-    factory.get_error()
+    stream.next(&mut *token, error)
 }
 
 unsafe extern "C" fn name() -> *const c_char {
@@ -285,7 +306,6 @@ static PLUGIN: LanceTokenizerPlugin = LanceTokenizerPlugin {
     create_stream,
     destroy_stream,
     next_token,
-    get_error,
     name,
     version,
 };

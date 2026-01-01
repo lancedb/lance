@@ -10,7 +10,7 @@ use libloading::Library;
 use snafu::location;
 
 use super::ffi::{
-    CStringRef, CToken, CTokenizerPlugin, GetPluginFn, LanceTokenStream, LanceTokenizer,
+    CError, CStringRef, CToken, CTokenizerPlugin, GetPluginFn, LanceTokenStream, LanceTokenizer,
     LanceTokenizerFactory, ENTRY_POINT_SYMBOL, PLUGIN_API_VERSION,
 };
 
@@ -101,28 +101,19 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    fn get_error(&self, factory: *mut LanceTokenizerFactory) -> Option<String> {
-        unsafe {
-            let error_ptr = ((*self.plugin).get_error)(factory);
-            if error_ptr.is_null() {
-                None
-            } else {
-                Some(CStr::from_ptr(error_ptr).to_string_lossy().into_owned())
-            }
-        }
-    }
-
     pub fn create_factory(&self, config: &str) -> Result<PluginFactory<'_>> {
-        let factory = unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config)) };
+        let mut error = CError::default();
+        let factory =
+            unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config), &mut error) };
 
         if factory.is_null() {
-            let error = self.get_error(std::ptr::null_mut());
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                "unknown error".to_string()
+            };
             return Err(Error::InvalidInput {
-                source: format!(
-                    "failed to create tokenizer factory: {}",
-                    error.unwrap_or_else(|| "unknown error".to_string())
-                )
-                .into(),
+                source: format!("failed to create tokenizer factory: {}", error_msg).into(),
                 location: location!(),
             });
         }
@@ -143,15 +134,16 @@ impl TokenizerPluginLibrary {
         &self,
         factory: *mut LanceTokenizerFactory,
     ) -> Result<*mut LanceTokenizer> {
-        let tokenizer = ((*self.plugin).create_tokenizer)(factory);
+        let mut error = CError::default();
+        let tokenizer = ((*self.plugin).create_tokenizer)(factory, &mut error);
         if tokenizer.is_null() {
-            let error = self.get_error(factory);
+            let error_msg = if error.has_message() {
+                error.message_str().to_string()
+            } else {
+                "unknown error".to_string()
+            };
             return Err(Error::InvalidInput {
-                source: format!(
-                    "failed to create tokenizer: {}",
-                    error.unwrap_or_else(|| "unknown error".to_string())
-                )
-                .into(),
+                source: format!("failed to create tokenizer: {}", error_msg).into(),
                 location: location!(),
             });
         }
@@ -169,10 +161,17 @@ impl TokenizerPluginLibrary {
         tokenizer: *mut LanceTokenizer,
         text: &str,
     ) -> Result<*mut LanceTokenStream> {
-        let stream = ((*self.plugin).create_stream)(tokenizer, CStringRef::from_str(text));
+        let mut error = CError::default();
+        let stream =
+            ((*self.plugin).create_stream)(tokenizer, CStringRef::from_str(text), &mut error);
         if stream.is_null() {
+            let error_msg = if error.has_message() {
+                error.message_str().to_string()
+            } else {
+                "unknown error".to_string()
+            };
             return Err(Error::InvalidInput {
-                source: "failed to create token stream".to_string().into(),
+                source: format!("failed to create token stream: {}", error_msg).into(),
                 location: location!(),
             });
         }
@@ -185,8 +184,13 @@ impl TokenizerPluginLibrary {
         }
     }
 
-    unsafe fn next_token(&self, stream: *mut LanceTokenStream, token: &mut CToken) -> i32 {
-        ((*self.plugin).next_token)(stream, token)
+    unsafe fn next_token(
+        &self,
+        stream: *mut LanceTokenStream,
+        token: &mut CToken,
+        error: &mut CError,
+    ) -> i32 {
+        ((*self.plugin).next_token)(stream, token, error)
     }
 }
 
@@ -249,22 +253,28 @@ pub struct PluginTokenStream<'a> {
     stream: *mut LanceTokenStream,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextTokenResult {
     Token,
     EndOfStream,
-    Error(i32),
+    Error(i32, String),
 }
 
 impl PluginTokenStream<'_> {
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
-        let result = unsafe { self.library.next_token(self.stream, token) };
+        let mut error = CError::default();
+        let result = unsafe { self.library.next_token(self.stream, token, &mut error) };
         if result > 0 {
             NextTokenResult::Token
         } else if result == 0 {
             NextTokenResult::EndOfStream
         } else {
-            NextTokenResult::Error(result)
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                format!("tokenizer error code: {}", result)
+            };
+            NextTokenResult::Error(result, error_msg)
         }
     }
 }
