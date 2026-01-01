@@ -286,3 +286,147 @@ impl Drop for PluginTokenStream<'_> {
         }
     }
 }
+
+/// An owned plugin factory that holds an Arc to the library.
+/// This allows the factory to be cached and reused across multiple tokenizations.
+pub struct OwnedPluginFactory {
+    library: Arc<TokenizerPluginLibrary>,
+    factory: *mut LanceTokenizerFactory,
+}
+
+// SAFETY: OwnedPluginFactory can be sent/shared across threads because:
+// 1. `library` (Arc<TokenizerPluginLibrary>) is Send + Sync
+// 2. `factory` is a raw pointer to plugin state that is only accessed through
+//    the library's thread-safe function pointers
+// 3. The factory is used with &mut self, ensuring single-threaded access
+unsafe impl Send for OwnedPluginFactory {}
+unsafe impl Sync for OwnedPluginFactory {}
+
+impl OwnedPluginFactory {
+    /// Create a new owned factory from a library and config.
+    pub fn new(library: Arc<TokenizerPluginLibrary>, config: &str) -> Result<Self> {
+        let mut error = CError::default();
+        let factory =
+            unsafe { ((*library.plugin).create_factory)(CStringRef::from_str(config), &mut error) };
+
+        if factory.is_null() {
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                "unknown error".to_string()
+            };
+            return Err(Error::InvalidInput {
+                source: format!("failed to create tokenizer factory: {}", error_msg).into(),
+                location: location!(),
+            });
+        }
+
+        Ok(Self { library, factory })
+    }
+
+    /// Create a tokenizer instance from this factory.
+    pub fn create_tokenizer(&self) -> Result<OwnedPluginTokenizerInstance> {
+        let mut error = CError::default();
+        let tokenizer =
+            unsafe { ((*self.library.plugin).create_tokenizer)(self.factory, &mut error) };
+        if tokenizer.is_null() {
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                "unknown error".to_string()
+            };
+            return Err(Error::InvalidInput {
+                source: format!("failed to create tokenizer: {}", error_msg).into(),
+                location: location!(),
+            });
+        }
+        Ok(OwnedPluginTokenizerInstance {
+            library: Arc::clone(&self.library),
+            tokenizer,
+        })
+    }
+}
+
+impl Drop for OwnedPluginFactory {
+    fn drop(&mut self) {
+        unsafe {
+            self.library.destroy_factory(self.factory);
+        }
+    }
+}
+
+/// An owned tokenizer instance created from an owned factory.
+pub struct OwnedPluginTokenizerInstance {
+    library: Arc<TokenizerPluginLibrary>,
+    tokenizer: *mut LanceTokenizer,
+}
+
+impl OwnedPluginTokenizerInstance {
+    /// Create a token stream for the given text.
+    pub fn create_stream(&self, text: &str) -> Result<OwnedPluginTokenStream> {
+        let mut error = CError::default();
+        let stream = unsafe {
+            ((*self.library.plugin).create_stream)(
+                self.tokenizer,
+                CStringRef::from_str(text),
+                &mut error,
+            )
+        };
+        if stream.is_null() {
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                "unknown error".to_string()
+            };
+            return Err(Error::InvalidInput {
+                source: format!("failed to create token stream: {}", error_msg).into(),
+                location: location!(),
+            });
+        }
+        Ok(OwnedPluginTokenStream {
+            library: Arc::clone(&self.library),
+            stream,
+        })
+    }
+}
+
+impl Drop for OwnedPluginTokenizerInstance {
+    fn drop(&mut self) {
+        unsafe {
+            self.library.destroy_tokenizer(self.tokenizer);
+        }
+    }
+}
+
+/// An owned token stream from an owned tokenizer instance.
+pub struct OwnedPluginTokenStream {
+    library: Arc<TokenizerPluginLibrary>,
+    stream: *mut LanceTokenStream,
+}
+
+impl OwnedPluginTokenStream {
+    pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
+        let mut error = CError::default();
+        let result = unsafe { ((*self.library.plugin).next_token)(self.stream, token, &mut error) };
+        if result > 0 {
+            NextTokenResult::Token
+        } else if result == 0 {
+            NextTokenResult::EndOfStream
+        } else {
+            let error_msg = if error.has_message() {
+                unsafe { error.message_str().to_string() }
+            } else {
+                format!("tokenizer error code: {}", result)
+            };
+            NextTokenResult::Error(result, error_msg)
+        }
+    }
+}
+
+impl Drop for OwnedPluginTokenStream {
+    fn drop(&mut self) {
+        unsafe {
+            self.library.destroy_stream(self.stream);
+        }
+    }
+}

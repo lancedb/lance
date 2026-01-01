@@ -8,7 +8,7 @@ use lance_core::Result;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 use super::ffi::CToken;
-use super::loader::{NextTokenResult, TokenizerPluginLibrary};
+use super::loader::{NextTokenResult, OwnedPluginFactory, TokenizerPluginLibrary};
 use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 
 /// PluginTokenizer loads a shared library at runtime and uses its tokenization
@@ -19,6 +19,9 @@ pub struct PluginTokenizer {
 
     /// Configuration string for creating factories (format defined by plugin)
     config: String,
+
+    /// Cached factory for repeated tokenization (lazily initialized)
+    cached_factory: Option<OwnedPluginFactory>,
 }
 
 impl PluginTokenizer {
@@ -27,6 +30,7 @@ impl PluginTokenizer {
         Ok(Self {
             library,
             config: config.into(),
+            cached_factory: None,
         })
     }
 
@@ -34,6 +38,7 @@ impl PluginTokenizer {
         Self {
             library,
             config: config.into(),
+            cached_factory: None,
         }
     }
 
@@ -46,10 +51,12 @@ impl PluginTokenizer {
     }
 
     fn create_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
-        // Note: This is not the most efficient approach for repeated tokenization,
-        //       but it ensures thread safety and simplifies lifetime management.
-        //       For production use, consider caching the factory/tokenizer.
-        let stream = PluginTokenStreamAdapter::new(Arc::clone(&self.library), &self.config, text);
+        let stream = PluginTokenStreamAdapter::new(
+            &mut self.cached_factory,
+            &self.library,
+            &self.config,
+            text,
+        );
         BoxTokenStream::new(stream)
     }
 }
@@ -59,6 +66,7 @@ impl Clone for PluginTokenizer {
         Self {
             library: Arc::clone(&self.library),
             config: self.config.clone(),
+            cached_factory: None,
         }
     }
 }
@@ -91,67 +99,86 @@ struct PluginTokenStreamAdapter {
 }
 
 impl PluginTokenStreamAdapter {
-    fn new(library: Arc<TokenizerPluginLibrary>, config: &str, text: &str) -> Self {
+    fn new(
+        cached_factory: &mut Option<OwnedPluginFactory>,
+        library: &Arc<TokenizerPluginLibrary>,
+        config: &str,
+        text: &str,
+    ) -> Self {
         let mut tokens = Vec::new();
         let mut has_error = false;
 
-        // Create factory, tokenizer, and stream, then collect all tokens
-        match library.create_factory(config) {
-            Ok(factory) => match factory.create_tokenizer() {
-                Ok(tokenizer_instance) => match tokenizer_instance.create_stream(text) {
-                    Ok(mut stream) => {
-                        let mut c_token = CToken::default();
-                        loop {
-                            match stream.next_token(&mut c_token) {
-                                NextTokenResult::Token => {
-                                    let text = if c_token.text.data.is_null() {
-                                        String::new()
-                                    } else {
-                                        unsafe {
-                                            let slice = std::slice::from_raw_parts(
-                                                c_token.text.data as *const u8,
-                                                c_token.text.length as usize,
-                                            );
-                                            String::from_utf8_lossy(slice).into_owned()
-                                        }
-                                    };
+        // Lazily create and cache the factory
+        let factory = match cached_factory {
+            Some(f) => f,
+            None => match OwnedPluginFactory::new(Arc::clone(library), config) {
+                Ok(f) => {
+                    *cached_factory = Some(f);
+                    cached_factory.as_ref().unwrap()
+                }
+                Err(e) => {
+                    log::error!("Failed to create plugin factory: {}", e);
+                    return Self {
+                        current_token: Token::default(),
+                        tokens,
+                        index: 0,
+                        has_error: true,
+                    };
+                }
+            },
+        };
 
-                                    tokens.push(Token {
-                                        offset_from: c_token.offset_from as usize,
-                                        offset_to: c_token.offset_to as usize,
-                                        position: c_token.position as usize,
-                                        text,
-                                        position_length: c_token.position_length as usize,
-                                    });
-                                }
-                                NextTokenResult::EndOfStream => {
-                                    break;
-                                }
-                                NextTokenResult::Error(code, msg) => {
-                                    log::error!(
-                                        "Plugin tokenizer error during tokenization (code: {}): {}",
-                                        code,
-                                        msg
-                                    );
-                                    has_error = true;
-                                    tokens.clear();
-                                    break;
-                                }
+        // Create tokenizer and stream, then collect all tokens
+        match factory.create_tokenizer() {
+            Ok(tokenizer_instance) => match tokenizer_instance.create_stream(text) {
+                Ok(mut stream) => {
+                    let mut c_token = CToken::default();
+                    loop {
+                        match stream.next_token(&mut c_token) {
+                            NextTokenResult::Token => {
+                                let text = if c_token.text.data.is_null() {
+                                    String::new()
+                                } else {
+                                    unsafe {
+                                        let slice = std::slice::from_raw_parts(
+                                            c_token.text.data as *const u8,
+                                            c_token.text.length as usize,
+                                        );
+                                        String::from_utf8_lossy(slice).into_owned()
+                                    }
+                                };
+
+                                tokens.push(Token {
+                                    offset_from: c_token.offset_from as usize,
+                                    offset_to: c_token.offset_to as usize,
+                                    position: c_token.position as usize,
+                                    text,
+                                    position_length: c_token.position_length as usize,
+                                });
+                            }
+                            NextTokenResult::EndOfStream => {
+                                break;
+                            }
+                            NextTokenResult::Error(code, msg) => {
+                                log::error!(
+                                    "Plugin tokenizer error during tokenization (code: {}): {}",
+                                    code,
+                                    msg
+                                );
+                                has_error = true;
+                                tokens.clear();
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        log::error!("Failed to create plugin token stream: {}", e);
-                        has_error = true;
-                    }
-                },
+                }
                 Err(e) => {
-                    log::error!("Failed to create plugin tokenizer instance: {}", e);
+                    log::error!("Failed to create plugin token stream: {}", e);
                     has_error = true;
                 }
             },
             Err(e) => {
-                log::error!("Failed to create plugin factory: {}", e);
+                log::error!("Failed to create plugin tokenizer instance: {}", e);
                 has_error = true;
             }
         }

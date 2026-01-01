@@ -11,9 +11,11 @@ use std::sync::OnceLock;
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::plugin::{PluginTokenizer, TokenizerPluginLibrary};
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use libloading::Library;
 use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
+static PLUGIN_LIBRARY: OnceLock<Library> = OnceLock::new();
 
 fn get_plugin_path() -> PathBuf {
     PLUGIN_PATH
@@ -52,6 +54,25 @@ fn get_plugin_path() -> PathBuf {
             lib_path
         })
         .clone()
+}
+
+/// Get a reference to the loaded plugin library for calling test helper functions.
+fn get_plugin_library() -> &'static Library {
+    PLUGIN_LIBRARY.get_or_init(|| {
+        let plugin_path = get_plugin_path();
+        unsafe { Library::new(&plugin_path).expect("Failed to load plugin library") }
+    })
+}
+
+/// Get the number of times create_factory has been called in the test plugin.
+fn get_factory_create_count() -> u32 {
+    let library = get_plugin_library();
+    unsafe {
+        let func: libloading::Symbol<extern "C" fn() -> u32> = library
+            .get(b"lance_test_get_factory_create_count")
+            .expect("Failed to get lance_test_get_factory_create_count");
+        func()
+    }
 }
 
 #[test]
@@ -373,5 +394,224 @@ fn test_plugin_error_with_inverted_index_params() {
         tokens.len(),
         0,
         "Error should be propagated through InvertedIndexParams"
+    );
+}
+
+#[test]
+fn test_plugin_multithread_with_clones() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let plugin_path = get_plugin_path();
+
+    // Create the original tokenizer
+    let tokenizer = PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
+
+    // Wrap in Arc for sharing (we'll clone the tokenizer, not share the Arc)
+    let tokenizer = Arc::new(tokenizer);
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let mut thread_tokenizer = (*tokenizer).clone();
+            thread::spawn(move || {
+                let text = format!("thread {} test data", i);
+                let mut stream = thread_tokenizer.token_stream_for_doc(&text);
+                let mut tokens = Vec::new();
+                while stream.advance() {
+                    tokens.push(stream.token().text.clone());
+                }
+                (i, tokens)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (thread_id, tokens) = handle.join().expect("Thread panicked");
+        assert_eq!(
+            tokens.len(),
+            4,
+            "Thread {} should produce 4 tokens",
+            thread_id
+        );
+        assert_eq!(tokens[0], "thread");
+        assert_eq!(tokens[1], thread_id.to_string());
+        assert_eq!(tokens[2], "test");
+        assert_eq!(tokens[3], "data");
+    }
+}
+
+#[test]
+fn test_plugin_multithread_repeated_tokenization() {
+    use std::thread;
+
+    let plugin_path = get_plugin_path();
+
+    // Test that the cached factory is reused correctly within each thread
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let path = plugin_path.clone();
+            thread::spawn(move || {
+                let mut tokenizer =
+                    PluginTokenizer::new(&path, "{}").expect("Failed to create tokenizer");
+
+                // Tokenize multiple times to test factory caching
+                let mut all_results = Vec::new();
+                for j in 0..10 {
+                    let text = format!("iteration {}", j);
+                    let mut stream = tokenizer.token_stream_for_doc(&text);
+                    let mut tokens = Vec::new();
+                    while stream.advance() {
+                        tokens.push(stream.token().text.clone());
+                    }
+                    all_results.push(tokens);
+                }
+
+                (i, all_results)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (thread_id, results) = handle.join().expect("Thread panicked");
+        assert_eq!(
+            results.len(),
+            10,
+            "Thread {} should have 10 iterations",
+            thread_id
+        );
+        for (j, tokens) in results.iter().enumerate() {
+            assert_eq!(
+                tokens.len(),
+                2,
+                "Thread {} iteration {} should have 2 tokens",
+                thread_id,
+                j
+            );
+            assert_eq!(tokens[0], "iteration");
+            assert_eq!(tokens[1], j.to_string());
+        }
+    }
+}
+
+#[test]
+fn test_plugin_multithread_with_lance_tokenizer_trait() {
+    use std::thread;
+
+    let plugin_path = get_plugin_path();
+
+    // Test using Box<dyn LanceTokenizer> which is the typical usage pattern
+    let tokenizer: Box<dyn LanceTokenizer> =
+        Box::new(PluginTokenizer::new(&plugin_path, r#"{"lowercase": true}"#).unwrap());
+
+    let handles: Vec<_> = (0..4)
+        .map(|| {
+            // Clone using the trait method
+            let mut thread_tokenizer = tokenizer.box_clone();
+            thread::spawn(move || {
+                let mut stream = thread_tokenizer.token_stream_for_doc("HELLO World");
+                let mut tokens = Vec::new();
+                while stream.advance() {
+                    tokens.push(stream.token().text.clone());
+                }
+                tokens
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let tokens = handle.join().expect("Thread panicked");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], "hello");
+        assert_eq!(tokens[1], "world");
+    }
+}
+
+#[test]
+fn test_factory_caching_behavior() {
+    let plugin_path = get_plugin_path();
+
+    let mut tokenizer =
+        PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
+
+    // First tokenization - factory should be created (count increases by 1)
+    let count_before = get_factory_create_count();
+    {
+        let mut stream = tokenizer.token_stream_for_doc("hello world");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens.len(), 2);
+    }
+    let count_after = get_factory_create_count();
+    assert_eq!(
+        count_after - count_before,
+        1,
+        "Factory should be created once on first tokenization"
+    );
+
+    // Second tokenization - factory should be cached (count stays same)
+    let count_before = get_factory_create_count();
+    {
+        let mut stream = tokenizer.token_stream_for_doc("foo bar baz");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens.len(), 3);
+    }
+    let count_after = get_factory_create_count();
+    assert_eq!(
+        count_after - count_before,
+        0,
+        "Factory should be cached (no new factory created)"
+    );
+}
+
+#[test]
+fn test_clone_creates_separate_factory() {
+    let plugin_path = get_plugin_path();
+
+    let mut tokenizer =
+        PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
+
+    // Use tokenizer to cache factory (creates 1 factory)
+    let count_before = get_factory_create_count();
+    {
+        let mut stream = tokenizer.token_stream_for_doc("hello");
+        while stream.advance() {}
+    }
+    let count_after = get_factory_create_count();
+    assert_eq!(
+        count_after - count_before,
+        1,
+        "Original tokenizer should create one factory"
+    );
+
+    // Clone and use it - should create a new factory
+    let mut cloned = tokenizer.clone();
+    let count_before = get_factory_create_count();
+    {
+        let mut stream = cloned.token_stream_for_doc("world");
+        while stream.advance() {}
+    }
+    let count_after = get_factory_create_count();
+    assert_eq!(
+        count_after - count_before,
+        1,
+        "Cloned tokenizer should create its own factory"
+    );
+
+    // Original tokenizer should still use its cached factory
+    let count_before = get_factory_create_count();
+    {
+        let mut stream = tokenizer.token_stream_for_doc("test");
+        while stream.advance() {}
+    }
+    let count_after = get_factory_create_count();
+    assert_eq!(
+        count_after - count_before,
+        0,
+        "Original tokenizer should still use cached factory"
     );
 }

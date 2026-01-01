@@ -3,6 +3,11 @@
 
 use std::ffi::{c_char, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Counter for tracking how many times create_factory is called.
+/// Used for testing factory caching behavior.
+static FACTORY_CREATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 const PLUGIN_API_VERSION: u32 = 1;
 
@@ -220,6 +225,7 @@ unsafe extern "C" fn api_version() -> u32 {
 }
 
 unsafe extern "C" fn create_factory(config: LanceStringRef, _error: *mut Error) -> *mut c_void {
+    FACTORY_CREATE_COUNT.fetch_add(1, Ordering::SeqCst);
     let config_str = config.as_str();
     Box::into_raw(Box::new(Factory::new(config_str))) as *mut c_void
 }
@@ -313,4 +319,11 @@ static PLUGIN: LanceTokenizerPlugin = LanceTokenizerPlugin {
 #[no_mangle]
 pub extern "C" fn lance_tokenizer_get_plugin() -> *const LanceTokenizerPlugin {
     &PLUGIN
+}
+
+/// Get the number of times create_factory has been called.
+/// Used for testing factory caching behavior.
+#[no_mangle]
+pub extern "C" fn lance_test_get_factory_create_count() -> u32 {
+    FACTORY_CREATE_COUNT.load(Ordering::SeqCst) as u32
 }
