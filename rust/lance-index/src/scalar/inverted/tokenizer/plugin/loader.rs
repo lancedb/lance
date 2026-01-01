@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::CStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,8 +10,8 @@ use libloading::Library;
 use snafu::location;
 
 use super::ffi::{
-    CToken, CTokenizerPlugin, GetPluginFn, LanceTokenStream, LanceTokenizer, LanceTokenizerFactory,
-    ENTRY_POINT_SYMBOL, PLUGIN_API_VERSION,
+    CStringRef, CToken, CTokenizerPlugin, GetPluginFn, LanceTokenStream, LanceTokenizer,
+    LanceTokenizerFactory, ENTRY_POINT_SYMBOL, PLUGIN_API_VERSION,
 };
 
 pub struct TokenizerPluginLibrary {
@@ -113,14 +113,7 @@ impl TokenizerPluginLibrary {
     }
 
     pub fn create_factory(&self, config_json: &str) -> Result<PluginFactory<'_>> {
-        let config_cstring = CString::new(config_json).map_err(|e| Error::InvalidInput {
-            source: format!("invalid config JSON (contains null byte): {}", e).into(),
-            location: location!(),
-        })?;
-
-        let factory = unsafe {
-            ((*self.plugin).create_factory)(config_cstring.as_ptr(), config_json.len() as u32)
-        };
+        let factory = unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config_json)) };
 
         if factory.is_null() {
             let error = self.get_error(std::ptr::null_mut());
@@ -176,11 +169,7 @@ impl TokenizerPluginLibrary {
         tokenizer: *mut LanceTokenizer,
         text: &str,
     ) -> Result<*mut LanceTokenStream> {
-        let stream = ((*self.plugin).create_stream)(
-            tokenizer,
-            text.as_ptr() as *const c_char,
-            text.len() as u32,
-        );
+        let stream = ((*self.plugin).create_stream)(tokenizer, CStringRef::from_str(text));
         if stream.is_null() {
             return Err(Error::InvalidInput {
                 source: "failed to create token stream".to_string().into(),

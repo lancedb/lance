@@ -11,6 +11,6 @@ pub mod ffi;
 pub mod loader;
 pub mod tokenizer;
 
-pub use ffi::{CToken, CTokenizerPlugin, PLUGIN_API_VERSION};
+pub use ffi::{CStringRef, CToken, CTokenizerPlugin, PLUGIN_API_VERSION};
 pub use loader::TokenizerPluginLibrary;
 pub use tokenizer::PluginTokenizer;

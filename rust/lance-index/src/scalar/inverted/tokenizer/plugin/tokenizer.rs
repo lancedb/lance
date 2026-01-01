@@ -104,13 +104,13 @@ impl PluginTokenStreamAdapter {
                         loop {
                             match stream.next_token(&mut c_token) {
                                 NextTokenResult::Token => {
-                                    let text = if c_token.text.is_null() {
+                                    let text = if c_token.text.data.is_null() {
                                         String::new()
                                     } else {
                                         unsafe {
                                             let slice = std::slice::from_raw_parts(
-                                                c_token.text as *const u8,
-                                                c_token.text_length as usize,
+                                                c_token.text.data as *const u8,
+                                                c_token.text.length as usize,
                                             );
                                             String::from_utf8_lossy(slice).into_owned()
                                         }

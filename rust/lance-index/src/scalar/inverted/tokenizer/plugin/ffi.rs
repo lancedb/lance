@@ -9,6 +9,49 @@ use std::ffi::{c_char, c_void};
 
 pub const PLUGIN_API_VERSION: u32 = 1;
 
+/// A reference to a UTF-8 string (not necessarily null-terminated).
+/// This provides a zero-copy way to pass strings between Rust and C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CStringRef {
+    pub data: *const c_char,
+    pub length: u32,
+}
+
+impl CStringRef {
+    /// Create a CStringRef from a Rust string slice.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        Self {
+            data: s.as_ptr() as *const c_char,
+            length: s.len() as u32,
+        }
+    }
+
+    /// Convert to a Rust string slice.
+    ///
+    /// # Safety
+    /// The caller must ensure the data pointer is valid and points to valid UTF-8.
+    pub unsafe fn as_str(&self) -> &str {
+        if self.data.is_null() || self.length == 0 {
+            ""
+        } else {
+            let slice = std::slice::from_raw_parts(self.data as *const u8, self.length as usize);
+            std::str::from_utf8_unchecked(slice)
+        }
+    }
+}
+
+impl Default for CStringRef {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null(),
+            length: 0,
+        }
+    }
+}
+
+/// Token information produced by the tokenizer.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CToken {
@@ -21,14 +64,11 @@ pub struct CToken {
     /// Position of this token in the sequence (0-indexed)
     pub position: u32,
 
-    /// Pointer to the token text (null-terminated UTF-8)
-    pub text: *const c_char,
-
-    /// Length of the token text in bytes (not including null terminator)
-    pub text_length: u32,
-
     /// Position length (usually 1, but can be > 1 for synonyms)
     pub position_length: u32,
+
+    /// Token text (UTF-8, not necessarily null-terminated)
+    pub text: CStringRef,
 }
 
 impl Default for CToken {
@@ -37,9 +77,8 @@ impl Default for CToken {
             offset_from: 0,
             offset_to: 0,
             position: 0,
-            text: std::ptr::null(),
-            text_length: 0,
             position_length: 1,
+            text: CStringRef::default(),
         }
     }
 }
@@ -51,18 +90,14 @@ pub type LanceTokenStream = c_void;
 #[repr(C)]
 pub struct CTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(
-        config_json: *const c_char,
-        config_len: u32,
-    ) -> *mut LanceTokenizerFactory,
+    pub create_factory: unsafe extern "C" fn(config: CStringRef) -> *mut LanceTokenizerFactory,
     pub destroy_factory: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory),
     pub create_tokenizer:
         unsafe extern "C" fn(factory: *mut LanceTokenizerFactory) -> *mut LanceTokenizer,
     pub destroy_tokenizer: unsafe extern "C" fn(tokenizer: *mut LanceTokenizer),
     pub create_stream: unsafe extern "C" fn(
         tokenizer: *mut LanceTokenizer,
-        text: *const c_char,
-        text_length: u32,
+        text: CStringRef,
     ) -> *mut LanceTokenStream,
     pub destroy_stream: unsafe extern "C" fn(stream: *mut LanceTokenStream),
 
@@ -86,14 +121,36 @@ mod tests {
     use std::mem;
 
     #[test]
+    fn test_cstring_ref_from_str() {
+        let s = "hello";
+        let sr = CStringRef::from_str(s);
+        assert_eq!(sr.length, 5);
+        assert!(!sr.data.is_null());
+
+        unsafe {
+            assert_eq!(sr.as_str(), "hello");
+        }
+    }
+
+    #[test]
+    fn test_cstring_ref_empty() {
+        let sr = CStringRef::default();
+        assert!(sr.data.is_null());
+        assert_eq!(sr.length, 0);
+
+        unsafe {
+            assert_eq!(sr.as_str(), "");
+        }
+    }
+
+    #[test]
     fn test_ctoken_layout() {
         // Verify CToken has expected size and alignment for C interop
-        // On 64-bit systems: 3*u32 + padding + pointer + 2*u32 = 32 bytes
-        // On 32-bit systems: 5*u32 + pointer = 24 bytes
+        // CToken: 4*u32 + CStringRef (pointer + u32)
         let expected_size = if mem::size_of::<*const c_char>() == 8 {
-            32 // 64-bit: includes padding before pointer
+            32 // 64-bit: 4*4 + 8 + 4 + padding = 32
         } else {
-            24 // 32-bit: no padding needed
+            24 // 32-bit: 4*4 + 4 + 4 = 24
         };
         assert_eq!(mem::size_of::<CToken>(), expected_size);
 
@@ -107,8 +164,8 @@ mod tests {
         assert_eq!(token.offset_from, 0);
         assert_eq!(token.offset_to, 0);
         assert_eq!(token.position, 0);
-        assert!(token.text.is_null());
-        assert_eq!(token.text_length, 0);
         assert_eq!(token.position_length, 1);
+        assert!(token.text.data.is_null());
+        assert_eq!(token.text.length, 0);
     }
 }

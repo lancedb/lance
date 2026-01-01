@@ -12,8 +12,12 @@ extern "C" {
 
 #define LANCE_TOKENIZER_PLUGIN_API_VERSION 1
 
-/// The `text` pointer is valid only until the next call to `next_token()`
-/// or `destroy_stream()`. Callers should copy the text if needed.
+/// A reference to a UTF-8 string. This provides a zero-copy way to pass strings between Rust and C.
+typedef struct LanceStringRef {
+    const char* data;
+    uint32_t length;
+} LanceStringRef;
+
 typedef struct LanceToken {
     /// Start and end byte offsets in the original text (UTF-8)
     uint32_t offset_from;
@@ -23,10 +27,18 @@ typedef struct LanceToken {
     uint32_t position;
     uint32_t position_length;
 
-    /// Pointer to the token text (null-terminated UTF-8)
-    /// Valid until next `next_token()` or `destroy_stream()` call
-    const char* text;
-    uint32_t text_length;
+    /// Token text.
+    ///
+    /// Plugins may return either:
+    /// - A slice of the original input text (zero-copy)
+    /// - A pointer to stream-owned scratch memory
+    ///
+    /// The pointer must remain valid until the next next_token() call
+    /// or destroy_stream(), whichever comes first.
+    ///
+    /// Note: Lance copies the text immediately after each next_token() call,
+    ///       so plugins may safely reuse internal buffers.
+    LanceStringRef text;
 } LanceToken;
 
 typedef struct LanceTokenizerFactory LanceTokenizerFactory;
@@ -38,10 +50,9 @@ typedef struct LanceTokenizerPlugin {
 
     /// Create a tokenizer factory with the given JSON configuration.
     ///
-    /// @param config_json JSON configuration string (UTF-8, null-terminated)
-    /// @param config_len Length of config_json in bytes (not including null terminator)
+    /// @param config JSON configuration string (UTF-8)
     /// @return Factory handle, or NULL on error (call get_error for details)
-    LanceTokenizerFactory* (*create_factory)(const char* config_json, uint32_t config_len);
+    LanceTokenizerFactory* (*create_factory)(LanceStringRef config);
 
     /// Destroy a factory and free its resources.
     ///
@@ -64,10 +75,9 @@ typedef struct LanceTokenizerPlugin {
     /// The stream must be destroyed before creating another stream from the same tokenizer.
     ///
     /// @param tokenizer Tokenizer handle
-    /// @param text Text to tokenize (UTF-8, not necessarily null-terminated)
-    /// @param text_length Length of text in bytes
+    /// @param text Text to tokenize (UTF-8)
     /// @return Stream handle, or NULL on error (call get_error for details)
-    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, const char* text, uint32_t text_length);
+    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, LanceStringRef text);
 
     /// Destroy a token stream and free its resources.
     ///
