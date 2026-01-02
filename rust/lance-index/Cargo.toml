@@ -87,6 +87,7 @@ lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
+serial_test = "3"
 
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]

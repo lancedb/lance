@@ -327,3 +327,10 @@ pub extern "C" fn lance_tokenizer_get_plugin() -> *const LanceTokenizerPlugin {
 pub extern "C" fn lance_test_get_factory_create_count() -> u32 {
     FACTORY_CREATE_COUNT.load(Ordering::SeqCst) as u32
 }
+
+/// Reset the factory create counter to zero.
+/// Used for testing factory caching behavior.
+#[no_mangle]
+pub extern "C" fn lance_test_reset_factory_create_count() {
+    FACTORY_CREATE_COUNT.store(0, Ordering::SeqCst);
+}

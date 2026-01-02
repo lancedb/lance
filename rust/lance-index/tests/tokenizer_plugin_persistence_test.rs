@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use serial_test::serial;
 use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -64,6 +65,7 @@ fn tokenize(tokenizer: &mut Box<dyn LanceTokenizer>, text: &str) -> Vec<String> 
 /// 2. Plugin settings are deserialized from protobuf
 /// 3. The restored tokenizer behaves identically to the original
 #[test]
+#[serial(plugin_tests)]
 fn test_tokenizer_plugin_config_preserved_after_protobuf_roundtrip() {
     use lance_index::pbold::InvertedIndexDetails;
 
@@ -138,6 +140,7 @@ fn test_tokenizer_plugin_config_preserved_after_protobuf_roundtrip() {
 /// This verifies that search will work correctly after reopening an index
 /// created with a plugin tokenizer.
 #[test]
+#[serial(plugin_tests)]
 fn test_tokens_match_after_reopen_with_plugin() {
     use lance_index::pbold::InvertedIndexDetails;
 
@@ -183,6 +186,7 @@ fn test_tokens_match_after_reopen_with_plugin() {
 
 /// Verify that protobuf schema has fields for plugin configuration.
 #[test]
+#[serial(plugin_tests)]
 fn test_protobuf_schema_has_plugin_fields() {
     use lance_index::pbold::InvertedIndexDetails;
 
@@ -218,6 +222,7 @@ fn test_protobuf_schema_has_plugin_fields() {
 
 /// Test backward compatibility: old indexes without plugin fields should work.
 #[test]
+#[serial(plugin_tests)]
 fn test_backward_compatibility_no_plugin_fields() {
     use lance_index::pbold::InvertedIndexDetails;
 
@@ -256,6 +261,7 @@ fn test_backward_compatibility_no_plugin_fields() {
 
 /// Test that missing plugin config causes an error.
 #[test]
+#[serial(plugin_tests)]
 fn test_plugin_requires_config() {
     use lance_index::pbold::InvertedIndexDetails;
 
