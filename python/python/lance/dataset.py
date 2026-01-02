@@ -720,7 +720,8 @@ class LanceDataset(pa.dataset.Dataset):
                     "k": 10,
                     "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
-                    "refine_factor": 1
+                    "refine_factor": 1,
+                    "distance_range": (0.0, 1.0),
                 }
 
         batch_size: int, default None
@@ -4690,7 +4691,44 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
+        """Configure nearest neighbor search.
+
+        Parameters
+        ----------
+        column: str
+            The name of the vector column to search.
+        q: QueryVectorLike
+            The query vector.
+        k: int, optional
+            The number of nearest neighbors to return.
+        metric: str, optional
+            The distance metric to use (e.g., "L2", "cosine", "dot", "hamming").
+        nprobes: int, optional
+            The number of partitions to search. Sets both minimum_nprobes and
+            maximum_nprobes to the same value.
+        minimum_nprobes: int, optional
+            The minimum number of partitions to search.
+        maximum_nprobes: int, optional
+            The maximum number of partitions to search.
+        refine_factor: int, optional
+            The refine factor for the search.
+        use_index: bool, default True
+            Whether to use the index for the search.
+        ef: int, optional
+            The ef parameter for HNSW search.
+        distance_range: tuple[Optional[float], Optional[float]], optional
+            A tuple of (lower_bound, upper_bound) to filter results by distance.
+            Both bounds are optional. The lower bound is inclusive and the upper
+            bound is exclusive, so (0.0, 1.0) keeps distances d where
+            0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+
+        Returns
+        -------
+        ScannerBuilder
+            The scanner builder for method chaining.
+        """
         q, q_dim = _coerce_query_vector(q)
 
         lance_field = self.ds._ds.lance_schema.field_case_insensitive(column)
@@ -4747,6 +4785,13 @@ class ScannerBuilder:
             # `ef` should be >= `k`, but `k` could be None so we can't check it here
             # the rust code will check it
             raise ValueError(f"ef must be > 0 but got {ef}")
+
+        if distance_range is not None:
+            if len(distance_range) != 2:
+                raise ValueError(
+                    "distance_range must be a tuple of (lower_bound, upper_bound)"
+                )
+
         self._nearest = {
             "column": column,
             "q": q,
@@ -4757,6 +4802,7 @@ class ScannerBuilder:
             "refine_factor": refine_factor,
             "use_index": use_index,
             "ef": ef,
+            "distance_range": distance_range,
         }
         return self
 

@@ -63,7 +63,7 @@ lance-io = { version = "=2.0.0-beta.4", path = "./rust/lance-io", default-featur
 lance-linalg = { version = "=2.0.0-beta.4", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=2.0.0-beta.4", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=2.0.0-beta.4", path = "./rust/lance-namespace-impls" }
-lance-namespace-reqwest-client = "0.4.0"
+lance-namespace-reqwest-client = "=0.4.0"
 lance-table = { version = "=2.0.0-beta.4", path = "./rust/lance-table" }
 lance-test-macros = { version = "=2.0.0-beta.4", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=2.0.0-beta.4", path = "./rust/lance-testing" }

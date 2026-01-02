@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::sync::Arc;
 
-use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
+use super::{scale_to_u8, ScalarQuantizer};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
     vector::{
@@ -387,17 +387,24 @@ impl VectorStore for ScalarQuantizationStorage {
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let (offset, chunk) = self.chunk(id);
         let query_sq_code = chunk.sq_code_slice(id - offset).to_vec();
+        let bounds = self.quantizer.bounds();
         SQDistCalculator {
             query_sq_code,
-            bounds: self.quantizer.bounds(),
+            scale: sq_distance_scale(&bounds),
             storage: self,
         }
     }
 }
 
+#[inline]
+fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
+    let range = (bounds.end - bounds.start) as f32;
+    (range * range) / (255.0_f32 * 255.0_f32)
+}
+
 pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
-    bounds: Range<f64>,
+    scale: f32,
     storage: &'a ScalarQuantizationStorage,
 }
 
@@ -423,7 +430,7 @@ impl<'a> SQDistCalculator<'a> {
         };
         Self {
             query_sq_code,
-            bounds,
+            scale: sq_distance_scale(&bounds),
             storage,
         }
     }
@@ -440,29 +447,35 @@ impl DistCalculator for SQDistCalculator<'_> {
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         };
-        inverse_scalar_dist(std::iter::once(dist), &self.bounds)[0]
+        dist * self.scale
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
         match self.storage.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => inverse_scalar_dist(
-                self.storage.chunks.iter().flat_map(|c| {
+            DistanceType::L2 | DistanceType::Cosine => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
                         .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
-                }),
-                &self.bounds,
-            ),
-            DistanceType::Dot => inverse_scalar_dist(
-                self.storage.chunks.iter().flat_map(|c| {
+                })
+                .map(|dist| dist * self.scale)
+                .collect(),
+            DistanceType::Dot => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
                         .map(|sq_codes| dot_distance(sq_codes, &self.query_sq_code))
-                }),
-                &self.bounds,
-            ),
+                })
+                .map(|dist| dist * self.scale)
+                .collect(),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         }
     }

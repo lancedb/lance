@@ -669,7 +669,7 @@ pub async fn auto_cleanup_hook(
             }
         };
 
-        if manifest.version % interval != 0 {
+        if interval != 0 && manifest.version % interval != 0 {
             return Ok(None);
         }
     } else {
@@ -1345,6 +1345,15 @@ mod tests {
         assert_eq!(removed.old_versions, 1);
     }
 
+    // Helper function to check that the number of files is correct.
+    async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
+        let file_count = fixture.count_files().await.unwrap();
+
+        assert_eq!(file_count.num_data_files, num_expected_files);
+        assert_eq!(file_count.num_manifest_files, num_expected_files);
+        assert_eq!(file_count.num_tx_files, num_expected_files);
+    }
+
     #[tokio::test]
     async fn auto_cleanup_old_versions() {
         // Every n commits, all versions older than T should be deleted.
@@ -1370,15 +1379,6 @@ mod tests {
             parse_duration(dataset_config.get("lance.auto_cleanup.older_than").unwrap()).unwrap(),
         )
         .unwrap();
-
-        // Helper function to check that the number of files is correct.
-        async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
-            let file_count = fixture.count_files().await.unwrap();
-
-            assert_eq!(file_count.num_data_files, num_expected_files);
-            assert_eq!(file_count.num_manifest_files, num_expected_files);
-            assert_eq!(file_count.num_tx_files, num_expected_files);
-        }
 
         // First, write many files within the "older_than" window. Check that
         // no files are automatically cleaned up.
@@ -1439,6 +1439,40 @@ mod tests {
             fixture.overwrite_some_data().await.unwrap();
             check_num_files(&fixture, num_expected_files).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_auto_cleanup_interval_zero() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        check_num_files(&fixture, 3).await;
+
+        let mut dataset = fixture.open().await.unwrap();
+        let mut config_updates = HashMap::new();
+        config_updates.insert(
+            "lance.auto_cleanup.interval".to_string(),
+            Some("0".to_string()),
+        );
+        config_updates.insert(
+            "lance.auto_cleanup.retain_versions".to_string(),
+            Some("1".to_string()),
+        );
+        dataset
+            .update_config(config_updates)
+            .replace()
+            .await
+            .unwrap();
+
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        // The last version before the new commit is retained, means we have 2 versions to assert
+        check_num_files(&fixture, 2).await;
+
+        fixture.overwrite_some_data().await.unwrap();
+        check_num_files(&fixture, 2).await;
     }
 
     #[tokio::test]

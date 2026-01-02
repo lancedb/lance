@@ -1080,6 +1080,37 @@ impl Dataset {
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
+            let distance_range: Option<(Option<f32>, Option<f32>)> =
+                if let Some(dr) = nearest.get_item("distance_range")? {
+                    if dr.is_none() {
+                        None
+                    } else {
+                        let tuple = dr
+                            .downcast::<PyTuple>()
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                        if tuple.len() != 2 {
+                            return Err(PyValueError::new_err(
+                                "distance_range must be a tuple of (lower_bound, upper_bound)",
+                            ));
+                        }
+                        let lower_any = tuple.get_item(0)?;
+                        let lower = if lower_any.is_none() {
+                            None
+                        } else {
+                            Some(lower_any.extract()?)
+                        };
+                        let upper_any = tuple.get_item(1)?;
+                        let upper = if upper_any.is_none() {
+                            None
+                        } else {
+                            Some(upper_any.extract()?)
+                        };
+                        Some((lower, upper))
+                    }
+                } else {
+                    None
+                };
+
             scanner
                 .map(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
@@ -1096,6 +1127,9 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s.use_index(use_index);
+                    if let Some((lower, upper)) = distance_range {
+                        s.distance_range(lower, upper);
+                    }
                     s
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

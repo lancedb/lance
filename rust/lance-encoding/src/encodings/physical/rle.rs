@@ -960,19 +960,43 @@ mod tests {
         );
         metadata_explicit.insert("lance-encoding:bss".to_string(), "off".to_string());
 
-        let mut generator = RleDataGenerator::new(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+        let mut generator = RleDataGenerator::new(vec![
+            i32::MIN,
+            i32::MIN,
+            i32::MIN,
+            i32::MIN,
+            i32::MIN + 1,
+            i32::MIN + 1,
+            i32::MIN + 1,
+            i32::MIN + 1,
+            i32::MIN + 2,
+            i32::MIN + 2,
+            i32::MIN + 2,
+            i32::MIN + 2,
+        ]);
         let data_explicit = generator.generate_default(RowCount::from(10000)).unwrap();
         check_round_trip_encoding_of_data(vec![data_explicit], &test_cases, metadata_explicit)
             .await;
 
         // 2. Test automatic RLE selection based on data characteristics
-        // 80% repetition should trigger RLE (> default 50% threshold)
+        // 80% repetition should trigger RLE (> default 50% threshold).
+        //
+        // Use values with the high bit set so bitpacking can't shrink the values.
         // Explicitly disable BSS to ensure RLE is tested
         let mut metadata = HashMap::new();
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
 
-        let mut values = vec![42i32; 8000]; // 80% repetition
-        values.extend([1i32, 2i32, 3i32, 4i32, 5i32].repeat(400)); // 20% variety
+        let mut values = vec![i32::MIN; 8000]; // 80% repetition
+        values.extend(
+            [
+                i32::MIN + 1,
+                i32::MIN + 2,
+                i32::MIN + 3,
+                i32::MIN + 4,
+                i32::MIN + 5,
+            ]
+            .repeat(400),
+        ); // 20% variety
         let arr = Arc::new(Int32Array::from(values)) as Arc<dyn Array>;
         check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
