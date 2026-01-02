@@ -370,11 +370,13 @@ impl InvertedIndexParams {
 
     /// Set a tokenizer plugin to use.
     /// `library_path` is path to the plugin shared library (.so, .dylib, or .dll)
-    /// `config` is optional configuration string for the plugin (format defined by plugin)
-    pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
+    /// `config` is the configuration string for the plugin (format defined by plugin).
+    /// This is required because the "empty" representation varies by format
+    /// (e.g., "{}" for JSON, "" for plain text).
+    pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(library_path);
-        self.tokenizer_plugin_config = config;
+        self.tokenizer_plugin_config = Some(config);
         self
     }
 
@@ -494,6 +496,13 @@ impl InvertedIndexParams {
                 )
             })?;
 
+            let config = self.tokenizer_plugin_config.as_ref().ok_or_else(|| {
+                Error::invalid_input(
+                    "base_tokenizer is 'plugin' but tokenizer_plugin_config is not set.",
+                    location!(),
+                )
+            })?;
+
             // Check if the plugin file exists before attempting to load
             let path = Path::new(plugin_path);
             if !path.exists() {
@@ -507,7 +516,6 @@ impl InvertedIndexParams {
                 ));
             }
 
-            let config = self.tokenizer_plugin_config.as_deref().unwrap_or("{}");
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
             Ok(Box::new(tokenizer))
         }

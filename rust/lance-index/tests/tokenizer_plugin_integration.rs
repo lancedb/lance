@@ -215,7 +215,7 @@ fn test_inverted_index_params_with_plugin() {
 
     let params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
-        Some(r#"{"lowercase": true}"#.to_string()),
+        r#"{"lowercase": true}"#.to_string(),
     );
 
     let mut tokenizer = params
@@ -377,7 +377,7 @@ fn test_plugin_error_with_inverted_index_params() {
     // Test error propagation through InvertedIndexParams interface
     let params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
-        Some(r#"{"error_after_n_tokens": 1}"#.to_string()),
+        r#"{"error_after_n_tokens": 1}"#.to_string(),
     );
 
     let mut tokenizer = params
@@ -504,7 +504,7 @@ fn test_plugin_multithread_with_lance_tokenizer_trait() {
         Box::new(PluginTokenizer::new(&plugin_path, r#"{"lowercase": true}"#).unwrap());
 
     let handles: Vec<_> = (0..4)
-        .map(|| {
+        .map(|_| {
             // Clone using the trait method
             let mut thread_tokenizer = tokenizer.box_clone();
             thread::spawn(move || {

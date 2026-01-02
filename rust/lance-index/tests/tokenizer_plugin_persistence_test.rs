@@ -72,7 +72,7 @@ fn test_tokenizer_plugin_config_preserved_after_protobuf_roundtrip() {
     // Step 1: Create params with plugin (lowercase enabled)
     let original_params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
-        Some(r#"{"lowercase": true}"#.to_string()),
+        r#"{"lowercase": true}"#.to_string(),
     );
 
     // Verify original params work correctly with plugin
@@ -146,7 +146,7 @@ fn test_tokens_match_after_reopen_with_plugin() {
     // Create params with plugin that does NOT lowercase
     let original_params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
-        Some(r#"{"lowercase": false}"#.to_string()),
+        r#"{"lowercase": false}"#.to_string(),
     );
 
     // Index document with plugin tokenizer (preserves case)
@@ -191,7 +191,7 @@ fn test_protobuf_schema_has_plugin_fields() {
     // Create params with plugin
     let params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
-        Some(r#"{"mode": "test"}"#.to_string()),
+        r#"{"mode": "test"}"#.to_string(),
     );
 
     // Convert to protobuf
@@ -254,16 +254,16 @@ fn test_backward_compatibility_no_plugin_fields() {
     );
 }
 
-/// Test that empty plugin config is handled correctly.
+/// Test that missing plugin config causes an error.
 #[test]
-fn test_plugin_with_empty_config() {
+fn test_plugin_requires_config() {
     use lance_index::pbold::InvertedIndexDetails;
 
     let plugin_path = get_plugin_path();
 
-    // Create params with plugin but no config
-    let original_params =
-        InvertedIndexParams::default().plugin(plugin_path.to_string_lossy().to_string(), None);
+    // Create params with plugin and explicit empty JSON config
+    let original_params = InvertedIndexParams::default()
+        .plugin(plugin_path.to_string_lossy().to_string(), "{}".to_string());
 
     // Roundtrip through protobuf
     let proto: InvertedIndexDetails = (&original_params)
@@ -271,14 +271,35 @@ fn test_plugin_with_empty_config() {
         .expect("Failed to convert to protobuf");
 
     assert!(proto.tokenizer_plugin_library.is_some());
-    assert!(proto.tokenizer_plugin_config.is_none());
+    assert_eq!(proto.tokenizer_plugin_config, Some("{}".to_string()));
 
     let restored_params: InvertedIndexParams = (&proto)
         .try_into()
         .expect("Failed to convert from protobuf");
 
-    // Should work with empty config (plugin uses defaults)
+    // Should work with explicit empty JSON config
     let mut tokenizer = restored_params.build().expect("Failed to build tokenizer");
     let tokens = tokenize(&mut tokenizer, "Hello World");
     assert_eq!(tokens, vec!["Hello", "World"]);
+
+    // Test that missing config causes an error (construct via proto)
+    let proto_without_config = InvertedIndexDetails {
+        base_tokenizer: Some("plugin".to_string()),
+        language: r#""English""#.to_string(), // Required field
+        tokenizer_plugin_library: Some(plugin_path.to_string_lossy().to_string()),
+        tokenizer_plugin_config: None,
+        ..Default::default()
+    };
+    let params_without_config: InvertedIndexParams = (&proto_without_config)
+        .try_into()
+        .expect("Failed to convert from protobuf");
+    let result = params_without_config.build();
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string()
+            .contains("tokenizer_plugin_config is not set"),
+        "Expected error about missing config, got: {}",
+        err
+    );
 }

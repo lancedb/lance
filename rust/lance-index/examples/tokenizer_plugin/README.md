@@ -52,7 +52,7 @@ use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 let params = InvertedIndexParams::default()
     .plugin(
         "/path/to/libmy_tokenizer.so".to_string(),
-        Some(r#"{"lowercase": true}"#.to_string()),
+        r#"{"lowercase": true}"#.to_string(),
     );
 
 // Use params when creating an inverted index

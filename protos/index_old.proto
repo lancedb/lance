@@ -39,6 +39,17 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
+  // Path to a tokenizer plugin shared library (.so on Linux, .dylib on macOS, .dll on Windows).
+  // The path can be absolute or relative to the current working directory.
+  // If the library cannot be loaded (file not found, missing symbols, API version mismatch, etc.),
+  // index creation and queries will fail with an error.
+  // The plugin must implement the Lance tokenizer plugin C ABI interface defined in include/lance_tokenizer_plugin.h.
+  // When this field is set, base_tokenizer should be set to "plugin".
   optional string tokenizer_plugin_library = 12;
+
+  // Configuration string passed to the tokenizer plugin when creating a factory.
+  // The format is defined by the plugin implementation (e.g., JSON, YAML).
+  // This field is REQUIRED when tokenizer_plugin_library is set, because the
+  // representation of "empty" config varies by serialization format (e.g., "{}" for JSON, "" for plain text).
   optional string tokenizer_plugin_config = 13;
 }
