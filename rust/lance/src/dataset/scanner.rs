@@ -3035,32 +3035,47 @@ impl Scanner {
             Arc::new(vec![])
         };
         // Find an index for the column and check if metric is compatible
-        let matching_index =
-            if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
-                let idx = self
-                    .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                let index_metric = idx.metric_type();
+        let matching_index = if let Some(index) =
+            indices.iter().find(|i| i.fields.contains(&column_id))
+        {
+            // TODO: Once we do https://github.com/lance-format/lance/issues/5231, we
+            // should be able to get the metric type directly from the index metadata,
+            // at least for newer indexes.
+            let idx = self
+                .dataset
+                .open_vector_index(
+                    q.column.as_str(),
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            let index_metric = idx.metric_type();
 
-                // Check if user's requested metric is compatible with index
-                let use_this_index = match q.metric_type {
-                    Some(user_metric) => user_metric == index_metric,
-                    None => true, // No preference, use index's metric
-                };
-
-                if use_this_index {
-                    Some((index, idx, index_metric))
-                } else {
-                    None
+            // Check if user's requested metric is compatible with index
+            let use_this_index = match q.metric_type {
+                Some(user_metric) => {
+                    if user_metric == index_metric {
+                        true
+                    } else {
+                        log::warn!(
+                            "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
+                            user_metric,
+                            index_metric
+                        );
+                        false
+                    }
                 }
+                None => true, // No preference, use index's metric
+            };
+
+            if use_this_index {
+                Some((index, idx, index_metric))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         if let Some((index, _idx, index_metric)) = matching_index {
             log::trace!("index found for vector search");
