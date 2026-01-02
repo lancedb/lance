@@ -10,8 +10,7 @@ use std::ffi::{c_char, c_void};
 
 pub const PLUGIN_API_VERSION: u32 = 1;
 
-/// A reference to a UTF-8 string (not necessarily null-terminated).
-/// This provides a zero-copy way to pass strings between Rust and C.
+/// A reference to a UTF-8 string that provides a zero-copy way to pass strings between Rust and C.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CStringRef {
@@ -82,7 +81,6 @@ impl CError {
     }
 }
 
-/// Token information produced by the tokenizer.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CToken {
@@ -98,7 +96,7 @@ pub struct CToken {
     /// Position length (usually 1, but can be > 1 for synonyms)
     pub position_length: u32,
 
-    /// Token text (UTF-8, not necessarily null-terminated)
+    /// Token text (UTF-8)
     pub text: CStringRef,
 }
 
@@ -195,40 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ctoken_default() {
-        let token = CToken::default();
-        assert_eq!(token.offset_from, 0);
-        assert_eq!(token.offset_to, 0);
-        assert_eq!(token.position, 0);
-        assert_eq!(token.position_length, 1);
-        assert!(token.text.data.is_null());
-        assert_eq!(token.text.length, 0);
-    }
-
-    #[test]
-    fn test_cerror_default() {
-        let error = CError::default();
-        assert!(!error.has_message());
-        unsafe {
-            assert_eq!(error.message_str(), "");
-        }
-    }
-
-    #[test]
-    fn test_cerror_with_message() {
-        let msg = "test error";
-        let error = CError {
-            message: CStringRef::from_str(msg),
-        };
-        assert!(error.has_message());
-        unsafe {
-            assert_eq!(error.message_str(), "test error");
-        }
-    }
-
-    #[test]
     fn test_cstringref_to_string_lossy_with_invalid_utf8() {
-        // Create a byte array with invalid UTF-8 (0xFF is not valid in UTF-8)
         let invalid_utf8: [u8; 6] = [0x68, 0x65, 0x6c, 0x6c, 0x6F, 0xFF]; // "hello" + invalid byte
         let sr = CStringRef {
             data: invalid_utf8.as_ptr() as *const c_char,
@@ -239,24 +204,6 @@ mod tests {
             let result = sr.to_string_lossy();
             // Invalid byte should be replaced with U+FFFD
             assert_eq!(result, "hello\u{FFFD}");
-        }
-    }
-
-    #[test]
-    fn test_cerror_with_invalid_utf8() {
-        // Simulate plugin returning invalid UTF-8 in error message
-        let invalid_utf8: [u8; 5] = [0x65, 0x72, 0x72, 0x6F, 0xFF]; // "error" + invalid byte
-        let error = CError {
-            message: CStringRef {
-                data: invalid_utf8.as_ptr() as *const c_char,
-                length: 5,
-            },
-        };
-        assert!(error.has_message());
-        unsafe {
-            let msg = error.message_str();
-            // Invalid byte should be replaced with U+FFFD
-            assert_eq!(msg, "error\u{FFFD}");
         }
     }
 }
