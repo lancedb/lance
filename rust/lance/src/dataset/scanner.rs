@@ -79,8 +79,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{
-    default_distance_type_for, get_vector_dim, get_vector_type, is_distance_type_supported_for,
-    validate_distance_type_for,
+    default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -3050,13 +3049,7 @@ impl Scanner {
 
                 // Check if user's requested metric is compatible with index
                 let use_this_index = match q.metric_type {
-                    Some(user_metric) => {
-                        // Use index if metrics match, OR if user's metric is invalid for
-                        // this data type (e.g., L2 on binary vectors). In the latter case,
-                        // there's no valid flat search option, so use the index.
-                        user_metric == index_metric
-                            || !is_distance_type_supported_for(user_metric, &element_type)
-                    }
+                    Some(user_metric) => user_metric == index_metric,
                     None => true, // No preference, use index's metric
                 };
 
