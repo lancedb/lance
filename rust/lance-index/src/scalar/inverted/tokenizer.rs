@@ -484,6 +484,8 @@ impl InvertedIndexParams {
     fn build_plugin_tokenizer(&self) -> Result<Box<dyn LanceTokenizer>> {
         #[cfg(feature = "tokenizer-plugin")]
         {
+            use std::path::Path;
+
             use plugin::PluginTokenizer;
 
             let plugin_path = self.tokenizer_plugin_library.as_ref().ok_or_else(|| {
@@ -491,6 +493,20 @@ impl InvertedIndexParams {
                     "base_tokenizer is 'plugin' but tokenizer_plugin_library is not set",
                 )
             })?;
+
+            // Check if the plugin file exists before attempting to load
+            let path = Path::new(plugin_path);
+            if !path.exists() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "tokenizer plugin library not found: {:?}. \
+                         Please ensure the file exists and the path is correct.",
+                        plugin_path
+                    ),
+                    location!(),
+                ));
+            }
+
             let config = self.tokenizer_plugin_config.as_deref().unwrap_or("{}");
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
             Ok(Box::new(tokenizer))
