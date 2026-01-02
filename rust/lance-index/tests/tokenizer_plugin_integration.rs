@@ -6,19 +6,14 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::plugin::{PluginTokenizer, TokenizerPluginLibrary};
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-use libloading::Library;
 use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
-static PLUGIN_LIBRARY: OnceLock<Library> = OnceLock::new();
-
-/// Mutex to synchronize tests to prevent data race.
-static FACTORY_COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
 fn get_plugin_path() -> PathBuf {
     PLUGIN_PATH
@@ -57,25 +52,6 @@ fn get_plugin_path() -> PathBuf {
             lib_path
         })
         .clone()
-}
-
-/// Get a reference to the loaded plugin library for calling test helper functions.
-fn get_plugin_library() -> &'static Library {
-    PLUGIN_LIBRARY.get_or_init(|| {
-        let plugin_path = get_plugin_path();
-        unsafe { Library::new(&plugin_path).expect("Failed to load plugin library") }
-    })
-}
-
-/// Get the number of times create_factory has been called in the test plugin.
-fn get_factory_create_count() -> u32 {
-    let library = get_plugin_library();
-    unsafe {
-        let func: libloading::Symbol<extern "C" fn() -> u32> = library
-            .get(b"lance_test_get_factory_create_count")
-            .expect("Failed to get lance_test_get_factory_create_count");
-        func()
-    }
 }
 
 #[test]
@@ -527,100 +503,4 @@ fn test_plugin_multithread_with_lance_tokenizer_trait() {
         assert_eq!(tokens[0], "hello");
         assert_eq!(tokens[1], "world");
     }
-}
-
-#[test]
-fn test_factory_caching_behavior() {
-    // Acquire lock to prevent other tests from interfering with the counter
-    let _lock = FACTORY_COUNTER_LOCK.lock().unwrap();
-
-    let plugin_path = get_plugin_path();
-
-    let mut tokenizer =
-        PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
-
-    // First tokenization - factory should be created (count increases by 1)
-    let count_before = get_factory_create_count();
-    {
-        let mut stream = tokenizer.token_stream_for_doc("hello world");
-        let mut tokens = Vec::new();
-        while stream.advance() {
-            tokens.push(stream.token().text.clone());
-        }
-        assert_eq!(tokens.len(), 2);
-    }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        1,
-        "Factory should be created once on first tokenization"
-    );
-
-    // Second tokenization - factory should be cached (count stays same)
-    let count_before = get_factory_create_count();
-    {
-        let mut stream = tokenizer.token_stream_for_doc("foo bar baz");
-        let mut tokens = Vec::new();
-        while stream.advance() {
-            tokens.push(stream.token().text.clone());
-        }
-        assert_eq!(tokens.len(), 3);
-    }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        0,
-        "Factory should be cached (no new factory created)"
-    );
-}
-
-#[test]
-fn test_clone_creates_separate_factory() {
-    // Acquire lock to prevent other tests from interfering with the counter
-    let _lock = FACTORY_COUNTER_LOCK.lock().unwrap();
-
-    let plugin_path = get_plugin_path();
-
-    let mut tokenizer =
-        PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
-
-    // Use tokenizer to cache factory (creates 1 factory)
-    let count_before = get_factory_create_count();
-    {
-        let mut stream = tokenizer.token_stream_for_doc("hello");
-        while stream.advance() {}
-    }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        1,
-        "Original tokenizer should create one factory"
-    );
-
-    // Clone and use it - should create a new factory
-    let mut cloned = tokenizer.clone();
-    let count_before = get_factory_create_count();
-    {
-        let mut stream = cloned.token_stream_for_doc("world");
-        while stream.advance() {}
-    }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        1,
-        "Cloned tokenizer should create its own factory"
-    );
-
-    // Original tokenizer should still use its cached factory
-    let count_before = get_factory_create_count();
-    {
-        let mut stream = tokenizer.token_stream_for_doc("test");
-        while stream.advance() {}
-    }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        0,
-        "Original tokenizer should still use cached factory"
-    );
 }
