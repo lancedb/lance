@@ -6,7 +6,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::plugin::{PluginTokenizer, TokenizerPluginLibrary};
@@ -16,6 +16,9 @@ use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PLUGIN_LIBRARY: OnceLock<Library> = OnceLock::new();
+
+/// Mutex to synchronize tests to prevent data race.
+static FACTORY_COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
 fn get_plugin_path() -> PathBuf {
     PLUGIN_PATH
@@ -528,6 +531,9 @@ fn test_plugin_multithread_with_lance_tokenizer_trait() {
 
 #[test]
 fn test_factory_caching_behavior() {
+    // Acquire lock to prevent other tests from interfering with the counter
+    let _lock = FACTORY_COUNTER_LOCK.lock().unwrap();
+
     let plugin_path = get_plugin_path();
 
     let mut tokenizer =
@@ -570,6 +576,9 @@ fn test_factory_caching_behavior() {
 
 #[test]
 fn test_clone_creates_separate_factory() {
+    // Acquire lock to prevent other tests from interfering with the counter
+    let _lock = FACTORY_COUNTER_LOCK.lock().unwrap();
+
     let plugin_path = get_plugin_path();
 
     let mut tokenizer =
