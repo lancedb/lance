@@ -45,10 +45,19 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
     scanner.project(&[path])?;
     let mut stream = scanner.try_into_stream().await?;
     while let Some(batch) = stream.try_next().await? {
-        let col = batch.column_by_name(path).ok_or_else(|| Error::Internal {
-            message: format!("Validation scan did not contain expected column {}", path),
-            location: location!(),
-        })?;
+        // `path` can be a nested path (e.g. "b.c") which will not be found by
+        // `RecordBatch::column_by_name`. We project exactly one column and validate it directly.
+        if batch.num_columns() != 1 {
+            return Err(Error::Internal {
+                message: format!(
+                    "Expected exactly one column in validation scan for {}, got {}",
+                    path,
+                    batch.num_columns()
+                ),
+                location: location!(),
+            });
+        }
+        let col = batch.column(0);
         if col.null_count() > 0 {
             return Err(Error::invalid_input(
                 format!(
@@ -1637,6 +1646,66 @@ mod test {
 
     #[rstest]
     #[tokio::test]
+    async fn test_set_not_null_succeeds_nested(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::{ArrayRef, StructArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            )]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let original_fragments = dataset.fragments().to_vec();
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+            .await?;
+        dataset.validate().await?;
+
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "c",
+                    DataType::Int32,
+                    false
+                )])),
+                false
+            )])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_set_not_null_fails_with_nulls(
         #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
     ) -> Result<()> {
@@ -1670,6 +1739,63 @@ mod test {
         assert_eq!(
             &ArrowSchema::from(dataset.schema()),
             &ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_set_not_null_fails_with_nulls_nested(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::{ArrayRef, StructArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+            )]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("contains NULL values"));
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "c",
+                    DataType::Int32,
+                    true
+                )])),
+                false
+            )])
         );
 
         Ok(())
