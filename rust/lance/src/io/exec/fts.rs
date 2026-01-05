@@ -20,7 +20,7 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, PARTS_SEARCHED_METRIC};
+use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, PARTITIONS_SEARCHED_METRIC};
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 
 use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
@@ -42,7 +42,7 @@ use tracing::instrument;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
-    parts_searched: Count,
+    partitions_searched: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -50,13 +50,13 @@ impl FtsIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
-            parts_searched: metrics.new_count(PARTS_SEARCHED_METRIC, partition),
+            partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
-        self.parts_searched.add(num_parts);
+        self.partitions_searched.add(num_parts);
     }
 }
 
@@ -1143,7 +1143,7 @@ pub mod tests {
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::datagen::DatafusionDatagenExt;
-    use lance_datafusion::utils::PARTS_SEARCHED_METRIC;
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::scalar::inverted::query::{
         BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
@@ -1315,7 +1315,7 @@ pub mod tests {
         let stats = stats_holder.consume();
         let parts_searched = stats
             .all_counts
-            .get(PARTS_SEARCHED_METRIC)
+            .get(PARTITIONS_SEARCHED_METRIC)
             .copied()
             .unwrap_or_default();
         assert_eq!(parts_searched, expected_parts);
@@ -1328,6 +1328,6 @@ pub mod tests {
             .full_text_search(FullTextSearchQuery::new("hello".to_string()))
             .unwrap();
         let analysis = analyze_scanner.analyze_plan().await.unwrap();
-        assert!(analysis.contains(PARTS_SEARCHED_METRIC));
+        assert!(analysis.contains(PARTITIONS_SEARCHED_METRIC));
     }
 }
