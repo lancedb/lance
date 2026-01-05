@@ -1832,6 +1832,15 @@ impl Dataset {
             .collect()
     }
 
+    pub async fn prune_fragments(&self, filter: &str) -> Result<Fragment> {
+        let frag_ids = Scanner::scalar_indexed_prune_fragments(
+            Arc::new(self.clone()),
+            filter,
+            self.manifest.fragments.clone(),
+        ).await?;
+        Ok(frag_ids)
+    }
+
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
         let dataset = Arc::new(self.clone());
         let fragment = self

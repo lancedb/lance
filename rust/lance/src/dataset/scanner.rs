@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -3969,6 +3970,48 @@ impl Scanner {
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))
+    }
+
+    pub async fn scalar_indexed_prune_fragments(
+        dataset: Arc<Dataset>,
+        filter: &str,
+        fragments: Arc<Vec<Fragment>>) -> Result<Vec<Fragment>> {
+        let mut scanner = Scanner::new(dataset.clone()).filter(filter)?;
+
+        let filter_plan = scanner.create_filter_plan(true).await?;
+
+        if let Some(index_expr) = filter_plan.expr_filter_plan.index_query.as_ref() {
+            // Figure out which fragments are covered by ALL indices
+            let (_, missing_frags) = scanner
+                .partition_frags_by_coverage(index_expr, fragments)
+                .await?;
+
+            // Evaluate indices to find out which fragments satisfied
+            let expr_result = index_expr.evaluate(dataset.as_ref(), &NoOpMetricsCollector).await?;
+
+            match expr_result {
+                IndexExprResult::Exact(mask) | IndexExprResult::AtMost(mask) => {
+                    match mask {
+                        RowAddrMask::AllowList(map) => {
+                            let allow_fragids : HashSet<u32> = map.fragments().into_iter().collect();
+                            let mut allow_frags : Vec<Fragment> = fragments
+                                .iter()
+                                .filter(|f| allow_fragids.contains(*f.id))
+                                .cloned()
+                                .collect();
+
+                            allow_frags.extend(missing_frags);
+                            Ok(allow_frags)
+                        }
+                        RowAddrMask::BlockList(_) => Ok(fragments.to_vec())
+                    }
+                }
+
+                IndexExprResult::AtLeast(_) => Ok(fragments.to_vec())
+            }
+        } else {
+            Ok(fragments.to_vec())
+        }
     }
 }
 

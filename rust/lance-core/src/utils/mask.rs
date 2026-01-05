@@ -621,6 +621,10 @@ impl RowAddrTreeMap {
 
         Ok(Self { inner })
     }
+
+    pub fn fragments(&self) -> Vec<u32> {
+        self.inner.keys().cloned().collect()
+    }
 }
 
 impl std::ops::BitOr<Self> for RowAddrTreeMap {
