@@ -2556,15 +2556,6 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::metrics::LocalMetricsCollector;
-    use crate::{
-        metrics::NoOpMetricsCollector,
-        scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
-            lance_format::LanceIndexStore,
-            IndexStore, SargableQuery, ScalarIndex, SearchResult,
-        },
-    };
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{record_batch, FixedSizeListArray};
     use datafusion::{
@@ -2583,6 +2574,16 @@ mod tests {
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
+
+    use crate::metrics::LocalMetricsCollector;
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::{
+            btree::{BTreeIndex, BTREE_PAGES_NAME},
+            lance_format::LanceIndexStore,
+            IndexStore, SargableQuery, ScalarIndex, SearchResult,
+        },
+    };
 
     use super::{
         part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,

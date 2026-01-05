@@ -9,24 +9,6 @@ use std::{
     sync::Arc,
 };
 
-use super::{
-    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
-};
-use super::{AnyQuery, IndexStore, ScalarIndex};
-use crate::pbold;
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{
-        expression::SargableQueryParser,
-        registry::{
-            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME,
-        },
-        CreatedIndex, UpdateCriteria,
-    },
-};
-use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -49,6 +31,25 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
+
+use super::{
+    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
+};
+use super::{AnyQuery, IndexStore, ScalarIndex};
+use crate::pbold;
+use crate::{
+    frag_reuse::FragReuseIndex,
+    scalar::{
+        expression::SargableQueryParser,
+        registry::{
+            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
+        },
+        CreatedIndex, UpdateCriteria,
+    },
+};
+use crate::{metrics::MetricsCollector, Index, IndexType};
+use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
