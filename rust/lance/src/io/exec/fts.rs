@@ -20,8 +20,8 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, PARTITIONS_SEARCHED_METRIC};
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
+use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, PARTITIONS_SEARCHED_METRIC};
 
 use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
@@ -1141,17 +1141,17 @@ pub mod tests {
     use std::sync::{Arc, Mutex};
 
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
-    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::inverted::query::{
         BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
     };
     use lance_index::scalar::inverted::{InvertedIndex, FTS_SCHEMA};
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
-    use lance_index::metrics::NoOpMetricsCollector;
 
     use crate::{
         index::DatasetIndexInternalExt,
@@ -1292,11 +1292,7 @@ pub mod tests {
             .unwrap()
             .unwrap();
         let index = dataset
-            .open_generic_index(
-                "text",
-                &index_meta.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
             .await
             .unwrap();
         let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
