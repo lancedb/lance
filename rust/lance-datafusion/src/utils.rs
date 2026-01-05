@@ -234,6 +234,7 @@ pub const REQUESTS_METRIC: &str = "requests";
 pub const BYTES_READ_METRIC: &str = "bytes_read";
 pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
 pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
+pub const PARTS_SEARCHED_METRIC: &str = "parts_searched";
 pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
 pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
