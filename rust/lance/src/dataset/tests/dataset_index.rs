@@ -2467,7 +2467,6 @@ async fn test_auto_infer_lance_tokenizer() {
     assert_eq!(1, batch.num_rows());
 }
 
-
 #[tokio::test]
 async fn test_prune_fragments_without_scalar_index_returns_all() {
     // Build a small dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].

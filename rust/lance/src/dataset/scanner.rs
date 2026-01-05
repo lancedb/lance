@@ -4015,7 +4015,8 @@ impl Scanner {
                 IndexExprResult::Exact(mask) | IndexExprResult::AtMost(mask) => match mask {
                     RowAddrMask::AllowList(map) => {
                         let allow_fragids: HashSet<u32> = map.fragments().into_iter().collect();
-                        let mut allow_frags: Vec<Fragment> = fragments.clone()
+                        let mut allow_frags: Vec<Fragment> = fragments
+                            .clone()
                             .iter()
                             .filter(|f| allow_fragids.contains(&(f.id as u32)))
                             .cloned()
