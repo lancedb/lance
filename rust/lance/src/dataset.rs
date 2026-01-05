@@ -1837,7 +1837,8 @@ impl Dataset {
             Arc::new(self.clone()),
             filter,
             self.manifest.fragments.clone(),
-        ).await
+        )
+        .await
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {

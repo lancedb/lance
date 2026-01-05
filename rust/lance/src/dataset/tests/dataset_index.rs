@@ -5,10 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::vec;
 
+use crate::dataset::scanner::test_dataset::TestVectorDataset;
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::ROW_ID;
 use crate::index::vector::VectorIndexParams;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -2463,4 +2465,94 @@ async fn test_auto_infer_lance_tokenizer() {
         .await
         .unwrap();
     assert_eq!(1, batch.num_rows());
+}
+
+
+#[tokio::test]
+async fn test_prune_fragments_without_scalar_index_returns_all() {
+    // Build a small dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
+    let dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+
+    let original_fragments = dataset.fragments().clone();
+
+    // Without a scalar index, pruning should be a no-op and return all fragments.
+    let pruned = dataset.prune_fragments("i >= 30").await.unwrap();
+
+    assert_eq!(pruned.len(), original_fragments.len());
+    let original_ids: Vec<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+    assert_eq!(pruned_ids, original_ids);
+}
+
+#[tokio::test]
+async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() {
+    // Dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+
+    // Create a scalar index on i so all current fragments are indexed.
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let fragments = dataset.fragments().clone();
+    assert!(fragments.len() >= 3);
+
+    // For filter i >= 30, all matching rows live in the last two fragments.
+    let expected_tail_ids: Vec<u64> = fragments[fragments.len() - 2..]
+        .iter()
+        .map(|f| f.id)
+        .collect();
+
+    let pruned = dataset.prune_fragments("i >= 30").await.unwrap();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+
+    assert_eq!(pruned_ids, expected_tail_ids);
+}
+
+#[tokio::test]
+async fn test_prune_fragments_keeps_fragments_outside_index_coverage() {
+    // Use TestVectorDataset to get a dataset with an Int32 column "i".
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+
+    // Build a scalar index on i covering the initial fragments.
+    test_ds.make_scalar_index().await.unwrap();
+
+    let before_fragments = test_ds.dataset.fragments().clone();
+    let before_ids: HashSet<u64> = before_fragments.iter().map(|f| f.id).collect();
+
+    // Append new data so the new fragment is not covered by the existing index.
+    test_ds.append_new_data().await.unwrap();
+    let all_fragments = test_ds.dataset.fragments().clone();
+    let new_fragments: Vec<_> = all_fragments
+        .iter()
+        .filter(|f| !before_ids.contains(&f.id))
+        .collect();
+
+    // Sanity check: we expect exactly one newly appended fragment.
+    assert_eq!(new_fragments.len(), 1);
+    let new_fragment_id = new_fragments[0].id;
+
+    // Use a filter that only matches early rows, which live in the original fragments.
+    let pruned = test_ds.dataset.prune_fragments("i < 10").await.unwrap();
+    let pruned_ids: HashSet<u64> = pruned.iter().map(|f| f.id).collect();
+
+    // Fragments without index coverage must not be pruned.
+    assert!(pruned_ids.contains(&new_fragment_id));
 }
