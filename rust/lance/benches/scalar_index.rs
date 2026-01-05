@@ -12,6 +12,7 @@ use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
 use lance_core::cache::LanceCache;
+use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};

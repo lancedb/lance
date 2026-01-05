@@ -9,33 +9,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::pbold;
-use arrow::array::BinaryBuilder;
-use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{
-    cache::{CacheKey, LanceCache, WeakLanceCache},
-    error::LanceOptionExt,
-    utils::{
-        mask::{NullableRowAddrSet, RowAddrTreeMap},
-        tokio::get_num_compute_intensive_cpus,
-    },
-    Error, Result, ROW_ID,
-};
-use roaring::RoaringBitmap;
-use serde::Serialize;
-use snafu::location;
-use tracing::instrument;
-
 use super::{
     btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
 };
 use super::{AnyQuery, IndexStore, ScalarIndex};
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -49,6 +27,28 @@ use crate::{
 };
 use crate::{metrics::MetricsCollector, Index, IndexType};
 use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
+use arrow::array::BinaryBuilder;
+use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion_common::ScalarValue;
+use deepsize::DeepSizeOf;
+use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowSetOps;
+use lance_core::{
+    cache::{CacheKey, LanceCache, WeakLanceCache},
+    error::LanceOptionExt,
+    utils::{
+        mask::{NullableRowAddrSet, RowAddrTreeMap},
+        tokio::get_num_compute_intensive_cpus,
+    },
+    Error, Result, ROW_ID,
+};
+use roaring::RoaringBitmap;
+use serde::Serialize;
+use snafu::location;
+use tracing::instrument;
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -844,6 +844,7 @@ pub mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;

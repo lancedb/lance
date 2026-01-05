@@ -25,6 +25,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     utils::{
         address::RowAddress,
