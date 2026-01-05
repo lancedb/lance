@@ -3972,6 +3972,24 @@ impl Scanner {
         Ok(format!("{}", display.indent(verbose)))
     }
 
+    /// Prune a list of fragments using scalar indices for a given filter.
+    ///
+    /// This helper builds a temporary [`Scanner`] over `dataset`, plans `filter`
+    /// with scalar index support and, when possible, evaluates the scalar index
+    /// expression to determine which fragments contain any candidate rows.
+    ///
+    /// Returns the subset of `fragments` that still need to be scanned:
+    /// fragments that have at least one candidate row according to the index
+    /// result, plus any fragments that are not fully covered by all indices.
+    /// Fragments outside the index coverage are never dropped.
+    ///
+    /// Pruning only happens when the filter plan contains a scalar index query
+    /// whose evaluation yields an allow-list [`RowAddrMask`] with *exact* or
+    /// *at-most* semantics. In that case, fragments that are fully covered by
+    /// the indices and have no allowed rows are pruned. If there is no index
+    /// query, the result has *at-least* semantics, or the index result is
+    /// represented as a block-list, all input `fragments` are returned
+    /// unchanged.
     pub async fn scalar_indexed_prune_fragments(
         dataset: Arc<Dataset>,
         filter: &str,
