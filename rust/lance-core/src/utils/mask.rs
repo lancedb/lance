@@ -261,6 +261,9 @@ pub trait RowSetOps: Clone + Sized {
     /// because of "full fragment" markers) should return `None`.
     fn len(&self) -> Option<u64>;
 
+    /// Remove a value from the row set.
+    fn remove(&mut self, value: u64) -> bool;
+
     /// Returns whether this set contains the given row.
     fn contains(&self, row: Self::Row) -> bool;
 
@@ -347,6 +350,27 @@ impl RowSetOps for RowAddrTreeMap {
                 RowAddrSelection::Partial(indices) => Some(indices.len()),
             })
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
+    }
+
+    fn remove(&mut self, value: u64) -> bool {
+        let upper = (value >> 32) as u32;
+        let lower = value as u32;
+        match self.inner.get_mut(&upper) {
+            None => false,
+            Some(RowAddrSelection::Full) => {
+                let mut set = RoaringBitmap::full();
+                set.remove(lower);
+                self.inner.insert(upper, RowAddrSelection::Partial(set));
+                true
+            }
+            Some(RowAddrSelection::Partial(lower_set)) => {
+                let removed = lower_set.remove(lower);
+                if lower_set.is_empty() {
+                    self.inner.remove(&upper);
+                }
+                removed
+            }
+        }
     }
 
     fn contains(&self, row: Self::Row) -> bool {
@@ -530,27 +554,6 @@ impl RowAddrTreeMap {
             None => None,
             Some(RowAddrSelection::Full) => None,
             Some(RowAddrSelection::Partial(set)) => Some(set),
-        }
-    }
-
-    pub fn remove(&mut self, value: u64) -> bool {
-        let upper = (value >> 32) as u32;
-        let lower = value as u32;
-        match self.inner.get_mut(&upper) {
-            None => false,
-            Some(RowAddrSelection::Full) => {
-                let mut set = RoaringBitmap::full();
-                set.remove(lower);
-                self.inner.insert(upper, RowAddrSelection::Partial(set));
-                true
-            }
-            Some(RowAddrSelection::Partial(lower_set)) => {
-                let removed = lower_set.remove(lower);
-                if lower_set.is_empty() {
-                    self.inner.remove(&upper);
-                }
-                removed
-            }
         }
     }
 
