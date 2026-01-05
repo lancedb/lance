@@ -4983,6 +4983,7 @@ dependencies = [
  "lance-encoding",
  "lance-io",
  "lance-testing",
+ "libc",
  "log",
  "num-traits",
  "object_store",
