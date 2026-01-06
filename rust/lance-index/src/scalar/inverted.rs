@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
-pub use builder::InvertedIndexBuilder;
+pub use builder::{
+    InvertedIndexBuildMetrics, InvertedIndexBuildMetricsSnapshot, InvertedIndexBuilder,
+};
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{cache::LanceCache, Result};
