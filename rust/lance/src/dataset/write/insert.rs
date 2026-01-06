@@ -236,8 +236,22 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let mut upsert_values = HashMap::new();
+                let mut config_upsert_values: Option<HashMap<String, String>> = None;
+
+                // Set column stats policy if enabled
+                if context.params.enable_column_stats {
+                    config_upsert_values
+                        .get_or_insert_with(HashMap::new)
+                        .insert(
+                            String::from("lance.column_stats.enabled"),
+                            String::from("true"),
+                        );
+                }
+
+                // Set auto cleanup params if provided
                 if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
+                    let upsert_values = config_upsert_values.get_or_insert_with(HashMap::new);
+
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.interval"),
                         auto_cleanup_params.interval.to_string(),
@@ -252,11 +266,7 @@ impl<'a> InsertBuilder<'a> {
                         format_duration(duration).to_string(),
                     );
                 }
-                let config_upsert_values = if upsert_values.is_empty() {
-                    None
-                } else {
-                    Some(upsert_values)
-                };
+
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
@@ -752,5 +762,127 @@ mod test {
         assert!(last.bytes_written > 0, "final bytes_written must be > 0");
         assert_eq!(last.rows_written, 300, "all 300 rows must be reported");
         assert_eq!(last.files_written, 1, "a single file should be written");
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_policy_set_on_create() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_column_stats_create")
+            .with_params(&WriteParams {
+                enable_column_stats: true,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await
+            .unwrap();
+
+        let config_value = dataset.manifest.config.get("lance.column_stats.enabled");
+        assert_eq!(config_value, Some(&"true".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_policy_not_set_when_disabled() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_column_stats_disabled")
+            .with_params(&WriteParams {
+                enable_column_stats: false,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await
+            .unwrap();
+
+        let config_value = dataset.manifest.config.get("lance.column_stats.enabled");
+        assert_eq!(config_value, None);
+    }
+
+    #[tokio::test]
+    async fn test_policy_enforcement_on_append() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_policy_enforcement")
+            .with_params(&WriteParams {
+                enable_column_stats: true,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch1)], schema.clone()))
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        )
+        .unwrap();
+
+        let result = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                enable_column_stats: false,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()))
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+        if let Err(Error::InvalidInput { source, .. }) = result {
+            let error_msg = source.to_string();
+            assert!(error_msg.contains("Column statistics policy mismatch"));
+            assert!(error_msg.contains("enable_column_stats=true"));
+            assert!(error_msg.contains("enable_column_stats=false"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_params_for_dataset_inherits_policy() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_inherit_policy")
+            .with_params(&WriteParams {
+                enable_column_stats: true,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        let params = WriteParams::for_dataset(&dataset);
+        assert_eq!(params.enable_column_stats, true);
+
+        let result = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..params
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        assert!(result.is_ok());
     }
 }
