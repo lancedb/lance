@@ -1832,6 +1832,13 @@ impl Dataset {
             .collect()
     }
 
+    /// Prunes dataset fragments using scalar indices for the given filter expression.
+    ///
+    /// This returns the subset of manifest fragments that still need to be scanned,
+    /// in manifest order. Fragments not covered by the participating scalar indices
+    /// are always retained, and if the filter does not yield a scalar index query
+    /// (or the index result cannot safely exclude fragments), this method is effectively
+    /// a no-op and returns all fragments.
     pub async fn prune_fragments(&self, filter: &str) -> Result<Vec<Fragment>> {
         Scanner::scalar_indexed_prune_fragments(
             Arc::new(self.clone()),

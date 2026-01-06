@@ -10,7 +10,6 @@ use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::ROW_ID;
 use crate::index::vector::VectorIndexParams;
-use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -2469,10 +2468,27 @@ async fn test_auto_infer_lance_tokenizer() {
 
 #[tokio::test]
 async fn test_prune_fragments_without_scalar_index_returns_all() {
-    // Build a small dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
-    let dataset = gen_batch()
-        .col("i", array::step::<Int32Type>())
-        .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(10))
+    // Build a dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..50))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, &test_uri, Some(write_params))
         .await
         .unwrap();
 
@@ -2490,9 +2506,26 @@ async fn test_prune_fragments_without_scalar_index_returns_all() {
 #[tokio::test]
 async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() {
     // Dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
-    let mut dataset = gen_batch()
-        .col("i", array::step::<Int32Type>())
-        .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(10))
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..50))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
         .await
         .unwrap();
 
@@ -2509,7 +2542,7 @@ async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() 
         .unwrap();
 
     let fragments = dataset.fragments().clone();
-    assert!(fragments.len() >= 3);
+    assert_eq!(fragments.len(), 5);
 
     // For filter i >= 30, all matching rows live in the last two fragments.
     let expected_tail_ids: Vec<u64> = fragments[fragments.len() - 2..]
@@ -2525,7 +2558,8 @@ async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() 
 
 #[tokio::test]
 async fn test_prune_fragments_keeps_fragments_outside_index_coverage() {
-    // Use TestVectorDataset to get a dataset with an Int32 column "i".
+    // Use TestVectorDataset to construct a multi-fragment dataset with an Int32 column "i".
+    // This matches the pattern used elsewhere in dataset_index.rs for multi-fragment tests.
     let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();

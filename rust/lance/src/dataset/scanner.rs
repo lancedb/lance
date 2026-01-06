@@ -4002,7 +4002,7 @@ impl Scanner {
 
         if let Some(index_expr) = filter_plan.expr_filter_plan.index_query.as_ref() {
             // Figure out which fragments are covered by ALL indices
-            let (_, missing_frags) = scanner
+            let (covered_frags, missing_frags) = scanner
                 .partition_frags_by_coverage(index_expr, fragments.clone())
                 .await?;
 
@@ -4015,17 +4015,42 @@ impl Scanner {
                 IndexExprResult::Exact(mask) | IndexExprResult::AtMost(mask) => match mask {
                     RowAddrMask::AllowList(map) => {
                         let allow_fragids: HashSet<u32> = map.fragments().into_iter().collect();
-                        let mut allow_frags: Vec<Fragment> = fragments
+
+                        let mut allow_frags: Vec<Fragment> = covered_frags
                             .clone()
                             .iter()
                             .filter(|f| allow_fragids.contains(&(f.id as u32)))
                             .cloned()
                             .collect();
 
+                        // Always return index uncovered fragments
                         allow_frags.extend(missing_frags);
                         Ok(allow_frags)
                     }
-                    RowAddrMask::BlockList(_) => Ok(fragments.to_vec()),
+
+                    RowAddrMask::BlockList(map) => {
+                        if map.is_empty() {
+                            // No fragment is blocked, return all fragments
+                            Ok(fragments.to_vec())
+                        } else {
+                            let blocked_fragids: HashSet<u32> = map.fragments().into_iter().collect();
+
+                            // If a fragment is not blocked or partially blocked, it needs to scan.
+                            let mut allow_frags: Vec<Fragment> = covered_frags
+                                .clone()
+                                .iter()
+                                .filter(|f| {
+                                    !blocked_fragids.contains(&(f.id as u32))
+                                        || map.get_fragment_bitmap(f.id as u32).is_some()
+                                })
+                                .cloned()
+                                .collect();
+
+                            // Always return index uncovered fragments
+                            allow_frags.extend(missing_frags);
+                            Ok(allow_frags)
+                        }
+                    }
                 },
 
                 IndexExprResult::AtLeast(_) => Ok(fragments.to_vec()),
