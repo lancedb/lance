@@ -11,6 +11,7 @@ use std::{
 };
 
 use arrow_array::RecordBatchReader;
+use arrow_ipc;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
@@ -2423,6 +2424,129 @@ impl ProjectedFileReader {
             .read_tasks(params, batch_size, projection, filter)
             .await
     }
+
+    /// Check if the file contains column statistics.
+    ///
+    /// Column statistics are stored in the schema metadata under the key
+    /// `lance:column_stats:buffer_index`. If this key exists, the file
+    /// has column statistics that can be read with `read_column_stats()`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the file has column statistics, `false` otherwise.
+    pub fn has_column_stats(&self) -> bool {
+        self.metadata
+            .file_schema
+            .metadata
+            .contains_key("lance:column_stats:buffer_index")
+    }
+
+    /// Read column statistics from the file.
+    ///
+    /// Column statistics are stored as a global buffer containing an Arrow IPC
+    /// encoded RecordBatch. The batch uses a **column-oriented layout** with
+    /// one row per dataset column, optimized for selective column reads.
+    ///
+    /// Schema (one row per dataset column):
+    /// - `column_name`: UTF-8 - Name of the dataset column
+    /// - `zone_starts`: List<UInt64> - Starting row offsets of each zone (fragment-local)
+    /// - `zone_lengths`: List<UInt64> - Number of rows in each zone
+    /// - `null_counts`: List<UInt32> - Number of null values per zone
+    /// - `nan_counts`: List<UInt32> - Number of NaN values per zone (for float types)
+    /// - `min_values`: List<UTF-8> - Minimum value per zone (ScalarValue debug format)
+    /// - `max_values`: List<UTF-8> - Maximum value per zone (ScalarValue debug format)
+    ///
+    /// This column-oriented layout enables efficient reads: to get stats for a
+    /// single column (e.g., "age"), you only need to read one row. Arrow IPC's
+    /// columnar storage means reading `zone_starts` doesn't read `min_values`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(RecordBatch))` if the file has column statistics
+    /// - `Ok(None)` if the file does not have column statistics
+    /// - `Err` if there was an error reading or parsing the statistics
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let reader = FileReader::try_open(object_store, path, None).await?;
+    /// if let Some(stats_batch) = reader.read_column_stats().await? {
+    ///     println!("File has {} zones of statistics", stats_batch.num_rows());
+    /// }
+    /// ```
+    pub async fn read_column_stats(&self) -> Result<Option<arrow_array::RecordBatch>> {
+        // Check if column stats exist
+        let Some(buffer_index_str) = self
+            .metadata
+            .file_schema
+            .metadata
+            .get("lance:column_stats:buffer_index")
+        else {
+            return Ok(None);
+        };
+
+        // Parse the buffer index
+        let buffer_index: usize = buffer_index_str.parse().map_err(|_| Error::Internal {
+            message: format!(
+                "Invalid column stats buffer index in metadata: {}",
+                buffer_index_str
+            ),
+            location: location!(),
+        })?;
+
+        // Check bounds
+        if buffer_index >= self.metadata.file_buffers.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "Column stats buffer index {} out of bounds (only {} buffers)",
+                    buffer_index,
+                    self.metadata.file_buffers.len()
+                ),
+                location: location!(),
+            });
+        }
+
+        // Read the buffer
+        let buffer_descriptor = &self.metadata.file_buffers[buffer_index];
+        let stats_bytes_vec = self
+            .scheduler
+            .submit_request(
+                vec![
+                    buffer_descriptor.position..buffer_descriptor.position + buffer_descriptor.size,
+                ],
+                0,
+            )
+            .await?;
+
+        // Combine all bytes into a single buffer (usually should be just one chunk)
+        let stats_bytes = if stats_bytes_vec.len() == 1 {
+            stats_bytes_vec.into_iter().next().unwrap()
+        } else {
+            // Concatenate multiple chunks
+            let total_size: usize = stats_bytes_vec.iter().map(|b| b.len()).sum();
+            let mut combined = BytesMut::with_capacity(total_size);
+            for chunk in stats_bytes_vec {
+                combined.extend_from_slice(&chunk);
+            }
+            combined.freeze()
+        };
+
+        // Decode Arrow IPC format
+        let cursor = Cursor::new(stats_bytes.as_ref());
+        let mut reader =
+            arrow_ipc::reader::FileReader::try_new(cursor, None).map_err(|e| Error::Internal {
+                message: format!("Failed to decode column stats Arrow IPC: {}", e),
+                location: location!(),
+            })?;
+
+        // Read the single batch
+        let batch = reader.next().transpose().map_err(|e| Error::Internal {
+            message: format!("Failed to read column stats batch: {}", e),
+            location: location!(),
+        })?;
+
+        Ok(batch)
+    }
 }
 
 /// Inspects a page and returns a String describing the page's encoding
@@ -3765,6 +3889,7 @@ mod tests {
         let fs = FsFixture::default();
         let _written = create_some_file(&fs, version).await;
         let cache = test_cache();
+
         let file_scheduler = fs
             .scheduler
             .open_file(&fs.tmp_path, &CachedFileSize::unknown())
@@ -3807,6 +3932,187 @@ mod tests {
             deep_size > num_columns * 50,
             "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_reading() {
+        use arrow_array::{Int32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let fs = FsFixture::default();
+
+        // Create a schema with metadata indicating column stats
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "data",
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions {
+                enable_column_stats: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Write some data (this will trigger column stats generation)
+        let data_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "data",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        file_writer.write_batch(&data_batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        // Read the file and check column stats
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Check that column stats exist
+        assert!(
+            file_reader.has_column_stats(),
+            "File should have column stats"
+        );
+
+        // Read the column stats
+        let stats_batch = file_reader
+            .read_column_stats()
+            .await
+            .unwrap()
+            .expect("Expected column stats to be present");
+
+        // Verify the schema of the stats batch (column-oriented)
+        assert_eq!(stats_batch.num_columns(), 7);
+        assert_eq!(
+            stats_batch.schema().field(0).name(),
+            "column_name",
+            "First field should be column_name"
+        );
+        assert_eq!(
+            stats_batch.schema().field(1).name(),
+            "zone_starts",
+            "Second field should be zone_starts (List)"
+        );
+        assert_eq!(
+            stats_batch.schema().field(2).name(),
+            "zone_lengths",
+            "Third field should be zone_lengths (List)"
+        );
+
+        // Verify we have at least one row (one per dataset column)
+        assert!(
+            stats_batch.num_rows() > 0,
+            "Should have at least one row (one per dataset column)"
+        );
+
+        // Verify column_name contains "data"
+        let column_names = stats_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(column_names.value(0), "data");
+
+        // Verify zone_starts is a List array with at least one zone
+        use arrow_array::ListArray;
+        let zone_starts = stats_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            zone_starts.value(0).len() > 0,
+            "Should have at least one zone for the 'data' column"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_column_stats() {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let fs = FsFixture::default();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "foo",
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions {
+                enable_column_stats: false, // Explicitly disable
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Write some data
+        let data_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "foo",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        file_writer.write_batch(&data_batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        // Read the file
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Verify no column stats
+        assert!(
+            !file_reader.has_column_stats(),
+            "File should not have column stats"
+        );
+
+        let stats = file_reader.read_column_stats().await.unwrap();
+        assert!(stats.is_none(), "Should return None when no stats present");
     }
 
     #[tokio::test]
