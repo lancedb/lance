@@ -456,6 +456,16 @@ impl StructuralEncodingStrategy {
                 DataType::FixedSizeList(inner, _)
                     if matches!(inner.data_type(), DataType::Struct(_)) =>
                 {
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::NotSupported {
+                            source: format!(
+                                "FixedSizeList<Struct> is only supported in Lance file format 2.2+, current version: {}",
+                                self.version
+                            )
+                            .into(),
+                            location: location!(),
+                        });
+                    }
                     // Complex FixedSizeList needs structural encoding
                     let child = field
                         .children

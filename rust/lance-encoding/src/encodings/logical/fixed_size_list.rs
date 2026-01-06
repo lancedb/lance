@@ -624,12 +624,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::simple(simple_struct_fields(), 2, LanceFileVersion::V2_1)]
-    #[case::nested_struct(nested_struct_fields(), 2, LanceFileVersion::V2_1)]
-    #[case::struct_with_list(struct_with_list_fields(), 2, LanceFileVersion::V2_1)]
-    #[case::struct_with_large_list(struct_with_large_list_fields(), 2, LanceFileVersion::V2_1)]
-    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2, LanceFileVersion::V2_1)]
-    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2, LanceFileVersion::V2_1)]
+    #[case::simple(simple_struct_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::nested_struct(nested_struct_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::struct_with_list(struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::struct_with_large_list(struct_with_large_list_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2, LanceFileVersion::V2_2)]
     #[case::struct_with_map(struct_with_map_fields(), 2, LanceFileVersion::V2_2)]
     #[test_log::test(tokio::test)]
     async fn test_fsl_struct_random(
