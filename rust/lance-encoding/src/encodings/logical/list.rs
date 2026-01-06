@@ -235,7 +235,7 @@ mod tests {
     };
     use arrow_array::{
         builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
-        Array, ArrayRef, BooleanArray, DictionaryArray, Int32Array, LargeStringArray, ListArray,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray,
         StructArray, UInt64Array, UInt8Array,
     };
 
