@@ -82,7 +82,7 @@ def _get_or_create_dataset(num_rows: int, dim: int = 1024) -> str:
     # Use a fixed directory path based on parameters
     tmpdir = Path(tempfile.gettempdir()) / f"lance_bench_{num_rows}_{dim}"
     tmpdir.mkdir(exist_ok=True)
-    dataset_uri = "file+uring://" + str(tmpdir / "vector_dataset.lance")
+    dataset_uri = "file://" + str(tmpdir / "vector_dataset.lance")
 
     # Check if dataset already exists and has correct row count
     try:
@@ -92,7 +92,8 @@ def _get_or_create_dataset(num_rows: int, dim: int = 1024) -> str:
             return dataset_uri
         else:
             print(
-                f"Dataset exists but has wrong row count ({ds.count_rows()} vs {num_rows}), recreating..."
+                "Dataset exists but has wrong row count "
+                f"({ds.count_rows()} vs {num_rows}), recreating..."
             )
     except Exception:
         print(f"Creating new dataset at {dataset_uri}")

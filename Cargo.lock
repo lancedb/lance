@@ -4739,6 +4739,7 @@ dependencies = [
  "lance-test-macros",
  "lance-testing",
  "lapack",
+ "libc",
  "log",
  "lzma-sys",
  "mock_instant",

@@ -55,7 +55,7 @@ struct CachedDataset {
 fn get_or_create_dataset(rt: &Runtime, version: LanceFileVersion) -> Arc<CachedDataset> {
     // Create dataset in fixed temp directory
     let uri = format!(
-        "file+uring:///tmp/lance_bench_throughput_{}_{}_{}",
+        "file:///tmp/lance_bench_throughput_{}_{}_{}",
         NUM_ROWS, DIM, version
     );
 
