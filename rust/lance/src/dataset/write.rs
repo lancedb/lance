@@ -515,8 +515,7 @@ impl WriteParams {
                              but WriteParams has enable_column_stats={}. \
                              All fragments in a dataset must have consistent column statistics. \
                              Use WriteParams::for_dataset() to inherit the correct policy.",
-                            dataset_policy,
-                            self.enable_column_stats
+                            dataset_policy, self.enable_column_stats
                         ),
                         location!(),
                     ));

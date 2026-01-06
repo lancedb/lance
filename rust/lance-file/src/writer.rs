@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use arrow_array::{
-    builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder},
     ArrayRef, RecordBatch, StringArray,
+    builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder},
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
