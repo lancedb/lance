@@ -91,6 +91,7 @@ lzma-sys = { version = "0.1" }
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
+libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
@@ -163,6 +164,10 @@ harness = false
 
 [[bench]]
 name = "random_access"
+harness = false
+
+[[bench]]
+name = "vector_throughput"
 harness = false
 
 [lints]
