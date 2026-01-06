@@ -6,8 +6,6 @@
 //! This benchmark measures concurrent vector search performance with IVF_PQ indexes,
 //! similar to the Python test_ivf_pq_throughput benchmark.
 
-#![allow(clippy::print_stdout)]
-
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
@@ -15,6 +13,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use futures::{StreamExt, TryStreamExt};
 use lance_file::version::LanceFileVersion;
+use log::info;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
@@ -46,18 +45,21 @@ const MAX_ITERATIONS: usize = 50;
 
 /// Cached dataset with pre-generated query vectors
 struct CachedDataset {
-    uri: String,
     dataset: Arc<Dataset>,
     query_vectors: Vec<Arc<Float32Array>>,
+}
+
+fn dataset_path(version: LanceFileVersion) -> String {
+    format!(
+        "/tmp/lance_bench_throughput_{}_{}_{}",
+        NUM_ROWS, DIM, version
+    )
 }
 
 /// Get or create a cached dataset with IVF_PQ index and query vectors
 fn get_or_create_dataset(rt: &Runtime, version: LanceFileVersion) -> Arc<CachedDataset> {
     // Create dataset in fixed temp directory
-    let uri = format!(
-        "file:///tmp/lance_bench_throughput_{}_{}_{}",
-        NUM_ROWS, DIM, version
-    );
+    let uri = format!("file://{}", dataset_path(version));
 
     rt.block_on(async {
         // Check if dataset exists on disk with correct row count
@@ -67,29 +69,29 @@ fn get_or_create_dataset(rt: &Runtime, version: LanceFileVersion) -> Arc<CachedD
         if let Ok(dataset) = Dataset::open(&uri).await {
             let row_count = dataset.count_rows(None).await.unwrap();
             if row_count == NUM_ROWS {
-                println!("Reusing existing dataset at {} ({} rows)", uri, row_count);
+                info!("Reusing existing dataset at {} ({} rows)", uri, row_count);
                 needs_creation = false;
 
                 // Check if index exists
                 let indices = dataset.load_indices().await.unwrap();
                 if !indices.is_empty() {
-                    println!(
+                    log::info!(
                         "Dataset already has {} index(es), skipping index creation",
                         indices.len()
                     );
                     needs_indexing = false;
                 } else {
-                    println!("Dataset exists but has no index, will create index");
+                    info!("Dataset exists but has no index, will create index");
                 }
             } else {
-                println!(
+                info!(
                     "Dataset exists but has wrong row count ({} vs {}), recreating",
                     row_count, NUM_ROWS
                 );
                 std::fs::remove_dir_all(&uri).ok();
             }
         } else {
-            println!(
+            info!(
                 "Creating new dataset with {} rows, {} dimensions",
                 NUM_ROWS, DIM
             );
@@ -112,7 +114,6 @@ fn get_or_create_dataset(rt: &Runtime, version: LanceFileVersion) -> Arc<CachedD
         let query_vectors = generate_query_vectors();
 
         let cached = Arc::new(CachedDataset {
-            uri: uri.clone(),
             dataset: Arc::new(dataset),
             query_vectors,
         });
@@ -161,12 +162,12 @@ async fn create_dataset(uri: &str) {
         .await
         .unwrap();
 
-    println!("Dataset created at {}", uri);
+    info!("Dataset created at {}", uri);
 }
 
 /// Create IVF_PQ index on the dataset
 async fn create_ivf_pq_index(dataset: &mut Dataset) {
-    println!("Creating IVF_PQ index...");
+    info!("Creating IVF_PQ index...");
 
     let ivf_params = IvfBuildParams {
         num_partitions: Some(IVF_PARTITIONS),
@@ -191,7 +192,7 @@ async fn create_ivf_pq_index(dataset: &mut Dataset) {
         .await
         .unwrap();
 
-    println!("IVF_PQ index created");
+    info!("IVF_PQ index created");
 }
 
 /// Generate random query vectors
@@ -207,37 +208,41 @@ fn generate_query_vectors() -> Vec<Arc<Float32Array>> {
 
 /// Drop dataset files from OS page cache (Linux only)
 #[cfg(target_os = "linux")]
-fn drop_dataset_from_cache(uri: &str) -> std::io::Result<()> {
+fn drop_dataset_from_cache(dataset_dir: &str) -> std::io::Result<()> {
     use std::fs;
     use std::os::unix::io::AsRawFd;
 
     // Walk the dataset directory and drop each file from cache
-    if let Ok(entries) = fs::read_dir(uri) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(file) = fs::File::open(&path) {
-                    let fd = file.as_raw_fd();
-                    // POSIX_FADV_DONTNEED = 4
-                    let result =
-                        unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
-                    if result != 0 {
-                        eprintln!(
-                            "Warning: Failed to drop {:?} from cache: {}",
-                            path,
-                            std::io::Error::from_raw_os_error(result)
-                        );
-                    }
+    let mut num_dropped = 0;
+    let entries = fs::read_dir(format!("{}/data", dataset_dir)).unwrap();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(file) = fs::File::open(&path) {
+                let fd = file.as_raw_fd();
+                // POSIX_FADV_DONTNEED = 4
+                let result = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+                if result != 0 {
+                    panic!(
+                        "Warning: Failed to drop {:?} from cache: {}",
+                        path,
+                        std::io::Error::from_raw_os_error(result)
+                    );
                 }
+                num_dropped += 1;
             }
         }
+    }
+    if num_dropped == 0 {
+        // Sanity check to ensure that we actually dropped some files from cache.
+        panic!("No files dropped from cache");
     }
 
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_dataset_from_cache(_uri: &str) -> std::io::Result<()> {
+fn drop_dataset_from_cache(_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -312,7 +317,7 @@ fn bench_ivf_pq_throughput(c: &mut Criterion) {
                             || {
                                 // Setup: drop cache if uncached
                                 if !cached {
-                                    drop_dataset_from_cache(&cached_dataset.uri).ok();
+                                    drop_dataset_from_cache(&dataset_path(version)).ok();
                                 }
                             },
                             |_| {
