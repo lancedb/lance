@@ -6,7 +6,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{
+    builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder},
+    ArrayRef, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_common::ScalarValue;
+use datafusion_expr::Accumulator;
+use lance_core::utils::zone::{FileZoneBuilder, ZoneBound, ZoneProcessor};
 
 use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -106,6 +114,10 @@ pub struct FileWriterOptions {
     /// versions may have more efficient encodings.  However, newer format versions will
     /// require more up-to-date readers to read the data.
     pub format_version: Option<LanceFileVersion>,
+
+    /// If true, enable column statistics generation when writing data files.
+    /// Column statistics can be used for query optimization and filtering.
+    pub enable_column_stats: bool,
 }
 
 // Total in-memory budget for buffering serialized page metadata before flushing
@@ -192,6 +204,114 @@ impl PageMetadataSpill {
     }
 }
 
+/// Column statistics for a single zone
+#[derive(Debug, Clone)]
+struct ColumnZoneStatistics {
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: u32,
+    nan_count: u32,
+    // TODO: add more stats like mean, avg_len and dist_cnt
+    bound: ZoneBound,
+}
+
+/// Statistics processor for a single column that implements ZoneProcessor trait
+struct ColumnStatisticsProcessor {
+    #[allow(dead_code)]
+    data_type: DataType,
+    min: MinAccumulator,
+    max: MaxAccumulator,
+    null_count: u32,
+    nan_count: u32,
+}
+
+impl ColumnStatisticsProcessor {
+    fn new(data_type: DataType) -> Result<Self> {
+        // TODO: Does it handle all types?
+        let min = MinAccumulator::try_new(&data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        let max = MaxAccumulator::try_new(&data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        Ok(Self {
+            data_type,
+            min,
+            max,
+            null_count: 0,
+            nan_count: 0,
+        })
+    }
+
+    fn count_nans(array: &ArrayRef) -> u32 {
+        match array.data_type() {
+            DataType::Float16 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float32 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float64 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Implement ZoneProcessor trait for ColumnStatisticsProcessor
+impl ZoneProcessor for ColumnStatisticsProcessor {
+    type ZoneStatistics = ColumnZoneStatistics;
+
+    fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
+        self.null_count += array.null_count() as u32;
+        self.nan_count += Self::count_nans(array);
+        self.min
+            .update_batch(std::slice::from_ref(array))
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.max
+            .update_batch(std::slice::from_ref(array))
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        Ok(())
+    }
+
+    fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        Ok(ColumnZoneStatistics {
+            min: self
+                .min
+                .evaluate()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+            max: self
+                .max
+                .evaluate()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+            null_count: self.null_count,
+            nan_count: self.nan_count,
+            bound,
+        })
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.min = MinAccumulator::try_new(&self.data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.max = MaxAccumulator::try_new(&self.data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.null_count = 0;
+        self.nan_count = 0;
+        Ok(())
+    }
+}
+
 fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Page>> {
     let mut pages = Vec::new();
     let mut cursor = data.clone();
@@ -213,6 +333,9 @@ enum PageSpillState {
     Active(PageMetadataSpill),
 }
 
+/// Zone size for column statistics (1 million rows per zone)
+const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
+
 pub struct FileWriter {
     writer: Box<dyn Writer>,
     schema: Option<LanceSchema>,
@@ -230,6 +353,8 @@ pub struct FileWriter {
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
     page_spill: Option<PageSpillState>,
+    /// Column statistics processors (one per column), only initialized if enable_column_stats is true
+    column_stats_processors: Option<Vec<FileZoneBuilder<ColumnStatisticsProcessor>>>,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -288,6 +413,7 @@ impl FileWriter {
             schema_metadata: HashMap::new(),
             page_spill: None,
             options,
+            column_stats_processors: None,
         }
     }
 
@@ -480,6 +606,18 @@ impl FileWriter {
         self.schema_metadata
             .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
+
+        // Initialize column statistics processors if enabled
+        if self.options.enable_column_stats {
+            let mut processors = Vec::new();
+            for field in &self.schema.as_ref().unwrap().fields {
+                let data_type = field.data_type().clone();
+                let processor = ColumnStatisticsProcessor::new(data_type)?;
+                processors.push(FileZoneBuilder::new(processor, COLUMN_STATS_ZONE_SIZE)?);
+            }
+            self.column_stats_processors = Some(processors);
+        }
+
         Ok(())
     }
 
@@ -615,6 +753,22 @@ impl FileWriter {
         self.rows_written += num_rows;
 
         self.write_pages(encoding_tasks).await?;
+
+        // Accumulate column statistics if enabled
+        if let Some(ref mut processors) = self.column_stats_processors {
+            for (field, processor) in self
+                .schema
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .zip(processors.iter_mut())
+            {
+                if let Some(array) = batch.column_by_name(&field.name) {
+                    processor.process_chunk(array)?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -910,6 +1064,10 @@ impl FileWriter {
         }
 
         // 3. write global buffers (we write the schema here)
+        // Build the column statistics if enabled
+        if self.options.enable_column_stats {
+            self.build_column_statistics().await?;
+        }
         let global_buffer_offsets = self.write_global_buffers().await?;
         let num_global_buffers = global_buffer_offsets.len() as u32;
 
@@ -954,6 +1112,214 @@ impl FileWriter {
     pub async fn abort(&mut self) {
         // For multipart uploads, ObjectWriter's Drop impl will abort
         // the upload when the writer is dropped.
+    }
+
+    /// Build column statistics for the written data.
+    ///
+    /// Builds and stores column statistics if enabled.
+    ///
+    /// Statistics are serialized as an Arrow RecordBatch and stored in a global buffer.
+    /// This format is forward/backward compatible - new statistics fields can be added
+    /// without breaking older readers.
+    ///
+    /// The RecordBatch schema:
+    /// - column_name: String - Name of the column
+    /// - zone_start: UInt64 - Starting row offset of the zone
+    /// - zone_length: UInt64 - Number of rows in the zone (span, not count)
+    /// - null_count: UInt32 - Number of null values
+    /// - nan_count: UInt32 - Number of NaN values (for float types)
+    /// - min: String - Minimum value (serialized as string for compatibility)
+    /// - max: String - Maximum value (serialized as string for compatibility)
+    /// - (future fields can be added here without breaking compatibility)
+    async fn build_column_statistics(&mut self) -> Result<()> {
+        let Some(processors) = self.column_stats_processors.take() else {
+            return Ok(()); // Statistics not enabled
+        };
+
+        let schema = self.schema.as_ref().ok_or_else(|| {
+            Error::invalid_input(
+                "Cannot build statistics: schema not initialized",
+                location!(),
+            )
+        })?;
+
+        // Column-oriented layout: one row per dataset column
+        // Each field contains a list of values (one per zone)
+        let mut column_names = Vec::new();
+
+        // Create list builders with proper field definitions (non-nullable items)
+        let zone_starts_field = ArrowField::new("item", DataType::UInt64, false);
+        let mut zone_starts_builder =
+            ListBuilder::new(UInt64Builder::with_capacity(processors.len()))
+                .with_field(zone_starts_field);
+
+        let zone_lengths_field = ArrowField::new("item", DataType::UInt64, false);
+        let mut zone_lengths_builder =
+            ListBuilder::new(UInt64Builder::with_capacity(processors.len()))
+                .with_field(zone_lengths_field);
+
+        let null_counts_field = ArrowField::new("item", DataType::UInt32, false);
+        let mut null_counts_builder =
+            ListBuilder::new(UInt32Builder::with_capacity(processors.len()))
+                .with_field(null_counts_field);
+
+        let nan_counts_field = ArrowField::new("item", DataType::UInt32, false);
+        let mut nan_counts_builder =
+            ListBuilder::new(UInt32Builder::with_capacity(processors.len()))
+                .with_field(nan_counts_field);
+
+        let mins_field = ArrowField::new("item", DataType::Utf8, false);
+        let mut mins_builder = ListBuilder::new(StringBuilder::with_capacity(
+            processors.len(),
+            processors.len() * 32,
+        ))
+        .with_field(mins_field);
+
+        let maxs_field = ArrowField::new("item", DataType::Utf8, false);
+        let mut maxs_builder = ListBuilder::new(StringBuilder::with_capacity(
+            processors.len(),
+            processors.len() * 32,
+        ))
+        .with_field(maxs_field);
+
+        for (field, processor) in schema.fields.iter().zip(processors.into_iter()) {
+            let zones = processor.finalize()?;
+
+            // Skip columns with no zones
+            if zones.is_empty() {
+                continue;
+            }
+
+            column_names.push(field.name.clone());
+
+            // Build arrays for this column's zones
+            for zone in &zones {
+                zone_starts_builder.values().append_value(zone.bound.start);
+                zone_lengths_builder
+                    .values()
+                    .append_value(zone.bound.length as u64);
+                null_counts_builder.values().append_value(zone.null_count);
+                nan_counts_builder.values().append_value(zone.nan_count);
+                // Serialize ScalarValue as string for forward compatibility
+                mins_builder
+                    .values()
+                    .append_value(format!("{:?}", zone.min));
+                maxs_builder
+                    .values()
+                    .append_value(format!("{:?}", zone.max));
+            }
+
+            // Finish the lists for this column (one row)
+            zone_starts_builder.append(true);
+            zone_lengths_builder.append(true);
+            null_counts_builder.append(true);
+            nan_counts_builder.append(true);
+            mins_builder.append(true);
+            maxs_builder.append(true);
+        }
+
+        // If no statistics were collected, return early
+        if column_names.is_empty() {
+            return Ok(());
+        }
+
+        // Create Arrow arrays
+        let column_name_array = Arc::new(StringArray::from(column_names)) as ArrayRef;
+        let zone_starts_array = Arc::new(zone_starts_builder.finish()) as ArrayRef;
+        let zone_lengths_array = Arc::new(zone_lengths_builder.finish()) as ArrayRef;
+        let null_counts_array = Arc::new(null_counts_builder.finish()) as ArrayRef;
+        let nan_counts_array = Arc::new(nan_counts_builder.finish()) as ArrayRef;
+        let mins_array = Arc::new(mins_builder.finish()) as ArrayRef;
+        let maxs_array = Arc::new(maxs_builder.finish()) as ArrayRef;
+
+        // Create schema for the statistics RecordBatch
+        // Column-oriented: one row per dataset column, each field is a list
+        let stats_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("column_name", DataType::Utf8, false),
+            ArrowField::new(
+                "zone_starts",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt64, false))),
+                false,
+            ),
+            ArrowField::new(
+                "zone_lengths",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt64, false))),
+                false,
+            ),
+            ArrowField::new(
+                "null_counts",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "nan_counts",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "min_values",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false))),
+                false,
+            ),
+            ArrowField::new(
+                "max_values",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false))),
+                false,
+            ),
+        ]));
+
+        // Create RecordBatch
+        let stats_batch = RecordBatch::try_new(
+            stats_schema,
+            vec![
+                column_name_array,
+                zone_starts_array,
+                zone_lengths_array,
+                null_counts_array,
+                nan_counts_array,
+                mins_array,
+                maxs_array,
+            ],
+        )
+        .map_err(|e| {
+            Error::invalid_input(
+                format!("Failed to create statistics batch: {}", e),
+                location!(),
+            )
+        })?;
+
+        // Serialize to Arrow IPC format
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                arrow_ipc::writer::FileWriter::try_new(&mut buffer, &stats_batch.schema())
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("Failed to create IPC writer: {}", e),
+                            location!(),
+                        )
+                    })?;
+            writer.write(&stats_batch).map_err(|e| {
+                Error::invalid_input(format!("Failed to write statistics: {}", e), location!())
+            })?;
+            writer.finish().map_err(|e| {
+                Error::invalid_input(format!("Failed to finish IPC writer: {}", e), location!())
+            })?;
+        }
+
+        // Store as global buffer
+        let buffer_bytes = Bytes::from(buffer);
+        let buffer_index = self.add_global_buffer(buffer_bytes).await?;
+
+        // Store the buffer index in schema metadata so readers can find it
+        self.schema_metadata.insert(
+            "lance:column_stats:buffer_index".to_string(),
+            buffer_index.to_string(),
+        );
+        self.schema_metadata
+            .insert("lance:column_stats:version".to_string(), "1".to_string());
+
+        Ok(())
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
