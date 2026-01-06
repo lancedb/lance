@@ -235,8 +235,8 @@ mod tests {
     };
     use arrow_array::{
         builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
-        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray,
-        StructArray, UInt64Array, UInt8Array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
+        UInt64Array, UInt8Array,
     };
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
