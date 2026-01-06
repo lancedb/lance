@@ -242,9 +242,30 @@ impl PostingIterator {
                     block_idx += 1;
                 }
                 self.index = self.index.max(block_idx * BLOCK_SIZE);
-                let length = self.list.len();
-                while self.index < length && (self.doc().unwrap().doc_id() as u32) < least_id {
-                    self.index += 1;
+                let length = list.length as usize;
+                while self.index < length {
+                    let block_idx = self.index / BLOCK_SIZE;
+                    let block_offset = self.index % BLOCK_SIZE;
+                    let compressed = unsafe {
+                        let compressed = self.compressed.as_ref().unwrap();
+                        &mut *compressed.get()
+                    };
+                    if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
+                        let block = list.blocks.value(block_idx);
+                        compressed.decompress(block, block_idx, list.blocks.len(), list.length);
+                    }
+                    let in_block = &compressed.doc_ids[block_offset..];
+                    let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
+                    let new_offset = block_offset + offset_in_block;
+                    if new_offset < compressed.doc_ids.len() {
+                        self.index = block_idx * BLOCK_SIZE + new_offset;
+                        break;
+                    }
+                    if block_idx + 1 >= list.blocks.len() {
+                        self.index = length;
+                        break;
+                    }
+                    self.index = (block_idx + 1) * BLOCK_SIZE;
                 }
                 self.block_idx = self.index / BLOCK_SIZE;
             }
@@ -950,6 +971,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
+    }
+
+    #[test]
+    fn test_posting_iterator_next_compressed_partition_point() {
+        let mut docs = DocSet::default();
+        let num_docs = (BLOCK_SIZE * 2 + 5) as u32;
+        for i in 0..num_docs {
+            docs.append(i as u64, 1);
+        }
+
+        let doc_ids = (0..num_docs).collect::<Vec<_>>();
+        let posting = generate_posting_list(doc_ids, 1.0, None, true);
+        let mut iter = PostingIterator::new(String::from("term"), 0, 0, posting, docs.len());
+
+        iter.next(10);
+        assert_eq!(iter.doc().unwrap().doc_id(), 10);
+
+        let target = BLOCK_SIZE as u64 + 3;
+        iter.next(target);
+        assert_eq!(iter.doc().unwrap().doc_id(), target);
+
+        iter.next(num_docs as u64 + 10);
+        assert!(iter.doc().is_none());
     }
 
     #[test]
