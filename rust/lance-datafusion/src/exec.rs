@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -34,7 +35,6 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -547,7 +547,13 @@ pub async fn analyze_plan(
 
     let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
-    let analyze = Arc::new(AnalyzeExec::new(true, true, vec![MetricType::SUMMARY], plan, schema));
+    let analyze = Arc::new(AnalyzeExec::new(
+        true,
+        true,
+        vec![MetricType::SUMMARY],
+        plan,
+        schema,
+    ));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
