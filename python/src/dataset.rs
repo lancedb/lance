@@ -1503,8 +1503,8 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    fn checkout_version(&self, py: Python, version: Py<PyAny>) -> PyResult<Self> {
-        let reference = self.transform_ref(py, Some(version))?;
+    fn checkout_version(&self, version: Bound<PyAny>) -> PyResult<Self> {
+        let reference = self.transform_ref(Some(version))?;
         self._checkout_version(reference)
     }
 
@@ -1514,7 +1514,7 @@ impl Dataset {
         &mut self,
         py: Python,
         target_path: String,
-        reference: Option<Py<PyAny>>,
+        reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         // Perform a shallow clone of the dataset into the target path.
@@ -1527,7 +1527,7 @@ impl Dataset {
 
         // Use a mutable clone of the inner dataset for operations that require &mut self
         let mut new_self = self.ds.as_ref().clone();
-        let reference = self.transform_ref(py, reference)?;
+        let reference = self.transform_ref(reference)?;
 
         let ds = rt()
             .block_on(
@@ -1632,8 +1632,8 @@ impl Dataset {
         })
     }
 
-    fn create_tag(&mut self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
-        let reference = self.transform_ref(py, reference)?;
+    fn create_tag(&mut self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
+        let reference = self.transform_ref(reference)?;
         rt().block_on(
             None,
             self.ds.as_ref().tags().create(tag.as_str(), reference),
@@ -1658,8 +1658,8 @@ impl Dataset {
         Ok(())
     }
 
-    fn update_tag(&self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
-        let reference = self.transform_ref(py, reference)?;
+    fn update_tag(&self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
+        let reference = self.transform_ref(reference)?;
         rt().block_on(
             None,
             self.ds.as_ref().tags().update(tag.as_str(), reference),
@@ -1684,13 +1684,12 @@ impl Dataset {
     #[pyo3(signature = (branch, reference=None, storage_options=None))]
     fn create_branch(
         &mut self,
-        py: Python,
         branch: String,
-        reference: Option<Py<PyAny>>,
+        reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
-        let reference = self.transform_ref(py, reference)?;
+        let reference = self.transform_ref(reference)?;
         let store_params = storage_options.map(|opts| ObjectStoreParams {
             storage_options: Some(opts),
             ..Default::default()
@@ -2811,25 +2810,25 @@ impl DatasetDelta {
     }
 
     /// Get inserted rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
-    fn get_inserted_rows(&self) -> PyResult<PyObject> {
+    fn get_inserted_rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         use arrow::pyarrow::IntoPyArrow;
         use arrow_array::RecordBatchReader;
         let stream = rt()
             .block_on(None, self.inner.get_inserted_rows())?
             .infer_error()?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
-        Python::with_gil(|py| reader.into_pyarrow(py))
+        reader.into_pyarrow(py)
     }
 
     /// Get updated rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
-    fn get_updated_rows(&self) -> PyResult<PyObject> {
+    fn get_updated_rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         use arrow::pyarrow::IntoPyArrow;
         use arrow_array::RecordBatchReader;
         let stream = rt()
             .block_on(None, self.inner.get_updated_rows())?
             .infer_error()?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
-        Python::with_gil(|py| reader.into_pyarrow(py))
+        reader.into_pyarrow(py)
     }
 }
 
@@ -2884,15 +2883,15 @@ impl PyWriteDest {
 }
 
 impl Dataset {
-    fn transform_ref(&self, py: Python, reference: Option<Py<PyAny>>) -> PyResult<Ref> {
+    fn transform_ref(&self, reference: Option<Bound<PyAny>>) -> PyResult<Ref> {
         if let Some(reference) = reference {
-            if let Ok(i) = reference.downcast_bound::<PyInt>(py) {
+            if let Ok(i) = reference.downcast::<PyInt>() {
                 let version_number: u64 = i.extract()?;
                 Ok(version_number.into())
-            } else if let Ok(tag_name) = reference.downcast_bound::<PyString>(py) {
+            } else if let Ok(tag_name) = reference.downcast::<PyString>() {
                 let tag: &str = &tag_name.to_string_lossy();
                 Ok(tag.into())
-            } else if let Ok(tuple) = reference.downcast_bound::<PyTuple>(py) {
+            } else if let Ok(tuple) = reference.downcast::<PyTuple>() {
                 if tuple.len() == 2 {
                     let (branch_name, version_number) =
                         tuple.extract::<(Option<String>, Option<u64>)>()?;
