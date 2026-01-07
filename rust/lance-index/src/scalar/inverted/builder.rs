@@ -28,8 +28,8 @@ use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use snafu::location;
 use smallvec::SmallVec;
+use snafu::location;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -1249,6 +1249,7 @@ pub fn document_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::NoOpMetricsCollector;
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1256,7 +1257,6 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
-    use crate::metrics::NoOpMetricsCollector;
     use std::sync::atomic::AtomicU64;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
@@ -1395,5 +1395,4 @@ mod tests {
 
         Ok(())
     }
-
 }
