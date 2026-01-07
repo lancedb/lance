@@ -232,7 +232,11 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn declare_table<'py>(&self, py: Python<'py>, request: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn declare_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.declare_table(request))?
@@ -439,7 +443,11 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn declare_table<'py>(&self, py: Python<'py>, request: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn declare_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.declare_table(request))?
