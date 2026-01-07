@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use crate::file::object_store_from_uri_or_path;
+use crate::rt;
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -33,15 +35,13 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use pyo3::intern;
+use pyo3::types::PyNone;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyIterator,
     IntoPyObjectExt,
 };
-use pyo3::types::PyNone;
-use crate::file::object_store_from_uri_or_path;
-use crate::rt;
 
 /// A wrapper around a JSON string that converts to a Python object
 /// using json.loads when marshalling to Python.
@@ -131,7 +131,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, array: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        array: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };

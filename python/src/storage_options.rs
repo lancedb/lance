@@ -44,7 +44,9 @@ impl PyStorageOptionsProvider {
                 "StorageOptionsProvider must implement fetch_storage_options() method",
             ));
         }
-        Ok(Self { inner: obj.clone().unbind() })
+        Ok(Self {
+            inner: obj.clone().unbind(),
+        })
     }
 }
 

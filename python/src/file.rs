@@ -35,7 +35,12 @@ use lance_io::{
     ReadBatchParams,
 };
 use object_store::path::Path;
-use pyo3::{exceptions::{PyIOError, PyRuntimeError}, pyclass, pyfunction, pymethods, types::PyAny, Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python};
+use pyo3::{
+    exceptions::{PyIOError, PyRuntimeError},
+    pyclass, pyfunction, pymethods,
+    types::PyAny,
+    Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};

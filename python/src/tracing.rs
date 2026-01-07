@@ -18,7 +18,6 @@
 use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
-use pyo3::{pyclass, Py, PyAny};
 use pyo3::pyfunction;
 use pyo3::pymethods;
 use pyo3::types::PyDict;
@@ -29,6 +28,7 @@ use pyo3::IntoPyObject;
 use pyo3::PyErr;
 use pyo3::PyResult;
 use pyo3::Python;
+use pyo3::{pyclass, Py, PyAny};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
