@@ -48,9 +48,9 @@ bytes = "1.11"
 log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
-prost = "0.13.5"
+prost = "0.14.1"
 roaring = "0.10.1"
-prost-types = "0.13.5"
+prost-types = "0.14.1"
 chrono = "0.4.41"
 
 [profile.dev]
