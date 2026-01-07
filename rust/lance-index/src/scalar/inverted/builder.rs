@@ -756,7 +756,7 @@ impl IndexWorker {
 
 #[derive(Debug, Clone)]
 pub enum PositionRecorder {
-    Position(SmallVec<[u32; 8]>),
+    Position(SmallVec<[u32; 4]>),
     Count(u32),
 }
 
