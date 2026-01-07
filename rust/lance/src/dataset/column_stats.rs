@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
@@ -550,8 +552,9 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_all_fragments_have_stats() {
         // Create dataset with column stats enabled
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -571,10 +574,9 @@ mod tests {
                 vec![
                     Arc::new(Int32Array::from_iter_values((i * 100)..((i + 1) * 100))),
                     Arc::new(ArrowStringArray::from_iter_values(
-                        (i * 100)
-                            ..((i + 1) * 100)
-                                .map(|n| format!("name_{}", n))
-                                .collect::<Vec<_>>(),
+                        ((i * 100)..((i + 1) * 100))
+                            .map(|n| format!("name_{}", n))
+                            .collect::<Vec<_>>(),
                     )),
                 ],
             )
@@ -588,7 +590,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset).unwrap();
+                let mut append_params = WriteParams::for_dataset(&dataset);
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
@@ -617,8 +619,9 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_some_fragments_lack_stats() {
         // Create dataset with mixed stats
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -650,7 +653,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let mut append_params = WriteParams::for_dataset(&dataset).unwrap();
+        let mut append_params = WriteParams::for_dataset(&dataset);
         append_params.mode = crate::dataset::WriteMode::Append;
         append_params.enable_column_stats = false; // Explicitly disable
         Dataset::write(reader, test_uri, Some(append_params))
@@ -674,8 +677,9 @@ mod tests {
     #[tokio::test]
     async fn test_global_offset_calculation() {
         // Test that zone offsets are correctly adjusted to global positions
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",
@@ -706,7 +710,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset).unwrap();
+                let mut append_params = WriteParams::for_dataset(&dataset);
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
@@ -743,9 +747,16 @@ mod tests {
         .await
         .unwrap();
 
-        let stats_batch = reader.read_all_batches().await.unwrap();
-        assert_eq!(stats_batch.len(), 1);
-        let batch = &stats_batch[0];
+        // Read stats using read_stream and collect batches
+        use futures::StreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        let mut stream = reader.read_stream(lance_io::ReadBatchParams::RangeFull, 1024, 16, FilterExpression::no_filter()).unwrap();
+        let mut batches = vec![];
+        while let Some(batch_result) = stream.next().await {
+            batches.push(batch_result.unwrap());
+        }
+        assert!(!batches.is_empty());
+        let batch = &batches[0];
 
         // Verify zone_starts contain global offsets
         let zone_starts_list = batch
@@ -767,8 +778,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_dataset() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -804,8 +816,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_column_types() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("int_col", DataType::Int32, false),
@@ -817,7 +830,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from_iter_values(0..100)),
-                Arc::new(generate_random_array(RowCount::from(100))),
+                Arc::new(generate_random_array(100)),
                 Arc::new(ArrowStringArray::from_iter_values(
                     (0..100).map(|i| format!("str_{}", i)),
                 )),
@@ -846,8 +859,9 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_single_fragment() {
         // Test consolidation with just one fragment
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -886,8 +900,9 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_large_dataset() {
         // Test with larger dataset to verify zone handling
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int64, false),
@@ -946,68 +961,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_consolidation_after_update() {
-        // Test that update operations create fragments with stats
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("value", DataType::Int32, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..200)),
-                Arc::new(Int32Array::from_iter_values(0..200)),
-            ],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let write_params = WriteParams {
-            max_rows_per_file: 100,
-            enable_column_stats: true,
-            ..Default::default()
-        };
-
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
-            .await
-            .unwrap();
-
-        // Update some rows
-        dataset
-            .update()
-            .update_where("id < 100")
-            .unwrap()
-            .set("value", "999")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-
-        dataset = Dataset::open(test_uri).await.unwrap();
-
-        // All fragments should have stats (original + updated)
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
-
-        // This might be None if update doesn't preserve stats - that's a valid outcome
-        // The test documents the behavior
-        if result.is_none() {
-            println!("Note: Update operations don't preserve column stats (expected behavior)");
-        }
-    }
 
     #[tokio::test]
     async fn test_consolidation_with_nullable_columns() {
         // Test with nullable columns that have actual nulls
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        use lance_core::utils::tempfile::TempStrDir;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),

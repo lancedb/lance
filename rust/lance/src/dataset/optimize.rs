@@ -2219,9 +2219,10 @@ mod tests {
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        PrimitiveArray, RecordBatch, RecordBatchIterator,
+        PrimitiveArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use lance_io::scheduler::ScanScheduler;
+    use arrow_schema::{DataType, Field, Schema, Field as ArrowField, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_arrow::BLOB_META_KEY;
@@ -7962,11 +7963,8 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let append_params = WriteParams {
-                    mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
-                    ..Default::default()
-                };
+                let mut append_params = WriteParams::for_dataset(&dataset);
+                append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
                     .unwrap();
@@ -8034,11 +8032,8 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let append_params = WriteParams {
-                    mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
-                    ..Default::default()
-                };
+                let mut append_params = WriteParams::for_dataset(&dataset);
+                append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
                     .unwrap();
@@ -8123,7 +8118,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 100,
             enable_column_stats: true,
-            use_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
 
@@ -8143,7 +8138,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset).unwrap();
+                let mut append_params = WriteParams::for_dataset(&dataset);
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
