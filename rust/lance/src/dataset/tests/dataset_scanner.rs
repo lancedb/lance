@@ -22,17 +22,17 @@ use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexPara
 use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
+use crate::dataset::scanner::test_dataset::TestVectorDataset;
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::WriteParams;
 use crate::Dataset;
+use lance_core::utils::tempfile::TempStrDir;
+use lance_encoding::version::LanceFileVersion;
 use lance_index::scalar::inverted::query::FtsQuery;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::Query;
 use pretty_assertions::assert_eq;
-use lance_core::utils::tempfile::TempStrDir;
-use lance_encoding::version::LanceFileVersion;
-use crate::dataset::scanner::test_dataset::TestVectorDataset;
-use crate::dataset::WriteParams;
 
 #[tokio::test]
 async fn test_vector_filter_fts_search() {
@@ -471,7 +471,6 @@ async fn check_results(
     assert_eq!(ids.values(), expected_ids);
 }
 
-
 #[tokio::test]
 async fn test_prune_fragments_without_scalar_index_returns_all() {
     // Build a dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
@@ -486,7 +485,7 @@ async fn test_prune_fragments_without_scalar_index_returns_all() {
         schema.clone(),
         vec![Arc::new(Int32Array::from_iter_values(0..50))],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
@@ -523,7 +522,7 @@ async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() 
         schema.clone(),
         vec![Arc::new(Int32Array::from_iter_values(0..50))],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
@@ -586,7 +585,7 @@ async fn test_prune_fragments_with_scalar_index_and_mixed_or_filter_is_noop() {
         schema.clone(),
         vec![Arc::new(col_a), Arc::new(col_b), Arc::new(col_c)],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
@@ -674,7 +673,7 @@ async fn test_prune_fragments_with_zonemap_scalar_index_prunes_non_matching_frag
         schema.clone(),
         vec![Arc::new(Int32Array::from_iter_values(0..50))],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
@@ -725,7 +724,7 @@ async fn test_prune_fragments_with_scalar_index_blocklist_partial_keeps_all_frag
         schema.clone(),
         vec![Arc::new(Int32Array::from_iter_values(0..50))],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
@@ -779,7 +778,7 @@ async fn test_prune_fragments_with_scalar_index_blocklist_empty_keeps_all_fragme
         schema.clone(),
         vec![Arc::new(Int32Array::from_iter_values(0..50))],
     )
-        .unwrap();
+    .unwrap();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let write_params = WriteParams {
