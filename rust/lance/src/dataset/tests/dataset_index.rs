@@ -2557,6 +2557,79 @@ async fn test_prune_fragments_with_scalar_index_prunes_non_matching_fragments() 
 }
 
 #[tokio::test]
+async fn test_prune_fragments_with_scalar_index_and_mixed_or_filter_is_noop() {
+    // Multi-column dataset with predictable fragment boundaries: 5 fragments
+    // of 10 rows each, columns col_a, col_b, col_c.
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("col_a", DataType::Int32, false),
+        ArrowField::new("col_b", DataType::Int32, false),
+        ArrowField::new("col_c", DataType::Int32, false),
+    ]));
+
+    // col_a: 0..50 (monotonic sequence for range queries)
+    let col_a = Int32Array::from_iter_values(0..50);
+    // col_b: first fragment has small values (< 10) so rows there can only
+    // match the filter via the non-indexed side `col_b < 10`; later fragments
+    // have large values.
+    let col_b =
+        Int32Array::from_iter_values((0..50).map(
+            |i| {
+                if i < 10 {
+                    i
+                } else {
+                    100 + i
+                }
+            },
+        ));
+    // col_c: arbitrary third column, no index.
+    let col_c = Int32Array::from_iter_values((0..50).map(|i| i * 2));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(col_a), Arc::new(col_b), Arc::new(col_c)],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    // Create a scalar index only on col_a.
+    dataset
+        .create_index(
+            &["col_a"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 5);
+
+    // For filter `col_a >= 10 OR col_b < 10`, only `col_a` is indexable. The
+    // planner should treat this OR as mixed indexability and fall back to a
+    // refine-only filter plan, so scalar-index-based pruning becomes a no-op
+    // and all fragments are retained.
+    let pruned = dataset
+        .prune_fragments("col_a >= 10 OR col_b < 10")
+        .await
+        .unwrap();
+    let original_ids: Vec<u64> = fragments.iter().map(|f| f.id).collect();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+    assert_eq!(pruned_ids, original_ids);
+}
+
+#[tokio::test]
 async fn test_prune_fragments_keeps_fragments_outside_index_coverage() {
     // Use TestVectorDataset to construct a multi-fragment dataset with an Int32 column "i".
     // This matches the pattern used elsewhere in dataset_index.rs for multi-fragment tests.
