@@ -639,7 +639,7 @@ impl IndexWorker {
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text) as u32;
+                    let token_id = self.builder.tokens.add(token_text);
                     self.token_occurrences
                         .entry(token_id)
                         .or_insert_with(|| PositionRecorder::new(true))
@@ -657,7 +657,7 @@ impl IndexWorker {
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text) as u32;
+                    let token_id = self.builder.tokens.add(token_text);
                     self.token_ids.push(token_id);
                     token_num += 1;
                 }
