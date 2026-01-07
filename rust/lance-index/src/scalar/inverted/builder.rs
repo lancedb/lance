@@ -29,6 +29,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -79,77 +80,6 @@ pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
         .expect("failed to parse LANCE_FTS_TARGET_SIZE")
 });
 
-/// Build-time metrics for inverted index creation.
-#[derive(Debug, Default)]
-pub struct InvertedIndexBuildMetrics {
-    docs_indexed: std::sync::atomic::AtomicU64,
-    tokens_indexed: std::sync::atomic::AtomicU64,
-    unique_tokens_indexed: std::sync::atomic::AtomicU64,
-    positions_indexed: std::sync::atomic::AtomicU64,
-    token_bytes_indexed: std::sync::atomic::AtomicU64,
-    flushes: std::sync::atomic::AtomicU64,
-}
-
-/// Snapshot of build-time metrics values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvertedIndexBuildMetricsSnapshot {
-    /// Total documents indexed.
-    pub docs_indexed: u64,
-    /// Total tokens indexed (after tokenization).
-    pub tokens_indexed: u64,
-    /// Sum of per-document unique token counts.
-    pub unique_tokens_indexed: u64,
-    /// Total positions recorded (only when with_position = true).
-    pub positions_indexed: u64,
-    /// Sum of token byte lengths.
-    pub token_bytes_indexed: u64,
-    /// Number of partition flushes.
-    pub flushes: u64,
-}
-
-impl InvertedIndexBuildMetrics {
-    fn record_doc(
-        &self,
-        tokens: u64,
-        unique_tokens: u64,
-        positions: u64,
-        token_bytes: u64,
-    ) {
-        self.docs_indexed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.tokens_indexed
-            .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
-        self.unique_tokens_indexed
-            .fetch_add(unique_tokens, std::sync::atomic::Ordering::Relaxed);
-        self.positions_indexed
-            .fetch_add(positions, std::sync::atomic::Ordering::Relaxed);
-        self.token_bytes_indexed
-            .fetch_add(token_bytes, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn record_flush(&self) {
-        self.flushes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> InvertedIndexBuildMetricsSnapshot {
-        InvertedIndexBuildMetricsSnapshot {
-            docs_indexed: self.docs_indexed.load(std::sync::atomic::Ordering::Relaxed),
-            tokens_indexed: self.tokens_indexed.load(std::sync::atomic::Ordering::Relaxed),
-            unique_tokens_indexed: self
-                .unique_tokens_indexed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            positions_indexed: self
-                .positions_indexed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            token_bytes_indexed: self
-                .token_bytes_indexed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            flushes: self.flushes.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
@@ -157,7 +87,6 @@ pub struct InvertedIndexBuilder {
     new_partitions: Vec<u64>,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
-    metrics: Option<Arc<InvertedIndexBuildMetrics>>,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -207,15 +136,7 @@ impl InvertedIndexBuilder {
             src_store,
             token_set_format,
             fragment_mask,
-            metrics: None,
         }
-    }
-
-    /// Enable metrics collection for this build and return a shared handle.
-    pub fn enable_metrics(&mut self) -> Arc<InvertedIndexBuildMetrics> {
-        let metrics = Arc::new(InvertedIndexBuildMetrics::default());
-        self.metrics = Some(metrics.clone());
-        metrics
     }
 
     pub async fn update(
@@ -257,7 +178,6 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let fragment_mask = self.fragment_mask;
             let token_set_format = self.token_set_format;
-            let metrics = self.metrics.clone();
             let task = tokio::task::spawn(async move {
                 let mut worker = IndexWorker::new(
                     store,
@@ -266,7 +186,6 @@ impl InvertedIndexBuilder {
                     id_alloc,
                     fragment_mask,
                     token_set_format,
-                    metrics,
                 )
                 .await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -654,7 +573,10 @@ struct IndexWorker {
     total_doc_length: usize,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
-    metrics: Option<Arc<InvertedIndexBuildMetrics>>,
+    token_occurrences: HashMap<u32, PositionRecorder>,
+    token_ids: Vec<u32>,
+    last_token_count: usize,
+    last_unique_token_count: usize,
 }
 
 impl IndexWorker {
@@ -665,7 +587,6 @@ impl IndexWorker {
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
         token_set_format: TokenSetFormat,
-        metrics: Option<Arc<InvertedIndexBuildMetrics>>,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
@@ -685,7 +606,10 @@ impl IndexWorker {
             total_doc_length: 0,
             fragment_mask,
             token_set_format,
-            metrics,
+            token_occurrences: HashMap::new(),
+            token_ids: Vec::new(),
+            last_token_count: 0,
+            last_unique_token_count: 0,
         })
     }
 
@@ -703,22 +627,38 @@ impl IndexWorker {
 
         let with_position = self.has_position();
         for (doc, row_id) in docs {
-            let mut token_occurrences = HashMap::new();
-            let mut token_num = 0;
-            let mut token_bytes = 0u64;
-            {
+            let mut token_num: u32 = 0;
+            if with_position {
+                if self.token_occurrences.capacity() < self.last_unique_token_count {
+                    self.token_occurrences
+                        .reserve(self.last_unique_token_count - self.token_occurrences.capacity());
+                }
+                self.token_occurrences.clear();
+
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
-                    if self.metrics.is_some() {
-                        token_bytes += token_text.len() as u64;
-                    }
-                    let token_id = self.builder.tokens.add(token_text) as usize;
-                    token_occurrences
-                        .entry(token_id as u32)
-                        .or_insert_with(|| PositionRecorder::new(with_position))
+                    let token_id = self.builder.tokens.add(token_text) as u32;
+                    self.token_occurrences
+                        .entry(token_id)
+                        .or_insert_with(|| PositionRecorder::new(true))
                         .push(token.position as u32);
+                    token_num += 1;
+                }
+            } else {
+                if self.token_ids.capacity() < self.last_token_count {
+                    self.token_ids
+                        .reserve(self.last_token_count - self.token_ids.capacity());
+                }
+                self.token_ids.clear();
+
+                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
+                while token_stream.advance() {
+                    let token = token_stream.token_mut();
+                    let token_text = std::mem::take(&mut token.text);
+                    let token_id = self.builder.tokens.add(token_text) as u32;
+                    self.token_ids.push(token_id);
                     token_num += 1;
                 }
             }
@@ -730,29 +670,44 @@ impl IndexWorker {
             let doc_id = self.builder.docs.append(row_id, token_num);
             self.total_doc_length += doc.len();
 
-            let unique_tokens = token_occurrences.len() as u64;
-            let mut positions_indexed = 0u64;
-            for (token_id, term_positions) in token_occurrences.into_iter() {
-                if with_position && self.metrics.is_some() {
-                    positions_indexed += term_positions.len() as u64;
+            if with_position {
+                let unique_tokens = self.token_occurrences.len();
+                for (token_id, term_positions) in self.token_occurrences.drain() {
+                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
+
+                    let old_size = posting_list.size();
+                    posting_list.add(doc_id, term_positions);
+                    let new_size = posting_list.size();
+                    self.estimated_size += new_size - old_size;
                 }
+                self.last_unique_token_count = unique_tokens;
+            } else if token_num > 0 {
+                self.token_ids.sort_unstable();
+                let mut iter = self.token_ids.iter();
+                let mut current = *iter.next().unwrap();
+                let mut count = 1u32;
+                for &token_id in iter {
+                    if token_id == current {
+                        count += 1;
+                        continue;
+                    }
 
-                let posting_list = &mut self.builder.posting_lists[token_id as usize];
+                    let posting_list = &mut self.builder.posting_lists[current as usize];
+                    let old_size = posting_list.size();
+                    posting_list.add(doc_id, PositionRecorder::Count(count));
+                    let new_size = posting_list.size();
+                    self.estimated_size += new_size - old_size;
 
+                    current = token_id;
+                    count = 1;
+                }
+                let posting_list = &mut self.builder.posting_lists[current as usize];
                 let old_size = posting_list.size();
-                posting_list.add(doc_id, term_positions);
+                posting_list.add(doc_id, PositionRecorder::Count(count));
                 let new_size = posting_list.size();
                 self.estimated_size += new_size - old_size;
             }
-
-            if let Some(metrics) = self.metrics.as_ref() {
-                metrics.record_doc(
-                    token_num as u64,
-                    unique_tokens,
-                    positions_indexed,
-                    token_bytes,
-                );
-            }
+            self.last_token_count = token_num as usize;
 
             if self.builder.docs.len() as u32 == u32::MAX
                 || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20
@@ -788,9 +743,6 @@ impl IndexWorker {
         );
         builder.write(self.store.as_ref()).await?;
         self.partitions.push(builder.id());
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.record_flush();
-        }
         Ok(())
     }
 
@@ -804,14 +756,14 @@ impl IndexWorker {
 
 #[derive(Debug, Clone)]
 pub enum PositionRecorder {
-    Position(Vec<u32>),
+    Position(SmallVec<[u32; 8]>),
     Count(u32),
 }
 
 impl PositionRecorder {
     fn new(with_position: bool) -> Self {
         if with_position {
-            Self::Position(Vec::new())
+            Self::Position(SmallVec::new())
         } else {
             Self::Count(0)
         }
@@ -837,7 +789,7 @@ impl PositionRecorder {
 
     pub fn into_vec(self) -> Vec<u32> {
         match self {
-            Self::Position(positions) => positions,
+            Self::Position(positions) => positions.into_vec(),
             Self::Count(_) => vec![0],
         }
     }
@@ -1304,7 +1256,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
-    use lance_io::object_store::ObjectStore;
+    use crate::metrics::NoOpMetricsCollector;
     use std::sync::atomic::AtomicU64;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
@@ -1344,7 +1296,6 @@ mod tests {
             id_alloc.clone(),
             None,
             token_set_format,
-            None,
         )
         .await?;
         worker1
@@ -1359,7 +1310,6 @@ mod tests {
             id_alloc.clone(),
             None,
             token_set_format,
-            None,
         )
         .await?;
         worker2
@@ -1397,7 +1347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inverted_index_build_metrics() -> Result<()> {
+    async fn test_inverted_index_without_positions_tracks_frequency() -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -1409,36 +1359,41 @@ mod tests {
             Field::new("doc", DataType::Utf8, true),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
-        let docs = Arc::new(StringArray::from(vec![
-            Some("hello world"),
-            Some("hello hello"),
-        ]));
-        let row_ids = Arc::new(UInt64Array::from(vec![0u64, 1u64]));
-        let batch = RecordBatch::try_new(schema, vec![docs, row_ids])?;
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let docs = Arc::new(StringArray::from(vec![Some("hello hello world")]));
+        let row_ids = Arc::new(UInt64Array::from(vec![0u64]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![docs, row_ids])?;
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
         let stream = Box::pin(stream);
 
         let params = InvertedIndexParams::new(
             "whitespace".to_string(),
             tantivy::tokenizer::Language::English,
         )
-        .with_position(true)
+        .with_position(false)
         .remove_stop_words(false)
         .stem(false)
         .max_token_length(None);
 
         let mut builder = InvertedIndexBuilder::new(params);
-        let metrics = builder.enable_metrics();
         builder.update(stream, store.as_ref()).await?;
 
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.docs_indexed, 2);
-        assert_eq!(snapshot.tokens_indexed, 4);
-        assert_eq!(snapshot.unique_tokens_indexed, 3);
-        assert_eq!(snapshot.positions_indexed, 4);
-        assert_eq!(snapshot.token_bytes_indexed, 20);
-        assert_eq!(snapshot.flushes, 1);
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(index.partitions.len(), 1);
+        let partition = &index.partitions[0];
+        let token_id = partition.tokens.get("hello").unwrap();
+        let posting = partition
+            .inverted_list
+            .posting_list(token_id, false, &NoOpMetricsCollector)
+            .await?;
+
+        let mut iter = posting.iter();
+        let (doc_id, freq, positions) = iter.next().unwrap();
+        assert_eq!(doc_id, 0);
+        assert_eq!(freq, 2);
+        assert!(positions.is_none());
+        assert!(iter.next().is_none());
 
         Ok(())
     }
+
 }

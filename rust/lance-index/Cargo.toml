@@ -59,6 +59,7 @@ rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
+smallvec = "1.15"
 tantivy.workspace = true
 lindera = { workspace = true, optional = true }
 lindera-tantivy = { workspace = true, optional = true }
