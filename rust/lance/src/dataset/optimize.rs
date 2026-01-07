@@ -7925,4 +7925,303 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn test_compaction_with_deletions_preserves_stats() {
+        use crate::dataset::WriteParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        // Write 3 fragments
+        for i in 0..3 {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values((i * 100)..((i + 1) * 100))),
+                    Arc::new(Int32Array::from_iter_values((i * 100)..((i + 1) * 100))),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+
+            if i == 0 {
+                Dataset::write(reader, test_uri, Some(write_params.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                let dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
+                Dataset::write(reader, test_uri, Some(append_params))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Delete some rows
+        dataset.delete("id < 50").await.unwrap();
+        dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Compact with deletions materialized
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            materialize_deletions: true,
+            consolidate_column_stats: true,
+            ..Default::default()
+        };
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // Verify stats file was created
+        dataset = Dataset::open(test_uri).await.unwrap();
+        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
+        assert!(
+            stats_file.is_some(),
+            "Stats should be consolidated even with deletions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_multiple_rounds_updates_stats() {
+        use crate::dataset::WriteParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 50,
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        // Write 6 small fragments
+        for i in 0..6 {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    (i * 50)..((i + 1) * 50),
+                ))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+
+            if i == 0 {
+                Dataset::write(reader, test_uri, Some(write_params.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                let dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
+                Dataset::write(reader, test_uri, Some(append_params))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 6);
+
+        // First compaction
+        let options = CompactionOptions {
+            target_rows_per_fragment: 150,
+            consolidate_column_stats: true,
+            ..Default::default()
+        };
+
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        dataset = Dataset::open(test_uri).await.unwrap();
+
+        let first_stats_file = dataset
+            .manifest
+            .config
+            .get("lance.column_stats.file")
+            .cloned();
+        assert!(first_stats_file.is_some());
+
+        // Add more fragments
+        for i in 6..9 {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    (i * 50)..((i + 1) * 50),
+                ))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+            let append_params = WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                enable_column_stats: true,
+                ..Default::default()
+            };
+            Dataset::write(reader, test_uri, Some(append_params))
+                .await
+                .unwrap();
+        }
+
+        // Second compaction
+        dataset = Dataset::open(test_uri).await.unwrap();
+        compact_files(&mut dataset, options, None).await.unwrap();
+        dataset = Dataset::open(test_uri).await.unwrap();
+
+        let second_stats_file = dataset
+            .manifest
+            .config
+            .get("lance.column_stats.file")
+            .cloned();
+        assert!(second_stats_file.is_some());
+
+        // Stats file should be updated (different version)
+        assert_ne!(
+            first_stats_file, second_stats_file,
+            "Stats file should be updated after second compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_with_stable_row_ids_and_stats() {
+        use crate::dataset::WriteParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write with stable row IDs
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            enable_column_stats: true,
+            use_stable_row_ids: true,
+            ..Default::default()
+        };
+
+        for i in 0..3 {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    (i * 100)..((i + 1) * 100),
+                ))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+
+            if i == 0 {
+                Dataset::write(reader, test_uri, Some(write_params.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                let dataset = Dataset::open(test_uri).await.unwrap();
+                let mut append_params = WriteParams::for_dataset(&dataset).unwrap();
+                append_params.mode = crate::dataset::WriteMode::Append;
+                Dataset::write(reader, test_uri, Some(append_params))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Compact with stable row IDs
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            consolidate_column_stats: true,
+            ..Default::default()
+        };
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // Verify stats file was created
+        dataset = Dataset::open(test_uri).await.unwrap();
+        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
+        assert!(
+            stats_file.is_some(),
+            "Stats should work with stable row IDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_no_fragments_to_compact_preserves_stats() {
+        use crate::dataset::WriteParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write one large fragment (no compaction needed)
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2000))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        // Try to compact (should do nothing)
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            consolidate_column_stats: true,
+            ..Default::default()
+        };
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        // No compaction should happen
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(metrics.fragments_added, 0);
+
+        // Stats file should still not exist (no compaction happened)
+        dataset = Dataset::open(test_uri).await.unwrap();
+        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
+        assert!(
+            stats_file.is_none(),
+            "No stats file should be created when no compaction happens"
+        );
+    }
 }

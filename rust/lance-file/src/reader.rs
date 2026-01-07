@@ -1233,11 +1233,14 @@ impl FileReader {
                 )));
             }
             if *column_index >= metadata.column_infos.len() as u32 {
-                return Err(Error::invalid_input(format!(
-                    "The projection specified the column index {} but there are only {} columns in the file",
-                    column_index,
-                    metadata.column_infos.len()
-                )));
+                return Err(Error::invalid_input(
+                    format!(
+                        "The projection specified the column index {} but there are only {} columns in the file",
+                        column_index,
+                        metadata.column_infos.len()
+                    ),
+                    location!(),
+                ));
             }
         }
         Ok(())

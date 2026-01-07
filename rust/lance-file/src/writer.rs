@@ -535,10 +535,13 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "The field `{}` contained null values even though the field is marked non-null in the schema",
-                field.name
-            )));
+            return Err(Error::invalid_input(
+                format!(
+                    "The field `{}` contained null values even though the field is marked non-null in the schema",
+                    field.name
+                ),
+                location!(),
+            ));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {

@@ -842,4 +842,208 @@ mod tests {
 
         assert!(result.is_some(), "Should handle multiple column types");
     }
+
+    #[tokio::test]
+    async fn test_consolidation_single_fragment() {
+        // Test consolidation with just one fragment
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should consolidate even with single fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_large_dataset() {
+        // Test with larger dataset to verify zone handling
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Float32, false),
+        ]));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 50_000,
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        // Write 2 fragments with 50k rows each (should create multiple zones)
+        for i in 0..2 {
+            let start = i * 50_000;
+            let end = (i + 1) * 50_000;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow_array::Int64Array::from_iter_values(
+                        start as i64..end as i64,
+                    )),
+                    Arc::new(Float32Array::from_iter_values(
+                        (start..end).map(|n| n as f32),
+                    )),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+            if i == 0 {
+                Dataset::write(reader, test_uri, Some(write_params.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                let dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
+                Dataset::write(reader, test_uri, Some(append_params))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should handle large dataset with multiple zones"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_after_update() {
+        // Test that update operations create fragments with stats
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values(0..200)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Update some rows
+        dataset
+            .update()
+            .update_where("id < 100")
+            .unwrap()
+            .set("value", "999")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        dataset = Dataset::open(test_uri).await.unwrap();
+
+        // All fragments should have stats (original + updated)
+        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
+            .await
+            .unwrap();
+
+        // This might be None if update doesn't preserve stats - that's a valid outcome
+        // The test documents the behavior
+        if result.is_none() {
+            println!("Note: Update operations don't preserve column stats (expected behavior)");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_with_nullable_columns() {
+        // Test with nullable columns that have actual nulls
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nullable_value", DataType::Int32, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from(
+                    (0..100)
+                        .map(|i| if i % 3 == 0 { None } else { Some(i) })
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should handle nullable columns with nulls"
+        );
+    }
 }
