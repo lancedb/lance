@@ -36,7 +36,11 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::DatasetIndexExt;
-use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+use lance_index::{
+    scalar::{BuiltinIndexType, ScalarIndexParams},
+    vector::DIST_COL,
+    IndexType,
+};
 use lance_linalg::distance::MetricType;
 
 use datafusion::common::{assert_contains, assert_not_contains};
@@ -2652,4 +2656,232 @@ async fn test_prune_fragments_keeps_fragments_outside_index_coverage() {
 
     // Fragments without index coverage must not be pruned.
     assert!(pruned_ids.contains(&new_fragment_id));
+}
+
+#[tokio::test]
+async fn test_prune_fragments_with_zonemap_scalar_index_prunes_non_matching_fragments() {
+    // Dataset with 5 fragments of 10 rows each: z = [0, 1, ..., 49].
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "z",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..50))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    // Create a ZoneMap scalar index on z so all current fragments are indexed.
+    let zonemap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+    dataset
+        .create_index(&["z"], IndexType::Scalar, None, &zonemap_params, true)
+        .await
+        .unwrap();
+
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 5);
+
+    // For filter z >= 30, all matching rows live in the last two fragments.
+    // ZoneMap returns an AtMost allow-list mask, and scalar_indexed_prune_fragments
+    // prunes covered fragments that have no allowed rows while keeping uncovered
+    // fragments, so we expect only the tail fragments to remain.
+    let expected_tail_ids: Vec<u64> = fragments[fragments.len() - 2..]
+        .iter()
+        .map(|f| f.id)
+        .collect();
+
+    let pruned = dataset.prune_fragments("z >= 30").await.unwrap();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+
+    assert_eq!(pruned_ids, expected_tail_ids);
+}
+
+#[tokio::test]
+async fn test_prune_fragments_with_scalar_index_blocklist_partial_keeps_all_fragments() {
+    // Dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..50))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    // Create a scalar BTree index on i so all current fragments are indexed.
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let original_fragments = dataset.fragments().clone();
+    assert_eq!(original_fragments.len(), 5);
+
+    // Filter i != 30 is implemented as NOT(i = 30). The scalar index evaluates the
+    // equality as an exact allow-list and then negates it to an exact block-list
+    // containing only the single row with i = 30. Since no fragment is fully
+    // blocked in the resulting RowAddrMask::BlockList, scalar_indexed_prune_fragments
+    // must keep all fragments and preserve their manifest order.
+    let pruned = dataset.prune_fragments("i != 30").await.unwrap();
+
+    assert_eq!(pruned.len(), original_fragments.len());
+    let original_ids: Vec<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+    assert_eq!(pruned_ids, original_ids);
+}
+
+#[tokio::test]
+async fn test_prune_fragments_with_scalar_index_blocklist_empty_keeps_all_fragments() {
+    // Dataset with 5 fragments of 10 rows each: i = [0, 1, ..., 49].
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..50))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    // Create a scalar BTree index on i so all current fragments are indexed.
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let original_fragments = dataset.fragments().clone();
+    assert_eq!(original_fragments.len(), 5);
+
+    // Filter i != 1000 is implemented as NOT(i = 1000). The equality matches no
+    // rows, so the negated scalar index result is an exact block-list with an
+    // empty RowAddrTreeMap. scalar_indexed_prune_fragments treats an empty
+    // RowAddrMask::BlockList as "no fragment is blocked" and returns all
+    // fragments unchanged.
+    let pruned = dataset.prune_fragments("i != 1000").await.unwrap();
+
+    assert_eq!(pruned.len(), original_fragments.len());
+    let original_ids: Vec<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+    assert_eq!(pruned_ids, original_ids);
+}
+
+#[tokio::test]
+async fn test_prune_fragments_with_scalar_index_blocklist_full_blocks_some_fragments() {
+    // Dataset with 5 fragments of 10 rows each. Fragment 0 has only i = 30 so that
+    // i = 30 selects the entire first fragment, while other fragments have distinct
+    // values. From the data perspective this is a "full-block" fragment for the
+    // equality side of the predicate.
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+
+    // Build five batches of 10 identical values each so fragment boundaries align
+    // with constant-value regions under the 10-row write parameters.
+    let make_batch = |value: i32| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![value; 10]))],
+        )
+        .unwrap()
+    };
+
+    let batches = vec![
+        Ok(make_batch(30)), // fragment 0: all 30
+        Ok(make_batch(10)), // fragment 1: all 10
+        Ok(make_batch(20)), // fragment 2: all 20
+        Ok(make_batch(40)), // fragment 3: all 40
+        Ok(make_batch(50)), // fragment 4: all 50
+    ];
+
+    let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        max_rows_per_group: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    // Create a scalar BTree index on i so all fragments are indexed.
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let original_fragments = dataset.fragments().clone();
+    assert_eq!(original_fragments.len(), 5);
+
+    // Filter i != 30 is implemented as NOT(i = 30). The equality side selects
+    // every row in fragment 0 and no rows in other fragments. Today the scalar
+    // index expression represents this as a BlockList with a *partial* bitmap
+    // for fragment 0 (RowAddrSelection::Partial), so scalar_indexed_prune_fragments
+    // treats it as a partially blocked fragment and keeps all fragments.
+    let pruned = dataset.prune_fragments("i != 30").await.unwrap();
+
+    assert_eq!(pruned.len(), original_fragments.len());
+    let original_ids: Vec<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let pruned_ids: Vec<u64> = pruned.iter().map(|f| f.id).collect();
+    assert_eq!(pruned_ids, original_ids);
 }
