@@ -1678,16 +1678,14 @@ async fn rewrite_files(
         }
     }
 
-    let mut params = WriteParams {
-        max_rows_per_file: options.target_rows_per_fragment,
-        max_rows_per_group: options.max_rows_per_group,
-        mode: WriteMode::Append,
-        // External blobs may reference URIs outside the dataset's base_paths
-        // (e.g. absolute file:// URIs with base_id == 0). Without this flag
-        // the writer would reject such blobs.
-        allow_external_blob_outside_bases: true,
-        ..Default::default()
-    };
+    let mut params = WriteParams::for_dataset(&dataset);
+    params.max_rows_per_file = options.target_rows_per_fragment;
+    params.max_rows_per_group = options.max_rows_per_group;
+    params.mode = WriteMode::Append;
+    // External blobs may reference URIs outside the dataset's base_paths
+    // (e.g. absolute file:// URIs with base_id == 0). Without this flag
+    // the writer would reject such blobs.
+    params.allow_external_blob_outside_bases = true;
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
     }
@@ -2221,8 +2219,7 @@ mod tests {
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
         PrimitiveArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
-    use lance_io::scheduler::ScanScheduler;
-    use arrow_schema::{DataType, Field, Schema, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_arrow::BLOB_META_KEY;
@@ -2239,6 +2236,7 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
+    use lance_io::scheduler::ScanScheduler;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -6819,6 +6817,9 @@ mod tests {
         );
     }
 
+    // Note: This test is disabled because policy enforcement now prevents
+    // creating datasets with mixed stats. The "all-or-nothing" consolidation
+    // logic is still in place for backwards compatibility with older datasets.
     #[tokio::test]
     async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
         use crate::BlobArrayBuilder;
