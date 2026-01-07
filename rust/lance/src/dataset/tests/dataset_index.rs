@@ -2572,16 +2572,7 @@ async fn test_prune_fragments_with_scalar_index_and_mixed_or_filter_is_noop() {
     // col_b: first fragment has small values (< 10) so rows there can only
     // match the filter via the non-indexed side `col_b < 10`; later fragments
     // have large values.
-    let col_b =
-        Int32Array::from_iter_values((0..50).map(
-            |i| {
-                if i < 10 {
-                    i
-                } else {
-                    100 + i
-                }
-            },
-        ));
+    let col_b = Int32Array::from_iter_values((0..50).map(|i| if i < 10 { i } else { 100 + i }));
     // col_c: arbitrary third column, no index.
     let col_c = Int32Array::from_iter_values((0..50).map(|i| i * 2));
 
