@@ -339,7 +339,7 @@ mod tests {
         expression_reference::ExprType,
         extensions::{
             simple_extension_declaration::{ExtensionFunction, MappingType},
-            SimpleExtensionDeclaration, SimpleExtensionUri,
+            SimpleExtensionDeclaration, SimpleExtensionUri, SimpleExtensionUrn,
         },
         function_argument::ArgType,
         r#type::{Boolean, Kind, Nullability, Struct, I32},
@@ -365,16 +365,25 @@ mod tests {
                 git_hash: "".to_string(),
                 producer: "unit-test".to_string(),
             }),
+            #[expect(deprecated)]
             extension_uris: vec![
                 SimpleExtensionUri {
                     extension_uri_anchor: 1,
                     uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml".to_string(),
                 }
             ],
+            extension_urns: vec![
+                SimpleExtensionUrn {
+                    extension_urn_anchor: 1,
+                    urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml".to_string(),
+                }
+            ],
             extensions: vec![
                 SimpleExtensionDeclaration {
                     mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                        #[expect(deprecated)]
                         extension_uri_reference: 1,
+                        extension_urn_reference: 1,
                         function_anchor: 1,
                         name: "lt".to_string(),
                     })),

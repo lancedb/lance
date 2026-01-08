@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use crate::file::object_store_from_uri_or_path;
+use crate::rt;
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -33,15 +35,13 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use pyo3::intern;
+use pyo3::types::PyNone;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyIterator,
     IntoPyObjectExt,
 };
-
-use crate::file::object_store_from_uri_or_path;
-use crate::rt;
 
 /// A wrapper around a JSON string that converts to a Python object
 /// using json.loads when marshalling to Python.
@@ -131,7 +131,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        array: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
@@ -164,7 +168,7 @@ impl KMeans {
         cluster_ids.into_data().to_pyarrow(py)
     }
 
-    fn centroids(&self, py: Python) -> PyResult<PyObject> {
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         if let Some(kmeans) = self.trained_kmeans.as_ref() {
             let centroids: Float32Array = kmeans.centroids.as_primitive().clone();
             let fixed_size_arr =
@@ -177,7 +181,7 @@ impl KMeans {
                     })?;
             fixed_size_arr.into_data().to_pyarrow(py)
         } else {
-            Ok(py.None())
+            Ok(PyNone::get(py).to_owned().into_any())
         }
     }
 }
@@ -259,7 +263,7 @@ impl Hnsw {
         Ok(())
     }
 
-    fn vectors(&self, py: Python) -> PyResult<PyObject> {
+    fn vectors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.vectors.to_data().to_pyarrow(py)
     }
 }
@@ -279,7 +283,7 @@ where
 }
 
 /// Export a Vec of Lance types to a Python object.
-pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<PyObject>>
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<Py<PyAny>>>
 where
     PyLance<&'a T>: IntoPyObject<'a>,
 {

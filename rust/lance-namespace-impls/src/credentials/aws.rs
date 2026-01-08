@@ -11,9 +11,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::Client as StsClient;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
-use log::{debug, info};
+use lance_namespace::models::Identity;
+use log::{debug, info, warn};
+use sha2::{Digest, Sha256};
 
 use super::{
     redact_credential, CredentialVendor, VendedCredentials, VendedPermission,
@@ -24,6 +27,7 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct AwsCredentialVendorConfig {
     /// The IAM role ARN to assume.
+    /// Used for both AssumeRole (static/api_key) and AssumeRoleWithWebIdentity (auth_token).
     pub role_arn: String,
 
     /// Optional external ID for the assume role request.
@@ -43,7 +47,18 @@ pub struct AwsCredentialVendorConfig {
 
     /// Permission level for vended credentials.
     /// Default: Read (full read access)
+    /// Used to generate scoped IAM policy for all credential flows.
     pub permission: VendedPermission,
+
+    /// Salt for API key hashing.
+    /// Required when using API key authentication.
+    /// API keys are hashed as: SHA256(api_key + ":" + salt)
+    pub api_key_salt: Option<String>,
+
+    /// Map of SHA256(api_key + ":" + salt) -> permission level.
+    /// When an API key is provided, its hash is looked up in this map.
+    /// If found, the mapped permission is used instead of the default permission.
+    pub api_key_hash_permissions: HashMap<String, VendedPermission>,
 }
 
 impl AwsCredentialVendorConfig {
@@ -56,6 +71,8 @@ impl AwsCredentialVendorConfig {
             role_session_name: None,
             region: None,
             permission: VendedPermission::default(),
+            api_key_salt: None,
+            api_key_hash_permissions: HashMap::new(),
         }
     }
 
@@ -86,6 +103,32 @@ impl AwsCredentialVendorConfig {
     /// Set the permission level for vended credentials.
     pub fn with_permission(mut self, permission: VendedPermission) -> Self {
         self.permission = permission;
+        self
+    }
+
+    /// Set the API key salt for hashing.
+    pub fn with_api_key_salt(mut self, salt: impl Into<String>) -> Self {
+        self.api_key_salt = Some(salt.into());
+        self
+    }
+
+    /// Add an API key hash to permission mapping.
+    pub fn with_api_key_hash_permission(
+        mut self,
+        key_hash: impl Into<String>,
+        permission: VendedPermission,
+    ) -> Self {
+        self.api_key_hash_permissions
+            .insert(key_hash.into(), permission);
+        self
+    }
+
+    /// Set the entire API key hash permissions map.
+    pub fn with_api_key_hash_permissions(
+        mut self,
+        permissions: HashMap<String, VendedPermission>,
+    ) -> Self {
+        self.api_key_hash_permissions = permissions;
         self
     }
 }
@@ -206,60 +249,84 @@ impl AwsCredentialVendor {
 
         policy.to_string()
     }
-}
 
-#[async_trait]
-impl CredentialVendor for AwsCredentialVendor {
-    async fn vend_credentials(&self, table_location: &str) -> Result<VendedCredentials> {
-        debug!(
-            "AWS credential vending: location={}, permission={}",
-            table_location, self.config.permission
-        );
+    /// Hash an API key using SHA-256 with salt (Polaris pattern).
+    /// Format: SHA256(api_key + ":" + salt) as hex string.
+    pub fn hash_api_key(api_key: &str, salt: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{}:{}", api_key, salt));
+        format!("{:x}", hasher.finalize())
+    }
 
-        let (bucket, prefix) = Self::parse_s3_uri(table_location)?;
-        let policy = Self::build_policy(&bucket, &prefix, self.config.permission);
-
-        let role_session_name = self
-            .config
-            .role_session_name
-            .clone()
-            .unwrap_or_else(|| "lance-credential-vending".to_string());
-
-        // Cap session name to 64 chars (AWS limit)
-        let role_session_name = if role_session_name.len() > 64 {
-            role_session_name[..64].to_string()
-        } else {
-            role_session_name
-        };
-
-        // Convert millis to seconds for AWS API (rounding up to ensure at least the requested duration)
-        // AWS STS allows 900-43200 seconds (15 min - 12 hours), clamp to valid range
-        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
-
-        let mut request = self
-            .sts_client
-            .assume_role()
-            .role_arn(&self.config.role_arn)
-            .role_session_name(&role_session_name)
-            .policy(&policy)
-            .duration_seconds(duration_secs);
-
-        if let Some(ref external_id) = self.config.external_id {
-            request = request.external_id(external_id);
+    /// Extract a session name from a JWT token (best effort, no validation).
+    /// Decodes the payload and extracts 'sub' or 'email' claim.
+    /// Falls back to "lance-web-identity" if parsing fails.
+    fn derive_session_name_from_token(token: &str) -> String {
+        // JWT format: header.payload.signature
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return "lance-web-identity".to_string();
         }
 
-        let response = request.send().await.map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
-                "Failed to assume role '{}': {}",
-                self.config.role_arn, e
-            ))),
-            location: snafu::location!(),
-        })?;
+        // Decode the payload (second part)
+        let payload = match URL_SAFE_NO_PAD.decode(parts[1]) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Try standard base64 as fallback
+                match base64::engine::general_purpose::STANDARD_NO_PAD.decode(parts[1]) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return "lance-web-identity".to_string(),
+                }
+            }
+        };
 
-        let credentials = response.credentials().ok_or_else(|| Error::IO {
-            source: Box::new(std::io::Error::other(
-                "AssumeRole response missing credentials",
-            )),
+        // Parse as JSON and extract 'sub' or 'email'
+        let json: serde_json::Value = match serde_json::from_slice(&payload) {
+            Ok(v) => v,
+            Err(_) => return "lance-web-identity".to_string(),
+        };
+
+        let subject = json
+            .get("sub")
+            .or_else(|| json.get("email"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Sanitize for role session name (alphanumeric, =, @, -, .)
+        let sanitized: String = subject
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '=' || *c == '@' || *c == '-' || *c == '.')
+            .collect();
+
+        let session_name = format!("lance-{}", sanitized);
+
+        // Cap to 64 chars (AWS limit)
+        if session_name.len() > 64 {
+            session_name[..64].to_string()
+        } else {
+            session_name
+        }
+    }
+
+    /// Cap a session name to 64 characters (AWS limit).
+    fn cap_session_name(name: &str) -> String {
+        if name.len() > 64 {
+            name[..64].to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Extract credentials from an STS Credentials response.
+    fn extract_credentials(
+        &self,
+        credentials: Option<&aws_sdk_sts::types::Credentials>,
+        bucket: &str,
+        prefix: &str,
+        permission: VendedPermission,
+    ) -> Result<VendedCredentials> {
+        let credentials = credentials.ok_or_else(|| Error::IO {
+            source: Box::new(std::io::Error::other("STS response missing credentials")),
             location: snafu::location!(),
         })?;
 
@@ -273,7 +340,7 @@ impl CredentialVendor for AwsCredentialVendor {
 
         info!(
             "AWS credentials vended: bucket={}, prefix={}, permission={}, expires_at={}, access_key_id={}",
-            bucket, prefix, self.config.permission, expires_at_millis, redact_credential(&access_key_id)
+            bucket, prefix, permission, expires_at_millis, redact_credential(&access_key_id)
         );
 
         let mut storage_options = HashMap::new();
@@ -291,6 +358,211 @@ impl CredentialVendor for AwsCredentialVendor {
         }
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
+    }
+
+    /// Vend credentials using AssumeRoleWithWebIdentity (for auth_token).
+    async fn vend_with_web_identity(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        auth_token: &str,
+        policy: &str,
+    ) -> Result<VendedCredentials> {
+        let session_name = Self::derive_session_name_from_token(auth_token);
+        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
+
+        debug!(
+            "AWS AssumeRoleWithWebIdentity: role={}, session={}, permission={}",
+            self.config.role_arn, session_name, self.config.permission
+        );
+
+        let response = self
+            .sts_client
+            .assume_role_with_web_identity()
+            .role_arn(&self.config.role_arn)
+            .web_identity_token(auth_token)
+            .role_session_name(&session_name)
+            .policy(policy)
+            .duration_seconds(duration_secs)
+            .send()
+            .await
+            .map_err(|e| Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "AssumeRoleWithWebIdentity failed for role '{}': {}",
+                    self.config.role_arn, e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        self.extract_credentials(
+            response.credentials(),
+            bucket,
+            prefix,
+            self.config.permission,
+        )
+    }
+
+    /// Vend credentials using AssumeRole with API key validation.
+    async fn vend_with_api_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        api_key: &str,
+    ) -> Result<VendedCredentials> {
+        let salt = self
+            .config
+            .api_key_salt
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput {
+                source: "api_key_salt must be configured to use API key authentication".into(),
+                location: snafu::location!(),
+            })?;
+
+        let key_hash = Self::hash_api_key(api_key, salt);
+
+        // Look up permission from hash mapping
+        let permission = self
+            .config
+            .api_key_hash_permissions
+            .get(&key_hash)
+            .copied()
+            .ok_or_else(|| {
+                warn!(
+                    "Invalid API key: hash {} not found in permissions map",
+                    &key_hash[..8]
+                );
+                Error::InvalidInput {
+                    source: "Invalid API key".into(),
+                    location: snafu::location!(),
+                }
+            })?;
+
+        let policy = Self::build_policy(bucket, prefix, permission);
+        let session_name = Self::cap_session_name(&format!("lance-api-{}", &key_hash[..16]));
+        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
+
+        debug!(
+            "AWS AssumeRole with API key: role={}, session={}, permission={}",
+            self.config.role_arn, session_name, permission
+        );
+
+        let request = self
+            .sts_client
+            .assume_role()
+            .role_arn(&self.config.role_arn)
+            .role_session_name(&session_name)
+            .policy(&policy)
+            .duration_seconds(duration_secs)
+            .external_id(&key_hash); // Use hash as external_id
+
+        let response = request.send().await.map_err(|e| Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "AssumeRole with API key failed for role '{}': {}",
+                self.config.role_arn, e
+            ))),
+            location: snafu::location!(),
+        })?;
+
+        self.extract_credentials(response.credentials(), bucket, prefix, permission)
+    }
+
+    /// Vend credentials using AssumeRole with static configuration.
+    async fn vend_with_static_config(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        policy: &str,
+    ) -> Result<VendedCredentials> {
+        let role_session_name = self
+            .config
+            .role_session_name
+            .clone()
+            .unwrap_or_else(|| "lance-credential-vending".to_string());
+        let role_session_name = Self::cap_session_name(&role_session_name);
+
+        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
+
+        debug!(
+            "AWS AssumeRole (static): role={}, session={}, permission={}",
+            self.config.role_arn, role_session_name, self.config.permission
+        );
+
+        let mut request = self
+            .sts_client
+            .assume_role()
+            .role_arn(&self.config.role_arn)
+            .role_session_name(&role_session_name)
+            .policy(policy)
+            .duration_seconds(duration_secs);
+
+        if let Some(ref external_id) = self.config.external_id {
+            request = request.external_id(external_id);
+        }
+
+        let response = request.send().await.map_err(|e| Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "AssumeRole failed for role '{}': {}",
+                self.config.role_arn, e
+            ))),
+            location: snafu::location!(),
+        })?;
+
+        self.extract_credentials(
+            response.credentials(),
+            bucket,
+            prefix,
+            self.config.permission,
+        )
+    }
+}
+
+#[async_trait]
+impl CredentialVendor for AwsCredentialVendor {
+    async fn vend_credentials(
+        &self,
+        table_location: &str,
+        identity: Option<&Identity>,
+    ) -> Result<VendedCredentials> {
+        debug!(
+            "AWS credential vending: location={}, permission={}, has_identity={}",
+            table_location,
+            self.config.permission,
+            identity.is_some()
+        );
+
+        let (bucket, prefix) = Self::parse_s3_uri(table_location)?;
+
+        match identity {
+            Some(id) if id.auth_token.is_some() => {
+                // Use AssumeRoleWithWebIdentity with configured permission
+                let policy = Self::build_policy(&bucket, &prefix, self.config.permission);
+                self.vend_with_web_identity(
+                    &bucket,
+                    &prefix,
+                    id.auth_token.as_ref().unwrap(),
+                    &policy,
+                )
+                .await
+            }
+            Some(id) if id.api_key.is_some() => {
+                // Use AssumeRole with API key validation and mapped permission
+                self.vend_with_api_key(&bucket, &prefix, id.api_key.as_ref().unwrap())
+                    .await
+            }
+            Some(_) => {
+                // Identity provided but neither api_key nor auth_token set
+                Err(Error::InvalidInput {
+                    source: "Identity provided but neither api_key nor auth_token is set".into(),
+                    location: snafu::location!(),
+                })
+            }
+            None => {
+                // Use AssumeRole with static configuration
+                let policy = Self::build_policy(&bucket, &prefix, self.config.permission);
+                self.vend_with_static_config(&bucket, &prefix, &policy)
+                    .await
+            }
+        }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -543,7 +815,7 @@ mod tests {
                 .expect("should create read vendor");
 
             let read_creds = read_vendor
-                .vend_credentials(&table_location)
+                .vend_credentials(&table_location, None)
                 .await
                 .expect("should vend read credentials");
 
@@ -582,7 +854,7 @@ mod tests {
                 .expect("should create admin vendor");
 
             let admin_creds = admin_vendor
-                .vend_credentials(&table_location)
+                .vend_credentials(&table_location, None)
                 .await
                 .expect("should vend admin credentials");
 
@@ -627,8 +899,7 @@ mod tests {
             // Create a child namespace
             let create_ns_req = CreateNamespaceRequest {
                 id: Some(vec!["test_ns".to_string()]),
-                properties: None,
-                mode: None,
+                ..Default::default()
             };
             namespace
                 .create_namespace(create_ns_req)
@@ -640,6 +911,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_ns".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             let create_response = namespace
                 .create_table(create_table_req, table_data)
@@ -704,8 +976,7 @@ mod tests {
             // List tables to verify the table was created
             let list_req = ListTablesRequest {
                 id: Some(vec!["test_ns".to_string()]),
-                page_token: None,
-                limit: None,
+                ..Default::default()
             };
             let list_response = namespace
                 .list_tables(list_req)
@@ -719,6 +990,7 @@ mod tests {
             // Clean up: drop the table
             let drop_req = DropTableRequest {
                 id: Some(vec!["test_ns".to_string(), "test_table".to_string()]),
+                ..Default::default()
             };
             namespace
                 .drop_table(drop_req)
@@ -755,12 +1027,12 @@ mod tests {
 
             // Vend credentials multiple times to verify consistent behavior
             let creds1 = vendor
-                .vend_credentials(&table_location)
+                .vend_credentials(&table_location, None)
                 .await
                 .expect("should vend credentials first time");
 
             let creds2 = vendor
-                .vend_credentials(&table_location)
+                .vend_credentials(&table_location, None)
                 .await
                 .expect("should vend credentials second time");
 
@@ -802,13 +1074,13 @@ mod tests {
 
             // Vend credentials for table1
             let creds1 = vendor
-                .vend_credentials(&table1_location)
+                .vend_credentials(&table1_location, None)
                 .await
                 .expect("should vend credentials for table1");
 
             // Vend credentials for table2
             let creds2 = vendor
-                .vend_credentials(&table2_location)
+                .vend_credentials(&table2_location, None)
                 .await
                 .expect("should vend credentials for table2");
 
@@ -861,8 +1133,7 @@ mod tests {
             // Verify namespace works
             let create_ns_req = CreateNamespaceRequest {
                 id: Some(vec!["props_test".to_string()]),
-                properties: None,
-                mode: None,
+                ..Default::default()
             };
             namespace
                 .create_namespace(create_ns_req)

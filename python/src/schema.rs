@@ -108,7 +108,7 @@ impl LanceSchema {
         Ok(Self(schema))
     }
 
-    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         // We don't have a single message for the schema, just protobuf message
         // for a field. So, the state will be:
         // (metadata_json, field_protos...)
