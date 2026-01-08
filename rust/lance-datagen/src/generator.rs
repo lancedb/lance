@@ -1712,6 +1712,7 @@ impl ArrayGenerator for RandomListGenerator {
     }
 }
 
+/// Generates random map arrays where each map has 0-4 entries.
 #[derive(Debug)]
 struct RandomMapGenerator {
     field: Arc<Field>,
@@ -2832,6 +2833,7 @@ pub mod array {
         Box::new(RandomListGenerator::new(item_gen, is_large))
     }
 
+    /// Generates random map arrays where each map has 0-4 entries.
     pub fn rand_map(key_type: &DataType, value_type: &DataType) -> Box<dyn ArrayGenerator> {
         let keys_gen = rand_type(key_type);
         let values_gen = rand_type(value_type);
