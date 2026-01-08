@@ -67,6 +67,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1117,6 +1118,70 @@ public class DatasetTest {
           assertNotNull(readTransaction.uuid());
           assertInstanceOf(Append.class, readTransaction.operation());
         }
+      }
+    }
+  }
+
+  @Test
+  void testCommitTransactionDetachedTrue(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testCommitTransactionDetachedTrue").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset base = suite.createEmptyDataset(true)) {
+        assertEquals(1, base.version());
+        assertEquals(1, base.latestVersion());
+        assertEquals(0, base.countRows());
+        long baseVersion = base.version();
+        long baseLatestVersion = base.latestVersion();
+        long baseRowCount = base.countRows();
+        FragmentMetadata fragment = suite.createNewFragment(5);
+        Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
+        Transaction transaction = base.newTransactionBuilder().operation(append).build();
+        try (Dataset committed = base.commitTransaction(transaction, true)) {
+          // Original dataset is not refreshed to the new version.
+          assertEquals(baseVersion, base.version());
+          assertEquals(baseRowCount, base.countRows());
+
+          // Latest version should not change.
+          assertEquals(base.latestVersion(), baseLatestVersion);
+
+          // Committed dataset has a detached version.
+          assertNotEquals(baseVersion + 1, committed.version());
+          assertNotEquals(committed.version(), committed.latestVersion());
+          assertEquals(baseRowCount + 5, committed.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testCommitTransactionDetachedTrueOnV1ManifestThrowsUnsupported(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("commitTransactionDetachedTrueOnV1").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = suite.createEmptyDataset()) {
+        List<Version> versionsBefore = dataset.listVersions();
+        long versionIdBefore = versionsBefore.get(0).getId();
+
+        FragmentMetadata fragment = suite.createNewFragment(3);
+        Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
+        Transaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        UnsupportedOperationException ex =
+            assertThrows(
+                UnsupportedOperationException.class,
+                () -> dataset.commitTransaction(transaction, true));
+
+        // Error should indicate detached commits are not supported on v1 manifests.
+        assertNotNull(ex.getMessage());
+        assertTrue(ex.getMessage().toLowerCase().contains("detached"));
+
+        // Dataset state should remain unchanged after the failed detached commit.
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+        List<Version> versionsAfter = dataset.listVersions();
+        assertEquals(1, versionsAfter.size());
+        assertEquals(versionIdBefore, versionsAfter.get(0).getId());
       }
     }
   }

@@ -11,7 +11,7 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jbyte;
+use jni::sys::{jboolean, jbyte};
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -562,6 +562,7 @@ fn convert_to_java_operation_inner<'local>(
             mem_wal_to_merge: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
+            inserted_rows_filter: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -727,10 +728,16 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached_jbool: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(&mut env, java_dataset, java_transaction)
+        inner_commit_transaction(
+            &mut env,
+            java_dataset,
+            java_transaction,
+            detached_jbool != 0,
+        )
     )
 }
 
@@ -738,6 +745,7 @@ fn inner_commit_transaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached: bool,
 ) -> Result<JObject<'local>> {
     let write_param_jobj = env
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
@@ -771,7 +779,7 @@ fn inner_commit_transaction<'local>(
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params)?
+        dataset_guard.commit_transaction(transaction, store_params, detached)?
     };
     new_blocking_ds.into_java(env)
 }
@@ -1043,6 +1051,7 @@ fn convert_to_rust_operation(
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter: None,
             }
         }
         "DataReplacement" => {

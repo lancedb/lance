@@ -179,8 +179,8 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// Check whether the transaction conflicts with another transaction.
-    /// Mutate the current [TransactionRebase] based on [other_transaction] to be used for
-    /// eventually [finish] the rebase process.
+    /// Mutate the current [TransactionRebase] based on `other_transaction` to be used for
+    /// eventually finishing the rebase process.
     ///
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
@@ -343,17 +343,84 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_merge, ..
+            mem_wal_to_merge,
+            inserted_rows_filter: self_inserted_rows_filter,
+            ..
         } = &self.transaction.operation
         {
+            if let Operation::Update {
+                inserted_rows_filter: other_inserted_rows_filter,
+                ..
+            } = &other_transaction.operation
+            {
+                // The presence of inserted_rows_filter means this is a primary key operation
+                // and strict conflict detection should be applied.
+                match (self_inserted_rows_filter, other_inserted_rows_filter) {
+                    (Some(self_keys), Some(other_keys)) => {
+                        if self_keys.field_ids != other_keys.field_ids {
+                            // Different key columns - can't verify conflicts
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                        // Check for intersection. If the bloom filter configs don't match
+                        // (e.g., different number_of_items or probability), intersects() returns
+                        // an error and we treat it as a conflict to be safe.
+                        let Ok((has_intersection, _maybe_false_positive)) =
+                            self_keys.intersects(other_keys)
+                        else {
+                            // Bloom filter configs don't match - treat as conflict
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        };
+                        if has_intersection {
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                    }
+                    (Some(_), None) => {
+                        // Current transaction has primary key conflict detection but
+                        // the already committed transaction doesn't have a filter.
+                        // We can't determine what rows were inserted by the other
+                        // transaction, so we must fail to be safe.
+                        return Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
-                | Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Append { .. } => {
+                    // If current transaction has primary key conflict detection,
+                    // we can't safely commit against an Append because we don't
+                    // know if the appended rows conflict with inserted rows.
+                    if self_inserted_rows_filter.is_some() {
+                        return Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ));
+                    }
+                    Ok(())
+                }
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -1797,6 +1864,7 @@ mod tests {
             mem_wal_to_merge: None,
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
+            inserted_rows_filter: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1808,6 +1876,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1822,6 +1891,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1923,6 +1993,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1937,6 +2008,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
         ];
         let transactions =
@@ -2058,6 +2130,7 @@ mod tests {
                     mem_wal_to_merge: None,
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
+                    inserted_rows_filter: None,
                 },
             ),
             (
@@ -2070,6 +2143,7 @@ mod tests {
                     mem_wal_to_merge: None,
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
+                    inserted_rows_filter: None,
                 },
             ),
             (
@@ -2228,6 +2302,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
             create_update_config_for_test(
                 Some(HashMap::from_iter(vec![(
@@ -2423,6 +2498,7 @@ mod tests {
                     mem_wal_to_merge: None,
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
+                    inserted_rows_filter: None,
                 },
                 [
                     Compatible,    // append
@@ -2845,6 +2921,7 @@ mod tests {
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
+                inserted_rows_filter: None,
             },
         ];
 
@@ -3149,7 +3226,7 @@ mod tests {
                         "{}: expected NotCompatible but got {:?}",
                         description,
                         result
-                    );
+                    )
                 }
                 Retryable => {
                     assert!(

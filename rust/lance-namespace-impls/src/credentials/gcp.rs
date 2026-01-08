@@ -44,12 +44,15 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use google_cloud_auth::credentials;
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
-use log::{debug, info};
+use lance_namespace::models::Identity;
+use log::{debug, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{redact_credential, CredentialVendor, VendedCredentials, VendedPermission};
 
@@ -79,6 +82,31 @@ pub struct GcpCredentialVendorConfig {
     /// Note: GCP token duration cannot be configured; the token lifetime
     /// is determined by the STS endpoint (typically 1 hour).
     pub permission: VendedPermission,
+
+    /// Workload Identity Provider resource name for OIDC token exchange.
+    /// Required when using auth_token identity for Workload Identity Federation.
+    ///
+    /// Format: `projects/{project_number}/locations/global/workloadIdentityPools/{pool_id}/providers/{provider_id}`
+    ///
+    /// The OIDC token's issuer must match the provider's configuration.
+    pub workload_identity_provider: Option<String>,
+
+    /// Service account to impersonate after Workload Identity Federation.
+    /// Optional - if set, the exchanged token will be used to generate an
+    /// access token for this service account.
+    ///
+    /// Format: `my-sa@project.iam.gserviceaccount.com`
+    pub impersonation_service_account: Option<String>,
+
+    /// Salt for API key hashing.
+    /// Required when using API key authentication.
+    /// API keys are hashed as: SHA256(api_key + ":" + salt)
+    pub api_key_salt: Option<String>,
+
+    /// Map of SHA256(api_key + ":" + salt) -> permission level.
+    /// When an API key is provided, its hash is looked up in this map.
+    /// If found, the mapped permission is used instead of the default permission.
+    pub api_key_hash_permissions: HashMap<String, VendedPermission>,
 }
 
 impl GcpCredentialVendorConfig {
@@ -102,6 +130,47 @@ impl GcpCredentialVendorConfig {
     /// Set the permission level for vended credentials.
     pub fn with_permission(mut self, permission: VendedPermission) -> Self {
         self.permission = permission;
+        self
+    }
+
+    /// Set the Workload Identity Provider for OIDC token exchange.
+    pub fn with_workload_identity_provider(mut self, provider: impl Into<String>) -> Self {
+        self.workload_identity_provider = Some(provider.into());
+        self
+    }
+
+    /// Set the service account to impersonate after Workload Identity Federation.
+    pub fn with_impersonation_service_account(
+        mut self,
+        service_account: impl Into<String>,
+    ) -> Self {
+        self.impersonation_service_account = Some(service_account.into());
+        self
+    }
+
+    /// Set the API key salt for hashing.
+    pub fn with_api_key_salt(mut self, salt: impl Into<String>) -> Self {
+        self.api_key_salt = Some(salt.into());
+        self
+    }
+
+    /// Add an API key hash to permission mapping.
+    pub fn with_api_key_hash_permission(
+        mut self,
+        key_hash: impl Into<String>,
+        permission: VendedPermission,
+    ) -> Self {
+        self.api_key_hash_permissions
+            .insert(key_hash.into(), permission);
+        self
+    }
+
+    /// Set the entire API key hash permissions map.
+    pub fn with_api_key_hash_permissions(
+        mut self,
+        permissions: HashMap<String, VendedPermission>,
+    ) -> Self {
+        self.api_key_hash_permissions = permissions;
         self
     }
 }
@@ -459,25 +528,237 @@ impl GcpCredentialVendor {
 
         Ok((token_response.access_token, expires_at_millis))
     }
-}
 
-#[async_trait]
-impl CredentialVendor for GcpCredentialVendor {
-    async fn vend_credentials(&self, table_location: &str) -> Result<VendedCredentials> {
+    /// Hash an API key using SHA-256 with salt (Polaris pattern).
+    /// Format: SHA256(api_key + ":" + salt) as hex string.
+    pub fn hash_api_key(api_key: &str, salt: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{}:{}", api_key, salt));
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Extract a session name from a JWT token (best effort, no validation).
+    /// Decodes the payload and extracts 'sub' or 'email' claim.
+    /// Falls back to "lance-gcp-identity" if parsing fails.
+    fn derive_session_name_from_token(token: &str) -> String {
+        // JWT format: header.payload.signature
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return "lance-gcp-identity".to_string();
+        }
+
+        // Decode the payload (second part)
+        let payload = match URL_SAFE_NO_PAD.decode(parts[1]) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Try standard base64 as fallback
+                match base64::engine::general_purpose::STANDARD_NO_PAD.decode(parts[1]) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return "lance-gcp-identity".to_string(),
+                }
+            }
+        };
+
+        // Parse as JSON and extract 'sub' or 'email'
+        let json: serde_json::Value = match serde_json::from_slice(&payload) {
+            Ok(v) => v,
+            Err(_) => return "lance-gcp-identity".to_string(),
+        };
+
+        let subject = json
+            .get("sub")
+            .or_else(|| json.get("email"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Sanitize: keep only alphanumeric, @, -, .
+        let sanitized: String = subject
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '@' || *c == '-' || *c == '.')
+            .collect();
+
+        format!("lance-{}", sanitized)
+    }
+
+    /// Normalize the Workload Identity Provider to the full audience format expected by GCP STS.
+    ///
+    /// GCP STS expects audience in the format:
+    /// `//iam.googleapis.com/projects/{project}/locations/global/workloadIdentityPools/{pool}/providers/{provider}`
+    ///
+    /// This function accepts either:
+    /// - Full format: `//iam.googleapis.com/projects/...`
+    /// - Short format: `projects/...` (will be prefixed with `//iam.googleapis.com/`)
+    fn normalize_workload_identity_audience(provider: &str) -> String {
+        const IAM_PREFIX: &str = "//iam.googleapis.com/";
+        if provider.starts_with(IAM_PREFIX) {
+            provider.to_string()
+        } else {
+            format!("{}{}", IAM_PREFIX, provider)
+        }
+    }
+
+    /// Exchange an OIDC token for GCP access token using Workload Identity Federation.
+    ///
+    /// This requires:
+    /// 1. A Workload Identity Pool and Provider configured in GCP
+    /// 2. The OIDC token's issuer to match the provider's configuration
+    /// 3. Optionally, a service account to impersonate after token exchange
+    async fn exchange_oidc_for_gcp_token(&self, oidc_token: &str) -> Result<String> {
+        let workload_identity_provider = self
+            .config
+            .workload_identity_provider
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput {
+                source: "gcp_workload_identity_provider must be configured for OIDC token exchange"
+                    .into(),
+                location: snafu::location!(),
+            })?;
+
+        // Normalize audience to full format expected by GCP STS
+        let audience = Self::normalize_workload_identity_audience(workload_identity_provider);
+
+        // Exchange OIDC token for GCP federated token via STS
+        let params = [
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            ("subject_token", oidc_token),
+            ("audience", audience.as_str()),
+            ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+        ];
+
+        let response = self
+            .http_client
+            .post(STS_TOKEN_EXCHANGE_URL)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to exchange OIDC token for GCP token: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "GCP STS token exchange failed with status {}: {}",
+                    status, body
+                ))),
+                location: snafu::location!(),
+            });
+        }
+
+        let token_response: TokenExchangeResponse =
+            response.json().await.map_err(|e| Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to parse GCP STS token response: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        let federated_token = token_response.access_token;
+
+        // If impersonation is configured, use the federated token to get an impersonated token
+        if let Some(ref service_account) = self.config.impersonation_service_account {
+            return self
+                .impersonate_service_account(&federated_token, service_account)
+                .await;
+        }
+
+        Ok(federated_token)
+    }
+
+    /// Vend credentials using Workload Identity Federation (for auth_token).
+    async fn vend_with_web_identity(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        auth_token: &str,
+    ) -> Result<VendedCredentials> {
+        let session_name = Self::derive_session_name_from_token(auth_token);
         debug!(
-            "GCP credential vending: location={}, permission={}",
-            table_location, self.config.permission
+            "GCP vend_with_web_identity: bucket={}, prefix={}, session={}",
+            bucket, prefix, session_name
         );
 
-        let (bucket, prefix) = Self::parse_gcs_uri(table_location)?;
+        // Exchange OIDC token for GCP token
+        let gcp_token = self.exchange_oidc_for_gcp_token(auth_token).await?;
 
-        // Get source token from default credentials
+        // Build access boundary and downscope
+        let access_boundary = Self::build_access_boundary(bucket, prefix, self.config.permission);
+        let (downscoped_token, expires_at_millis) =
+            self.downscope_token(&gcp_token, &access_boundary).await?;
+
+        let mut storage_options = HashMap::new();
+        storage_options.insert("google_storage_token".to_string(), downscoped_token.clone());
+        storage_options.insert(
+            "expires_at_millis".to_string(),
+            expires_at_millis.to_string(),
+        );
+
+        info!(
+            "GCP credentials vended (web identity): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
+            bucket, prefix, self.config.permission, expires_at_millis, redact_credential(&downscoped_token)
+        );
+
+        Ok(VendedCredentials::new(storage_options, expires_at_millis))
+    }
+
+    /// Vend credentials using API key validation.
+    async fn vend_with_api_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        api_key: &str,
+    ) -> Result<VendedCredentials> {
+        let salt = self
+            .config
+            .api_key_salt
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput {
+                source: "api_key_salt must be configured to use API key authentication".into(),
+                location: snafu::location!(),
+            })?;
+
+        let key_hash = Self::hash_api_key(api_key, salt);
+
+        // Look up permission from hash mapping
+        let permission = self
+            .config
+            .api_key_hash_permissions
+            .get(&key_hash)
+            .copied()
+            .ok_or_else(|| {
+                warn!(
+                    "Invalid API key: hash {} not found in permissions map",
+                    &key_hash[..8]
+                );
+                Error::InvalidInput {
+                    source: "Invalid API key".into(),
+                    location: snafu::location!(),
+                }
+            })?;
+
+        debug!(
+            "GCP vend_with_api_key: bucket={}, prefix={}, permission={}",
+            bucket, prefix, permission
+        );
+
+        // Get source token using ADC and downscope with the API key's permission
         let source_token = self.get_source_token().await?;
-
-        // Build access boundary for this location and permission
-        let access_boundary = Self::build_access_boundary(&bucket, &prefix, self.config.permission);
-
-        // Exchange for downscoped token
+        let access_boundary = Self::build_access_boundary(bucket, prefix, permission);
         let (downscoped_token, expires_at_millis) = self
             .downscope_token(&source_token, &access_boundary)
             .await?;
@@ -490,15 +771,74 @@ impl CredentialVendor for GcpCredentialVendor {
         );
 
         info!(
-            "GCP credentials vended: bucket={}, prefix={}, permission={}, expires_at={}, token={}",
-            bucket,
-            prefix,
-            self.config.permission,
-            expires_at_millis,
-            redact_credential(&downscoped_token)
+            "GCP credentials vended (api_key): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
+            bucket, prefix, permission, expires_at_millis, redact_credential(&downscoped_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
+    }
+}
+
+#[async_trait]
+impl CredentialVendor for GcpCredentialVendor {
+    async fn vend_credentials(
+        &self,
+        table_location: &str,
+        identity: Option<&Identity>,
+    ) -> Result<VendedCredentials> {
+        debug!(
+            "GCP credential vending: location={}, permission={}, identity={:?}",
+            table_location,
+            self.config.permission,
+            identity.map(|i| format!(
+                "api_key={}, auth_token={}",
+                i.api_key.is_some(),
+                i.auth_token.is_some()
+            ))
+        );
+
+        let (bucket, prefix) = Self::parse_gcs_uri(table_location)?;
+
+        // Dispatch based on identity
+        match identity {
+            Some(id) if id.auth_token.is_some() => {
+                let auth_token = id.auth_token.as_ref().unwrap();
+                self.vend_with_web_identity(&bucket, &prefix, auth_token)
+                    .await
+            }
+            Some(id) if id.api_key.is_some() => {
+                let api_key = id.api_key.as_ref().unwrap();
+                self.vend_with_api_key(&bucket, &prefix, api_key).await
+            }
+            Some(_) => Err(Error::InvalidInput {
+                source: "Identity provided but neither auth_token nor api_key is set".into(),
+                location: snafu::location!(),
+            }),
+            None => {
+                // Static credential vending using ADC
+                let source_token = self.get_source_token().await?;
+                let access_boundary =
+                    Self::build_access_boundary(&bucket, &prefix, self.config.permission);
+                let (downscoped_token, expires_at_millis) = self
+                    .downscope_token(&source_token, &access_boundary)
+                    .await?;
+
+                let mut storage_options = HashMap::new();
+                storage_options
+                    .insert("google_storage_token".to_string(), downscoped_token.clone());
+                storage_options.insert(
+                    "expires_at_millis".to_string(),
+                    expires_at_millis.to_string(),
+                );
+
+                info!(
+                    "GCP credentials vended (static): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
+                    bucket, prefix, self.config.permission, expires_at_millis, redact_credential(&downscoped_token)
+                );
+
+                Ok(VendedCredentials::new(storage_options, expires_at_millis))
+            }
+        }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -633,5 +973,27 @@ mod tests {
         assert_eq!(rules.len(), 1);
         // No condition when prefix is empty (full bucket access)
         assert!(rules[0].availability_condition.is_none());
+    }
+
+    #[test]
+    fn test_normalize_workload_identity_audience() {
+        // Short format should be prefixed
+        let short =
+            "projects/123456/locations/global/workloadIdentityPools/my-pool/providers/my-provider";
+        let normalized = GcpCredentialVendor::normalize_workload_identity_audience(short);
+        assert_eq!(
+            normalized,
+            "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/my-pool/providers/my-provider"
+        );
+
+        // Full format should be unchanged
+        let full = "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/my-pool/providers/my-provider";
+        let normalized = GcpCredentialVendor::normalize_workload_identity_audience(full);
+        assert_eq!(normalized, full);
+
+        // Edge case: already has prefix (idempotent)
+        let normalized_again =
+            GcpCredentialVendor::normalize_workload_identity_audience(&normalized);
+        assert_eq!(normalized_again, full);
     }
 }

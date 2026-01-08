@@ -56,6 +56,7 @@ public class WriteParams {
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
   private final Optional<LanceFileVersion> dataStorageVersion;
+  private final Optional<Boolean> enableV2ManifestPaths;
   private Map<String, String> storageOptions = new HashMap<>();
   private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
   private final Optional<List<BasePath>> initialBases;
@@ -68,6 +69,7 @@ public class WriteParams {
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<LanceFileVersion> dataStorageVersion,
+      Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
@@ -78,6 +80,7 @@ public class WriteParams {
     this.mode = mode;
     this.enableStableRowIds = enableStableRowIds;
     this.dataStorageVersion = dataStorageVersion;
+    this.enableV2ManifestPaths = enableV2ManifestPaths;
     this.storageOptions = storageOptions;
     this.s3CredentialsRefreshOffsetSeconds = s3CredentialsRefreshOffsetSeconds;
     this.initialBases = initialBases;
@@ -111,6 +114,10 @@ public class WriteParams {
 
   public Optional<String> getDataStorageVersion() {
     return dataStorageVersion.map(LanceFileVersion::getVersionString);
+  }
+
+  public Optional<Boolean> getEnableV2ManifestPaths() {
+    return enableV2ManifestPaths;
   }
 
   public Map<String, String> getStorageOptions() {
@@ -148,6 +155,7 @@ public class WriteParams {
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
+    private Optional<Boolean> enableV2ManifestPaths;
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
     private Optional<List<BasePath>> initialBases = Optional.empty();
@@ -188,6 +196,11 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withEnableV2ManifestPaths(boolean enableV2ManifestPaths) {
+      this.enableV2ManifestPaths = Optional.of(enableV2ManifestPaths);
+      return this;
+    }
+
     public Builder withS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
       this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
       return this;
@@ -211,6 +224,7 @@ public class WriteParams {
           mode,
           enableStableRowIds,
           dataStorageVersion,
+          enableV2ManifestPaths,
           storageOptions,
           s3CredentialsRefreshOffsetSeconds,
           initialBases,

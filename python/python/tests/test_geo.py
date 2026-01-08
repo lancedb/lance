@@ -104,3 +104,52 @@ def test_geo_sql(tmp_path: Path):
     assert np.allclose(
         np.array(result["dist"]), np.array([2.5495097567963922]), atol=1e-8
     )
+
+
+def test_rtree_index(tmp_path: Path):
+    # LineStrings
+    num_lines = 10000
+    line_offsets = np.arange(num_lines + 1, dtype=np.int32) * 2
+    linestrings_2d = linestrings(
+        [np.random.randn(num_lines * 2) * 100, np.random.randn(num_lines * 2) * 100],
+        line_offsets,
+    )
+    assert len(linestrings_2d) == num_lines
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(linestring("xy")).with_name("linestring"),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [np.arange(num_lines, dtype=np.int64), linestrings_2d], schema=schema
+    )
+    ds = lance.write_dataset(table, str(tmp_path / "test_rtree_index.lance"))
+
+    def query(ds: lance.LanceDataset, has_index=False):
+        sql = """
+              SELECT `id`, linestring
+              FROM dataset
+              WHERE
+              St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))
+              """
+
+        batches = ds.sql("EXPLAIN ANALYZE " + sql).build().to_batch_records()
+        explain = pa.Table.from_batches(batches).to_pandas().to_string()
+
+        if has_index:
+            assert "ScalarIndexQuery" in explain
+        else:
+            assert "ScalarIndexQuery" not in explain
+
+        batches = ds.sql(sql).build().to_batch_records()
+        return pa.Table.from_batches(batches)
+
+    table_without_index = query(ds)
+
+    ds.create_scalar_index("linestring", "RTREE")
+
+    table_with_index = query(ds, has_index=True)
+
+    assert table_with_index == table_without_index

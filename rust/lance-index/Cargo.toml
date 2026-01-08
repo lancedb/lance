@@ -30,6 +30,9 @@ deepsize.workspace = true
 dirs.workspace = true
 fst.workspace = true
 futures.workspace = true
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+geo-types = { workspace = true }
 half.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
@@ -39,6 +42,7 @@ lance-core.workspace = true
 lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
+lance-geo.workspace = true
 lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
@@ -75,6 +79,7 @@ rangemap.workspace = true
 approx.workspace = true
 criterion.workspace = true
 env_logger = "0.11.6"
+geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 test-log.workspace = true
@@ -151,6 +156,10 @@ harness = false
 
 [[bench]]
 name = "bitmap"
+harness = false
+
+[[bench]]
+name = "geo"
 harness = false
 
 [lints]

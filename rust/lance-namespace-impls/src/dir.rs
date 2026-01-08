@@ -26,7 +26,7 @@ use lance_namespace::models::{
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
     DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
     DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableRequest, DropTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    DropTableRequest, DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
     ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
 };
 
@@ -712,12 +712,14 @@ impl DirectoryNamespace {
     /// # Arguments
     ///
     /// * `table_uri` - The full URI of the table
+    /// * `identity` - Optional identity from the request for identity-based credential vending
     async fn get_storage_options_for_table(
         &self,
         table_uri: &str,
+        identity: Option<&Identity>,
     ) -> Result<Option<HashMap<String, String>>> {
         if let Some(ref vendor) = self.credential_vendor {
-            let vended = vendor.vend_credentials(table_uri).await?;
+            let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
         Ok(self.storage_options.clone())
@@ -828,8 +830,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         Self::validate_root_namespace_id(&request.id)?;
+        #[allow(clippy::needless_update)]
         Ok(DescribeNamespaceResponse {
             properties: Some(HashMap::new()),
+            ..Default::default()
         })
     }
 
@@ -962,7 +966,20 @@ impl LanceNamespace for DirectoryNamespace {
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.describe_table(request.clone()).await {
-                Ok(response) => return Ok(response),
+                Ok(mut response) => {
+                    // Only apply identity-based credential vending when explicitly requested
+                    if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                        if let Some(ref table_uri) = response.table_uri {
+                            let identity = request.identity.as_deref();
+                            response.storage_options = self
+                                .get_storage_options_for_table(table_uri, identity)
+                                .await?;
+                        }
+                    } else if request.vend_credentials == Some(false) {
+                        response.storage_options = None;
+                    }
+                    return Ok(response);
+                }
                 Err(_)
                     if self.dir_listing_enabled
                         && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
@@ -993,6 +1010,35 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
+        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+
+        // If not loading detailed metadata, return minimal response with just location
+        if !load_detailed_metadata {
+            let storage_options = if vend_credentials {
+                self.get_storage_options_for_table(&table_uri, identity)
+                    .await?
+            } else {
+                None
+            };
+            return Ok(DescribeTableResponse {
+                table: Some(table_name),
+                namespace: request.id.as_ref().map(|id| {
+                    if id.len() > 1 {
+                        id[..id.len() - 1].to_vec()
+                    } else {
+                        vec![]
+                    }
+                }),
+                location: Some(table_uri.clone()),
+                table_uri: Some(table_uri),
+                storage_options,
+                ..Default::default()
+            });
+        }
+
         // Try to load the dataset to get real information
         match Dataset::open(&table_uri).await {
             Ok(mut dataset) => {
@@ -1001,11 +1047,20 @@ impl LanceNamespace for DirectoryNamespace {
                     dataset = dataset.checkout_version(requested_version as u64).await?;
                 }
 
-                let version = dataset.version().version;
+                let version_info = dataset.version();
                 let lance_schema = dataset.schema();
                 let arrow_schema: arrow_schema::Schema = lance_schema.into();
                 let json_schema = arrow_schema_to_json(&arrow_schema)?;
-                let storage_options = self.get_storage_options_for_table(&table_uri).await?;
+                let storage_options = if vend_credentials {
+                    self.get_storage_options_for_table(&table_uri, identity)
+                        .await?
+                } else {
+                    None
+                };
+
+                // Convert BTreeMap to HashMap for the response
+                let metadata: std::collections::HashMap<String, String> =
+                    version_info.metadata.into_iter().collect();
 
                 Ok(DescribeTableResponse {
                     table: Some(table_name),
@@ -1016,18 +1071,24 @@ impl LanceNamespace for DirectoryNamespace {
                             vec![]
                         }
                     }),
-                    version: Some(version as i64),
+                    version: Some(version_info.version as i64),
                     location: Some(table_uri.clone()),
                     table_uri: Some(table_uri),
                     schema: Some(Box::new(json_schema)),
                     storage_options,
-                    stats: None,
+                    metadata: Some(metadata),
+                    ..Default::default()
                 })
             }
             Err(err) => {
                 // Use the reserved file status from the atomic check
                 if status.has_reserved_file {
-                    let storage_options = self.get_storage_options_for_table(&table_uri).await?;
+                    let storage_options = if vend_credentials {
+                        self.get_storage_options_for_table(&table_uri, identity)
+                            .await?
+                    } else {
+                        None
+                    };
                     Ok(DescribeTableResponse {
                         table: Some(table_name),
                         namespace: request.id.as_ref().map(|id| {
@@ -1037,12 +1098,10 @@ impl LanceNamespace for DirectoryNamespace {
                                 vec![]
                             }
                         }),
-                        version: None,
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
-                        schema: None,
                         storage_options,
-                        stats: None,
+                        ..Default::default()
                     })
                 } else {
                     Err(Error::Namespace {
@@ -1111,8 +1170,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DropTableResponse {
             id: request.id,
             location: Some(table_uri),
-            properties: None,
-            transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -1181,10 +1239,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?;
 
         Ok(CreateTableResponse {
-            transaction_id: None,
             version: Some(1),
             location: Some(table_uri),
             storage_options: self.storage_options.clone(),
+            ..Default::default()
         })
     }
 
@@ -1194,7 +1252,19 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateEmptyTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             #[allow(deprecated)]
-            return manifest_ns.create_empty_table(request).await;
+            let mut response = manifest_ns.create_empty_table(request.clone()).await?;
+            // Only apply identity-based credential vending when explicitly requested
+            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                if let Some(ref location) = response.location {
+                    let identity = request.identity.as_deref();
+                    response.storage_options = self
+                        .get_storage_options_for_table(location, identity)
+                        .await?;
+                }
+            } else if request.vend_credentials == Some(false) {
+                response.storage_options = None;
+            }
+            return Ok(response);
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
@@ -1226,16 +1296,38 @@ impl LanceNamespace for DirectoryNamespace {
                 location: snafu::location!(),
             })?;
 
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+        let storage_options = if vend_credentials {
+            self.get_storage_options_for_table(&table_uri, identity)
+                .await?
+        } else {
+            None
+        };
+
         Ok(CreateEmptyTableResponse {
-            transaction_id: None,
             location: Some(table_uri),
-            storage_options: self.storage_options.clone(),
+            storage_options,
+            ..Default::default()
         })
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
-            return manifest_ns.declare_table(request).await;
+            let mut response = manifest_ns.declare_table(request.clone()).await?;
+            // Only apply identity-based credential vending when explicitly requested
+            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                if let Some(ref location) = response.location {
+                    let identity = request.identity.as_deref();
+                    response.storage_options = self
+                        .get_storage_options_for_table(location, identity)
+                        .await?;
+                }
+            } else if request.vend_credentials == Some(false) {
+                response.storage_options = None;
+            }
+            return Ok(response);
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
@@ -1280,10 +1372,20 @@ impl LanceNamespace for DirectoryNamespace {
                 location: snafu::location!(),
             })?;
 
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+        let storage_options = if vend_credentials {
+            self.get_storage_options_for_table(&table_uri, identity)
+                .await?
+        } else {
+            None
+        };
+
         Ok(DeclareTableResponse {
-            transaction_id: None,
             location: Some(table_uri),
-            storage_options: self.storage_options.clone(),
+            storage_options,
+            ..Default::default()
         })
     }
 
@@ -1361,8 +1463,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(lance_namespace::models::DeregisterTableResponse {
             id: request.id,
             location: Some(table_uri),
-            properties: None,
-            transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -2161,8 +2262,7 @@ mod tests {
         // List child namespaces
         let list_req = ListNamespacesRequest {
             id: Some(vec![]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
         let result = namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2194,8 +2294,7 @@ mod tests {
         // List children of parent
         let list_req = ListNamespacesRequest {
             id: Some(vec!["parent".to_string()]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
         let result = namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2207,8 +2306,7 @@ mod tests {
         // List root should only show parent
         let list_req = ListNamespacesRequest {
             id: Some(vec![]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
         let result = namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2239,8 +2337,7 @@ mod tests {
         // List tables in child namespace
         let list_req = ListTablesRequest {
             id: Some(vec!["test_ns".to_string()]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
         let result = namespace.list_tables(list_req).await;
         assert!(result.is_ok());
@@ -2287,8 +2384,7 @@ mod tests {
         // List tables
         let list_req = ListTablesRequest {
             id: Some(vec!["test_ns".to_string()]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
         let result = namespace.list_tables(list_req).await;
         assert!(result.is_ok());
@@ -2425,6 +2521,7 @@ mod tests {
         // Describe namespace and verify properties
         let describe_req = DescribeNamespaceRequest {
             id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
         };
         let result = namespace.describe_namespace(describe_req).await;
         assert!(result.is_ok());
@@ -2503,6 +2600,7 @@ mod tests {
             id: Some(vec!["ns1".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = namespace.list_tables(list_req).await.unwrap();
         assert_eq!(result.tables.len(), 1);
@@ -2512,6 +2610,7 @@ mod tests {
             id: Some(vec!["ns2".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = namespace.list_tables(list_req).await.unwrap();
         assert_eq!(result.tables.len(), 1);

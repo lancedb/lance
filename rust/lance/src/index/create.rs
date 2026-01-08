@@ -172,7 +172,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::NGram
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
-                | IndexType::LabelList,
+                | IndexType::LabelList
+                | IndexType::RTree,
                 LANCE_SCALAR_INDEX,
             ) => {
                 assert!(

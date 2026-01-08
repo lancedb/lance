@@ -113,8 +113,7 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
     async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
         let request = DescribeTableRequest {
             id: Some(self.table_id.clone()),
-            version: None,
-            with_table_uri: None,
+            ..Default::default()
         };
 
         let response = self

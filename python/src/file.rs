@@ -37,7 +37,9 @@ use lance_io::{
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError},
-    pyclass, pyfunction, pymethods, IntoPyObjectExt, PyErr, PyObject, PyResult, Python,
+    pyclass, pyfunction, pymethods,
+    types::PyAny,
+    Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -171,7 +173,7 @@ impl LanceFileStatistics {
 pub struct LanceFileMetadata {
     /// The schema of the file
     #[serde(skip)]
-    pub schema: Option<PyObject>,
+    pub schema: Option<Py<PyAny>>,
     /// The major version of the file
     pub major_version: u16,
     /// The minor version of the file
@@ -305,7 +307,7 @@ impl LanceFileWriter {
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         s3_credentials_refresh_offset_seconds: Option<u64>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
@@ -446,7 +448,7 @@ impl LanceFileSession {
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let provider = storage_options_provider
@@ -751,7 +753,7 @@ impl LanceFileReader {
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         s3_credentials_refresh_offset_seconds: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {

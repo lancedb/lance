@@ -78,8 +78,16 @@ public class TestUtils {
     public abstract Schema getSchema();
 
     public Dataset createEmptyDataset() {
+      return createEmptyDataset(false);
+    }
+
+    public Dataset createEmptyDataset(boolean enableV2Manifest) {
       Dataset dataset =
-          Dataset.create(allocator, datasetPath, getSchema(), new WriteParams.Builder().build());
+          Dataset.create(
+              allocator,
+              datasetPath,
+              getSchema(),
+              new WriteParams.Builder().withEnableV2ManifestPaths(enableV2Manifest).build());
       assertEquals(0, dataset.countRows());
       assertEquals(getSchema(), dataset.getSchema());
       List<Fragment> fragments = dataset.getFragments();

@@ -19,8 +19,8 @@ use datafusion_expr::{
 use tokio::try_join;
 
 use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, GeoQuery, LabelListQuery, MetricsCollector, RelationQuery,
+    SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery,
 };
 use lance_core::{
     utils::mask::{NullableRowAddrMask, RowAddrMask},
@@ -663,6 +663,113 @@ impl ScalarQueryParser for FtsQueryParser {
                     Arc::new(query),
                 ));
             }
+        }
+        None
+    }
+}
+
+/// A parser for geo indices that handles spatial queries
+#[derive(Debug, Clone)]
+pub struct GeoQueryParser {
+    index_name: String,
+}
+
+impl GeoQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
+
+impl ScalarQueryParser for GeoQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(GeoQuery::IsNull),
+            true,
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if (func.name() == "st_intersects"
+            || func.name() == "st_contains"
+            || func.name() == "st_within"
+            || func.name() == "st_touches"
+            || func.name() == "st_crosses"
+            || func.name() == "st_overlaps"
+            || func.name() == "st_covers"
+            || func.name() == "st_coveredby")
+            && args.len() == 2
+        {
+            let left_arg = &args[0];
+            let right_arg = &args[1];
+            return match (left_arg, right_arg) {
+                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
+                    let mut field = Field::new("_geo", left_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: left_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
+                    let mut field = Field::new("_geo", right_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: right_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                _ => None,
+            };
         }
         None
     }

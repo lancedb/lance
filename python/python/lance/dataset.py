@@ -441,8 +441,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
-            import warnings
-
             warnings.warn(
                 "The 'index_cache_size' parameter is deprecated. "
                 "Use 'index_cache_size_bytes' instead. "
@@ -2343,6 +2341,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
+            Literal["RTREE"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -2428,8 +2427,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``, or
-            ``"BLOOMFILTER"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
+            ``"BLOOMFILTER"``, ``"RTREE"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2550,11 +2549,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "LABEL_LIST",
                 "INVERTED",
                 "BLOOMFILTER",
+                "RTREE",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", or "BLOOMFILTER" are supported for '
+                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -5663,8 +5663,6 @@ def write_dataset(
                     response = namespace.declare_table(declare_request)
                 except (UnsupportedOperationError, NotImplementedError):
                     # Fall back to deprecated create_empty_table
-                    import warnings
-
                     warnings.warn(
                         "create_empty_table is deprecated, use declare_table instead. "
                         "Support will be removed in 3.0.0.",
@@ -5677,8 +5675,6 @@ def write_dataset(
                     response = namespace.create_empty_table(fallback_request)
             else:
                 # Namespace doesn't have declare_table, fall back to create_empty_table
-                import warnings
-
                 warnings.warn(
                     "create_empty_table is deprecated, use declare_table instead. "
                     "Support will be removed in 3.0.0.",
