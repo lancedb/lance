@@ -167,6 +167,10 @@ name = "random_access"
 harness = false
 
 [[bench]]
+name = "fts_search"
+harness = false
+
+[[bench]]
 name = "vector_throughput"
 harness = false
 
