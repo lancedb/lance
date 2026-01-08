@@ -42,7 +42,7 @@ use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{IndexZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones, search_zones};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -475,7 +475,7 @@ impl ScalarIndex for BloomFilterIndex {
         };
 
         let processor = BloomFilterProcessor::new(params.clone())?;
-        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
+        let trainer = IndexZoneTrainer::new(processor, params.number_of_items)?;
         let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
@@ -596,12 +596,12 @@ impl BloomFilterIndexBuilder {
         })
     }
 
-    /// Train the builder using the shared ZoneTrainer. The input stream is expected to
+    /// Train the builder using the shared IndexZoneTrainer. The input stream is expected to
     /// contain the value column followed by `_rowaddr`, matching the order emitted by
     /// the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let processor = BloomFilterProcessor::new(self.params.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
+        let trainer = IndexZoneTrainer::new(processor, self.params.number_of_items)?;
         let (blocks, null_rows) = trainer.train(batches_source).await?;
         self.blocks = blocks;
         self.null_rows = Some(null_rows);

@@ -810,6 +810,7 @@ mod test {
 
     #[tokio::test]
     async fn test_policy_enforcement_on_append() {
+        // Test that appending with different column stats policy auto-corrects to match manifest
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch1 = RecordBatch::try_new(
             schema.clone(),
@@ -827,6 +828,8 @@ mod test {
             .unwrap();
 
         let dataset = Arc::new(dataset);
+
+        // Try to append with stats disabled - should auto-correct to match manifest (true)
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
@@ -836,23 +839,19 @@ mod test {
         let result = InsertBuilder::new(dataset.clone())
             .with_params(&WriteParams {
                 mode: WriteMode::Append,
-                enable_column_stats: false,
+                enable_column_stats: false, // Will be auto-corrected to true
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()))
             .await;
 
-        assert!(matches!(result, Err(Error::InvalidInput { .. })));
-        if let Err(Error::InvalidInput { source, .. }) = result {
-            let error_msg = source.to_string();
-            assert!(error_msg.contains("Column statistics policy mismatch"));
-            assert!(error_msg.contains("enable_column_stats=true"));
-            assert!(error_msg.contains("enable_column_stats=false"));
-        }
+        // Should succeed because we auto-correct to match manifest
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_write_params_for_dataset_inherits_policy() {
+    async fn test_write_params_auto_inherits_policy() {
+        // Test that WriteParams automatically inherits the column stats policy during validation
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -872,7 +871,10 @@ mod test {
             .await
             .unwrap();
 
-        let params = WriteParams::for_dataset(&dataset);
+        // Use default WriteParams which should auto-inherit enable_column_stats=true during validation
+        let mut params = WriteParams::default();
+        // Validation happens during write, so trigger it manually to test auto-inheritance
+        params.validate_column_stats_policy(Some(&dataset)).unwrap();
         assert_eq!(params.enable_column_stats, true);
 
         let result = InsertBuilder::new(Arc::new(dataset))

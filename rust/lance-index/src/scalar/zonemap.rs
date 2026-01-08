@@ -46,7 +46,7 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{IndexZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
@@ -681,7 +681,7 @@ impl ScalarIndex for ZoneMapIndex {
 
         let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
         let processor = ZoneMapProcessor::new(value_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
+        let trainer = IndexZoneTrainer::new(processor, self.rows_per_zone)?;
         let (updated_zones, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
@@ -853,7 +853,7 @@ impl ZoneMapIndexBuilder {
     /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let processor = ZoneMapProcessor::new(self.items_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
+        let trainer = IndexZoneTrainer::new(processor, self.options.rows_per_zone)?;
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
         self.null_rows = Some(null_rows);

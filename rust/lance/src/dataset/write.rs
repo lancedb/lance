@@ -412,40 +412,12 @@ pub struct WriteParams {
     pub blob_pack_file_size_threshold: Option<usize>,
 
     /// If true, enable column statistics generation when writing data files.
-    /// Column statistics can be used for query optimization and filtering.
     ///
     /// Note: Once set for a dataset, this setting should remain consistent across
-    /// all write operations. Use `WriteParams::for_dataset()` to automatically
-    /// inherit the dataset's policy.
+    /// all write operations. If not explicitly set, this will be automatically
+    /// inherited from the dataset's policy during validation.
+    /// Default is False.
     pub enable_column_stats: bool,
-}
-
-impl WriteParams {
-    /// Create WriteParams that inherit the dataset's column statistics policy.
-    ///
-    /// This ensures consistency across all write operations to the dataset.
-    /// If the dataset has `lance.column_stats.enabled` in its config, this
-    /// setting will be used. Otherwise, defaults to `false`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let params = WriteParams::for_dataset(&dataset);
-    /// // params.enable_column_stats matches dataset policy
-    /// ```
-    pub fn for_dataset(dataset: &Dataset) -> Self {
-        let enable_column_stats = dataset
-            .manifest
-            .config
-            .get("lance.column_stats.enabled")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(false);
-
-        Self {
-            enable_column_stats,
-            ..Default::default()
-        }
-    }
 }
 
 impl Default for WriteParams {
@@ -482,11 +454,11 @@ impl Default for WriteParams {
 }
 
 impl WriteParams {
-    /// Validate that these WriteParams are consistent with the dataset's column stats policy.
+    /// Validate and auto-inherit the dataset's column stats policy.
     ///
-    /// Returns an error if the dataset has a column stats policy and these params
-    /// don't match it. This ensures all fragments in a dataset have consistent
-    /// column statistics.
+    /// If the dataset has a policy set in the manifest, this will always respect
+    /// and use that value, overriding any value set in WriteParams. This ensures
+    /// all fragments in a dataset have consistent column statistics.
     ///
     /// # Arguments
     ///
@@ -494,8 +466,8 @@ impl WriteParams {
     ///
     /// # Errors
     ///
-    /// Returns an error if the params don't match the dataset's policy.
-    pub fn validate_column_stats_policy(&self, dataset: Option<&Dataset>) -> Result<()> {
+    /// Returns an error if the manifest contains an invalid policy value.
+    pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
         if let Some(dataset) = dataset {
             if let Some(policy_str) = dataset.manifest.config.get("lance.column_stats.enabled") {
                 let dataset_policy: bool = policy_str.parse().map_err(|_| {
@@ -508,18 +480,17 @@ impl WriteParams {
                     )
                 })?;
 
+                // Always respect the value from manifest
                 if self.enable_column_stats != dataset_policy {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Column statistics policy mismatch: dataset requires enable_column_stats={}, \
-                             but WriteParams has enable_column_stats={}. \
-                             All fragments in a dataset must have consistent column statistics. \
-                             Use WriteParams::for_dataset() to inherit the correct policy.",
-                            dataset_policy, self.enable_column_stats
-                        ),
-                        location!(),
-                    ));
+                    log::warn!(
+                        "Column statistics policy mismatch: WriteParams has enable_column_stats={}, \
+                         but dataset manifest requires enable_column_stats={}. \
+                         Using manifest value to ensure consistency.",
+                        self.enable_column_stats,
+                        dataset_policy
+                    );
                 }
+                self.enable_column_stats = dataset_policy;
             }
         }
         Ok(())
@@ -1322,7 +1293,7 @@ pub async fn write_fragments_internal(
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
-    // Validate column stats policy consistency
+    // Validate and auto-inherit column stats policy from dataset
     params.validate_column_stats_policy(dataset)?;
 
     let adapter = SchemaAdapter::new(data.schema());

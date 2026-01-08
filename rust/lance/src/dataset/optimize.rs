@@ -7964,7 +7964,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset);
+                let mut append_params = WriteParams::default();
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
@@ -8033,7 +8033,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset);
+                let mut append_params = WriteParams::default();
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
@@ -8139,7 +8139,7 @@ mod tests {
                     .unwrap();
             } else {
                 let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::for_dataset(&dataset);
+                let mut append_params = WriteParams::default();
                 append_params.mode = crate::dataset::WriteMode::Append;
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await

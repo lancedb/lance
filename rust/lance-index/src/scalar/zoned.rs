@@ -6,8 +6,11 @@
 //! This module provides common infrastructure for building zone-based scalar indexes.
 //! It handles chunking data streams into fixed-size zones while respecting fragment
 //! boundaries and computing zone bounds that remain valid after row deletions.
+//!
+//! Core zone types (`ZoneBound`, `ZoneProcessor`) are defined in `lance_core::utils::zone`
+//! and re-exported here for convenience.
 
-use arrow_array::{ArrayRef, UInt64Array};
+use arrow_array::UInt64Array;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::error::Error;
@@ -16,55 +19,17 @@ use lance_core::{ROW_ADDR, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 use lance_select::RowAddrTreeMap;
 
-//
-// Example: Suppose we have two fragments, each with 4 rows.
-// Fragment 0: start = 0, length = 4  // covers rows 0, 1, 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 0, 1, 2, 3
-// Fragment 1: start = 0, length = 4  // covers rows 0, 1, 2, 3 in fragment 1
-// The row addresses for fragment 1 are: (1<<32), (1<<32)+1, (1<<32)+2, (1<<32)+3
-//
-// Deletion is 0 index based. We delete the 0th and 1st row in fragment 0,
-// and the 1st and 2nd row in fragment 1,
-// Fragment 0: start = 2, length = 2 // covers rows 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 2, 3
-// Fragment 1: start = 0, length = 4  // covers rows 0, 3 in fragment 1
-// The row addresses for fragment 1 are: (1<<32), (1<<32)+3
-/// Zone bound within a fragment
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZoneBound {
-    pub fragment_id: u64,
-    // start is start row of the zone in the fragment, also known
-    // as the local offset. To get the actual first row address,
-    // use `(fragment_id << 32) | start`.
-    pub start: u64,
-    // length is the span of row offsets between the first and last row in the zone,
-    // calculated as (last_row_offset - first_row_offset + 1). It is not the count
-    // of physical rows, since deletions may create gaps within the span.
-    pub length: usize,
-}
-
-/// Index-specific logic used while building zones.
-pub trait ZoneProcessor {
-    type ZoneStatistics;
-
-    /// Process a slice of values that belongs to the current zone.
-    fn process_chunk(&mut self, values: &ArrayRef) -> Result<()>;
-
-    /// Emit statistics when the zone is full or the fragment changes.
-    fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics>;
-
-    /// Reset state so the processor can handle the next zone.
-    fn reset(&mut self) -> Result<()>;
-}
+// Re-export core zone types for convenience
+pub use lance_core::utils::zone::{ZoneBound, ZoneProcessor};
 
 /// Trainer that handles chunking, fragment boundaries, and zone flushing.
 #[derive(Debug)]
-pub struct ZoneTrainer<P> {
+pub struct IndexZoneTrainer<P> {
     processor: P,
     zone_capacity: u64,
 }
 
-impl<P> ZoneTrainer<P>
+impl<P> IndexZoneTrainer<P>
 where
     P: ZoneProcessor,
 {
@@ -281,7 +246,7 @@ where
 /// new data only — callers are responsible for merging with any existing bitmap.
 pub async fn rebuild_zones<P>(
     existing: &[P::ZoneStatistics],
-    trainer: ZoneTrainer<P>,
+    trainer: IndexZoneTrainer<P>,
     stream: SendableRecordBatchStream,
 ) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)>
 where
@@ -372,7 +337,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 4).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones: offsets [0..=3], [4..=7], [8..=9]
@@ -403,7 +368,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Two zones, one per fragment (capacity=10 is large enough)
@@ -428,7 +393,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10).unwrap();
         let err = trainer.train(stream).await.unwrap_err();
         assert!(
             format!("{}", err).contains("zone row offsets are out of order"),
@@ -457,7 +422,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone containing the 3 valid rows (empty batches skipped)
@@ -479,7 +444,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 1).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 1).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones, one per row (capacity=1)
@@ -504,7 +469,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10000).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10000).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone containing all 100 rows (capacity is large enough)
@@ -517,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_zero_capacity() {
         let processor = MockProcessor::new();
-        let result = ZoneTrainer::new(processor, 0);
+        let result = IndexZoneTrainer::new(processor, 0);
         assert!(result.is_err());
         assert!(
             result
@@ -540,7 +505,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 4).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Two zones: first 4 rows, then remaining 2 rows
@@ -571,7 +536,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 3).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 3).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones: frag 0 full zone, frag 0 partial (flushed at boundary), frag 1
@@ -612,7 +577,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 4).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Should create 2 zones (capacity=4):
@@ -647,7 +612,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone with 3 rows, but offset span [0..=200] so length=201 due to large gaps
@@ -673,7 +638,7 @@ mod tests {
         ));
 
         let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
+        let trainer = IndexZoneTrainer::new(processor, 10).unwrap();
         let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Should create 3 zones (one per fragment)
@@ -820,7 +785,7 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
+        let trainer = IndexZoneTrainer::new(MockProcessor::new(), 2).unwrap();
         let (rebuilt, _) = rebuild_zones(&existing, trainer, stream).await.unwrap();
         // Existing zone should remain unchanged and new stats appended afterwards
         assert_eq!(rebuilt.len(), 2);
@@ -850,7 +815,7 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
+        let trainer = IndexZoneTrainer::new(MockProcessor::new(), 2).unwrap();
         let (rebuilt, _) = rebuild_zones(&existing, trainer, stream).await.unwrap();
         // Existing zone plus two new fragments should yield three total zones
         assert_eq!(rebuilt.len(), 3);
