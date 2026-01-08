@@ -20,8 +20,8 @@ use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
-use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
 use snafu::location;
 
