@@ -22,7 +22,7 @@ use super::{
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
     query::FtsSearchParams,
     scorer::Scorer,
-    DocSet, PostingList, RawDocInfo,
+    CompressedPostingList, DocSet, PostingList, RawDocInfo,
 };
 use super::{builder::BLOCK_SIZE, DocInfo};
 use super::{
@@ -140,6 +140,28 @@ impl Ord for PostingIterator {
 }
 
 impl PostingIterator {
+    #[inline]
+    fn compressed_state_ptr(&self) -> *mut CompressedState {
+        debug_assert!(self.compressed.is_some());
+        // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
+        // `RefCell` to avoid the overhead of runtime borrow checking
+        self.compressed.as_ref().unwrap().get()
+    }
+
+    #[inline]
+    fn ensure_compressed_block_ptr(
+        &self,
+        list: &CompressedPostingList,
+        block_idx: usize,
+    ) -> *mut CompressedState {
+        let compressed = unsafe { &mut *self.compressed_state_ptr() };
+        if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
+            let block = list.blocks.value(block_idx);
+            compressed.decompress(block, block_idx, list.blocks.len(), list.length);
+        }
+        compressed as *mut CompressedState
+    }
+
     pub(crate) fn new(
         token: String,
         token_id: u32,
@@ -194,19 +216,10 @@ impl PostingIterator {
 
         match self.list {
             PostingList::Compressed(ref list) => {
-                debug_assert!(self.compressed.is_some());
-                // this method is called very frequently, so we prefer to use `UnsafeCell` instead of `RefCell`
-                // to avoid the overhead of runtime borrow checking
-                let compressed = unsafe {
-                    let compressed = self.compressed.as_ref().unwrap();
-                    &mut *compressed.get()
-                };
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
-                    let block = list.blocks.value(block_idx);
-                    compressed.decompress(block, block_idx, list.blocks.len(), list.length);
-                }
+                let compressed =
+                    unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
@@ -232,7 +245,7 @@ impl PostingIterator {
     // move to the next doc id that is greater than or equal to least_id
     fn next(&mut self, least_id: u64) {
         match self.list {
-            PostingList::Compressed(ref mut list) => {
+            PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
@@ -246,14 +259,8 @@ impl PostingIterator {
                 while self.index < length {
                     let block_idx = self.index / BLOCK_SIZE;
                     let block_offset = self.index % BLOCK_SIZE;
-                    let compressed = unsafe {
-                        let compressed = self.compressed.as_ref().unwrap();
-                        &mut *compressed.get()
-                    };
-                    if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
-                        let block = list.blocks.value(block_idx);
-                        compressed.decompress(block, block_idx, list.blocks.len(), list.length);
-                    }
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     let in_block = &compressed.doc_ids[block_offset..];
                     let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
                     let new_offset = block_offset + offset_in_block;
@@ -277,7 +284,7 @@ impl PostingIterator {
 
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
-            PostingList::Compressed(ref mut list) => {
+            PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 while self.block_idx + 1 < list.blocks.len()
