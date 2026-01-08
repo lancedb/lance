@@ -232,6 +232,7 @@ use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
+use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
@@ -766,10 +767,7 @@ impl CoreFieldDecoderStrategy {
                 )
             }
             DataType::List(_) | DataType::LargeList(_) => {
-                let child = field
-                    .children
-                    .first()
-                    .expect("List field must have a child");
+                let child = field.children.first().expect_ok()?;
                 let child_scheduler =
                     self.create_structural_field_scheduler(child, column_infos)?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
@@ -778,10 +776,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, dimension)
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
-                let child = field
-                    .children
-                    .first()
-                    .expect("FixedSizeList field must have a child");
+                let child = field.children.first().expect_ok()?;
                 let child_scheduler =
                     self.create_structural_field_scheduler(child, column_infos)?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
@@ -799,10 +794,7 @@ impl CoreFieldDecoderStrategy {
                         location: location!(),
                     });
                 }
-                let entries_child = field
-                    .children
-                    .first()
-                    .expect("Map field must have an entries child");
+                let entries_child = field.children.first().expect_ok()?;
                 let child_scheduler =
                     self.create_structural_field_scheduler(entries_child, column_infos)?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))

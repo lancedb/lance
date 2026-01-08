@@ -21,6 +21,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
+use lance_core::error::LanceOptionExt;
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -440,7 +441,7 @@ impl StructuralEncodingStrategy {
         } else {
             match data_type {
                 DataType::List(_) | DataType::LargeList(_) => {
-                    let child = field.children.first().expect("List should have a child");
+                    let child = field.children.first().expect_ok()?;
                     let child_encoder = self.do_create_field_encoder(
                         _encoding_strategy_root,
                         child,
@@ -467,10 +468,7 @@ impl StructuralEncodingStrategy {
                         });
                     }
                     // Complex FixedSizeList needs structural encoding
-                    let child = field
-                        .children
-                        .first()
-                        .expect("FixedSizeList should have a child");
+                    let child = field.children.first().expect_ok()?;
                     let child_encoder = self.do_create_field_encoder(
                         _encoding_strategy_root,
                         child,
