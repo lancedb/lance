@@ -218,8 +218,7 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                let compressed =
-                    unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
