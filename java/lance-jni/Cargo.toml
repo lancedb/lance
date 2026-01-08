@@ -30,8 +30,8 @@ lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
-arrow = { version = "56.1", features = ["ffi"] }
-arrow-schema = "56.1"
+arrow = { version = "57.1", features = ["ffi"] }
+arrow-schema = "57.1"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
@@ -48,9 +48,9 @@ bytes = "1.11"
 log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
-prost = "0.13.5"
+prost = "0.14.1"
 roaring = "0.10.1"
-prost-types = "0.13.5"
+prost-types = "0.14.1"
 chrono = "0.4.41"
 
 [profile.dev]

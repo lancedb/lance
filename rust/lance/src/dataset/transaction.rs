@@ -45,6 +45,7 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
+use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
@@ -251,6 +252,9 @@ pub enum Operation {
         fields_for_preserving_frag_bitmap: Vec<u32>,
         /// The mode of update
         update_mode: Option<UpdateMode>,
+        /// Optional filter for detecting conflicts on inserted row keys.
+        /// Only tracks keys from INSERT operations during merge insert, not updates.
+        inserted_rows_filter: Option<KeyExistenceFilter>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -449,6 +453,7 @@ impl PartialEq for Operation {
                     mem_wal_to_merge: a_mem_wal_to_merge,
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
+                    inserted_rows_filter: a_inserted_rows_filter,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -458,6 +463,7 @@ impl PartialEq for Operation {
                     mem_wal_to_merge: b_mem_wal_to_merge,
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
+                    inserted_rows_filter: b_inserted_rows_filter,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -470,6 +476,7 @@ impl PartialEq for Operation {
                         b_fields_for_preserving_frag_bitmap,
                     )
                     && a_update_mode == b_update_mode
+                    && a_inserted_rows_filter == b_inserted_rows_filter
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1707,6 +1714,7 @@ impl Transaction {
                 mem_wal_to_merge,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                ..
             } => {
                 // Extract existing fragments once for reuse
                 let existing_fragments = maybe_existing_fragments?;
@@ -2888,6 +2896,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 mem_wal_to_merge,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2906,6 +2915,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     1 => Some(UpdateMode::RewriteColumns),
                     _ => Some(UpdateMode::RewriteRows),
                 },
+                inserted_rows_filter: inserted_rows
+                    .map(|ik| KeyExistenceFilter::try_from(&ik))
+                    .transpose()?,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -3216,6 +3228,7 @@ impl From<&Transaction> for pb::Transaction {
                 mem_wal_to_merge,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -3233,6 +3246,7 @@ impl From<&Transaction> for pb::Transaction {
                         UpdateMode::RewriteColumns => 1,
                     })
                     .unwrap_or(0),
+                inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {

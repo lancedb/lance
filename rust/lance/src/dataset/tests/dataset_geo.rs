@@ -8,19 +8,22 @@ use crate::dataset::tests::dataset_transactions::execute_sql;
 use crate::Dataset;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::Float64Type;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
+use datafusion::common::{assert_contains, assert_not_contains};
+use geo_types::{coord, line_string, Rect};
+use geoarrow_array::{
+    builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
+    GeoArrowArray,
+};
+use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::{DatasetIndexExt, IndexType};
 
 #[tokio::test]
 async fn test_geo_types() {
-    use geo_types::{coord, line_string, Rect};
-    use geoarrow_array::{
-        builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
-        GeoArrowArray,
-    };
-    use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
-
     // 1. Creates arrow table with spatial data.
     let point_type = PointType::new(Dimension::XY, Default::default());
     let line_string_type = LineStringType::new(Dimension::XY, Default::default());
@@ -91,14 +94,6 @@ async fn test_geo_types() {
 
 #[tokio::test]
 async fn test_geo_sql() {
-    use arrow_array::types::Float64Type;
-    use geo_types::line_string;
-    use geoarrow_array::{
-        builder::{LineStringBuilder, PointBuilder},
-        GeoArrowArray,
-    };
-    use geoarrow_schema::{Dimension, LineStringType, PointType};
-
     // 1. Creates arrow table with point and linestring spatial data
     let point_type = PointType::new(Dimension::XY, Default::default());
     let line_string_type = LineStringType::new(Dimension::XY, Default::default());
@@ -152,4 +147,85 @@ async fn test_geo_sql() {
         batch.column(0).as_primitive::<Float64Type>().value(0),
         0.0015056772638228177
     );
+}
+
+#[tokio::test]
+async fn test_geo_rtree_index() {
+    // 1. Creates arrow table linestring spatial data
+    let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+
+    let schema =
+        arrow_schema::Schema::new(vec![line_string_type.clone().to_field("linestring", true)]);
+    let schema = Arc::new(schema) as arrow_schema::SchemaRef;
+
+    let num_rows = 10000;
+    let mut line_string_builder = LineStringBuilder::new(line_string_type.clone());
+    for i in 0..num_rows {
+        let i = i as f64;
+        line_string_builder
+            .push_line_string(Some(&line_string![
+                (x: i, y: i),
+                (x: i + 1.0, y: i + 1.0)
+            ]))
+            .unwrap();
+    }
+    let line_arr = line_string_builder.finish();
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![line_arr.to_array_ref()]).unwrap();
+
+    // 2. Write to lance
+    let lance_path = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+    let mut dataset = Dataset::write(reader, &lance_path, Some(Default::default()))
+        .await
+        .unwrap();
+
+    async fn assert_intersects_sql(dataset: &mut Dataset, has_index: bool) {
+        // Executes a SQL query with St_Distance function
+        let sql = "SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))";
+        let batches = dataset
+            .sql(sql)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let mut num_rows = 0;
+        for b in batches {
+            num_rows += b.num_rows();
+        }
+        assert_eq!(2, num_rows);
+
+        let batches = dataset
+            .sql(&format!("Explain {}", sql))
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let plan = format!("{:?}", batches);
+        if has_index {
+            assert_contains!(&plan, "ScalarIndexQuery");
+        } else {
+            assert_not_contains!(&plan, "ScalarIndexQuery");
+        }
+    }
+
+    assert_intersects_sql(&mut dataset, false).await;
+
+    dataset
+        .create_index(
+            &["linestring"],
+            IndexType::RTree,
+            Some("rtree_index".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_intersects_sql(&mut dataset, true).await;
 }

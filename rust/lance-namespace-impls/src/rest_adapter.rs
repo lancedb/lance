@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router, ServiceExt,
@@ -312,11 +312,13 @@ fn error_to_response(err: Error) -> Response {
 
 async fn create_namespace(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateNamespaceRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.create_namespace(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -326,6 +328,7 @@ async fn create_namespace(
 
 async fn list_namespaces(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<PaginationQuery>,
 ) -> Response {
@@ -333,6 +336,8 @@ async fn list_namespaces(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_namespaces(request).await {
@@ -343,11 +348,13 @@ async fn list_namespaces(
 
 async fn describe_namespace(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DescribeNamespaceRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.describe_namespace(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -357,11 +364,13 @@ async fn describe_namespace(
 
 async fn drop_namespace(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DropNamespaceRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.drop_namespace(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -371,11 +380,13 @@ async fn drop_namespace(
 
 async fn namespace_exists(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<NamespaceExistsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.namespace_exists(request).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -389,6 +400,7 @@ async fn namespace_exists(
 
 async fn list_tables(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<PaginationQuery>,
 ) -> Response {
@@ -396,6 +408,8 @@ async fn list_tables(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_tables(request).await {
@@ -406,11 +420,13 @@ async fn list_tables(
 
 async fn register_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RegisterTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.register_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -420,11 +436,13 @@ async fn register_table(
 
 async fn describe_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.describe_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -434,11 +452,13 @@ async fn describe_table(
 
 async fn table_exists(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<TableExistsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.table_exists(request).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -448,11 +468,14 @@ async fn table_exists(
 
 async fn drop_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
 ) -> Response {
     let request = DropTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.drop_table(request).await {
@@ -463,11 +486,13 @@ async fn drop_table(
 
 async fn deregister_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeregisterTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.deregister_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -487,6 +512,7 @@ struct CreateTableQuery {
 
 async fn create_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
@@ -494,6 +520,8 @@ async fn create_table(
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.create_table(request, body).await {
@@ -505,11 +533,13 @@ async fn create_table(
 #[allow(deprecated)]
 async fn create_empty_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateEmptyTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.create_empty_table(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -519,11 +549,13 @@ async fn create_empty_table(
 
 async fn declare_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeclareTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.declare_table(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -539,6 +571,7 @@ struct InsertQuery {
 
 async fn insert_into_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<InsertQuery>,
     body: Bytes,
@@ -546,6 +579,8 @@ async fn insert_into_table(
     let request = InsertIntoTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.insert_into_table(request, body).await {
@@ -569,6 +604,7 @@ struct MergeInsertQuery {
 
 async fn merge_insert_into_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<MergeInsertQuery>,
     body: Bytes,
@@ -583,6 +619,8 @@ async fn merge_insert_into_table(
         when_not_matched_by_source_delete_filt: params.when_not_matched_by_source_delete_filt,
         timeout: params.timeout,
         use_index: params.use_index,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.merge_insert_into_table(request, body).await {
@@ -593,11 +631,13 @@ async fn merge_insert_into_table(
 
 async fn update_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<UpdateTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.update_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -607,11 +647,13 @@ async fn update_table(
 
 async fn delete_from_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeleteFromTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.delete_from_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -621,11 +663,13 @@ async fn delete_from_table(
 
 async fn query_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<QueryTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.query_table(request).await {
         Ok(bytes) => (StatusCode::OK, bytes).into_response(),
@@ -635,6 +679,7 @@ async fn query_table(
 
 async fn count_table_rows(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
 ) -> Response {
@@ -642,6 +687,8 @@ async fn count_table_rows(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         version: None,
         predicate: None,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.count_table_rows(request).await {
@@ -656,11 +703,13 @@ async fn count_table_rows(
 
 async fn rename_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RenameTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.rename_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -670,11 +719,13 @@ async fn rename_table(
 
 async fn restore_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RestoreTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.restore_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -684,6 +735,7 @@ async fn restore_table(
 
 async fn list_table_versions(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<PaginationQuery>,
 ) -> Response {
@@ -691,6 +743,8 @@ async fn list_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_table_versions(request).await {
@@ -701,11 +755,14 @@ async fn list_table_versions(
 
 async fn get_table_stats(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
 ) -> Response {
     let request = GetTableStatsRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.get_table_stats(request).await {
@@ -716,12 +773,15 @@ async fn get_table_stats(
 
 async fn list_all_tables(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Query(params): Query<PaginationQuery>,
 ) -> Response {
     let request = ListTablesRequest {
         id: None,
         page_token: params.page_token,
         limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_all_tables(request).await {
@@ -736,11 +796,13 @@ async fn list_all_tables(
 
 async fn create_table_index(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableIndexRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.create_table_index(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -750,11 +812,13 @@ async fn create_table_index(
 
 async fn create_table_scalar_index(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableIndexRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.create_table_scalar_index(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -764,6 +828,7 @@ async fn create_table_scalar_index(
 
 async fn list_table_indices(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
 ) -> Response {
@@ -772,6 +837,8 @@ async fn list_table_indices(
         version: None,
         page_token: None,
         limit: None,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_table_indices(request).await {
@@ -788,6 +855,7 @@ struct IndexPathParams {
 
 async fn describe_table_index_stats(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
     Query(query): Query<DelimiterQuery>,
 ) -> Response {
@@ -795,6 +863,8 @@ async fn describe_table_index_stats(
         id: Some(parse_id(&params.id, query.delimiter.as_deref())),
         version: None,
         index_name: Some(params.index_name),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.describe_table_index_stats(request).await {
@@ -805,12 +875,15 @@ async fn describe_table_index_stats(
 
 async fn drop_table_index(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
     Query(query): Query<DelimiterQuery>,
 ) -> Response {
     let request = DropTableIndexRequest {
         id: Some(parse_id(&params.id, query.delimiter.as_deref())),
         index_name: Some(params.index_name),
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.drop_table_index(request).await {
@@ -825,11 +898,13 @@ async fn drop_table_index(
 
 async fn alter_table_add_columns(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAddColumnsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.alter_table_add_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -839,11 +914,13 @@ async fn alter_table_add_columns(
 
 async fn alter_table_alter_columns(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAlterColumnsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.alter_table_alter_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -853,11 +930,13 @@ async fn alter_table_alter_columns(
 
 async fn alter_table_drop_columns(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableDropColumnsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.alter_table_drop_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -867,11 +946,13 @@ async fn alter_table_drop_columns(
 
 async fn update_table_schema_metadata(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<UpdateTableSchemaMetadataRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.update_table_schema_metadata(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -885,6 +966,7 @@ async fn update_table_schema_metadata(
 
 async fn list_table_tags(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<PaginationQuery>,
 ) -> Response {
@@ -892,6 +974,8 @@ async fn list_table_tags(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
     };
 
     match backend.list_table_tags(request).await {
@@ -902,11 +986,13 @@ async fn list_table_tags(
 
 async fn get_table_tag_version(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<GetTableTagVersionRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.get_table_tag_version(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -916,11 +1002,13 @@ async fn get_table_tag_version(
 
 async fn create_table_tag(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableTagRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.create_table_tag(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
@@ -930,11 +1018,13 @@ async fn create_table_tag(
 
 async fn delete_table_tag(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeleteTableTagRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.delete_table_tag(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -944,11 +1034,13 @@ async fn delete_table_tag(
 
 async fn update_table_tag(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<UpdateTableTagRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.update_table_tag(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -962,11 +1054,13 @@ async fn update_table_tag(
 
 async fn explain_table_query_plan(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<ExplainTableQueryPlanRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.explain_table_query_plan(request).await {
         Ok(plan) => (StatusCode::OK, plan).into_response(),
@@ -976,11 +1070,13 @@ async fn explain_table_query_plan(
 
 async fn analyze_table_query_plan(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AnalyzeTableQueryPlanRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.analyze_table_query_plan(request).await {
         Ok(plan) => (StatusCode::OK, plan).into_response(),
@@ -994,6 +1090,7 @@ async fn analyze_table_query_plan(
 
 async fn describe_transaction(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(_params): Query<DelimiterQuery>,
     Json(mut request): Json<DescribeTransactionRequest>,
@@ -1007,6 +1104,7 @@ async fn describe_transaction(
     } else {
         request.id = Some(vec![id]);
     }
+    request.identity = extract_identity(&headers);
 
     match backend.describe_transaction(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -1016,6 +1114,7 @@ async fn describe_transaction(
 
 async fn alter_transaction(
     State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(_params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTransactionRequest>,
@@ -1027,6 +1126,7 @@ async fn alter_transaction(
     } else {
         request.id = Some(vec![id]);
     }
+    request.identity = extract_identity(&headers);
 
     match backend.alter_transaction(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -1052,6 +1152,36 @@ fn parse_id(id_str: &str, delimiter: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty()) // Filter out empty strings from split
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Extract identity information from HTTP headers
+///
+/// Extracts `x-api-key` and `Authorization` (Bearer token) headers and returns
+/// an Identity object if either is present.
+fn extract_identity(headers: &HeaderMap) -> Option<Box<Identity>> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let auth_token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            // Extract token from "Bearer <token>" format
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+                .map(|t| t.to_string())
+        });
+
+    if api_key.is_some() || auth_token.is_some() {
+        Some(Box::new(Identity {
+            api_key,
+            auth_token,
+        }))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1197,6 +1327,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1251,6 +1382,7 @@ mod tests {
                     id: Some(vec![format!("namespace{}", i)]),
                     properties: None,
                     mode: None,
+                    ..Default::default()
                 };
                 let result = fixture.namespace.create_namespace(create_req).await;
                 assert!(result.is_ok(), "Failed to create namespace{}", i);
@@ -1261,6 +1393,7 @@ mod tests {
                 id: Some(vec![]),
                 page_token: None,
                 limit: None,
+                ..Default::default()
             };
             let result = fixture.namespace.list_namespaces(list_req).await;
             assert!(result.is_ok());
@@ -1280,6 +1413,7 @@ mod tests {
                 id: Some(vec!["parent".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1292,6 +1426,7 @@ mod tests {
                 id: Some(vec!["parent".to_string(), "child1".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1303,6 +1438,7 @@ mod tests {
                 id: Some(vec!["parent".to_string(), "child2".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1315,6 +1451,7 @@ mod tests {
                 id: Some(vec!["parent".to_string()]),
                 page_token: None,
                 limit: None,
+                ..Default::default()
             };
             let result = fixture.namespace.list_namespaces(list_req).await;
             assert!(result.is_ok());
@@ -1334,6 +1471,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1345,6 +1483,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
 
             let result = fixture
@@ -1385,6 +1524,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1397,6 +1537,7 @@ mod tests {
                 let create_table_req = CreateTableRequest {
                     id: Some(vec!["test_namespace".to_string(), format!("table{}", i)]),
                     mode: Some("Create".to_string()),
+                    ..Default::default()
                 };
                 fixture
                     .namespace
@@ -1410,6 +1551,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 page_token: None,
                 limit: None,
+                ..Default::default()
             };
             let result = fixture.namespace.list_tables(list_req).await;
             assert!(result.is_ok());
@@ -1430,6 +1572,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1441,6 +1584,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1465,6 +1609,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1501,6 +1646,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1512,6 +1658,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1589,6 +1736,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1600,6 +1748,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1610,6 +1759,7 @@ mod tests {
             // Drop the table
             let drop_req = DropTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                ..Default::default()
             };
             let result = fixture.namespace.drop_table(drop_req).await;
             assert!(
@@ -1637,6 +1787,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1692,6 +1843,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1748,6 +1900,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1767,6 +1920,7 @@ mod tests {
             // Drop the empty table
             let drop_req = DropTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                ..Default::default()
             };
             let result = fixture.namespace.drop_table(drop_req).await;
             assert!(
@@ -1794,6 +1948,7 @@ mod tests {
                 id: Some(vec!["level1".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1805,6 +1960,7 @@ mod tests {
                 id: Some(vec!["level1".to_string(), "level2".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1820,6 +1976,7 @@ mod tests {
                 ]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1868,6 +2025,7 @@ mod tests {
                 id: Some(vec!["level1".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1879,6 +2037,7 @@ mod tests {
                 id: Some(vec!["level1".to_string(), "level2".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1894,6 +2053,7 @@ mod tests {
                 ]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1910,6 +2070,7 @@ mod tests {
                     "deep_table".to_string(),
                 ]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
 
             let result = fixture
@@ -1947,6 +2108,7 @@ mod tests {
                 id: Some(vec!["namespace1".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1958,6 +2120,7 @@ mod tests {
                 id: Some(vec!["namespace2".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1969,6 +2132,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["namespace1".to_string(), "shared_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1979,6 +2143,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["namespace2".to_string(), "shared_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -1989,6 +2154,7 @@ mod tests {
             // Drop table in namespace1
             let drop_req = DropTableRequest {
                 id: Some(vec!["namespace1".to_string(), "shared_table".to_string()]),
+                ..Default::default()
             };
             fixture.namespace.drop_table(drop_req).await.unwrap();
 
@@ -2018,6 +2184,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2029,6 +2196,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2061,6 +2229,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2080,6 +2249,7 @@ mod tests {
             // Verify namespace no longer exists
             let exists_req = NamespaceExistsRequest {
                 id: Some(vec!["test_namespace".to_string()]),
+                ..Default::default()
             };
             let result = fixture.namespace.namespace_exists(exists_req).await;
             assert!(result.is_err(), "Namespace should not exist after drop");
@@ -2100,6 +2270,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: Some(properties.clone()),
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2110,6 +2281,7 @@ mod tests {
             // Describe namespace and verify properties
             let describe_req = DescribeNamespaceRequest {
                 id: Some(vec!["test_namespace".to_string()]),
+                ..Default::default()
             };
             let result = fixture.namespace.describe_namespace(describe_req).await;
             assert!(result.is_ok());
@@ -2125,7 +2297,10 @@ mod tests {
             let fixture = RestServerFixture::new().await;
 
             // Root namespace should always exist
-            let exists_req = NamespaceExistsRequest { id: Some(vec![]) };
+            let exists_req = NamespaceExistsRequest {
+                id: Some(vec![]),
+                ..Default::default()
+            };
             let result = fixture.namespace.namespace_exists(exists_req).await;
             assert!(result.is_ok(), "Root namespace should exist");
 
@@ -2134,6 +2309,7 @@ mod tests {
                 id: Some(vec![]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             let result = fixture.namespace.create_namespace(create_req).await;
             assert!(result.is_err(), "Cannot create root namespace");
@@ -2167,6 +2343,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2181,6 +2358,7 @@ mod tests {
                     "physical_table".to_string(),
                 ]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2197,6 +2375,7 @@ mod tests {
                 location: "test_namespace$physical_table.lance".to_string(),
                 mode: None,
                 properties: None,
+                ..Default::default()
             };
 
             let result = fixture.namespace.register_table(register_req).await;
@@ -2231,6 +2410,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2244,6 +2424,7 @@ mod tests {
                 location: "s3://bucket/table.lance".to_string(),
                 mode: None,
                 properties: None,
+                ..Default::default()
             };
 
             let result = fixture.namespace.register_table(register_req).await;
@@ -2265,6 +2446,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2278,6 +2460,7 @@ mod tests {
                 location: "../outside/table.lance".to_string(),
                 mode: None,
                 properties: None,
+                ..Default::default()
             };
 
             let result = fixture.namespace.register_table(register_req).await;
@@ -2300,6 +2483,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2311,6 +2495,7 @@ mod tests {
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2330,6 +2515,7 @@ mod tests {
             // Deregister the table
             let deregister_req = DeregisterTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                ..Default::default()
             };
             let result = fixture.namespace.deregister_table(deregister_req).await;
             assert!(
@@ -2375,6 +2561,7 @@ mod tests {
                 id: Some(vec!["test_namespace".to_string()]),
                 properties: None,
                 mode: None,
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2389,6 +2576,7 @@ mod tests {
                     "original_table".to_string(),
                 ]),
                 mode: Some("Create".to_string()),
+                ..Default::default()
             };
             let create_response = fixture
                 .namespace
@@ -2402,6 +2590,7 @@ mod tests {
                     "test_namespace".to_string(),
                     "original_table".to_string(),
                 ]),
+                ..Default::default()
             };
             fixture
                 .namespace
@@ -2431,6 +2620,7 @@ mod tests {
                 location: relative_location.clone(),
                 mode: None,
                 properties: None,
+                ..Default::default()
             };
 
             let register_response = fixture

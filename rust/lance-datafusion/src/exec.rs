@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -545,7 +546,14 @@ pub async fn analyze_plan(
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
     let schema = plan.schema();
-    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+    // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
+    let analyze = Arc::new(AnalyzeExec::new(
+        true,
+        true,
+        vec![MetricType::SUMMARY],
+        plan,
+        schema,
+    ));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);

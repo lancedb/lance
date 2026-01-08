@@ -232,6 +232,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     mem_wal_to_merge: None,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    inserted_rows_filter: None,
                 };
                 Ok(Self(op))
             }
@@ -689,7 +690,7 @@ fn extract_update_map(ob: &Bound<'_, PyAny>) -> PyResult<Option<UpdateMap>> {
     }))
 }
 
-fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<PyObject> {
+fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<Py<PyAny>> {
     match update_map {
         None => Ok(py.None()),
         Some(map) => {

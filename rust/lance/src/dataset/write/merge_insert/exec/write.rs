@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
 use arrow_schema::Schema;
 use arrow_select;
-use datafusion::common::Result as DFResult;
+use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
@@ -26,6 +26,9 @@ use snafu::location;
 
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::write::merge_insert::inserted_rows::{
+    extract_key_value_from_batch, KeyExistenceFilter, KeyExistenceFilterBuilder,
+};
 use crate::dataset::write::merge_insert::{
     create_duplicate_row_error, format_key_values_on_columns,
 };
@@ -51,6 +54,8 @@ struct MergeState {
     delete_row_addrs: RoaringTreemap,
     /// Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
+    /// Track keys of newly inserted rows (not updates).
+    inserted_rows_filter: KeyExistenceFilterBuilder,
     /// Merge operation metrics
     metrics: MergeInsertMetrics,
     /// Whether the dataset uses stable row ids.
@@ -62,10 +67,16 @@ struct MergeState {
 }
 
 impl MergeState {
-    fn new(metrics: MergeInsertMetrics, stable_row_ids: bool, on_columns: Vec<String>) -> Self {
+    fn new(
+        metrics: MergeInsertMetrics,
+        stable_row_ids: bool,
+        on_columns: Vec<String>,
+        field_ids: Vec<i32>,
+    ) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(stable_row_ids))),
+            inserted_rows_filter: KeyExistenceFilterBuilder::new(field_ids),
             metrics,
             stable_row_ids,
             processed_row_ids: HashSet::new(),
@@ -116,6 +127,14 @@ impl MergeState {
             }
             Action::Insert => {
                 // Insert action - just insert new data
+                // Capture the key value for conflict detection (only for inserts, not updates)
+                if let Some(key_value) =
+                    extract_key_value_from_batch(batch, row_idx, &self.on_columns)
+                {
+                    self.inserted_rows_filter
+                        .insert(key_value)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                }
                 self.metrics.num_inserted_rows.add(1);
                 Ok(Some(row_idx)) // Keep this row for writing
             }
@@ -151,6 +170,10 @@ pub struct FullSchemaMergeInsertExec {
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
+    inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    /// Whether the ON columns match the schema's unenforced primary key.
+    /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
+    is_primary_key: bool,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -167,6 +190,20 @@ impl FullSchemaMergeInsertExec {
             Boundedness::Bounded,
         );
 
+        // Check if ON columns match the schema's unenforced primary key
+        let field_ids: Vec<i32> = params
+            .on
+            .iter()
+            .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
+            .collect();
+        let pk_field_ids: Vec<i32> = dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
+
         Ok(Self {
             input,
             dataset,
@@ -176,6 +213,8 @@ impl FullSchemaMergeInsertExec {
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
+            inserted_rows_filter: Arc::new(Mutex::new(None)),
+            is_primary_key,
         })
     }
 
@@ -195,6 +234,16 @@ impl FullSchemaMergeInsertExec {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
+    }
+
+    /// Returns the filter for inserted row keys if the execution has completed.
+    /// This contains keys of newly inserted rows (not updates) for conflict detection.
+    /// Returns `None` if the execution is still in progress or hasn't started.
+    pub fn inserted_rows_filter(&self) -> Option<KeyExistenceFilter> {
+        self.inserted_rows_filter
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Takes the affected rows (deleted/updated row addresses) if the execution has completed.
@@ -725,6 +774,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             merge_stats: self.merge_stats.clone(),
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
+            inserted_rows_filter: self.inserted_rows_filter.clone(),
+            is_primary_key: self.is_primary_key,
         }))
     }
 
@@ -766,10 +817,18 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let input_stream = self.input.execute(partition, context)?;
 
         // Step 1: Create shared state and streaming processor for row addresses and write data
+        // Get field IDs for the ON columns from the dataset schema
+        let field_ids: Vec<i32> = self
+            .params
+            .on
+            .iter()
+            .filter_map(|name| self.dataset.schema().field(name).map(|f| f.id))
+            .collect();
         let merge_state = Arc::new(Mutex::new(MergeState::new(
             MergeInsertMetrics::new(&self.metrics, partition),
             self.dataset.manifest.uses_stable_row_ids(),
             self.params.on.clone(),
+            field_ids,
         )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
@@ -779,7 +838,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
+        let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
+        let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -832,6 +893,13 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let merge_state =
                 Mutex::into_inner(merge_state).expect("MergeState lock should be available");
             let delete_row_addrs_clone = merge_state.delete_row_addrs;
+            let inserted_rows_filter = if is_primary_key {
+                Some(KeyExistenceFilter::from_bloom_filter(
+                    &merge_state.inserted_rows_filter,
+                ))
+            } else {
+                None
+            };
 
             let (updated_fragments, removed_fragment_ids) =
                 apply_deletions(&dataset, &delete_row_addrs_clone).await?;
@@ -850,6 +918,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
+                inserted_rows_filter: inserted_rows_filter.clone(),
             };
 
             // Step 5: Create and store the transaction
@@ -876,6 +945,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 if let Ok(mut affected_rows_guard) = affected_rows_holder.lock() {
                     affected_rows_guard.replace(delete_row_addrs_clone);
                 }
+                if let Ok(mut filter_guard) = inserted_rows_filter_holder.lock() {
+                    *filter_guard = inserted_rows_filter;
+                }
             };
 
             // Step 7: Return empty result (write operations don't return data)
@@ -900,7 +972,7 @@ mod tests {
     #[test]
     fn test_merge_state_duplicate_rowid_detection() {
         let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let mut merge_state = MergeState::new(metrics, false, Vec::new());
+        let mut merge_state = MergeState::new(metrics, false, Vec::new(), Vec::new());
 
         let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
         let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100

@@ -68,12 +68,22 @@ pub mod azure;
 #[cfg(feature = "credential-vendor-gcp")]
 pub mod gcp;
 
+/// Credential caching module.
+/// Available when any credential vendor feature is enabled.
+#[cfg(any(
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
+pub mod cache;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use lance_core::Result;
 use lance_io::object_store::uri_to_url;
+use lance_namespace::models::Identity;
 
 /// Default credential duration: 1 hour (3600000 milliseconds)
 pub const DEFAULT_CREDENTIAL_DURATION_MILLIS: u64 = 3600 * 1000;
@@ -188,6 +198,18 @@ pub const ENABLED: &str = "enabled";
 /// Common property key for permission level (short form).
 pub const PERMISSION: &str = "permission";
 
+/// Common property key to enable credential caching (short form).
+/// Default: true. Set to "false" to disable caching.
+pub const CACHE_ENABLED: &str = "cache_enabled";
+
+/// Common property key for API key salt (short form).
+/// Used to hash API keys before comparison: SHA256(api_key + ":" + salt)
+pub const API_KEY_SALT: &str = "api_key_salt";
+
+/// Property key prefix for API key hash to permission mappings (short form).
+/// Format: `api_key_hash.<sha256_hash> = "<permission>"`
+pub const API_KEY_HASH_PREFIX: &str = "api_key_hash.";
+
 /// AWS-specific property keys (short form, without prefix)
 #[cfg(feature = "credential-vendor-aws")]
 pub mod aws_props {
@@ -204,6 +226,14 @@ pub mod aws_props {
 #[cfg(feature = "credential-vendor-gcp")]
 pub mod gcp_props {
     pub const SERVICE_ACCOUNT: &str = "gcp_service_account";
+
+    /// Workload Identity Provider resource name for OIDC token exchange.
+    /// Format: //iam.googleapis.com/projects/{project}/locations/global/workloadIdentityPools/{pool}/providers/{provider}
+    pub const WORKLOAD_IDENTITY_PROVIDER: &str = "gcp_workload_identity_provider";
+
+    /// Service account to impersonate after Workload Identity Federation (optional).
+    /// If not set, uses the federated identity directly.
+    pub const IMPERSONATION_SERVICE_ACCOUNT: &str = "gcp_impersonation_service_account";
 }
 
 /// Azure-specific property keys (short form, without prefix)
@@ -215,6 +245,10 @@ pub mod azure_props {
     /// Azure credential duration in milliseconds.
     /// Default: 3600000 (1 hour). Azure SAS tokens can be valid up to 7 days.
     pub const DURATION_MILLIS: &str = "azure_duration_millis";
+
+    /// Client ID of the Azure AD App Registration for Workload Identity Federation.
+    /// Required when using auth_token identity for OIDC token exchange.
+    pub const FEDERATED_CLIENT_ID: &str = "azure_federated_client_id";
 }
 
 /// Vended credentials with expiration information.
@@ -271,16 +305,30 @@ pub trait CredentialVendor: Send + Sync + std::fmt::Debug {
     /// Vend credentials for accessing the specified table location.
     ///
     /// The permission level (read/write/admin) is determined by the vendor's
-    /// configuration, not per-request.
+    /// configuration, not per-request. When identity is provided, the vendor
+    /// may use different authentication flows:
+    ///
+    /// - `auth_token`: Use AssumeRoleWithWebIdentity (AWS validates the token)
+    /// - `api_key`: Validate against configured API key hashes and use AssumeRole
+    /// - `None`: Use static configuration with AssumeRole
     ///
     /// # Arguments
     ///
     /// * `table_location` - The table URI to vend credentials for
+    /// * `identity` - Optional identity from the request (api_key OR auth_token, mutually exclusive)
     ///
     /// # Returns
     ///
     /// Returns vended credentials with expiration information.
-    async fn vend_credentials(&self, table_location: &str) -> Result<VendedCredentials>;
+    ///
+    /// # Errors
+    ///
+    /// Returns error if identity validation fails (no fallback to static config).
+    async fn vend_credentials(
+        &self,
+        table_location: &str,
+        identity: Option<&Identity>,
+    ) -> Result<VendedCredentials>;
 
     /// Returns the cloud provider name (e.g., "aws", "gcp", "azure").
     fn provider_name(&self) -> &'static str;
@@ -349,21 +397,50 @@ pub async fn create_credential_vendor_for_location(
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     let provider = detect_provider_from_uri(table_location);
 
-    match provider {
+    let vendor: Option<Box<dyn CredentialVendor>> = match provider {
         #[cfg(feature = "credential-vendor-aws")]
-        "aws" => create_aws_vendor(properties).await,
+        "aws" => create_aws_vendor(properties).await?,
 
         #[cfg(feature = "credential-vendor-gcp")]
-        "gcp" => create_gcp_vendor(properties).await,
+        "gcp" => create_gcp_vendor(properties).await?,
 
         #[cfg(feature = "credential-vendor-azure")]
-        "azure" => create_azure_vendor(properties),
+        "azure" => create_azure_vendor(properties)?,
 
-        _ => Ok(None),
+        _ => None,
+    };
+
+    // Wrap with caching if enabled (default: true)
+    #[cfg(any(
+        feature = "credential-vendor-aws",
+        feature = "credential-vendor-azure",
+        feature = "credential-vendor-gcp"
+    ))]
+    if let Some(v) = vendor {
+        let cache_enabled = properties
+            .get(CACHE_ENABLED)
+            .map(|s| !s.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
+        if cache_enabled {
+            return Ok(Some(Box::new(cache::CachingCredentialVendor::new(v))));
+        } else {
+            return Ok(Some(v));
+        }
     }
+
+    #[cfg(not(any(
+        feature = "credential-vendor-aws",
+        feature = "credential-vendor-azure",
+        feature = "credential-vendor-gcp"
+    )))]
+    let _ = vendor;
+
+    Ok(None)
 }
 
 /// Parse permission from properties, defaulting to Read
+#[allow(dead_code)]
 fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
     properties
         .get(PERMISSION)
@@ -372,6 +449,7 @@ fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
 }
 
 /// Parse duration from properties using a vendor-specific key, defaulting to DEFAULT_CREDENTIAL_DURATION_MILLIS
+#[allow(dead_code)]
 fn parse_duration_millis(properties: &HashMap<String, String>, key: &str) -> u64 {
     properties
         .get(key)

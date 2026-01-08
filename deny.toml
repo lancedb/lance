@@ -85,7 +85,9 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "`paste` is used by datafusion" },
     { id = "RUSTSEC-2023-0071", reason = "`rsa` is used by opendal via reqsign" },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` used by hf-hub in examples" },
-    { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained; awaiting upstream object_store/hyper-rustls migration to rustls-pki-types" }
+    { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained; awaiting upstream object_store/hyper-rustls migration to rustls-pki-types" },
+    { id = "RUSTSEC-2025-0141", reason = "`bincode` is unmaintained and used by tantivy"},
+    { id = "RUSTSEC-2026-0002", reason = "`lru` is used by tantivy and aws-sdk-s3"},
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

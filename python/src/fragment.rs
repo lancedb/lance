@@ -112,7 +112,7 @@ impl FileFragment {
 
         let batches = convert_reader(reader)?;
 
-        reader.py().allow_threads(|| {
+        reader.py().detach(|| {
             rt().runtime.block_on(async move {
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
@@ -171,11 +171,11 @@ impl FileFragment {
     }
 
     #[pyo3(signature=(row_indices, columns=None))]
-    fn take(
-        self_: PyRef<'_, Self>,
+    fn take<'py>(
+        self_: PyRef<'py, Self>,
         row_indices: Vec<usize>,
         columns: Option<Vec<String>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
@@ -286,11 +286,12 @@ impl FileFragment {
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
     fn add_columns(
         &mut self,
+        py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
-        let transforms = transforms_from_python(transforms)?;
+        let transforms = transforms_from_python(py, transforms)?;
 
         let fragment = self.fragment.clone();
         let (fragment, schema) = rt()
@@ -351,7 +352,7 @@ impl FileFragment {
         }
     }
 
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
         logical_schema.to_pyarrow(self_.py())
@@ -419,9 +420,9 @@ fn do_write_fragments(
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
     dest: PyWriteDest,
-    reader: &Bound<PyAny>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<PyObject>> {
+    reader: &Bound<'_, PyAny>,
+    kwargs: Option<&Bound<PyDict>>,
+) -> PyResult<Vec<Py<PyAny>>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
     let get_fragments = |operation| match operation {
@@ -581,7 +582,7 @@ impl PyDeletionFile {
         Ok(Self(deletion_file))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -633,7 +634,7 @@ impl PyRowIdMeta {
         Ok(Self(row_id_meta))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -682,7 +683,7 @@ impl PyRowDatasetVersionMeta {
         Ok(Self(dataset_version_meta))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -712,7 +713,7 @@ pub struct FragmentSession {
 #[pymethods]
 impl FragmentSession {
     #[pyo3(signature=(indices))]
-    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
+    pub fn take<'py>(self_: PyRef<'py, Self>, indices: Vec<u32>) -> PyResult<Bound<'py, PyAny>> {
         let session = self_.session.clone();
         let batch = rt()
             .spawn(

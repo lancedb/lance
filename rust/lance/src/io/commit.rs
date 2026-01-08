@@ -63,7 +63,7 @@ use log;
 use object_store::path::Path;
 use prost::Message;
 
-mod conflict_resolver;
+pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]

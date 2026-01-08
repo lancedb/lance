@@ -108,12 +108,12 @@
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
-            <version>0.4.0</version>
+            <version>0.4.5</version>
         </dependency>
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-apache-client</artifactId>
-            <version>0.4.0</version>
+            <version>0.4.5</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

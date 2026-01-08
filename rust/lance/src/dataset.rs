@@ -824,7 +824,7 @@ impl Dataset {
             WriteMode::Create => {
                 let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
-                    location: None,
+                    ..Default::default()
                 };
                 // Try declare_table first, fall back to deprecated create_empty_table
                 // for backward compatibility with older namespace implementations.
@@ -835,7 +835,7 @@ impl Dataset {
                     Err(Error::NotSupported { .. }) => {
                         let fallback_request = CreateEmptyTableRequest {
                             id: Some(table_id.clone()),
-                            location: None,
+                            ..Default::default()
                         };
                         let fallback_resp = namespace
                             .create_empty_table(fallback_request)
@@ -894,8 +894,7 @@ impl Dataset {
             WriteMode::Append | WriteMode::Overwrite => {
                 let request = DescribeTableRequest {
                     id: Some(table_id.clone()),
-                    version: None,
-                    with_table_uri: None,
+                    ..Default::default()
                 };
                 let response =
                     namespace
