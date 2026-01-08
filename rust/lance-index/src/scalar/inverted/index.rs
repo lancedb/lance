@@ -1632,7 +1632,7 @@ impl PostingList {
                     let freq = freq as u32;
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1650,7 +1650,7 @@ impl PostingList {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };

@@ -412,7 +412,7 @@ impl Schema {
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_struct() {
+                if field.data_type().is_nested() {
                     if let Some(f) = field.exclude(other_field) {
                         fields.push(f)
                     }
