@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-
+use fst::Streamer;
 use lance_core::Result;
 
 use crate::scalar::IndexStore;
 
 use super::{
     builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
-    InvertedPartition, PostingListBuilder, TokenSetFormat,
+    InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
 };
 
 pub trait Merger {
@@ -123,11 +122,28 @@ impl Merger for SizeBasedMerger<'_> {
                 estimated_size = 0;
             }
 
-            let mut inv_token = HashMap::with_capacity(part.tokens.len());
             // merge token set
-            for (token, token_id) in part.tokens.iter() {
-                self.builder.tokens.add(token.clone());
-                inv_token.insert(token_id, token);
+            let mut token_id_map = vec![u32::MAX; part.tokens.len()];
+            match &part.tokens.tokens {
+                TokenMap::HashMap(map) => {
+                    for (token, token_id) in map.iter() {
+                        let new_token_id = self.builder.tokens.get_or_add(token.as_str());
+                        let index = *token_id as usize;
+                        debug_assert!(index < token_id_map.len());
+                        token_id_map[index] = new_token_id;
+                    }
+                }
+                TokenMap::Fst(map) => {
+                    let mut stream = map.stream();
+                    while let Some((token, token_id)) = stream.next() {
+                        let token_id = token_id as u32;
+                        let token = String::from_utf8_lossy(token);
+                        let new_token_id = self.builder.tokens.get_or_add(token.as_ref());
+                        let index = token_id as usize;
+                        debug_assert!(index < token_id_map.len());
+                        token_id_map[index] = new_token_id;
+                    }
+                }
             }
             // merge doc set
             let doc_id_offset = self.builder.docs.len() as u32;
@@ -149,7 +165,8 @@ impl Merger for SizeBasedMerger<'_> {
                 let posting_list = part
                     .inverted_list
                     .posting_list_from_batch(&postings.slice(token_id as usize, 1), token_id)?;
-                let new_token_id = self.builder.tokens.get(&inv_token[&token_id]).unwrap();
+                let new_token_id = token_id_map[token_id as usize];
+                debug_assert_ne!(new_token_id, u32::MAX);
                 let builder = &mut self.builder.posting_lists[new_token_id as usize];
                 let old_size = builder.size();
                 for (doc_id, freq, positions) in posting_list.iter() {
@@ -173,5 +190,106 @@ impl Merger for SizeBasedMerger<'_> {
 
         self.flush().await?;
         Ok(self.partitions.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::lance_format::LanceIndexStore;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_merge_reuses_token_ids_for_shared_tokens() -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let token_set_format = TokenSetFormat::default();
+
+        let mut builder0 = InnerBuilder::new(0, false, token_set_format);
+        let apple_id = builder0.tokens.add("apple".to_owned());
+        let banana_id = builder0.tokens.add("banana".to_owned());
+        builder0
+            .posting_lists
+            .resize_with(builder0.tokens.len(), || PostingListBuilder::new(false));
+        let doc_id = builder0.docs.append(10, 2);
+        builder0.posting_lists[apple_id as usize].add(doc_id, PositionRecorder::Count(1));
+        builder0.posting_lists[banana_id as usize].add(doc_id, PositionRecorder::Count(1));
+        builder0.write(src_store.as_ref()).await?;
+
+        let mut builder1 = InnerBuilder::new(1, false, token_set_format);
+        let banana_id = builder1.tokens.add("banana".to_owned());
+        let carrot_id = builder1.tokens.add("carrot".to_owned());
+        builder1
+            .posting_lists
+            .resize_with(builder1.tokens.len(), || PostingListBuilder::new(false));
+        let doc_id = builder1.docs.append(20, 2);
+        builder1.posting_lists[banana_id as usize].add(doc_id, PositionRecorder::Count(1));
+        builder1.posting_lists[carrot_id as usize].add(doc_id, PositionRecorder::Count(1));
+        builder1.write(src_store.as_ref()).await?;
+
+        let partition0 = InvertedPartition::load(
+            src_store.clone(),
+            0,
+            None,
+            &LanceCache::no_cache(),
+            token_set_format,
+        )
+        .await?;
+        let partition1 = InvertedPartition::load(
+            src_store.clone(),
+            1,
+            None,
+            &LanceCache::no_cache(),
+            token_set_format,
+        )
+        .await?;
+
+        let mut merger = SizeBasedMerger::new(
+            dest_store.as_ref(),
+            vec![partition0, partition1],
+            u64::MAX,
+            token_set_format,
+        );
+        let merged_partitions = merger.merge().await?;
+        assert_eq!(merged_partitions, vec![2]);
+
+        let merged = InvertedPartition::load(
+            dest_store.clone(),
+            merged_partitions[0],
+            None,
+            &LanceCache::no_cache(),
+            token_set_format,
+        )
+        .await?;
+
+        assert_eq!(merged.tokens.len(), 3);
+        assert_eq!(merged.docs.len(), 2);
+        assert_eq!(merged.docs.row_id(0), 10);
+        assert_eq!(merged.docs.row_id(1), 20);
+
+        let banana_token_id = merged.tokens.get("banana").unwrap();
+        let posting = merged
+            .inverted_list
+            .posting_list(banana_token_id, false, &NoOpMetricsCollector)
+            .await?;
+        let doc_ids: Vec<u64> = posting.iter().map(|(doc_id, _, _)| doc_id).collect();
+        assert_eq!(doc_ids, vec![0, 1]);
+
+        Ok(())
     }
 }

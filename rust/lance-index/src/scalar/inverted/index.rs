@@ -62,10 +62,7 @@ use super::{
     encoding::compress_posting_list,
     iter::CompressedPostingListIterator,
 };
-use super::{
-    encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
-};
+use super::{encoding::compress_positions, iter::PostingListIterator};
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
@@ -938,13 +935,6 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
-    }
-
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
         match format {
             TokenSetFormat::Arrow => self.into_arrow_batch(),
@@ -1148,6 +1138,24 @@ impl TokenSet {
         }
 
         token_id
+    }
+
+    pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
+        let next_id = self.next_id;
+        match self.tokens {
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&token_id) = map.get(token) {
+                    return token_id;
+                }
+
+                map.insert(token.to_owned(), next_id);
+            }
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        }
+
+        self.next_id += 1;
+        self.total_length += token.len();
+        next_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
