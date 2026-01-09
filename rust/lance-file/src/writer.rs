@@ -116,7 +116,7 @@ pub struct FileWriterOptions {
     pub format_version: Option<LanceFileVersion>,
 
     /// If true, enable column statistics generation when writing data files.
-    /// Column statistics can be used for query optimization and filtering.
+    /// Column statistics can be used for planning optimization and filtering.
     pub enable_column_stats: bool,
 }
 
@@ -227,11 +227,9 @@ struct ColumnStatisticsProcessor {
 
 impl ColumnStatisticsProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        // TODO: Does it handle all types?
-        let min = MinAccumulator::try_new(&data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let max = MaxAccumulator::try_new(&data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        // TODO: Upstream DataFusion accumulators does not handle many nested types
+        let min = MinAccumulator::try_new(&data_type)?;
+        let max = MaxAccumulator::try_new(&data_type)?;
         Ok(Self {
             data_type,
             min,
@@ -276,25 +274,15 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
         self.null_count += array.null_count() as u32;
         self.nan_count += Self::count_nans(array);
-        self.min
-            .update_batch(std::slice::from_ref(array))
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        self.max
-            .update_batch(std::slice::from_ref(array))
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.min.update_batch(std::slice::from_ref(array))?;
+        self.max.update_batch(std::slice::from_ref(array))?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         Ok(ColumnZoneStatistics {
-            min: self
-                .min
-                .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
-            max: self
-                .max
-                .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+            min: self.min.evaluate()?,
+            max: self.max.evaluate()?,
             null_count: self.null_count,
             nan_count: self.nan_count,
             bound,
@@ -302,10 +290,8 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.min = MinAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        self.max = MaxAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.min = MinAccumulator::try_new(&self.data_type)?;
+        self.max = MaxAccumulator::try_new(&self.data_type)?;
         self.null_count = 0;
         self.nan_count = 0;
         Ok(())

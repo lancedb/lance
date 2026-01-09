@@ -414,9 +414,8 @@ pub struct WriteParams {
     /// If true, enable column statistics generation when writing data files.
     ///
     /// Note: Once set for a dataset, this setting should remain consistent across
-    /// all write operations. If not explicitly set, this will be automatically
-    /// inherited from the dataset's policy during validation.
-    /// Default is False.
+    /// all write operations. This value must match the dataset's policy.
+    /// Default is `false`.
     pub enable_column_stats: bool,
 }
 
@@ -454,11 +453,11 @@ impl Default for WriteParams {
 }
 
 impl WriteParams {
-    /// Validate and auto-inherit the dataset's column stats policy.
+    /// Validate the dataset's column stats policy.
     ///
-    /// If the dataset has a policy set in the manifest, this will always respect
-    /// and use that value, overriding any value set in WriteParams. This ensures
-    /// all fragments in a dataset have consistent column statistics.
+    /// If the dataset has a policy set in the manifest, this will check that `enable_column_stats`
+    /// matches it. Returns an error if the values don't match. If the dataset doesn't have a policy,
+    /// the value from WriteParams (defaults to `false`) will be used.
     ///
     /// # Arguments
     ///
@@ -466,7 +465,8 @@ impl WriteParams {
     ///
     /// # Errors
     ///
-    /// Returns an error if the manifest contains an invalid policy value.
+    /// Returns an error if the manifest contains an invalid policy value or if
+    /// `enable_column_stats` doesn't match the dataset's policy.
     pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
         if let Some(dataset) = dataset {
             if let Some(policy_str) = dataset.manifest.config.get("lance.column_stats.enabled") {
@@ -480,18 +480,19 @@ impl WriteParams {
                     )
                 })?;
 
-                // Always respect the value from manifest
                 if self.enable_column_stats != dataset_policy {
-                    log::warn!(
-                        "Column statistics policy mismatch: WriteParams has enable_column_stats={}, \
-                         but dataset manifest requires enable_column_stats={}. \
-                         Using manifest value to ensure consistency.",
-                        self.enable_column_stats,
-                        dataset_policy
-                    );
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Column statistics policy mismatch: dataset requires enable_column_stats={}, \
+                             but WriteParams has enable_column_stats={}. \
+                             All fragments in a dataset must have consistent column statistics.",
+                            dataset_policy, self.enable_column_stats
+                        ),
+                        location!(),
+                    ));
                 }
-                self.enable_column_stats = dataset_policy;
             }
+            // If no policy in manifest, use the value from WriteParams (defaults to false)
         }
         Ok(())
     }
