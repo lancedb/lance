@@ -998,20 +998,13 @@ mod tests {
     fn test_block_max_score_matches_stored_value() {
         let doc_ids = vec![0_u32];
         let block_max_scores = vec![0.7_f32];
-        let posting_list =
-            generate_posting_list(doc_ids, 0.7, Some(block_max_scores), true);
+        let posting_list = generate_posting_list(doc_ids, 0.7, Some(block_max_scores), true);
         let expected = match &posting_list {
             PostingList::Compressed(list) => list.block_max_score(0),
             PostingList::Plain(_) => unreachable!("expected compressed posting list"),
         };
 
-        let posting = PostingIterator::new(
-            String::from("test"),
-            0,
-            0,
-            posting_list,
-            1,
-        );
+        let posting = PostingIterator::new(String::from("test"), 0, 0, posting_list, 1);
 
         let actual = posting.block_max_score();
         assert!(
