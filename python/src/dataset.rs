@@ -133,26 +133,35 @@ pub struct MergeInsertBuilder {
 #[pymethods]
 impl MergeInsertBuilder {
     #[new]
-    pub fn new(dataset: &Bound<'_, PyAny>, on: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let dataset: Py<Dataset> = dataset.extract()?;
-        let ds = dataset.borrow(on.py()).ds.clone();
+    #[pyo3(signature=(dataset, on=None))]
+    pub fn new(dataset: &Bound<'_, PyAny>, on: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let dataset_py: Py<Dataset> = dataset.extract()?;
+        let py = dataset.py();
+        let ds = dataset_py.borrow(py).ds.clone();
+
         // Either a single string, which we put in a vector or an iterator
-        // of strings, which we collect into a vector
-        let on = on
-            .downcast::<PyString>()
-            .map(|val| vec![val.to_string()])
-            .or_else(|_| {
-                let iterator = on.try_iter().map_err(|_| {
-                    PyTypeError::new_err(
-                        "The `on` argument to merge_insert must be a str or iterable of str",
-                    )
-                })?;
-                let mut keys = Vec::new();
-                for key in iterator {
-                    keys.push(key?.downcast::<PyString>()?.to_string());
-                }
-                PyResult::Ok(keys)
-            })?;
+        // of strings, which we collect into a vector. If `on` is None, we
+        // pass an empty vector and let the Rust builder fall back to the
+        // schema's unenforced primary key (if configured).
+        let on = if let Some(on_any) = on {
+            on_any
+                .downcast::<PyString>()
+                .map(|val| vec![val.to_string()])
+                .or_else(|_| {
+                    let iterator = on_any.try_iter().map_err(|_| {
+                        PyTypeError::new_err(
+                            "The `on` argument to merge_insert must be a str or iterable of str",
+                        )
+                    })?;
+                    let mut keys = Vec::new();
+                    for key in iterator {
+                        keys.push(key?.downcast::<PyString>()?.to_string());
+                    }
+                    PyResult::Ok(keys)
+                })?
+        } else {
+            Vec::new()
+        };
 
         let mut builder = LanceMergeInsertBuilder::try_new(ds, on)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -162,7 +171,7 @@ impl MergeInsertBuilder {
             .when_matched(WhenMatched::DoNothing)
             .when_not_matched(WhenNotMatched::DoNothing);
 
-        Ok(Self { builder, dataset })
+        Ok(Self { builder, dataset: dataset_py })
     }
 
     #[pyo3(signature=(condition=None))]

@@ -2026,7 +2026,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def merge_insert(
         self,
-        on: Union[str, Iterable[str]],
+        on: Optional[Union[str, Iterable[str]]] = None,
     ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
@@ -2058,10 +2058,15 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
 
-        on: Union[str, Iterable[str]]
+        on: Optional[Union[str, Iterable[str]]], default None
             A column (or columns) to join on.  This is how records from the
             source table and target table are matched.  Typically this is some
             kind of key or id column.
+
+            If ``on`` is not provided (or is ``None``), the merge insert
+            operation will use the dataset's unenforced primary key as defined
+            in the schema metadata. If no primary key is configured and
+            ``on`` is None, a :class:`ValueError` will be raised.
 
         Examples
         --------
