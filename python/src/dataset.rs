@@ -171,7 +171,10 @@ impl MergeInsertBuilder {
             .when_matched(WhenMatched::DoNothing)
             .when_not_matched(WhenNotMatched::DoNothing);
 
-        Ok(Self { builder, dataset: dataset_py })
+        Ok(Self {
+            builder,
+            dataset: dataset_py,
+        })
     }
 
     #[pyo3(signature=(condition=None))]
