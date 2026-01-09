@@ -165,6 +165,16 @@ impl Field {
             lt if lt.is_large_list() => {
                 DataType::LargeList(Arc::new(ArrowField::from(&self.children[0])))
             }
+            lt if lt.is_fixed_size_list_struct() => {
+                // Parse size from "fixed_size_list:struct:N"
+                let size: i32 =
+                    lt.0.split(':')
+                        .next_back()
+                        .expect("fixed_size_list:struct logical type missing size suffix")
+                        .parse()
+                        .expect("fixed_size_list:struct logical type has invalid size");
+                DataType::FixedSizeList(Arc::new(ArrowField::from(&self.children[0])), size)
+            }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
             }
@@ -1076,6 +1086,9 @@ impl TryFrom<&ArrowField> for Field {
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::FixedSizeList(item, _) if matches!(item.data_type(), DataType::Struct(_)) => {
+                vec![Self::try_from(item.as_ref())?]
+            }
             DataType::Map(entries, keys_sorted) => {
                 // TODO: We only support keys_sorted=false for now,
                 //  because converting a rust arrow map field to the python arrow field will

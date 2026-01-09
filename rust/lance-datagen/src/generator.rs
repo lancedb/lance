@@ -15,7 +15,7 @@ use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
-    LargeStringArray, ListArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    LargeStringArray, ListArray, MapArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
     RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
@@ -1712,6 +1712,85 @@ impl ArrayGenerator for RandomListGenerator {
     }
 }
 
+/// Generates random map arrays where each map has 0-4 entries.
+#[derive(Debug)]
+struct RandomMapGenerator {
+    field: Arc<Field>,
+    entries_field: Arc<Field>,
+    keys_gen: Box<dyn ArrayGenerator>,
+    values_gen: Box<dyn ArrayGenerator>,
+    lengths_gen: Box<dyn ArrayGenerator>,
+}
+
+impl RandomMapGenerator {
+    fn new(keys_gen: Box<dyn ArrayGenerator>, values_gen: Box<dyn ArrayGenerator>) -> Self {
+        let entries_fields = Fields::from(vec![
+            Field::new("keys", keys_gen.data_type().clone(), false),
+            Field::new("values", values_gen.data_type().clone(), true),
+        ]);
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entries_fields),
+            false,
+        ));
+        let map_type = DataType::Map(entries_field.clone(), false);
+        let field = Arc::new(Field::new("", map_type, true));
+        let lengths_dist = Uniform::new_inclusive(0_i32, 4).unwrap();
+        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist);
+
+        Self {
+            field,
+            entries_field,
+            keys_gen,
+            values_gen,
+            lengths_gen,
+        }
+    }
+}
+
+impl ArrayGenerator for RandomMapGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let lengths = self.lengths_gen.generate(length, rng)?;
+        let lengths = lengths.as_primitive::<Int32Type>();
+        let total_entries = lengths.values().iter().sum::<i32>() as u64;
+        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+
+        let keys = self.keys_gen.generate(RowCount::from(total_entries), rng)?;
+        let values = self
+            .values_gen
+            .generate(RowCount::from(total_entries), rng)?;
+
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("keys", keys.data_type().clone(), false),
+                Field::new("values", values.data_type().clone(), true),
+            ]),
+            vec![keys, values],
+            None,
+        );
+
+        Ok(Arc::new(MapArray::try_new(
+            self.entries_field.clone(),
+            offsets,
+            entries,
+            None,
+            false,
+        )?))
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.field.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
+    }
+}
+
 #[derive(Debug)]
 struct NullArrayGenerator {}
 
@@ -2754,6 +2833,13 @@ pub mod array {
         Box::new(RandomListGenerator::new(item_gen, is_large))
     }
 
+    /// Generates random map arrays where each map has 0-4 entries.
+    pub fn rand_map(key_type: &DataType, value_type: &DataType) -> Box<dyn ArrayGenerator> {
+        let keys_gen = rand_type(key_type);
+        let values_gen = rand_type(value_type);
+        Box::new(RandomMapGenerator::new(keys_gen, values_gen))
+    }
+
     pub fn rand_struct(fields: Fields) -> Box<dyn ArrayGenerator> {
         let child_gens = fields
             .iter()
@@ -2797,6 +2883,14 @@ pub mod array {
             DataType::FixedSizeBinary(size) => rand_fsb(*size),
             DataType::List(child) => rand_list(child.data_type(), false),
             DataType::LargeList(child) => rand_list(child.data_type(), true),
+            DataType::Map(entries_field, _) => {
+                let DataType::Struct(fields) = entries_field.data_type() else {
+                    panic!("Map entries field must be a struct");
+                };
+                let key_type = fields[0].data_type();
+                let value_type = fields[1].data_type();
+                rand_map(key_type, value_type)
+            }
             DataType::Duration(unit) => match unit {
                 TimeUnit::Second => rand::<DurationSecondType>(),
                 TimeUnit::Millisecond => rand::<DurationMillisecondType>(),
