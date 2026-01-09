@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
+use object_store::path::Path;
 use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -76,6 +77,22 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    #[snafu(display("Failed to read file: {path}, {location}"))]
+    ReadFile {
+        path: Path,
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display(
+        "Failed to decode column '{field_name}' (id: {field_id}) at offset {offset}, {location}"
+    ))]
+    DecodeColumn {
+        field_name: String,
+        field_id: i32,
+        offset: u64,
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index { message: String, location: Location },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
@@ -146,6 +163,30 @@ impl Error {
         let message: String = message.into();
         Self::IO {
             source: message.into(),
+            location,
+        }
+    }
+
+    pub fn read_file(path: Path, source: impl Into<BoxedError>, location: Location) -> Self {
+        Self::ReadFile {
+            path,
+            source: source.into(),
+            location,
+        }
+    }
+
+    pub fn decode_column(
+        field_name: impl Into<String>,
+        field_id: i32,
+        offset: u64,
+        source: impl Into<BoxedError>,
+        location: Location,
+    ) -> Self {
+        Self::DecodeColumn {
+            field_name: field_name.into(),
+            field_id,
+            offset,
+            source: source.into(),
             location,
         }
     }

@@ -420,6 +420,7 @@ impl RleMiniBlockDecompressor {
             16 => self.decode_generic::<u16>(values_buffer, lengths_buffer, num_values)?,
             32 => self.decode_generic::<u32>(values_buffer, lengths_buffer, num_values)?,
             64 => self.decode_generic::<u64>(values_buffer, lengths_buffer, num_values)?,
+            128 => self.decode_generic::<u128>(values_buffer, lengths_buffer, num_values)?,
             _ => unreachable!("RLE decoding bits_per_value must be 8, 16, 32, 64, or 128"),
         };
 

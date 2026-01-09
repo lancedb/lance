@@ -356,6 +356,7 @@ pub struct FileReader {
     decoder_plugins: Arc<DecoderPlugins>,
     cache: Arc<LanceCache>,
     options: FileReaderOptions,
+    path: Path,
 }
 #[derive(Debug)]
 struct Footer {
@@ -384,6 +385,7 @@ impl FileReader {
             metadata: self.metadata.clone(),
             options: self.options.clone(),
             num_rows: self.num_rows,
+            path: self.path.clone(),
         }
     }
 
@@ -836,6 +838,7 @@ impl FileReader {
             decoder_plugins,
             cache,
             options,
+            path,
         })
     }
 
