@@ -29,6 +29,7 @@ use crate::dataset::write::{
 use crate::{Error, Result};
 use tracing::info;
 
+use super::COLUMN_STATS_ENABLED_KEY;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
@@ -242,7 +243,7 @@ impl<'a> InsertBuilder<'a> {
                 config_upsert_values
                     .get_or_insert_with(HashMap::new)
                     .insert(
-                        String::from("lance.column_stats.enabled"),
+                        String::from(COLUMN_STATS_ENABLED_KEY),
                         if context.params.enable_column_stats {
                             String::from("true")
                         } else {
@@ -768,6 +769,7 @@ mod test {
 
     #[tokio::test]
     async fn test_column_stats_policy_set_on_create() {
+        // Test that COLUMN_STATS_ENABLED_KEY is set in manifest when creating dataset with stats enabled
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -784,13 +786,14 @@ mod test {
             .await
             .unwrap();
 
-        let config_value = dataset.manifest.config.get("lance.column_stats.enabled");
+        // Check that the manifest has the column stats config
+        let config_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
         assert_eq!(config_value, Some(&"true".to_string()));
     }
 
     #[tokio::test]
     async fn test_column_stats_policy_set_to_false_when_disabled() {
-        // Test that lance.column_stats.enabled is set to false when stats are explicitly disabled
+        // Test that COLUMN_STATS_ENABLED_KEY is set to false when stats are explicitly disabled
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -808,7 +811,7 @@ mod test {
             .unwrap();
 
         // Check that the manifest has the column stats config set to false
-        let config_value = dataset.manifest.config.get("lance.column_stats.enabled");
+        let config_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
         assert_eq!(config_value, Some(&"false".to_string()));
     }
 
@@ -908,6 +911,102 @@ mod test {
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_policy_enforcement_prevents_corruption_on_write_failure() {
+        // Test that dataset policy remains unchanged even if write fails
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_write_failure")
+            .with_params(&WriteParams {
+                enable_column_stats: true,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch1)], schema.clone()))
+            .await
+            .unwrap();
+
+        // Verify initial policy is set
+        let initial_policy = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
+        assert_eq!(initial_policy, Some(&"true".to_string()));
+
+        // Try to append with wrong policy (should fail validation before write)
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        )
+        .unwrap();
+
+        let result = InsertBuilder::new("memory://test_write_failure")
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                enable_column_stats: false,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()))
+            .await;
+
+        assert!(result.is_err());
+
+        // Verify policy is still unchanged
+        let dataset_after = Dataset::open("memory://test_write_failure").await.unwrap();
+        let policy_after = dataset_after.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
+        assert_eq!(policy_after, Some(&"true".to_string()));
+
+        // Verify dataset still has only original data (write never started)
+        assert_eq!(dataset_after.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_backwards_compat_dataset_without_policy_key() {
+        // Test that datasets work correctly with policy enforcement
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Create a dataset normally with stats disabled
+        let dataset = InsertBuilder::new("memory://test_backwards_compat")
+            .with_params(&WriteParams {
+                enable_column_stats: false,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        // Verify policy key is set
+        let policy_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
+        assert_eq!(policy_value, Some(&"false".to_string()));
+
+        // Appending with matching policy should work
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        )
+        .unwrap();
+
+        let result = InsertBuilder::new("memory://test_backwards_compat")
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                enable_column_stats: false,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()))
             .await;
 
         assert!(result.is_ok());

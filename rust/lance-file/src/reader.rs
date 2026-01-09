@@ -48,7 +48,7 @@ use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
-    writer::PAGE_BUFFER_ALIGNMENT,
+    writer::{COLUMN_STATS_BUFFER_INDEX_KEY, PAGE_BUFFER_ALIGNMENT},
 };
 
 /// Default chunk size for reading large pages (8MiB)
@@ -2434,9 +2434,6 @@ impl ProjectedFileReader {
     /// `lance:column_stats:buffer_index`. If this key exists, the file
     /// has column statistics that can be read with `read_column_stats()`.
     ///
-    /// # Returns
-    ///
-    /// `true` if the file has column statistics, `false` otherwise.
     pub fn has_column_stats(&self) -> bool {
         self.metadata
             .file_schema
@@ -2447,43 +2444,16 @@ impl ProjectedFileReader {
     /// Read column statistics from the file.
     ///
     /// Column statistics are stored as a global buffer containing an Arrow IPC
-    /// encoded RecordBatch. The batch uses a **column-oriented layout** with
-    /// one row per dataset column, optimized for selective column reads.
+    /// encoded RecordBatch. The batch uses a **flat (transposed) layout** with
+    /// one row per zone per column. See details in writer.rs
     ///
-    /// Schema (one row per dataset column):
-    /// - `column_name`: UTF-8 - Name of the dataset column
-    /// - `zone_starts`: List<UInt64> - Starting row offsets of each zone (fragment-local)
-    /// - `zone_lengths`: List<UInt64> - Number of rows in each zone
-    /// - `null_counts`: List<UInt32> - Number of null values per zone
-    /// - `nan_counts`: List<UInt32> - Number of NaN values per zone (for float types)
-    /// - `min_values`: List<UTF-8> - Minimum value per zone (ScalarValue debug format)
-    /// - `max_values`: List<UTF-8> - Maximum value per zone (ScalarValue debug format)
-    ///
-    /// This column-oriented layout enables efficient reads: to get stats for a
-    /// single column (e.g., "age"), you only need to read one row. Arrow IPC's
-    /// columnar storage means reading `zone_starts` doesn't read `min_values`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(RecordBatch))` if the file has column statistics
-    /// - `Ok(None)` if the file does not have column statistics
-    /// - `Err` if there was an error reading or parsing the statistics
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let reader = FileReader::try_open(object_store, path, None).await?;
-    /// if let Some(stats_batch) = reader.read_column_stats().await? {
-    ///     println!("File has {} zones of statistics", stats_batch.num_rows());
-    /// }
-    /// ```
     pub async fn read_column_stats(&self) -> Result<Option<arrow_array::RecordBatch>> {
         // Check if column stats exist
         let Some(buffer_index_str) = self
             .metadata
             .file_schema
             .metadata
-            .get("lance:column_stats:buffer_index")
+            .get(COLUMN_STATS_BUFFER_INDEX_KEY)
         else {
             return Ok(None);
         };
@@ -2521,6 +2491,7 @@ impl ProjectedFileReader {
             )
             .await?;
 
+        // TODO: Is it needed?
         // Combine all bytes into a single buffer (usually should be just one chunk)
         let stats_bytes = if stats_bytes_vec.len() == 1 {
             stats_bytes_vec.into_iter().next().unwrap()
@@ -4007,8 +3978,8 @@ mod tests {
             .unwrap()
             .expect("Expected column stats to be present");
 
-        // Verify the schema of the stats batch (column-oriented)
-        assert_eq!(stats_batch.num_columns(), 7);
+        // Verify the schema of the stats batch (flat layout)
+        assert_eq!(stats_batch.num_columns(), 8);
         assert_eq!(
             stats_batch.schema().field(0).name(),
             "column_name",
@@ -4016,19 +3987,24 @@ mod tests {
         );
         assert_eq!(
             stats_batch.schema().field(1).name(),
-            "zone_starts",
-            "Second field should be zone_starts (List)"
+            "zone_id",
+            "Second field should be zone_id"
         );
         assert_eq!(
             stats_batch.schema().field(2).name(),
-            "zone_lengths",
-            "Third field should be zone_lengths (List)"
+            "zone_start",
+            "Third field should be zone_start"
+        );
+        assert_eq!(
+            stats_batch.schema().field(3).name(),
+            "zone_length",
+            "Fourth field should be zone_length"
         );
 
-        // Verify we have at least one row (one per dataset column)
+        // Verify we have at least one row (one per zone per column)
         assert!(
             stats_batch.num_rows() > 0,
-            "Should have at least one row (one per dataset column)"
+            "Should have at least one row (one per zone per column)"
         );
 
         // Verify column_name contains "data"
@@ -4039,17 +4015,60 @@ mod tests {
             .unwrap();
         assert_eq!(column_names.value(0), "data");
 
-        // Verify zone_starts is a List array with at least one zone
-        use arrow_array::ListArray;
-        let zone_starts = stats_batch
+        // Verify zone_id is a UInt32 array
+        use arrow_array::UInt32Array;
+        let zone_ids = stats_batch
             .column(1)
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<UInt32Array>()
             .unwrap();
-        assert!(
-            zone_starts.value(0).len() > 0,
-            "Should have at least one zone for the 'data' column"
-        );
+        assert_eq!(zone_ids.value(0), 0, "First zone should have zone_id = 0");
+
+        // Verify zone_start and zone_length
+        use arrow_array::UInt64Array;
+        let zone_starts = stats_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let zone_lengths = stats_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(zone_starts.value(0), 0, "Zone should start at row 0");
+        assert_eq!(zone_lengths.value(0), 5, "Zone should have 5 rows");
+
+        // Verify null_count and nan_count
+        let null_counts = stats_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let nan_counts = stats_batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(null_counts.value(0), 0, "Should have 0 nulls");
+        assert_eq!(nan_counts.value(0), 0, "Should have 0 NaNs (Int32 type)");
+
+        // Verify min_value and max_value (stored as strings in ScalarValue debug format)
+        let min_values = stats_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let max_values = stats_batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Data was [1, 2, 3, 4, 5], so min=1, max=5
+        // Values are now stored without type prefix
+        assert_eq!(min_values.value(0), "1", "Min value should be 1");
+        assert_eq!(max_values.value(0), "5", "Max value should be 5");
     }
 
     #[tokio::test]

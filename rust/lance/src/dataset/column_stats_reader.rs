@@ -85,21 +85,23 @@ impl ColumnStatsReader {
                 location: location!(),
             })?;
 
-        let row_idx = (0..column_names.len())
-            .find(|&i| column_names.value(i) == column_name)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Column '{}' not found in statistics", column_name),
-                location: location!(),
-            })?;
+        // Check if column exists in stats batch
+        let row_idx = (0..column_names.len()).find(|&i| column_names.value(i) == column_name);
+
+        if row_idx.is_none() {
+            // Column not in stats - return None (no stats available)
+            return Ok(None);
+        }
+        let row_idx = row_idx.unwrap();
 
         // Get the field from the dataset schema
-        let field = self
-            .dataset_schema
-            .field(column_name)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Column '{}' not found in dataset schema", column_name),
-                location: location!(),
-            })?;
+        let field = self.dataset_schema.field(column_name);
+
+        if field.is_none() {
+            // Column not in schema - return None (no stats available)
+            return Ok(None);
+        }
+        let field = field.unwrap();
 
         // Extract arrays for this column
         let fragment_ids_ref = self
@@ -259,108 +261,72 @@ impl ColumnStatsReader {
 fn parse_scalar_value(s: &str, data_type: &arrow_schema::DataType) -> Result<ScalarValue> {
     use arrow_schema::DataType;
 
-    // The format is typically like: Int32(123), Float64(45.6), Utf8("hello")
-    // We need to extract the value and parse it according to the expected type
+    // The string now contains just the value without type prefix
+    // E.g., "42", "3.14", "hello" (no "Int32(...)" wrapper)
 
     match data_type {
-        DataType::Int8 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Int8(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Int8: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Int16 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Int16(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Int16: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Int32 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Int32(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Int32: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Int64 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Int64(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Int64: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::UInt8 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::UInt8(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse UInt8: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::UInt16 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::UInt16(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse UInt16: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::UInt32 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::UInt32(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse UInt32: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::UInt64 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::UInt64(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse UInt64: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Float32 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Float32(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Float32: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Float64 => {
-            let val = extract_numeric_value(s)?;
-            Ok(ScalarValue::Float64(Some(val.parse().map_err(|e| {
-                Error::Internal {
-                    message: format!("Failed to parse Float64: {}", e),
-                    location: location!(),
-                }
-            })?)))
-        }
-        DataType::Utf8 => {
-            let val = extract_string_value(s)?;
-            Ok(ScalarValue::Utf8(Some(val.to_string())))
-        }
-        DataType::LargeUtf8 => {
-            let val = extract_string_value(s)?;
-            Ok(ScalarValue::LargeUtf8(Some(val.to_string())))
-        }
+        DataType::Int8 => Ok(ScalarValue::Int8(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Int8 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Int16 => Ok(ScalarValue::Int16(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Int16 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Int32 => Ok(ScalarValue::Int32(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Int32 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Int64 => Ok(ScalarValue::Int64(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Int64 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::UInt8 => Ok(ScalarValue::UInt8(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse UInt8 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::UInt16 => Ok(ScalarValue::UInt16(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse UInt16 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::UInt32 => Ok(ScalarValue::UInt32(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse UInt32 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::UInt64 => Ok(ScalarValue::UInt64(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse UInt64 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Float32 => Ok(ScalarValue::Float32(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Float32 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Float64 => Ok(ScalarValue::Float64(Some(s.parse().map_err(|e| {
+            Error::Internal {
+                message: format!("Failed to parse Float64 from '{}': {}", s, e),
+                location: location!(),
+            }
+        })?))),
+        DataType::Utf8 => Ok(ScalarValue::Utf8(Some(s.to_string()))),
+        DataType::LargeUtf8 => Ok(ScalarValue::LargeUtf8(Some(s.to_string()))),
         _ => Err(Error::Internal {
             message: format!("Unsupported data type for stats parsing: {:?}", data_type),
             location: location!(),
@@ -368,30 +334,410 @@ fn parse_scalar_value(s: &str, data_type: &arrow_schema::DataType) -> Result<Sca
     }
 }
 
-/// Extract numeric value from debug format like "Int32(123)" -> "123"
-fn extract_numeric_value(s: &str) -> Result<&str> {
-    if let Some(start) = s.find('(') {
-        if let Some(end) = s.rfind(')') {
-            return Ok(&s[start + 1..end]);
-        }
-    }
-    Err(Error::Internal {
-        message: format!("Invalid numeric value format: {}", s),
-        location: location!(),
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Re-import types that are used by the parent module but not re-exported
+    use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
+    use arrow_array::{RecordBatch, StringArray as ArrowStringArray};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
 
-/// Extract string value from debug format like 'Utf8("hello")' -> "hello"
-fn extract_string_value(s: &str) -> Result<&str> {
-    if let Some(start) = s.find('"') {
-        if let Some(end) = s.rfind('"') {
-            if end > start {
-                return Ok(&s[start + 1..end]);
-            }
+    fn create_test_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::try_from(&ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("score", DataType::Float64, false),
+            ]))
+            .unwrap(),
+        )
+    }
+
+    fn create_test_stats_batch() -> RecordBatch {
+        // Create a consolidated stats batch with 2 columns: "id" and "name"
+        // Match the exact schema created by column_stats.rs (with proper inner field names)
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("column_name", DataType::Utf8, false),
+            ArrowField::new(
+                "fragment_ids",
+                DataType::List(Arc::new(ArrowField::new(
+                    "fragment_id",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "zone_starts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "zone_start",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "zone_lengths",
+                DataType::List(Arc::new(ArrowField::new(
+                    "zone_length",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "null_counts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "null_count",
+                    DataType::UInt32,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "nan_counts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "nan_count",
+                    DataType::UInt32,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "mins",
+                DataType::List(Arc::new(ArrowField::new("min", DataType::Utf8, false))),
+                false,
+            ),
+            ArrowField::new(
+                "maxs",
+                DataType::List(Arc::new(ArrowField::new("max", DataType::Utf8, false))),
+                false,
+            ),
+        ]);
+
+        // Build lists for "id" column (Int32) - use with_field to match the schema
+        let mut fragment_ids_builder = ListBuilder::new(UInt64Builder::new())
+            .with_field(ArrowField::new("fragment_id", DataType::UInt64, false));
+        fragment_ids_builder.values().append_value(0);
+        fragment_ids_builder.values().append_value(1);
+        fragment_ids_builder.append(true);
+
+        let mut zone_starts_builder = ListBuilder::new(UInt64Builder::new())
+            .with_field(ArrowField::new("zone_start", DataType::UInt64, false));
+        zone_starts_builder.values().append_value(0);
+        zone_starts_builder.values().append_value(100);
+        zone_starts_builder.append(true);
+
+        let mut zone_lengths_builder = ListBuilder::new(UInt64Builder::new())
+            .with_field(ArrowField::new("zone_length", DataType::UInt64, false));
+        zone_lengths_builder.values().append_value(100);
+        zone_lengths_builder.values().append_value(100);
+        zone_lengths_builder.append(true);
+
+        let mut null_counts_builder = ListBuilder::new(UInt32Builder::new())
+            .with_field(ArrowField::new("null_count", DataType::UInt32, false));
+        null_counts_builder.values().append_value(0);
+        null_counts_builder.values().append_value(0);
+        null_counts_builder.append(true);
+
+        let mut nan_counts_builder = ListBuilder::new(UInt32Builder::new())
+            .with_field(ArrowField::new("nan_count", DataType::UInt32, false));
+        nan_counts_builder.values().append_value(0);
+        nan_counts_builder.values().append_value(0);
+        nan_counts_builder.append(true);
+
+        let mut mins_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
+            "min",
+            DataType::Utf8,
+            false,
+        ));
+        mins_builder.values().append_value("0");
+        mins_builder.values().append_value("100");
+        mins_builder.append(true);
+
+        let mut maxs_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
+            "max",
+            DataType::Utf8,
+            false,
+        ));
+        maxs_builder.values().append_value("99");
+        maxs_builder.values().append_value("199");
+        maxs_builder.append(true);
+
+        // Build lists for "name" column (Utf8)
+        fragment_ids_builder.values().append_value(0);
+        fragment_ids_builder.values().append_value(1);
+        fragment_ids_builder.append(true);
+
+        zone_starts_builder.values().append_value(0);
+        zone_starts_builder.values().append_value(100);
+        zone_starts_builder.append(true);
+
+        zone_lengths_builder.values().append_value(100);
+        zone_lengths_builder.values().append_value(100);
+        zone_lengths_builder.append(true);
+
+        null_counts_builder.values().append_value(0);
+        null_counts_builder.values().append_value(0);
+        null_counts_builder.append(true);
+
+        nan_counts_builder.values().append_value(0);
+        nan_counts_builder.values().append_value(0);
+        nan_counts_builder.append(true);
+
+        mins_builder.values().append_value("alice");
+        mins_builder.values().append_value("mike");
+        mins_builder.append(true);
+
+        maxs_builder.values().append_value("jenny");
+        maxs_builder.values().append_value("zoe");
+        maxs_builder.append(true);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(ArrowStringArray::from(vec!["id", "name"])),
+                Arc::new(fragment_ids_builder.finish()),
+                Arc::new(zone_starts_builder.finish()),
+                Arc::new(zone_lengths_builder.finish()),
+                Arc::new(null_counts_builder.finish()),
+                Arc::new(nan_counts_builder.finish()),
+                Arc::new(mins_builder.finish()),
+                Arc::new(maxs_builder.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_read_column_stats_int32() {
+        let schema = create_test_schema();
+        let stats_batch = create_test_stats_batch();
+        let reader = ColumnStatsReader::new(schema, stats_batch);
+
+        let stats = reader.read_column_stats("id").unwrap().unwrap();
+
+        // Verify fragment_ids
+        assert_eq!(stats.fragment_ids, vec![0, 1]);
+
+        // Verify zone_starts
+        assert_eq!(stats.zone_starts, vec![0, 100]);
+
+        // Verify zone_lengths
+        assert_eq!(stats.zone_lengths, vec![100, 100]);
+
+        // Verify null_counts
+        assert_eq!(stats.null_counts, vec![0, 0]);
+
+        // Verify nan_counts
+        assert_eq!(stats.nan_counts, vec![0, 0]);
+
+        // Verify min_values
+        assert_eq!(stats.min_values.len(), 2);
+        assert_eq!(stats.min_values[0], ScalarValue::Int32(Some(0)));
+        assert_eq!(stats.min_values[1], ScalarValue::Int32(Some(100)));
+
+        // Verify max_values
+        assert_eq!(stats.max_values.len(), 2);
+        assert_eq!(stats.max_values[0], ScalarValue::Int32(Some(99)));
+        assert_eq!(stats.max_values[1], ScalarValue::Int32(Some(199)));
+    }
+
+    #[test]
+    fn test_read_column_stats_utf8() {
+        let schema = create_test_schema();
+        let stats_batch = create_test_stats_batch();
+        let reader = ColumnStatsReader::new(schema, stats_batch);
+
+        let stats = reader.read_column_stats("name").unwrap().unwrap();
+
+        // Verify fragment_ids
+        assert_eq!(stats.fragment_ids, vec![0, 1]);
+
+        // Verify min_values (strings)
+        assert_eq!(stats.min_values.len(), 2);
+        assert_eq!(
+            stats.min_values[0],
+            ScalarValue::Utf8(Some("alice".to_string()))
+        );
+        assert_eq!(
+            stats.min_values[1],
+            ScalarValue::Utf8(Some("mike".to_string()))
+        );
+
+        // Verify max_values (strings)
+        assert_eq!(stats.max_values.len(), 2);
+        assert_eq!(
+            stats.max_values[0],
+            ScalarValue::Utf8(Some("jenny".to_string()))
+        );
+        assert_eq!(
+            stats.max_values[1],
+            ScalarValue::Utf8(Some("zoe".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_read_column_stats_nonexistent_column() {
+        let schema = create_test_schema();
+        let stats_batch = create_test_stats_batch();
+        let reader = ColumnStatsReader::new(schema, stats_batch);
+
+        let result = reader.read_column_stats("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_column_stats_column_not_in_schema() {
+        let schema = create_test_schema();
+        let stats_batch = create_test_stats_batch();
+        let reader = ColumnStatsReader::new(schema, stats_batch);
+
+        // "score" is in schema but not in stats_batch
+        let result = reader.read_column_stats("score").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_scalar_value_int_types() {
+        let cases = vec![
+            (DataType::Int8, "42", ScalarValue::Int8(Some(42))),
+            (DataType::Int16, "1000", ScalarValue::Int16(Some(1000))),
+            (DataType::Int32, "100000", ScalarValue::Int32(Some(100000))),
+            (
+                DataType::Int64,
+                "9999999999",
+                ScalarValue::Int64(Some(9999999999)),
+            ),
+            (DataType::UInt8, "255", ScalarValue::UInt8(Some(255))),
+            (DataType::UInt16, "65535", ScalarValue::UInt16(Some(65535))),
+            (
+                DataType::UInt32,
+                "4294967295",
+                ScalarValue::UInt32(Some(4294967295)),
+            ),
+            (
+                DataType::UInt64,
+                "18446744073709551615",
+                ScalarValue::UInt64(Some(18446744073709551615)),
+            ),
+        ];
+
+        for (data_type, input, expected) in cases {
+            let result = parse_scalar_value(input, &data_type).unwrap();
+            assert_eq!(result, expected, "Failed for type {:?}", data_type);
         }
     }
-    Err(Error::Internal {
-        message: format!("Invalid string value format: {}", s),
-        location: location!(),
-    })
+
+    #[test]
+    fn test_parse_scalar_value_float_types() {
+        let result = parse_scalar_value("2.5", &DataType::Float32).unwrap();
+        assert_eq!(result, ScalarValue::Float32(Some(2.5)));
+
+        let result = parse_scalar_value("1.234567890123456", &DataType::Float64).unwrap();
+        assert_eq!(result, ScalarValue::Float64(Some(1.234567890123456)));
+    }
+
+    #[test]
+    fn test_parse_scalar_value_string_types() {
+        let result = parse_scalar_value("hello", &DataType::Utf8).unwrap();
+        assert_eq!(result, ScalarValue::Utf8(Some("hello".to_string())));
+
+        let result = parse_scalar_value("world", &DataType::LargeUtf8).unwrap();
+        assert_eq!(result, ScalarValue::LargeUtf8(Some("world".to_string())));
+    }
+
+    #[test]
+    fn test_parse_scalar_value_invalid_format() {
+        let result = parse_scalar_value("not_a_number", &DataType::Int32);
+        assert!(result.is_err());
+
+        let result = parse_scalar_value("not_a_float", &DataType::Float64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_scalar_value_unsupported_type() {
+        let result = parse_scalar_value("true", &DataType::Boolean);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported data type")
+        );
+    }
+
+    #[test]
+    fn test_empty_stats_batch() {
+        let schema = create_test_schema();
+
+        // Create empty stats batch
+        let stats_schema = ArrowSchema::new(vec![
+            ArrowField::new("column_name", DataType::Utf8, false),
+            ArrowField::new(
+                "fragment_ids",
+                DataType::List(Arc::new(ArrowField::new(
+                    "fragment_id",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "zone_starts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "zone_start",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "zone_lengths",
+                DataType::List(Arc::new(ArrowField::new(
+                    "zone_length",
+                    DataType::UInt64,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "null_counts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "null_count",
+                    DataType::UInt32,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "nan_counts",
+                DataType::List(Arc::new(ArrowField::new(
+                    "nan_count",
+                    DataType::UInt32,
+                    false,
+                ))),
+                false,
+            ),
+            ArrowField::new(
+                "mins",
+                DataType::List(Arc::new(ArrowField::new("min", DataType::Utf8, false))),
+                false,
+            ),
+            ArrowField::new(
+                "maxs",
+                DataType::List(Arc::new(ArrowField::new("max", DataType::Utf8, false))),
+                false,
+            ),
+        ]);
+
+        let empty_batch = RecordBatch::new_empty(Arc::new(stats_schema));
+        let reader = ColumnStatsReader::new(schema, empty_batch);
+
+        // Reading from empty batch should return None (no stats available)
+        let result = reader.read_column_stats("id").unwrap();
+        assert!(result.is_none());
+    }
 }

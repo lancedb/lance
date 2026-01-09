@@ -6,10 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow_array::{
-    ArrayRef, RecordBatch, StringArray,
-    builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder},
-};
+use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_common::ScalarValue;
@@ -65,6 +62,13 @@ pub struct FileWriteSummary {
     /// The final size of the file in bytes.
     pub size_bytes: u64,
 }
+
+/// Metadata key for column statistics buffer index
+pub(crate) const COLUMN_STATS_BUFFER_INDEX_KEY: &str = "lance:column_stats:buffer_index";
+/// Metadata key for column statistics version
+pub(crate) const COLUMN_STATS_VERSION_KEY: &str = "lance:column_stats:version";
+/// Current version of column statistics format
+pub(crate) const COLUMN_STATS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -217,7 +221,6 @@ struct ColumnZoneStatistics {
 
 /// Statistics processor for a single column that implements ZoneProcessor trait
 struct ColumnStatisticsProcessor {
-    #[allow(dead_code)]
     data_type: DataType,
     min: MinAccumulator,
     max: MaxAccumulator,
@@ -228,8 +231,10 @@ struct ColumnStatisticsProcessor {
 impl ColumnStatisticsProcessor {
     fn new(data_type: DataType) -> Result<Self> {
         // TODO: Upstream DataFusion accumulators does not handle many nested types
-        let min = MinAccumulator::try_new(&data_type)?;
-        let max = MaxAccumulator::try_new(&data_type)?;
+        let min = MinAccumulator::try_new(&data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        let max = MaxAccumulator::try_new(&data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         Ok(Self {
             data_type,
             min,
@@ -274,15 +279,25 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
         self.null_count += array.null_count() as u32;
         self.nan_count += Self::count_nans(array);
-        self.min.update_batch(std::slice::from_ref(array))?;
-        self.max.update_batch(std::slice::from_ref(array))?;
+        self.min
+            .update_batch(std::slice::from_ref(array))
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.max
+            .update_batch(std::slice::from_ref(array))
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         Ok(ColumnZoneStatistics {
-            min: self.min.evaluate()?,
-            max: self.max.evaluate()?,
+            min: self
+                .min
+                .evaluate()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+            max: self
+                .max
+                .evaluate()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
             null_count: self.null_count,
             nan_count: self.nan_count,
             bound,
@@ -290,8 +305,10 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.min = MinAccumulator::try_new(&self.data_type)?;
-        self.max = MaxAccumulator::try_new(&self.data_type)?;
+        self.min = MinAccumulator::try_new(&self.data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        self.max = MaxAccumulator::try_new(&self.data_type)
+            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         self.null_count = 0;
         self.nan_count = 0;
         Ok(())
@@ -317,6 +334,35 @@ fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Pag
 enum PageSpillState {
     Pending(Arc<ObjectStore>, Path),
     Active(PageMetadataSpill),
+}
+
+/// Convert ScalarValue to string, extracting only the value without type prefix
+/// E.g., Int32(42) -> "42", Float64(3.14) -> "3.14", Utf8("hello") -> "hello"
+fn scalar_value_to_string(value: &ScalarValue) -> String {
+    let debug_str = format!("{:?}", value);
+
+    // For string types, extract the quoted value
+    if debug_str.starts_with("Utf8(") || debug_str.starts_with("LargeUtf8(") {
+        // Extract content between quotes: Utf8("hello") -> "hello"
+        if let Some(start) = debug_str.find('"') {
+            if let Some(end) = debug_str.rfind('"') {
+                if end > start {
+                    return debug_str[start + 1..end].to_string();
+                }
+            }
+        }
+    }
+
+    // For numeric types, extract content between parentheses
+    // Int32(42) -> "42", Float64(3.14) -> "3.14"
+    if let Some(start) = debug_str.find('(') {
+        if let Some(end) = debug_str.rfind(')') {
+            return debug_str[start + 1..end].to_string();
+        }
+    }
+
+    // Fallback: return the whole debug string (shouldn't happen for supported types)
+    debug_str
 }
 
 /// Zone size for column statistics (1 million rows per zone)
@@ -743,6 +789,7 @@ impl FileWriter {
 
         self.write_pages(encoding_tasks).await?;
 
+        // TODO: Reuse the other read path so that we dont need to do the calculation twice
         // Accumulate column statistics if enabled
         if let Some(ref mut processors) = self.column_stats_processors {
             for (field, processor) in self
@@ -1105,21 +1152,10 @@ impl FileWriter {
 
     /// Build column statistics for the written data.
     ///
-    /// Builds and stores column statistics if enabled.
-    ///
     /// Statistics are serialized as an Arrow RecordBatch and stored in a global buffer.
     /// This format is forward/backward compatible - new statistics fields can be added
     /// without breaking older readers.
     ///
-    /// The RecordBatch schema:
-    /// - column_name: String - Name of the column
-    /// - zone_start: UInt64 - Starting row offset of the zone
-    /// - zone_length: UInt64 - Number of rows in the zone (span, not count)
-    /// - null_count: UInt32 - Number of null values
-    /// - nan_count: UInt32 - Number of NaN values (for float types)
-    /// - min: String - Minimum value (serialized as string for compatibility)
-    /// - max: String - Maximum value (serialized as string for compatibility)
-    /// - (future fields can be added here without breaking compatibility)
     async fn build_column_statistics(&mut self) -> Result<()> {
         let Some(processors) = self.column_stats_processors.take() else {
             return Ok(()); // Statistics not enabled
@@ -1132,44 +1168,30 @@ impl FileWriter {
             )
         })?;
 
-        // Column-oriented layout: one row per dataset column
-        // Each field contains a list of values (one per zone)
+        // Transposed (flat) layout: one row per zone per column
+        // It provides better simplicity and read efficiency compared to the nested layout (one row per column with nested lists)
+        // As the column statistics data is minimal compared to the data itself, the trade off of more row numbers is acceptable.
+        //
+        // Example layout for a dataset with 2 columns ("id", "price") and 2 zones:
+        // ┌─────────────┬─────────┬────────────┬─────────────┬────────────┬───────────┬───────────┬───────────┐
+        // │ column_name │ zone_id │ zone_start │ zone_length │ null_count │ nan_count │ min_value │ max_value │
+        // ├─────────────┼─────────┼────────────┼─────────────┼────────────┼───────────┼───────────┼───────────┤
+        // │ "id"        │ 0       │ 0          │ 1000000     │ 0          │ 0         │ "1"       │ "1000000" │
+        // │ "id"        │ 1       │ 1000000    │ 500000      │ 0          │ 0         │ "1000001" │ "1500000" │
+        // │ "price"     │ 0       │ 0          │ 1000000     │ 0          │ 0         │ "9.99"    │ "99.99"   │
+        // │ "price"     │ 1       │ 1000000    │ 500000      │ 5          │ 0         │ "10.50"   │ "100.50"  │
+        // └─────────────┴─────────┴────────────┴─────────────┴────────────┴───────────┴───────────┴───────────┘
+        //
+        // Each row represents one zone for one column. No nested structures (lists).
+        // Build flat arrays (one row per zone per column)
         let mut column_names = Vec::new();
-
-        // Create list builders with proper field definitions (non-nullable items)
-        let zone_starts_field = ArrowField::new("item", DataType::UInt64, false);
-        let mut zone_starts_builder =
-            ListBuilder::new(UInt64Builder::with_capacity(processors.len()))
-                .with_field(zone_starts_field);
-
-        let zone_lengths_field = ArrowField::new("item", DataType::UInt64, false);
-        let mut zone_lengths_builder =
-            ListBuilder::new(UInt64Builder::with_capacity(processors.len()))
-                .with_field(zone_lengths_field);
-
-        let null_counts_field = ArrowField::new("item", DataType::UInt32, false);
-        let mut null_counts_builder =
-            ListBuilder::new(UInt32Builder::with_capacity(processors.len()))
-                .with_field(null_counts_field);
-
-        let nan_counts_field = ArrowField::new("item", DataType::UInt32, false);
-        let mut nan_counts_builder =
-            ListBuilder::new(UInt32Builder::with_capacity(processors.len()))
-                .with_field(nan_counts_field);
-
-        let mins_field = ArrowField::new("item", DataType::Utf8, false);
-        let mut mins_builder = ListBuilder::new(StringBuilder::with_capacity(
-            processors.len(),
-            processors.len() * 32,
-        ))
-        .with_field(mins_field);
-
-        let maxs_field = ArrowField::new("item", DataType::Utf8, false);
-        let mut maxs_builder = ListBuilder::new(StringBuilder::with_capacity(
-            processors.len(),
-            processors.len() * 32,
-        ))
-        .with_field(maxs_field);
+        let mut zone_ids = Vec::new();
+        let mut zone_starts = Vec::new();
+        let mut zone_lengths = Vec::new();
+        let mut null_counts = Vec::new();
+        let mut nan_counts = Vec::new();
+        let mut min_values = Vec::new();
+        let mut max_values = Vec::new();
 
         for (field, processor) in schema.fields.iter().zip(processors.into_iter()) {
             let zones = processor.finalize()?;
@@ -1179,32 +1201,18 @@ impl FileWriter {
                 continue;
             }
 
-            column_names.push(field.name.clone());
-
-            // Build arrays for this column's zones
-            for zone in &zones {
-                zone_starts_builder.values().append_value(zone.bound.start);
-                zone_lengths_builder
-                    .values()
-                    .append_value(zone.bound.length as u64);
-                null_counts_builder.values().append_value(zone.null_count);
-                nan_counts_builder.values().append_value(zone.nan_count);
-                // Serialize ScalarValue as string for forward compatibility
-                mins_builder
-                    .values()
-                    .append_value(format!("{:?}", zone.min));
-                maxs_builder
-                    .values()
-                    .append_value(format!("{:?}", zone.max));
+            // Add one row per zone for this column
+            for (zone_idx, zone) in zones.iter().enumerate() {
+                column_names.push(field.name.clone());
+                zone_ids.push(zone_idx as u32);
+                zone_starts.push(zone.bound.start);
+                zone_lengths.push(zone.bound.length as u64);
+                null_counts.push(zone.null_count);
+                nan_counts.push(zone.nan_count);
+                // Serialize ScalarValue as string - only store the value, not the type
+                min_values.push(scalar_value_to_string(&zone.min));
+                max_values.push(scalar_value_to_string(&zone.max));
             }
-
-            // Finish the lists for this column (one row)
-            zone_starts_builder.append(true);
-            zone_lengths_builder.append(true);
-            null_counts_builder.append(true);
-            nan_counts_builder.append(true);
-            mins_builder.append(true);
-            maxs_builder.append(true);
         }
 
         // If no statistics were collected, return early
@@ -1212,62 +1220,40 @@ impl FileWriter {
             return Ok(());
         }
 
-        // Create Arrow arrays
+        // Create Arrow arrays (flat, no lists)
         let column_name_array = Arc::new(StringArray::from(column_names)) as ArrayRef;
-        let zone_starts_array = Arc::new(zone_starts_builder.finish()) as ArrayRef;
-        let zone_lengths_array = Arc::new(zone_lengths_builder.finish()) as ArrayRef;
-        let null_counts_array = Arc::new(null_counts_builder.finish()) as ArrayRef;
-        let nan_counts_array = Arc::new(nan_counts_builder.finish()) as ArrayRef;
-        let mins_array = Arc::new(mins_builder.finish()) as ArrayRef;
-        let maxs_array = Arc::new(maxs_builder.finish()) as ArrayRef;
+        let zone_id_array = Arc::new(arrow_array::UInt32Array::from(zone_ids)) as ArrayRef;
+        let zone_start_array = Arc::new(arrow_array::UInt64Array::from(zone_starts)) as ArrayRef;
+        let zone_length_array = Arc::new(arrow_array::UInt64Array::from(zone_lengths)) as ArrayRef;
+        let null_count_array = Arc::new(arrow_array::UInt32Array::from(null_counts)) as ArrayRef;
+        let nan_count_array = Arc::new(arrow_array::UInt32Array::from(nan_counts)) as ArrayRef;
+        let min_value_array = Arc::new(StringArray::from(min_values)) as ArrayRef;
+        let max_value_array = Arc::new(StringArray::from(max_values)) as ArrayRef;
 
-        // Create schema for the statistics RecordBatch
-        // Column-oriented: one row per dataset column, each field is a list
+        // Create schema for the statistics RecordBatch (flat schema, no lists)
         let stats_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("column_name", DataType::Utf8, false),
-            ArrowField::new(
-                "zone_starts",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt64, false))),
-                false,
-            ),
-            ArrowField::new(
-                "zone_lengths",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt64, false))),
-                false,
-            ),
-            ArrowField::new(
-                "null_counts",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt32, false))),
-                false,
-            ),
-            ArrowField::new(
-                "nan_counts",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::UInt32, false))),
-                false,
-            ),
-            ArrowField::new(
-                "min_values",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false))),
-                false,
-            ),
-            ArrowField::new(
-                "max_values",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false))),
-                false,
-            ),
+            ArrowField::new("zone_id", DataType::UInt32, false),
+            ArrowField::new("zone_start", DataType::UInt64, false),
+            ArrowField::new("zone_length", DataType::UInt64, false),
+            ArrowField::new("null_count", DataType::UInt32, false),
+            ArrowField::new("nan_count", DataType::UInt32, false),
+            ArrowField::new("min_value", DataType::Utf8, false),
+            ArrowField::new("max_value", DataType::Utf8, false),
         ]));
 
-        // Create RecordBatch
+        // Create RecordBatch (flat structure)
         let stats_batch = RecordBatch::try_new(
             stats_schema,
             vec![
                 column_name_array,
-                zone_starts_array,
-                zone_lengths_array,
-                null_counts_array,
-                nan_counts_array,
-                mins_array,
-                maxs_array,
+                zone_id_array,
+                zone_start_array,
+                zone_length_array,
+                null_count_array,
+                nan_count_array,
+                min_value_array,
+                max_value_array,
             ],
         )
         .map_err(|e| {
@@ -1302,11 +1288,13 @@ impl FileWriter {
 
         // Store the buffer index in schema metadata so readers can find it
         self.schema_metadata.insert(
-            "lance:column_stats:buffer_index".to_string(),
+            COLUMN_STATS_BUFFER_INDEX_KEY.to_string(),
             buffer_index.to_string(),
         );
-        self.schema_metadata
-            .insert("lance:column_stats:version".to_string(), "1".to_string());
+        self.schema_metadata.insert(
+            COLUMN_STATS_VERSION_KEY.to_string(),
+            COLUMN_STATS_VERSION.to_string(),
+        );
 
         Ok(())
     }
@@ -2813,5 +2801,413 @@ mod tests {
             write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
                 .await;
         assert_eq!(baseline, spilled);
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_flat_layout() {
+        // Test that column statistics use flat (transposed) layout
+        use arrow_array::{Float64Array, Int32Array};
+        use arrow_schema::Schema;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create data with 2.5M rows (will create 3 zones at 1M rows each)
+        let id_data: Vec<i32> = (0..2_500_000).collect();
+        let value_data: Vec<f64> = (0..2_500_000).map(|i| i as f64 * 0.5).collect();
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(id_data)),
+                Arc::new(Float64Array::from(value_data)),
+            ],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and verify the flat layout
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let stats_batch = file_reader
+            .read_column_stats()
+            .await
+            .unwrap()
+            .expect("Should have column stats");
+
+        // Verify flat schema (no lists)
+        let schema = stats_batch.schema();
+        // Schema should have 8 fields: column_name, zone_id, zone_start, zone_length, null_count, nan_count, min_value, max_value
+        assert_eq!(
+            schema.fields().len(),
+            8,
+            "Schema fields: {:?}",
+            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+        );
+        assert_eq!(schema.field(0).name(), "column_name");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).name(), "zone_id");
+        assert_eq!(schema.field(1).data_type(), &DataType::UInt32);
+        assert_eq!(schema.field(2).name(), "zone_start");
+        assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(3).name(), "zone_length");
+        assert_eq!(schema.field(3).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(4).name(), "null_count");
+        assert_eq!(schema.field(4).data_type(), &DataType::UInt32);
+        assert_eq!(schema.field(5).name(), "nan_count");
+        assert_eq!(schema.field(5).data_type(), &DataType::UInt32);
+        assert_eq!(schema.field(6).name(), "min_value");
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(7).name(), "max_value");
+        assert_eq!(schema.field(7).data_type(), &DataType::Utf8);
+
+        // Should have 6 rows: 2 columns × 3 zones each
+        assert_eq!(stats_batch.num_rows(), 6);
+
+        // Verify data structure
+        let column_names = stats_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let zone_ids = stats_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .unwrap();
+        let zone_starts = stats_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let zone_lengths = stats_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+
+        // Verify first column (id) has 3 zones
+        assert_eq!(column_names.value(0), "id");
+        assert_eq!(zone_ids.value(0), 0);
+        assert_eq!(zone_starts.value(0), 0);
+        assert_eq!(zone_lengths.value(0), 1_000_000);
+
+        assert_eq!(column_names.value(1), "id");
+        assert_eq!(zone_ids.value(1), 1);
+        assert_eq!(zone_starts.value(1), 1_000_000);
+        assert_eq!(zone_lengths.value(1), 1_000_000);
+
+        assert_eq!(column_names.value(2), "id");
+        assert_eq!(zone_ids.value(2), 2);
+        assert_eq!(zone_starts.value(2), 2_000_000);
+        assert_eq!(zone_lengths.value(2), 500_000);
+
+        // Verify second column (value) has 3 zones
+        assert_eq!(column_names.value(3), "value");
+        assert_eq!(zone_ids.value(3), 0);
+        assert_eq!(zone_starts.value(3), 0);
+
+        assert_eq!(column_names.value(4), "value");
+        assert_eq!(zone_ids.value(4), 1);
+
+        assert_eq!(column_names.value(5), "value");
+        assert_eq!(zone_ids.value(5), 2);
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_multiple_columns() {
+        // Test that stats are correctly computed for multiple columns with multiple zones
+        use arrow_array::{Float64Array, Int32Array};
+        use arrow_schema::Schema;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            ArrowField::new("col1", DataType::Int32, false),
+            ArrowField::new("col2", DataType::Int32, false),
+            ArrowField::new("col3", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create data with 1.5M rows (will create 2 zones)
+        let rows = 1_500_000;
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..rows)),
+                Arc::new(Int32Array::from_iter_values((0..rows).map(|i| i * 2))),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..rows).map(|i| i as f64 * 0.5),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and verify stats
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let stats_batch = file_reader
+            .read_column_stats()
+            .await
+            .unwrap()
+            .expect("Should have column stats");
+
+        // Should have 6 rows: 3 columns × 2 zones each
+        assert_eq!(stats_batch.num_rows(), 6);
+
+        // Verify all required columns exist
+        assert!(stats_batch.column_by_name("column_name").is_some());
+        assert!(stats_batch.column_by_name("zone_id").is_some());
+        assert!(stats_batch.column_by_name("min_value").is_some());
+        assert!(stats_batch.column_by_name("max_value").is_some());
+        assert!(stats_batch.column_by_name("null_count").is_some());
+
+        let column_names = stats_batch
+            .column_by_name("column_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Verify we have stats for all 3 columns (each appears twice for 2 zones)
+        let mut col1_count = 0;
+        let mut col2_count = 0;
+        let mut col3_count = 0;
+
+        for i in 0..stats_batch.num_rows() {
+            match column_names.value(i) {
+                "col1" => col1_count += 1,
+                "col2" => col2_count += 1,
+                "col3" => col3_count += 1,
+                _ => panic!("Unexpected column name"),
+            }
+        }
+
+        assert_eq!(col1_count, 2); // 2 zones
+        assert_eq!(col2_count, 2); // 2 zones
+        assert_eq!(col3_count, 2); // 2 zones
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_with_nulls_and_nans() {
+        // Test that null_count and nan_count are correctly tracked
+        use arrow_array::{Float64Array, Int32Array};
+        use arrow_schema::Schema;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Int32, true), // nullable
+            ArrowField::new("value", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create data with nulls and NaNs
+        let id_data = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+        let value_data = Float64Array::from(vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0]);
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(id_data), Arc::new(value_data)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            enable_column_stats: true,
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and verify null/nan counts
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let stats_batch = file_reader
+            .read_column_stats()
+            .await
+            .unwrap()
+            .expect("Should have column stats");
+
+        // Should have 2 rows: 2 columns × 1 zone each (only 5 rows total)
+        assert_eq!(stats_batch.num_rows(), 2);
+
+        let column_names = stats_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let null_counts = stats_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .unwrap();
+        let nan_counts = stats_batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .unwrap();
+
+        // Find id column stats
+        let id_idx = (0..stats_batch.num_rows())
+            .find(|&i| column_names.value(i) == "id")
+            .unwrap();
+        assert_eq!(null_counts.value(id_idx), 2); // 2 nulls in id column
+        assert_eq!(nan_counts.value(id_idx), 0); // No NaNs in int column
+
+        // Find value column stats
+        let value_idx = (0..stats_batch.num_rows())
+            .find(|&i| column_names.value(i) == "value")
+            .unwrap();
+        assert_eq!(null_counts.value(value_idx), 0); // No nulls in value column
+        assert_eq!(nan_counts.value(value_idx), 2); // 2 NaNs in value column
+    }
+
+    #[tokio::test]
+    async fn test_column_stats_disabled() {
+        // Test that no stats are written when disabled
+        use arrow_array::Int32Array;
+        use arrow_schema::Schema;
+
+        let arrow_schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            enable_column_stats: false, // Disabled
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and verify no stats
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let stats_batch = file_reader.read_column_stats().await.unwrap();
+        assert!(stats_batch.is_none(), "Should not have column stats");
     }
 }

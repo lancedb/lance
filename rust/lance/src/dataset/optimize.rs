@@ -124,6 +124,7 @@ use tracing::{info, warn};
 mod binary_copy;
 pub mod remapping;
 
+use crate::dataset::write::COLUMN_STATS_ENABLED_KEY;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
@@ -2216,8 +2217,8 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
-        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        PrimitiveArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
+        Array, ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
@@ -2236,7 +2237,6 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
-    use lance_io::scheduler::ScanScheduler;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -7963,9 +7963,12 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::default();
-                append_params.mode = crate::dataset::WriteMode::Append;
+                let _dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
                     .unwrap();
@@ -7995,6 +7998,92 @@ mod tests {
             stats_file.is_some(),
             "Stats should be consolidated even with deletions"
         );
+
+        // Read and verify the stats file content
+        let stats_path = stats_file.unwrap();
+        let full_path = dataset.base.child(stats_path.as_str());
+        let scheduler = lance_io::scheduler::ScanScheduler::new(
+            dataset.object_store.clone(),
+            lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file_scheduler = scheduler
+            .open_file(&full_path, &lance_io::utils::CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+            &dataset
+                .session
+                .metadata_cache
+                .file_metadata_cache(&full_path),
+            dataset.file_reader_options.clone().unwrap_or_default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reader.num_rows(), 2, "Should have 2 rows (id and value)");
+
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batches.push(batch);
+        }
+
+        let batch = &batches[0];
+        let column_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let names: Vec<_> = (0..2).map(|i| column_names.value(i)).collect();
+        assert!(names.contains(&"id") && names.contains(&"value"));
+
+        let mins = batch
+            .column_by_name("min_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        let maxs = batch
+            .column_by_name("max_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+
+        // After compaction with deletions (id < 50 deleted), verify "id" column stats
+        for row_idx in 0..2 {
+            if column_names.value(row_idx) == "id" {
+                let id_mins_array = mins.value(row_idx);
+                let id_mins = id_mins_array
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                let id_maxs_array = maxs.value(row_idx);
+                let id_maxs = id_maxs_array
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+
+                assert_eq!(id_mins.len(), 1, "Should have 1 fragment after compaction");
+                let min_val: i32 = id_mins.value(0).parse().unwrap();
+                let max_val: i32 = id_maxs.value(0).parse().unwrap();
+                // Rows with id < 50 were deleted, so min should be 50
+                assert_eq!(min_val, 50, "Min should be 50 after deleting id < 50");
+                assert_eq!(max_val, 299, "Max should be 299");
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -8032,9 +8121,12 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::default();
-                append_params.mode = crate::dataset::WriteMode::Append;
+                let _dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
                     .unwrap();
@@ -8062,6 +8154,96 @@ mod tests {
             .get("lance.column_stats.file")
             .cloned();
         assert!(first_stats_file.is_some());
+
+        // Verify the first stats file content after first compaction
+        let stats_path = first_stats_file.as_ref().unwrap();
+        let full_path = dataset.base.child(stats_path.as_str());
+        let scheduler = lance_io::scheduler::ScanScheduler::new(
+            dataset.object_store.clone(),
+            lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file_scheduler = scheduler
+            .open_file(&full_path, &lance_io::utils::CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+            &dataset
+                .session
+                .metadata_cache
+                .file_metadata_cache(&full_path),
+            dataset.file_reader_options.clone().unwrap_or_default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reader.num_rows(), 1, "Should have 1 row (only id column)");
+
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batches.push(batch);
+        }
+
+        let batch = &batches[0];
+        let column_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(column_names.len(), 1);
+        assert_eq!(column_names.value(0), "id");
+
+        let mins = batch
+            .column_by_name("min_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        let maxs = batch
+            .column_by_name("max_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+
+        let id_mins_array = mins.value(0);
+        let id_mins = id_mins_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let id_maxs_array = maxs.value(0);
+        let id_maxs = id_maxs_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+
+        // After first compaction: 6 fragments (50 rows each) compacted with target=150
+        // Should have consolidated stats covering 0-299
+        assert!(!id_mins.is_empty(), "Should have at least one fragment");
+        let all_mins: Vec<i32> = (0..id_mins.len())
+            .map(|i| id_mins.value(i).parse().unwrap())
+            .collect();
+        let all_maxs: Vec<i32> = (0..id_maxs.len())
+            .map(|i| id_maxs.value(i).parse().unwrap())
+            .collect();
+        let overall_min = all_mins.iter().min().unwrap();
+        let overall_max = all_maxs.iter().max().unwrap();
+        assert_eq!(*overall_min, 0, "First compaction min should be 0");
+        assert_eq!(
+            *overall_max, 299,
+            "First compaction max should be 299 (6 fragments * 50 rows)"
+        );
 
         // Add more fragments
         for i in 6..9 {
@@ -8095,10 +8277,104 @@ mod tests {
             .cloned();
         assert!(second_stats_file.is_some());
 
-        // Stats file should be updated (different version)
-        assert_ne!(
+        // Stats file path stays the same (version is stored in metadata)
+        assert_eq!(
             first_stats_file, second_stats_file,
-            "Stats file should be updated after second compaction"
+            "Stats file path should remain the same (_stats/column_stats.lance)"
+        );
+        // But the file content is updated with new version metadata
+
+        // Read and verify the final stats file content
+        let stats_path = second_stats_file.unwrap();
+        let full_path = dataset.base.child(stats_path.as_str());
+        let scheduler = lance_io::scheduler::ScanScheduler::new(
+            dataset.object_store.clone(),
+            lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file_scheduler = scheduler
+            .open_file(&full_path, &lance_io::utils::CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+            &dataset
+                .session
+                .metadata_cache
+                .file_metadata_cache(&full_path),
+            dataset.file_reader_options.clone().unwrap_or_default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reader.num_rows(), 1, "Should have 1 row (only id column)");
+
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batches.push(batch);
+        }
+
+        let batch = &batches[0];
+        let column_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(column_names.len(), 1);
+        assert_eq!(column_names.value(0), "id");
+
+        let mins = batch
+            .column_by_name("min_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        let maxs = batch
+            .column_by_name("max_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+
+        let id_mins_array = mins.value(0);
+        let id_mins = id_mins_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let id_maxs_array = maxs.value(0);
+        let id_maxs = id_maxs_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+
+        // After two rounds of compaction with target_rows_per_fragment=150:
+        // Verify we have consolidated stats for the full range (0 to 449)
+        assert!(!id_mins.is_empty(), "Should have at least one fragment");
+
+        // Collect all min/max values across fragments
+        let all_mins: Vec<i32> = (0..id_mins.len())
+            .map(|i| id_mins.value(i).parse().unwrap())
+            .collect();
+        let all_maxs: Vec<i32> = (0..id_maxs.len())
+            .map(|i| id_maxs.value(i).parse().unwrap())
+            .collect();
+
+        let overall_min = all_mins.iter().min().unwrap();
+        let overall_max = all_maxs.iter().max().unwrap();
+        assert_eq!(*overall_min, 0, "Overall min should be 0");
+        assert_eq!(
+            *overall_max, 449,
+            "Overall max should be 449 (9 fragments * 50 rows)"
         );
     }
 
@@ -8138,9 +8414,12 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                let dataset = Dataset::open(test_uri).await.unwrap();
-                let mut append_params = WriteParams::default();
-                append_params.mode = crate::dataset::WriteMode::Append;
+                let _dataset = Dataset::open(test_uri).await.unwrap();
+                let append_params = WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    enable_column_stats: true,
+                    ..Default::default()
+                };
                 Dataset::write(reader, test_uri, Some(append_params))
                     .await
                     .unwrap();
@@ -8165,6 +8444,85 @@ mod tests {
             stats_file.is_some(),
             "Stats should work with stable row IDs"
         );
+
+        // Read and verify the stats file content
+        let stats_path = stats_file.unwrap();
+        let full_path = dataset.base.child(stats_path.as_str());
+        let scheduler = lance_io::scheduler::ScanScheduler::new(
+            dataset.object_store.clone(),
+            lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file_scheduler = scheduler
+            .open_file(&full_path, &lance_io::utils::CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+            &dataset
+                .session
+                .metadata_cache
+                .file_metadata_cache(&full_path),
+            dataset.file_reader_options.clone().unwrap_or_default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reader.num_rows(), 1, "Should have 1 row (only id column)");
+
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batches.push(batch);
+        }
+
+        let batch = &batches[0];
+        let column_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(column_names.len(), 1);
+        assert_eq!(column_names.value(0), "id");
+
+        let mins = batch
+            .column_by_name("min_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        let maxs = batch
+            .column_by_name("max_values")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+
+        let id_mins_array = mins.value(0);
+        let id_mins = id_mins_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let id_maxs_array = maxs.value(0);
+        let id_maxs = id_maxs_array
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+
+        assert_eq!(id_mins.len(), 1, "Should have 1 fragment after compaction");
+        let min_val: i32 = id_mins.value(0).parse().unwrap();
+        let max_val: i32 = id_maxs.value(0).parse().unwrap();
+        assert_eq!(min_val, 0, "Min should be 0");
+        assert_eq!(max_val, 299, "Max should be 299 (3 fragments * 100 rows)");
     }
 
     #[tokio::test]

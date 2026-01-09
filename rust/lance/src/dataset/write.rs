@@ -12,7 +12,7 @@ use lance_arrow::{
     BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{
-    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -54,6 +54,17 @@ use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
+
+/// Manifest configuration key for column statistics policy
+pub const COLUMN_STATS_ENABLED_KEY: &str = "lance.column_stats.enabled";
+
+pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+    if storage_version >= LanceFileVersion::V2_2 {
+        BlobVersion::V2
+    } else {
+        BlobVersion::V1
+    }
+}
 
 mod commit;
 pub mod delete;
@@ -469,12 +480,12 @@ impl WriteParams {
     /// `enable_column_stats` doesn't match the dataset's policy.
     pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
         if let Some(dataset) = dataset {
-            if let Some(policy_str) = dataset.manifest.config.get("lance.column_stats.enabled") {
+            if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY) {
                 let dataset_policy: bool = policy_str.parse().map_err(|_| {
                     Error::invalid_input(
                         format!(
-                            "Invalid value for lance.column_stats.enabled in dataset config: {}",
-                            policy_str
+                            "[ColumnStats] Invalid value for {} in dataset config: {}",
+                            COLUMN_STATS_ENABLED_KEY, policy_str
                         ),
                         location!(),
                     )
@@ -483,7 +494,7 @@ impl WriteParams {
                 if self.enable_column_stats != dataset_policy {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column statistics policy mismatch: dataset requires enable_column_stats={}, \
+                            "[ColumnStats] Policy mismatch: dataset requires enable_column_stats={}, \
                              but WriteParams has enable_column_stats={}. \
                              All fragments in a dataset must have consistent column statistics.",
                             dataset_policy, self.enable_column_stats
@@ -492,7 +503,7 @@ impl WriteParams {
                     ));
                 }
             }
-            // If no policy in manifest, use the value from WriteParams (defaults to false)
+            // If no policy in manifest, use the value from WriteParams
         }
         Ok(())
     }

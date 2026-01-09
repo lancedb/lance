@@ -137,7 +137,7 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
-    fn scalar_is_nan(value: &ScalarValue) -> bool {
+    fn is_nan(value: &ScalarValue) -> bool {
         match value {
             ScalarValue::Float16(Some(value)) => value.is_nan(),
             ScalarValue::Float32(Some(value)) => value.is_nan(),
@@ -148,12 +148,12 @@ impl ZoneMapIndex {
 
     /// Returns true if the zone has a non-null, non-NaN min value.
     fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
-        !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
+        !(zone.min.is_null() || Self::is_nan(&zone.min))
     }
 
     /// Returns true if both min and max are non-null / non-NaN.
     fn zone_has_finite_extrema(zone: &ZoneMapStatistics) -> bool {
-        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
+        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::is_nan(&zone.max))
     }
 
     /// Global `[min, max]` folded across one or more ZoneMap segments (the
@@ -216,21 +216,13 @@ impl ZoneMapIndex {
                 Ok(zone.null_count > 0)
             }
             SargableQuery::Equals(target) => {
-                // Zone contains matching values if target falls within [min, max] range
-                // Handle null values - if target is null, check null_count
+                // Handle null values
                 if target.is_null() {
                     return Ok(zone.null_count > 0);
                 }
 
-                // Handle NaN values - if target is NaN, check nan_count
-                let is_nan = match target {
-                    ScalarValue::Float16(Some(f)) => f.is_nan(),
-                    ScalarValue::Float32(Some(f)) => f.is_nan(),
-                    ScalarValue::Float64(Some(f)) => f.is_nan(),
-                    _ => false,
-                };
-
-                if is_nan {
+                // Handle NaN values
+                if Self::is_nan(target) {
                     return Ok(zone.nan_count > 0);
                 }
 
@@ -253,50 +245,17 @@ impl ZoneMapIndex {
                 let start_check = match start {
                     Bound::Unbounded => true,
                     Bound::Included(s) => {
-                        // Handle NaN in range bounds - NaN is greater than all finite values
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0);
-                            }
-                            _ => {}
+                        // If bound is NaN, check if zone has NaN values
+                        if Self::is_nan(s) {
+                            return Ok(zone.nan_count > 0);
                         }
-                        // Handle the case where zone_max is NaN
-                        // If zone_max is NaN, the zone contains both finite values and NaN
-                        // Since we don't know the actual max, we'll be conservative and include the zone
-                        match zone_max {
-                            ScalarValue::Float16(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float32(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => true,
-                            _ => zone_max >= s,
-                        }
+                        // If zone_max is NaN, be conservative and include the zone
+                        Self::is_nan(zone_max) || zone_max >= s
                     }
                     Bound::Excluded(s) => {
-                        // Handle NaN in range bounds
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(false); // Nothing is greater than NaN
-                            }
-                            _ => {}
+                        // Nothing is greater than NaN
+                        if Self::is_nan(s) {
+                            return Ok(false);
                         }
                         zone_max > s
                     }
@@ -305,44 +264,16 @@ impl ZoneMapIndex {
                 let end_check = match end {
                     Bound::Unbounded => true,
                     Bound::Included(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // NaN is included, so check if zone has NaN values or finite values
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0 || zone_min <= e);
-                            }
-                            _ => {}
+                        // NaN is included, so check if zone has NaN values or finite values
+                        if Self::is_nan(e) {
+                            return Ok(zone.nan_count > 0 || zone_min <= e);
                         }
                         zone_min <= e
                     }
                     Bound::Excluded(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // Everything is less than NaN, so include all finite values
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(true);
-                            }
-                            _ => {}
+                        // Everything is less than NaN, so include all finite values
+                        if Self::is_nan(e) {
+                            return Ok(true);
                         }
                         zone_min < e
                     }
@@ -355,6 +286,8 @@ impl ZoneMapIndex {
                 Ok(values.iter().any(|value| {
                     if value.is_null() {
                         zone.null_count > 0
+                    } else if Self::is_nan(value) {
+                        zone.nan_count > 0
                     } else {
                         match value {
                             ScalarValue::Float16(Some(f)) => {
