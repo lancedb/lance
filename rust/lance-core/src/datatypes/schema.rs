@@ -54,9 +54,18 @@ impl FieldRef<'_> {
                 Ok(id)
             }
             FieldRef::ByPath(path) => {
-                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
-                    source: format!("Field '{}' not found in schema", path).into(),
-                    location: location!(),
+                let field = schema.field(path).ok_or_else(|| {
+                    let paths = schema.field_paths();
+                    let field_paths: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                    let suggestion = crate::levenshtein::find_best_suggestion(path, &field_paths);
+                    let mut error_msg = format!("Field '{}' not found in schema", path);
+                    if let Some(suggestion) = suggestion {
+                        error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+                    }
+                    Error::InvalidInput {
+                        source: error_msg.into(),
+                        location: location!(),
+                    }
                 })?;
                 Ok(field.id)
             }
@@ -384,6 +393,27 @@ impl Schema {
         SchemaFieldIterPreOrder::new(self)
     }
 
+    /// Get all field paths in the schema as a list of strings.
+    ///
+    /// This returns all field paths in the schema, including nested fields.
+    /// For example, if there's a struct field "user" with a field "name",
+    /// this will return "user.name" as one of the paths.
+    pub fn field_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for field in self.fields_pre_order() {
+            let ancestry = self.field_ancestry_by_id(field.id);
+            if let Some(ancestry) = ancestry {
+                let path = ancestry
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
     /// Returns a new schema that only contains the fields in `column_ids`.
     ///
     /// This projection can filter out both top-level and nested fields
@@ -544,12 +574,19 @@ impl Schema {
 
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
     pub fn field_id(&self, column: &str) -> Result<i32> {
-        self.field(column)
-            .map(|f| f.id)
-            .ok_or_else(|| Error::Schema {
-                message: "Vector column not in schema".to_string(),
+        self.field(column).map(|f| f.id).ok_or_else(|| {
+            let paths = self.field_paths();
+            let field_paths: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            let suggestion = crate::levenshtein::find_best_suggestion(column, &field_paths);
+            let mut error_msg = format!("Vector column '{}' not in schema", column);
+            if let Some(suggestion) = suggestion {
+                error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+            }
+            Error::Schema {
+                message: error_msg.to_string(),
                 location: location!(),
-            })
+            }
+        })
     }
 
     pub fn top_level_field_ids(&self) -> Vec<i32> {

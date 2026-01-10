@@ -145,6 +145,34 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
+/// Error for table column not found with suggestion.
+#[derive(Debug, Clone)]
+pub struct TableColumnNotFoundWithSuggestionError {
+    message: String,
+    suggestion: Option<String>,
+}
+
+impl TableColumnNotFoundWithSuggestionError {
+    pub fn new(message: String, suggestion: Option<String>) -> Self {
+        Self {
+            message,
+            suggestion,
+        }
+    }
+}
+
+impl std::fmt::Display for TableColumnNotFoundWithSuggestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Table column not found: {}", self.message)?;
+        if let Some(suggestion) = &self.suggestion {
+            write!(f, ". Did you mean '{}'?", suggestion)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TableColumnNotFoundWithSuggestionError {}
+
 /// Lance Namespace error type.
 ///
 /// This enum provides fine-grained error types for Lance Namespace operations.
@@ -222,6 +250,12 @@ pub enum NamespaceError {
     #[snafu(display("Table column not found: {message}"))]
     TableColumnNotFound { message: String },
 
+    /// The specified table column does not exist with suggestions.
+    #[snafu(transparent)]
+    TableColumnNotFoundWithSuggestion {
+        source: TableColumnNotFoundWithSuggestionError,
+    },
+
     /// Malformed request or invalid parameters.
     #[snafu(display("Invalid input: {message}"))]
     InvalidInput { message: String },
@@ -274,6 +308,7 @@ impl NamespaceError {
             Self::TransactionNotFound { .. } => ErrorCode::TransactionNotFound,
             Self::TableVersionNotFound { .. } => ErrorCode::TableVersionNotFound,
             Self::TableColumnNotFound { .. } => ErrorCode::TableColumnNotFound,
+            Self::TableColumnNotFoundWithSuggestion { .. } => ErrorCode::TableColumnNotFound,
             Self::InvalidInput { .. } => ErrorCode::InvalidInput,
             Self::ConcurrentModification { .. } => ErrorCode::ConcurrentModification,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
@@ -315,6 +350,16 @@ impl NamespaceError {
                 Self::TableSchemaValidationError { message }
             }
             None => Self::Internal { message },
+        }
+    }
+
+    /// Creates a NamespaceError for table column not found with suggestion.
+    pub fn table_column_not_found_with_suggestion(
+        message: impl Into<String>,
+        suggestion: Option<String>,
+    ) -> Self {
+        Self::TableColumnNotFoundWithSuggestion {
+            source: TableColumnNotFoundWithSuggestionError::new(message.into(), suggestion),
         }
     }
 }
@@ -400,5 +445,26 @@ mod tests {
             message: "users".to_string(),
         };
         assert_eq!(err.to_string(), "Table not found: users");
+    }
+
+    #[test]
+    fn test_table_column_not_found_with_suggestion() {
+        let err = NamespaceError::table_column_not_found_with_suggestion(
+            "column_name".to_string(),
+            Some("column_name_suggestion".to_string()),
+        );
+        assert_eq!(err.code(), ErrorCode::TableColumnNotFound);
+        assert_eq!(
+            err.to_string(),
+            "Table column not found: column_name. Did you mean 'column_name_suggestion'?"
+        );
+    }
+
+    #[test]
+    fn test_table_column_not_found_without_suggestion() {
+        let err =
+            NamespaceError::table_column_not_found_with_suggestion("column_name".to_string(), None);
+        assert_eq!(err.code(), ErrorCode::TableColumnNotFound);
+        assert_eq!(err.to_string(), "Table column not found: column_name");
     }
 }

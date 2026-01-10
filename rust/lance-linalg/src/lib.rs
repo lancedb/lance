@@ -18,5 +18,6 @@ pub(crate) mod test_utils;
 
 pub use clustering::Clustering;
 
-type Error = ArrowError;
-pub type Result<T> = std::result::Result<T, Error>;
+use lance_core::error::ToSnafuLocation;
+use lance_core::Error;
+pub type Result<T, E = Error> = std::result::Result<T, E>;

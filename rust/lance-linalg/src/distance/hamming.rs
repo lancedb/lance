@@ -10,6 +10,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
+use lance_core::error::ToSnafuLocation;
 
 pub trait Hamming {
     /// Hamming distance between two vectors.
@@ -73,10 +74,10 @@ pub fn hamming_distance_arrow_batch(
             from.len(),
         ),
         _ => {
-            return Err(Error::InvalidArgumentError(format!(
-                "Unsupported data type: {:?}",
-                from.data_type()
-            )))
+            return Err(Error::invalid_input(
+                format!("Unsupported data type: {:?}", from.data_type()),
+                std::panic::Location::caller().to_snafu_location(),
+            ))
         }
     };
 

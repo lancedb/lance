@@ -16,6 +16,7 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
+use lance_core::error::ToSnafuLocation;
 use num_traits::AsPrimitive;
 use num_traits::{bounds::Bounded, Float, Num};
 
@@ -162,10 +163,13 @@ pub fn normalize_arrow(v: &dyn Array) -> Result<(ArrayRef, f32)> {
         DataType::Float16 => do_normalize_arrow::<Float16Type>(v),
         DataType::Float32 => do_normalize_arrow::<Float32Type>(v),
         DataType::Float64 => do_normalize_arrow::<Float64Type>(v),
-        _ => Err(Error::SchemaError(format!(
-            "Normalize only supports float array, got: {}",
-            v.data_type()
-        ))),
+        _ => Err(Error::schema(
+            format!(
+                "Normalize only supports float array, got: {}",
+                v.data_type()
+            ),
+            std::panic::Location::caller().to_snafu_location(),
+        )),
     }
 }
 
@@ -189,12 +193,12 @@ where
     };
 
     // Use try_new to preserve the null buffer from the original array
-    FixedSizeListArray::try_new(
+    Ok(FixedSizeListArray::try_new(
         field,
         fsl.value_length(),
         Arc::new(norm_arr),
         fsl.nulls().cloned(),
-    )
+    )?)
 }
 
 /// L2 normalize a [FixedSizeListArray] (of vectors).
@@ -203,10 +207,13 @@ pub fn normalize_fsl(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray> {
         DataType::Float16 => do_normalize_fsl::<Float16Type>(fsl),
         DataType::Float32 => do_normalize_fsl::<Float32Type>(fsl),
         DataType::Float64 => do_normalize_fsl::<Float64Type>(fsl),
-        _ => Err(ArrowError::SchemaError(format!(
-            "Normalize only supports float array, got: {}",
-            fsl.value_type()
-        ))),
+        _ => Err(Error::schema(
+            format!(
+                "Normalize only supports float array, got: {}",
+                fsl.value_type()
+            ),
+            std::panic::Location::caller().to_snafu_location(),
+        )),
     }
 }
 
@@ -254,10 +261,13 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
         DataType::Int64 => hash_numeric_type(as_primitive_array::<Int64Type>(array)),
         DataType::Utf8 => hash_string_type(as_string_array(array)),
         DataType::LargeUtf8 => hash_string_type(as_largestring_array(array)),
-        _ => Err(ArrowError::SchemaError(format!(
-            "Hash only supports integer or string array, got: {}",
-            array.data_type()
-        ))),
+        _ => Err(Error::schema(
+            format!(
+                "Hash only supports integer or string array, got: {}",
+                array.data_type()
+            ),
+            std::panic::Location::caller().to_snafu_location(),
+        )),
     }
 }
 

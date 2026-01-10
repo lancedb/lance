@@ -211,6 +211,39 @@ impl TryFrom<&str> for IndexType {
                 format!("invalid index type: {}", value),
                 location!(),
             )),
+            _ => {
+                let valid_index_types = vec![
+                    "BTree",
+                    "Bitmap",
+                    "LabelList",
+                    "Inverted",
+                    "NGram",
+                    "FragmentReuse",
+                    "MemWal",
+                    "ZoneMap",
+                    "Vector",
+                    "IVF_FLAT",
+                    "IVF_SQ",
+                    "IVF_PQ",
+                    "IVF_RQ",
+                    "IVF_HNSW_FLAT",
+                    "IVF_HNSW_SQ",
+                    "IVF_HNSW_PQ",
+                ];
+                let suggestion =
+                    lance_core::levenshtein::find_best_suggestion(value, &valid_index_types);
+                let mut error_msg = format!("invalid index type: {}", value);
+                if let Some(suggestion) = suggestion {
+                    error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+                }
+                Err(Error::invalid_input(error_msg, location!()));
+                lance_core::levenshtein::find_best_suggestion(value, &valid_index_types);
+                let mut error_msg = format!("invalid index type: {}", value);
+                if let Some(suggestion) = suggestion {
+                    error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+                }
+                Err(Error::invalid_input(error_msg, location!()))
+            }
         }
     }
 }

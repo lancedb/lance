@@ -14,6 +14,7 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::error::ToSnafuLocation;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::SIMD_SUPPORT;
@@ -186,11 +187,14 @@ where
         to.values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "Invalid type: expect {:?} got {:?}",
-                from.data_type(),
-                to.value_type()
-            )))?;
+            .ok_or(Error::invalid_input(
+                format!(
+                    "Invalid type: expect {:?} got {:?}",
+                    from.data_type(),
+                    to.value_type()
+                ),
+                std::panic::Location::caller().to_snafu_location(),
+            ))?;
 
     let dists = to_values
         .as_slice()
@@ -234,10 +238,10 @@ pub fn dot_distance_arrow_batch(
                 .collect(),
             &to.convert_to_floating_point()?,
         ),
-        _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type: {:?}",
-            from.data_type()
-        ))),
+        _ => Err(Error::invalid_input(
+            format!("Unsupported data type: {:?}", from.data_type()),
+            std::panic::Location::caller().to_snafu_location(),
+        )),
     }
 }
 

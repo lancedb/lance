@@ -15,6 +15,9 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
 use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray};
 use arrow_schema::{ArrowError, DataType};
+use lance_core::error::ToSnafuLocation;
+
+use crate::Error;
 
 pub mod cosine;
 pub mod dot;
@@ -97,9 +100,20 @@ impl TryFrom<&str> for DistanceType {
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
             "hamming" => Ok(Self::Hamming),
-            _ => Err(ArrowError::InvalidArgumentError(format!(
-                "Metric type '{s}' is not supported"
-            ))),
+            _ => {
+                let valid_distance_types = vec!["l2", "euclidean", "cosine", "dot", "hamming"];
+                let suggestion =
+                    lance_core::levenshtein::find_best_suggestion(s, &valid_distance_types);
+                let mut error_msg = format!("Metric type '{s}' is not supported");
+                if let Some(suggestion) = suggestion {
+                    error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+                }
+                Err(Error::invalid_input(
+                    error_msg,
+                    std::panic::Location::caller().to_snafu_location(),
+                )
+                .into())
+            }
         }
     }
 }
@@ -112,8 +126,9 @@ pub fn multivec_distance(
     let dim = if let DataType::FixedSizeList(_, dim) = vectors.value_type() {
         dim as usize
     } else {
-        return Err(ArrowError::InvalidArgumentError(
-            "vectors must be a list of fixed size list".to_string(),
+        return Err(Error::invalid_input(
+            "vectors must be a list of fixed size list",
+            std::panic::Location::caller().to_snafu_location(),
         ));
     };
 
@@ -122,8 +137,9 @@ pub fn multivec_distance(
     match query.data_type() {
         DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::UInt8 => {}
         _ => {
-            return Err(ArrowError::InvalidArgumentError(
-                "query must be a float array or binary array".to_string(),
+            return Err(Error::invalid_input(
+                "query must be a float array or binary array",
+                std::panic::Location::caller().to_snafu_location(),
             ));
         }
     }

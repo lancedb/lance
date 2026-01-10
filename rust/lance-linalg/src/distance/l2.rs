@@ -18,6 +18,7 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::error::ToSnafuLocation;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::SIMD_SUPPORT;
@@ -217,11 +218,14 @@ where
         to.values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::ComputeError(format!(
-                "Cannot downcast to the same type: {} != {}",
-                T::FLOAT_TYPE,
-                to.value_type()
-            )))?;
+            .ok_or(Error::invalid_input(
+                format!(
+                    "Cannot downcast to the same type: {} != {}",
+                    T::FLOAT_TYPE,
+                    to.value_type()
+                ),
+                std::panic::Location::caller().to_snafu_location(),
+            ))?;
     let dists = l2_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
     Ok(Arc::new(Float32Array::new(
@@ -258,10 +262,10 @@ pub fn l2_distance_arrow_batch(
                 .collect(),
             &to.convert_to_floating_point()?,
         ),
-        _ => Err(Error::ComputeError(format!(
-            "Unsupported data type: {}",
-            from.data_type()
-        ))),
+        _ => Err(Error::invalid_input(
+            format!("Unsupported data type: {}", from.data_type()),
+            std::panic::Location::caller().to_snafu_location(),
+        )),
     }
 }
 
