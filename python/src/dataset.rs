@@ -1822,7 +1822,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
-            "INVERTED" => IndexType::Inverted,
+            "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -1879,7 +1879,7 @@ impl Dataset {
                     params: Some(config.config.clone()),
                 })
             }
-            "INVERTED" => {
+            "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
@@ -2031,7 +2031,7 @@ impl Dataset {
                 index_type_up
             );
             match index_type_up.as_str() {
-                "INVERTED" => {
+                "INVERTED" | "FTS" => {
                     // Call merge_index_files function for inverted index
                     lance_index::scalar::inverted::builder::merge_index_files(
                         self.ds.object_store(),

@@ -2338,6 +2338,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
+            Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
@@ -2407,7 +2408,7 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``INVERTED``. It is used to index document columns. This index
+        * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
@@ -2428,7 +2429,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2541,6 +2542,8 @@ class LanceDataset(pa.dataset.Dataset):
         # indexes that need parameterization
         if isinstance(index_type, str):
             index_type = index_type.upper()
+            if index_type == "FTS":
+                index_type = "INVERTED"
             if index_type not in [
                 "BTREE",
                 "BITMAP",
