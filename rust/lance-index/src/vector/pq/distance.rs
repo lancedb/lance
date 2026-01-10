@@ -106,7 +106,7 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
 ///  The squared L2 distance.
 ///
 #[inline]
-pub(super) fn compute_pq_distance(
+pub fn compute_pq_distance(
     distance_table: &[f32],
     num_bits: u32,
     num_sub_vectors: usize,
