@@ -2408,8 +2408,8 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This index
-          can conduct full-text searches. For example, a column that contains any word
+        * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This
+          index can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
