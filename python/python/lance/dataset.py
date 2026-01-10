@@ -2542,8 +2542,6 @@ class LanceDataset(pa.dataset.Dataset):
         # indexes that need parameterization
         if isinstance(index_type, str):
             index_type = index_type.upper()
-            if index_type == "FTS":
-                index_type = "INVERTED"
             if index_type not in [
                 "BTREE",
                 "BITMAP",
@@ -2551,6 +2549,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "FTS",
                 "BLOOMFILTER",
                 "RTREE",
             ]:
@@ -2590,7 +2589,7 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED"]:
+            elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
