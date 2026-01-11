@@ -166,10 +166,10 @@ message Field {
 
   bool unenforced_primary_key = 12;
 
-  // Position of this field in the primary key (1-based).
-  // 0 means the field is part of the primary key but no explicit position is set.
-  // When set to a positive value, primary key fields are ordered by this position.
-  uint32 unenforced_primary_key_position = 13;
+  // Field ID of this field in the primary key (1-based).
+  // 0 means the field is part of the primary key but no explicit field ID is set.
+  // When set to a positive value, primary key fields are ordered by this field ID.
+  uint32 unenforced_primary_key_field_id = 13;
 
   // DEPRECATED ----------------------------------------------------------------
 

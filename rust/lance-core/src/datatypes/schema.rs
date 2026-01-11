@@ -111,26 +111,26 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema, ordered by position.
+    /// The unenforced primary key fields in the schema, ordered by field ID.
     ///
-    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position.
-    /// Fields without explicit positions (using the legacy boolean flag) are ordered
-    /// by their schema field id and come after explicitly positioned fields.
+    /// Fields with explicit field IDs (1, 2, 3, ...) are ordered by their field ID.
+    /// Fields without explicit field IDs (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit field IDs.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
         let mut pk_fields: Vec<&Field> = self
             .fields_pre_order()
             .filter(|f| f.is_unenforced_primary_key())
             .collect();
 
-        // Sort by position, with fields lacking explicit position (position=0)
-        // coming after explicitly positioned fields, sorted by field id
+        // Sort by field ID, with fields lacking explicit field ID (field_id=0)
+        // coming after fields with explicit field IDs, sorted by schema field id
         pk_fields.sort_by_key(|f| {
-            let pos = f.unenforced_primary_key_position.unwrap_or(0);
-            if pos > 0 {
-                // Explicit position: sort by position, then by field id for stability
-                (false, pos as i32, f.id)
+            let pk_field_id = f.unenforced_primary_key_field_id.unwrap_or(0);
+            if pk_field_id > 0 {
+                // Explicit field ID: sort by field ID, then by schema field id for stability
+                (false, pk_field_id as i32, f.id)
             } else {
-                // No explicit position: sort by field id, after explicit positions
+                // No explicit field ID: sort by schema field id, after explicit field IDs
                 (true, f.id, f.id)
             }
         });
@@ -2622,7 +2622,7 @@ mod tests {
 
     #[test]
     fn test_schema_unenforced_primary_key_ordering() {
-        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID;
 
         // Test 1: Explicit positions should order by position
         let arrow_schema = ArrowSchema::new(vec![
@@ -2633,7 +2633,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
                         "2".to_owned(),
                     ),
                 ]
@@ -2647,7 +2647,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
                         "1".to_owned(),
                     ),
                 ]
@@ -2703,7 +2703,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
                         "1".to_owned(),
                     ),
                 ]
