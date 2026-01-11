@@ -111,11 +111,31 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema
+    /// The unenforced primary key fields in the schema, ordered by position.
+    ///
+    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position.
+    /// Fields without explicit positions (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after explicitly positioned fields.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
-        self.fields_pre_order()
-            .filter(|f| f.unenforced_primary_key)
-            .collect::<Vec<_>>()
+        let mut pk_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_primary_key())
+            .collect();
+
+        // Sort by position, with fields lacking explicit position (position=0)
+        // coming after explicitly positioned fields, sorted by field id
+        pk_fields.sort_by_key(|f| {
+            let pos = f.unenforced_primary_key_position.unwrap_or(0);
+            if pos > 0 {
+                // Explicit position: sort by position, then by field id for stability
+                (false, pos as i32, f.id)
+            } else {
+                // No explicit position: sort by field id, after explicit positions
+                (true, f.id, f.id)
+            }
+        });
+
+        pk_fields
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
@@ -2598,5 +2618,112 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        // Test 1: Explicit positions should order by position
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "2".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "b"); // position 1
+        assert_eq!(pk_fields[1].name, "a"); // position 2
+
+        // Test 2: No explicit positions should order by field id
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Int64, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "c"); // field_id 0
+        assert_eq!(pk_fields[1].name, "d"); // field_id 1
+
+        // Test 3: Mixed - explicit positions come before fields without explicit positions
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("e", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("f", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("g", DataType::Utf8, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 3);
+        assert_eq!(pk_fields[0].name, "f"); // explicit position 1
+        assert_eq!(pk_fields[1].name, "e"); // no explicit position, field_id 0
+        assert_eq!(pk_fields[2].name, "g"); // no explicit position, field_id 2
     }
 }
