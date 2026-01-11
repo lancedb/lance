@@ -57,7 +57,7 @@ pub fn convert_to_java_field<'local>(
             JValue::Object(&JObject::null()),
             JValue::Object(&metadata),
             JValue::Object(&children),
-            JValue::Bool(lance_field.unenforced_primary_key as jboolean),
+            JValue::Bool(lance_field.is_unenforced_primary_key() as jboolean),
         ],
     )?;
 
