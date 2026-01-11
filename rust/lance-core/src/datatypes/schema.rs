@@ -111,11 +111,11 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema, ordered by primary key field id.
+    /// The unenforced primary key fields in the schema, ordered by position.
     ///
-    /// Fields with explicit primary key field ids (1, 2, 3, ...) are ordered by their primary key field id.
-    /// Fields without explicit primary key field ids (using the legacy boolean flag) are ordered
-    /// by their schema field id and come after fields with explicit primary key field ids.
+    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position value.
+    /// Fields without explicit positions (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit positions.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
         let mut pk_fields: Vec<&Field> = self
             .fields_pre_order()
@@ -123,9 +123,9 @@ impl Schema {
             .collect();
 
         pk_fields.sort_by_key(|f| {
-            let pk_field_id = f.unenforced_primary_key_field_id.unwrap_or(0);
-            if pk_field_id > 0 {
-                (false, pk_field_id as i32, f.id)
+            let pk_position = f.unenforced_primary_key_position.unwrap_or(0);
+            if pk_position > 0 {
+                (false, pk_position as i32, f.id)
             } else {
                 (true, f.id, f.id)
             }
@@ -2618,7 +2618,7 @@ mod tests {
 
     #[test]
     fn test_schema_unenforced_primary_key_ordering() {
-        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID;
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
         // When field IDs are specified, fields are ordered by their field ID values
         let arrow_schema = ArrowSchema::new(vec![
@@ -2629,7 +2629,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
                         "2".to_owned(),
                     ),
                 ]
@@ -2643,7 +2643,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
                         "1".to_owned(),
                     ),
                 ]
@@ -2699,7 +2699,7 @@ mod tests {
                         "true".to_owned(),
                     ),
                     (
-                        LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID.to_owned(),
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
                         "1".to_owned(),
                     ),
                 ]
