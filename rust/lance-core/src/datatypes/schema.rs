@@ -111,11 +111,11 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema, ordered by field ID.
+    /// The unenforced primary key fields in the schema, ordered by primary key field id.
     ///
-    /// Fields with explicit field IDs (1, 2, 3, ...) are ordered by their field ID.
-    /// Fields without explicit field IDs (using the legacy boolean flag) are ordered
-    /// by their schema field id and come after fields with explicit field IDs.
+    /// Fields with explicit primary key field ids (1, 2, 3, ...) are ordered by their primary key field id.
+    /// Fields without explicit primary key field ids (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit primary key field ids.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
         let mut pk_fields: Vec<&Field> = self
             .fields_pre_order()

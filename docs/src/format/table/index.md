@@ -59,13 +59,13 @@ A primary key field must satisfy:
 To mark a field as part of the primary key, add the following metadata to the Arrow field:
 
 - `lance-schema:unenforced-primary-key`: Set to `true`, `1`, or `yes` (case-insensitive) to indicate the field is part of the primary key.
-- `lance-schema:unenforced-primary-key:field-id` (optional): A 1-based integer specifying the field's ID within a composite primary key.
+- `lance-schema:unenforced-primary-key:field-id` (optional): A 1-based integer specifying the primary key field id within a composite primary key.
 
-For composite primary keys with multiple columns, the field ID determines the primary key field ordering:
+For composite primary keys with multiple columns, the primary key field id determines the primary key field ordering:
 
-- When field IDs are specified, fields are ordered by their field ID values (1, 2, 3, ...).
-- When field IDs are not specified, fields are ordered by their lance schema field id.
-- Fields with explicit field IDs are ordered before fields without explicit field IDs.
+- When primary key field ids are specified, fields are ordered by their primary key field id values (1, 2, 3, ...).
+- When primary key field ids are not specified, fields are ordered by their lance schema field id.
+- Fields with explicit primary key field ids are ordered before fields without.
 
 ## Fragments
 
