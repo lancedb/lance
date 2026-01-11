@@ -2620,7 +2620,7 @@ mod tests {
     fn test_schema_unenforced_primary_key_ordering() {
         use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
-        // When field IDs are specified, fields are ordered by their field ID values
+        // When positions are specified, fields are ordered by their position values
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false).with_metadata(
                 vec![
@@ -2657,7 +2657,7 @@ mod tests {
         assert_eq!(pk_fields[0].name, "b");
         assert_eq!(pk_fields[1].name, "a");
 
-        // When field IDs are not specified, fields are ordered by their lance schema field id
+        // When positions are not specified, fields are ordered by their schema field id
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("c", DataType::Int32, false).with_metadata(
                 vec![(
@@ -2682,7 +2682,7 @@ mod tests {
         assert_eq!(pk_fields[0].name, "c");
         assert_eq!(pk_fields[1].name, "d");
 
-        // Fields with explicit field IDs are ordered before fields without explicit field IDs
+        // Fields with explicit positions are ordered before fields without
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("e", DataType::Int32, false).with_metadata(
                 vec![(
