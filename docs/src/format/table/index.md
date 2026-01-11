@@ -56,7 +56,7 @@ A primary key field must satisfy:
 - The field must be a leaf field (primitive data type without children).
 - The field must not be within a list or map type.
 
-To mark a field as part of the primary key, add the following metadata to the Arrow field:
+When using an Arrow schema to create a Lance table, add the following metadata to the Arrow field to mark it as part of the primary key:
 
 - `lance-schema:unenforced-primary-key`: Set to `true`, `1`, or `yes` (case-insensitive) to indicate the field is part of the primary key.
 - `lance-schema:unenforced-primary-key:position` (optional): A 1-based integer specifying the position within a composite primary key.
