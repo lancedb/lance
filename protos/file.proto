@@ -166,9 +166,9 @@ message Field {
 
   bool unenforced_primary_key = 12;
 
-  // Field ID of this field in the primary key (1-based).
-  // 0 means the field is part of the primary key but no explicit field ID is set.
-  // When set to a positive value, primary key fields are ordered by this field ID.
+  // Primary key field id (1-based), distinct from the schema field id.
+  // 0 means the field is part of the primary key but uses schema field id for ordering.
+  // When set to a positive value, primary key fields are ordered by this primary key field id.
   uint32 unenforced_primary_key_field_id = 13;
 
   // DEPRECATED ----------------------------------------------------------------
