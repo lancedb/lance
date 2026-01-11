@@ -48,6 +48,7 @@ Lance supports defining an unenforced primary key through field metadata.
 This is useful for deduplication during merge-insert operations and other use cases that benefit from logical row identity.
 The primary key is "unenforced" meaning Lance does not always validate uniqueness constraints.
 Users can use specific workloads like merge-insert to enforce it if necessary.
+The primary key is fixed after initial setting and must not be updated or removed.
 
 A primary key field must satisfy:
 
@@ -60,7 +61,7 @@ To mark a field as part of the primary key, add the following metadata to the Ar
 - `lance-schema:unenforced-primary-key`: Set to `true`, `1`, or `yes` (case-insensitive) to indicate the field is part of the primary key.
 - `lance-schema:unenforced-primary-key:field-id` (optional): A 1-based integer specifying the field's ID within a composite primary key.
 
-For composite primary keys with multiple columns, the field ID determines the column ordering:
+For composite primary keys with multiple columns, the field ID determines the primary key field ordering:
 
 - When field IDs are specified, fields are ordered by their field ID values (1, 2, 3, ...).
 - When field IDs are not specified, fields are ordered by their lance schema field id.

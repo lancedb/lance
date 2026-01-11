@@ -1130,13 +1130,11 @@ impl TryFrom<&ArrowField> for Field {
             }
             _ => vec![],
         };
-        // Parse primary key position: first try explicit position, then fall back to boolean flag
         let unenforced_primary_key_field_id = metadata
             .get(LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID)
             .and_then(|s| s.parse::<u32>().ok())
             .or_else(|| {
-                // Backward compatibility: if only the boolean flag is set, use 0 to indicate
-                // "is PK but no explicit position" (will be ordered by field id)
+                // Backward compatibility: use 0 for legacy boolean flag
                 metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
                     .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))

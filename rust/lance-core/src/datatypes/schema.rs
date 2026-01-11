@@ -122,15 +122,11 @@ impl Schema {
             .filter(|f| f.is_unenforced_primary_key())
             .collect();
 
-        // Sort by field ID, with fields lacking explicit field ID (field_id=0)
-        // coming after fields with explicit field IDs, sorted by schema field id
         pk_fields.sort_by_key(|f| {
             let pk_field_id = f.unenforced_primary_key_field_id.unwrap_or(0);
             if pk_field_id > 0 {
-                // Explicit field ID: sort by field ID, then by schema field id for stability
                 (false, pk_field_id as i32, f.id)
             } else {
-                // No explicit field ID: sort by schema field id, after explicit field IDs
                 (true, f.id, f.id)
             }
         });
@@ -2624,7 +2620,7 @@ mod tests {
     fn test_schema_unenforced_primary_key_ordering() {
         use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_FIELD_ID;
 
-        // Test 1: Explicit positions should order by position
+        // When field IDs are specified, fields are ordered by their field ID values
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false).with_metadata(
                 vec![
@@ -2658,10 +2654,10 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let pk_fields = schema.unenforced_primary_key();
         assert_eq!(pk_fields.len(), 2);
-        assert_eq!(pk_fields[0].name, "b"); // position 1
-        assert_eq!(pk_fields[1].name, "a"); // position 2
+        assert_eq!(pk_fields[0].name, "b");
+        assert_eq!(pk_fields[1].name, "a");
 
-        // Test 2: No explicit positions should order by field id
+        // When field IDs are not specified, fields are ordered by their lance schema field id
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("c", DataType::Int32, false).with_metadata(
                 vec![(
@@ -2683,10 +2679,10 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let pk_fields = schema.unenforced_primary_key();
         assert_eq!(pk_fields.len(), 2);
-        assert_eq!(pk_fields[0].name, "c"); // field_id 0
-        assert_eq!(pk_fields[1].name, "d"); // field_id 1
+        assert_eq!(pk_fields[0].name, "c");
+        assert_eq!(pk_fields[1].name, "d");
 
-        // Test 3: Mixed - explicit positions come before fields without explicit positions
+        // Fields with explicit field IDs are ordered before fields without explicit field IDs
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("e", DataType::Int32, false).with_metadata(
                 vec![(
@@ -2722,8 +2718,8 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let pk_fields = schema.unenforced_primary_key();
         assert_eq!(pk_fields.len(), 3);
-        assert_eq!(pk_fields[0].name, "f"); // explicit position 1
-        assert_eq!(pk_fields[1].name, "e"); // no explicit position, field_id 0
-        assert_eq!(pk_fields[2].name, "g"); // no explicit position, field_id 2
+        assert_eq!(pk_fields[0].name, "f");
+        assert_eq!(pk_fields[1].name, "e");
+        assert_eq!(pk_fields[2].name, "g");
     }
 }
