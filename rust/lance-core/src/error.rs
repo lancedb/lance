@@ -429,22 +429,7 @@ impl From<datafusion_common::DataFusionError> for Error {
                 message: e.to_string(),
                 location,
             },
-            datafusion_common::DataFusionError::ArrowError(arrow_err, _) => {
-                // Check if the ArrowError wraps an external error and extract it
-                match *arrow_err {
-                    ArrowError::ExternalError(source) => {
-                        // Try to downcast to lance_core::Error first
-                        match source.downcast::<Self>() {
-                            Ok(lance_err) => *lance_err,
-                            Err(source) => Self::External { source },
-                        }
-                    }
-                    other => Self::Arrow {
-                        message: other.to_string(),
-                        location,
-                    },
-                }
-            }
+            datafusion_common::DataFusionError::ArrowError(arrow_err, _) => Self::from(*arrow_err),
             datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
                 source: box_error(e),
                 location,
