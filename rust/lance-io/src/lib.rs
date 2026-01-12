@@ -27,13 +27,14 @@ pub mod utils;
 pub use scheduler::{bytes_read_counter, iops_counter};
 
 /// Defines a selection of rows to read from a file/batch
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ReadBatchParams {
     /// Select a contiguous range of rows
     Range(Range<usize>),
     /// Select multiple contiguous ranges of rows
     Ranges(Arc<[Range<u64>]>),
     /// Select all rows (this is the default)
+    #[default]
     RangeFull,
     /// Select all rows up to a given index
     RangeTo(RangeTo<usize>),
@@ -74,13 +75,6 @@ impl std::fmt::Display for ReadBatchParams {
                 write!(f, "Indices({})", indices_str)
             }
         }
-    }
-}
-
-impl Default for ReadBatchParams {
-    fn default() -> Self {
-        // Default of ReadBatchParams is reading the full batch.
-        Self::RangeFull
     }
 }
 

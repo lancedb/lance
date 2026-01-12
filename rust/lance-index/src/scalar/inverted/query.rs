@@ -71,16 +71,11 @@ impl Default for FtsSearchParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Operator {
     And,
+    #[default]
     Or,
-}
-
-impl Default for Operator {
-    fn default() -> Self {
-        Self::Or
-    }
 }
 
 impl TryFrom<&str> for Operator {

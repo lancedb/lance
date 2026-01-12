@@ -151,7 +151,7 @@ pub struct Field {
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
-    pub children: Vec<Field>,
+    pub children: Vec<Self>,
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,

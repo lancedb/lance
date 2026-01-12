@@ -27,7 +27,7 @@ pub enum KeyValue {
     Int64(i64),
     UInt64(u64),
     Binary(Vec<u8>),
-    Composite(Vec<KeyValue>),
+    Composite(Vec<Self>),
 }
 
 impl KeyValue {

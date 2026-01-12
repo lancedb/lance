@@ -1231,8 +1231,7 @@ pub async fn build_ivf_model(
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
-    if centroids.is_some() && !params.retrain {
-        let centroids = centroids.unwrap();
+    if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != num_partitions * dim {
             return Err(Error::Index {
@@ -1244,7 +1243,7 @@ pub async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(IvfModel::new(centroids.as_ref().clone(), None));
+        return Ok(IvfModel::new(centroids.clone(), None));
     }
     let sample_size_hint = num_partitions * params.sample_rate;
 

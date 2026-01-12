@@ -1755,19 +1755,21 @@ pub async fn train_btree_index(
         Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
     ]));
 
-    let mut sub_index_file;
-    if partition_id.is_none() {
-        sub_index_file = index_store
-            .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
-            .await?;
-    } else {
-        sub_index_file = index_store
-            .new_index_file(
-                part_page_data_file_path(partition_id.unwrap()).as_str(),
-                flat_schema.clone(),
-            )
-            .await?;
-    }
+    let mut sub_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_page_data_file_path(partition_id).as_str(),
+                    flat_schema.clone(),
+                )
+                .await?
+        }
+    };
 
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
@@ -1802,19 +1804,21 @@ pub async fn train_btree_index(
         RANGE_PARTITIONED_META_KEY.to_string(),
         range_id.is_some().to_string(),
     );
-    let mut btree_index_file;
-    if partition_id.is_none() {
-        btree_index_file = index_store
-            .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
-            .await?;
-    } else {
-        btree_index_file = index_store
-            .new_index_file(
-                part_lookup_file_path(partition_id.unwrap()).as_str(),
-                Arc::new(file_schema),
-            )
-            .await?;
-    }
+    let mut btree_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_lookup_file_path(partition_id).as_str(),
+                    Arc::new(file_schema),
+                )
+                .await?
+        }
+    };
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())

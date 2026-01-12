@@ -1533,7 +1533,7 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
 /// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
 /// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to "`field``with``backticks`"
+/// For example: \["field`with`backticks"\] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
