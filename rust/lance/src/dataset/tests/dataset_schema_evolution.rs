@@ -4,12 +4,14 @@
 use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
 use crate::Dataset;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
-    StringArray, StructArray,
+    cast::AsArray, Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
+    RecordBatchIterator, StringArray, StructArray,
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
 };
+use lance_arrow::RecordBatchExt;
 use lance_encoding::version::LanceFileVersion;
 use rstest::rstest;
 use std::collections::HashMap;
@@ -545,4 +547,105 @@ async fn prepare_initial_dataset_with_list_struct_col(version: LanceFileVersion)
     assert_eq!(dataset.schema().fields[1].name, "people");
 
     dataset
+}
+
+/// Regression test for issue #5702: project_by_schema should reorder fields inside List<Struct>.
+///
+/// This test simulates the scenario where a fragment's data file has fields stored in a
+/// different order than the schema expects. When reading such fragments, project_by_schema
+/// is called to reorder the columns, and it must handle nested List<Struct> types correctly.
+#[test]
+fn test_project_by_schema_list_struct_field_reorder_regression() {
+    // Create a RecordBatch with List<Struct> where inner struct fields are in "wrong" order (c, b, a)
+    // This simulates reading from a fragment where DataFile.fields has non-sequential field IDs
+    let source_inner_struct = DataType::Struct(Fields::from(vec![
+        Field::new("c", DataType::Utf8, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("a", DataType::Utf8, true),
+    ]));
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                source_inner_struct.clone(),
+                true,
+            ))),
+            true,
+        ),
+    ]));
+
+    // Create source data with fields in c, b, a order
+    let c_array = StringArray::from(vec!["c1", "c2"]);
+    let b_array = StringArray::from(vec!["b1", "b2"]);
+    let a_array = StringArray::from(vec!["a1", "a2"]);
+    let inner_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("c", DataType::Utf8, true)),
+            Arc::new(c_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Utf8, true)),
+            Arc::new(b_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("a", DataType::Utf8, true)),
+            Arc::new(a_array) as ArrayRef,
+        ),
+    ]);
+
+    let list_array = ListArray::new(
+        Arc::new(Field::new("item", source_inner_struct, true)),
+        OffsetBuffer::from_lengths([1, 1]),
+        Arc::new(inner_struct),
+        None,
+    );
+
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(list_array)],
+    )
+    .unwrap();
+
+    // Target schema expects inner struct fields in "correct" order (a, b, c)
+    let target_inner_struct = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("c", DataType::Utf8, true),
+    ]));
+    let target_schema = ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new("item", target_inner_struct, true))),
+            true,
+        ),
+    ]);
+
+    // This is the same project_by_schema call that happens in fragment.rs:2566
+    // Before the fix for #5702, this would fail with:
+    // "Incorrect datatype for StructArray field \"data\", expected List(Struct(\"a\": Utf8, ...)) got List(Struct(\"c\": Utf8, ...))"
+    let projected = batch.project_by_schema(&target_schema).unwrap();
+
+    // Verify the schema is correct
+    assert_eq!(projected.schema().as_ref(), &target_schema);
+
+    // Verify the data is correctly reordered
+    let projected_list = projected.column(1).as_list::<i32>();
+    let projected_struct = projected_list.values().as_struct();
+
+    // Fields should now be in order: a, b, c (by position)
+    assert_eq!(
+        projected_struct.column(0).as_ref(),
+        &StringArray::from(vec!["a1", "a2"]) as &dyn Array
+    );
+    assert_eq!(
+        projected_struct.column(1).as_ref(),
+        &StringArray::from(vec!["b1", "b2"]) as &dyn Array
+    );
+    assert_eq!(
+        projected_struct.column(2).as_ref(),
+        &StringArray::from(vec!["c1", "c2"]) as &dyn Array
+    );
 }
