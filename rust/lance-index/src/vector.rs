@@ -22,6 +22,7 @@ use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
 pub mod bq;
+pub mod distributed;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
@@ -30,6 +31,7 @@ pub mod kmeans;
 pub mod pq;
 pub mod quantizer;
 pub mod residual;
+pub mod shared;
 pub mod sq;
 pub mod storage;
 pub mod transform;

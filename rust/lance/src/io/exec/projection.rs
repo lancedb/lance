@@ -152,7 +152,7 @@ pub enum Selection<'a> {
     /// Selects this fields and all subfields
     FullField(&'a str),
     /// For a struct, selections of subfields
-    StructProjection(&'a str, Vec<Selection<'a>>),
+    StructProjection(&'a str, Vec<Self>),
 }
 
 impl Selection<'_> {

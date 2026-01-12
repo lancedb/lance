@@ -47,6 +47,7 @@ pub fn extract_write_params(
     mode: &JObject,
     enable_stable_row_ids: &JObject,
     data_storage_version: &JObject,
+    enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
     storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: &JObject, // Optional<Long>
@@ -75,6 +76,16 @@ pub fn extract_write_params(
             data_storage_version_val.as_str(),
         )?);
     }
+
+    // Enable v2 manifest paths by default.
+    write_params.enable_v2_manifest_paths =
+        if let Some(enable_v2_manifest_paths) = enable_v2_manifest_paths {
+            env.get_boolean_opt(enable_v2_manifest_paths)?
+                .unwrap_or(true)
+        } else {
+            true
+        };
+
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 

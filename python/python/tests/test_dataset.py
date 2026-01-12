@@ -2311,6 +2311,87 @@ def test_merge_insert_when_matched_fail(tmp_path: Path):
     assert unchanged_data == expected
 
 
+def test_merge_insert_when_matched_delete(tmp_path: Path):
+    """Test when_matched_delete functionality for merge insert."""
+    # Create initial dataset with ids 1-6
+    data = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # Test 1: Basic when_matched_delete - delete matched rows only
+    # Source has ids 4, 5, 6 (match) and 7, 8, 9 (no match)
+    # Only matched rows should be deleted, unmatched rows are ignored
+    delete_keys = pa.table({"id": [4, 5, 6, 7, 8, 9], "val": [0, 0, 0, 0, 0, 0]})
+    result = ds.merge_insert("id").when_matched_delete().execute(delete_keys)
+
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Verify only ids 1, 2, 3 remain
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3], "val": [10, 20, 30]})
+    assert remaining == expected
+
+    # Test 2: when_matched_delete with ID-only source
+    # Source contains only the key column
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    id_only_source = pa.table({"id": [2, 4, 6]})  # Delete even ids
+    result = ds.merge_insert("id").when_matched_delete().execute(id_only_source)
+
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Verify only odd ids remain
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 3, 5], "val": [10, 30, 50]})
+    assert remaining == expected
+
+    # Test 3: when_matched_delete combined with when_not_matched_insert_all
+    # Delete existing rows that match, insert new rows that don't match
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    new_data = pa.table(
+        {"id": [4, 5, 6, 7, 8, 9], "val": [400, 500, 600, 700, 800, 900]}
+    )
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+
+    # Should delete 3 (ids 4, 5, 6) and insert 3 (ids 7, 8, 9)
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+
+    # Verify: ids 1, 2, 3 (original), 7, 8, 9 (new inserts)
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 7, 8, 9], "val": [10, 20, 30, 700, 800, 900]})
+    assert remaining == expected
+
+    # Test 4: when_matched_delete with no matches (should be a no-op delete)
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    non_matching = pa.table({"id": [100, 200, 300], "val": [0, 0, 0]})
+    result = ds.merge_insert("id").when_matched_delete().execute(non_matching)
+
+    assert result["num_deleted_rows"] == 0
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Data should be unchanged
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    assert remaining == expected
+
+
 def test_merge_insert_large():
     # Doing subcolumns update with merge insert triggers this error.
     # Data needs to be large enough to make DataFusion create multiple batches
@@ -4908,3 +4989,38 @@ def test_branches(tmp_path: Path):
     branch1.checkout_latest()
     assert branch1.version == 2
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+
+
+def test_default_scan_options_nearest(tmp_path: Path) -> None:
+    dim = 4
+    num_rows = 10
+
+    values = []
+    for i in range(num_rows):
+        values.extend(float(i) for _ in range(dim))
+    value_array = pa.array(values, type=pa.float32())
+    vector_array = pa.FixedSizeListArray.from_arrays(value_array, dim)
+    table = pa.Table.from_pydict({"vector": vector_array, "id": list(range(num_rows))})
+
+    base_dir = tmp_path / "nearest_default_scan_options"
+    lance.write_dataset(table, base_dir)
+
+    query_vec = [0.0] * dim
+    default_scan_options = {
+        "nearest": {
+            "column": "vector",
+            "q": query_vec,
+            "k": 5,
+        },
+    }
+
+    ds = lance.dataset(base_dir, default_scan_options=default_scan_options)
+    result = ds.to_table()
+
+    assert result.num_rows == 5
+
+    assert "_distance" in result.column_names
+    distances = result["_distance"].to_pylist()
+    assert distances == sorted(distances)
+
+    assert "id" in result.column_names

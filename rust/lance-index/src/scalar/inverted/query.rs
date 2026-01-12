@@ -71,16 +71,11 @@ impl Default for FtsSearchParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Operator {
     And,
+    #[default]
     Or,
-}
-
-impl Default for Operator {
-    fn default() -> Self {
-        Self::Or
-    }
 }
 
 impl TryFrom<&str> for Operator {
@@ -635,6 +630,82 @@ impl BooleanQuery {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct BooleanMatchPlan {
+    pub column: String,
+    pub should: Vec<MatchQuery>,
+    pub must: Vec<MatchQuery>,
+    pub must_not: Vec<MatchQuery>,
+}
+
+#[allow(dead_code)]
+impl BooleanMatchPlan {
+    pub(crate) fn try_build(query: &FtsQuery) -> Option<Self> {
+        match query {
+            FtsQuery::Match(match_query) => {
+                let mut column = None;
+                let mut should = Vec::new();
+                Self::push_match(&mut should, &mut column, match_query)?;
+                Some(Self {
+                    column: column?,
+                    should,
+                    must: Vec::new(),
+                    must_not: Vec::new(),
+                })
+            }
+            FtsQuery::Boolean(bool_query) => {
+                let mut column = None;
+                let should = Self::collect_matches(&bool_query.should, &mut column)?;
+                let must = Self::collect_matches(&bool_query.must, &mut column)?;
+                let must_not = Self::collect_matches(&bool_query.must_not, &mut column)?;
+
+                if should.is_empty() && must.is_empty() {
+                    return None;
+                }
+                Some(Self {
+                    column: column?,
+                    should,
+                    must,
+                    must_not,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn push_match(
+        dest: &mut Vec<MatchQuery>,
+        column: &mut Option<String>,
+        query: &MatchQuery,
+    ) -> Option<()> {
+        let query_column = query.column.as_ref()?;
+        if let Some(existing) = column.as_ref() {
+            if existing != query_column {
+                return None;
+            }
+        } else {
+            *column = Some(query_column.clone());
+        }
+        dest.push(query.clone());
+        Some(())
+    }
+
+    fn collect_matches(
+        queries: &[FtsQuery],
+        column: &mut Option<String>,
+    ) -> Option<Vec<MatchQuery>> {
+        let mut matches = Vec::with_capacity(queries.len());
+        for query in queries {
+            let FtsQuery::Match(match_query) = query else {
+                return None;
+            };
+            Self::push_match(&mut matches, column, match_query)?;
+        }
+        Some(matches)
+    }
+}
+
 impl FtsQueryNode for BooleanQuery {
     fn columns(&self) -> HashSet<String> {
         let mut columns = HashSet::new();
@@ -908,5 +979,76 @@ mod tests {
             .with_slop(2);
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
+    }
+
+    #[test]
+    fn test_boolean_match_plan_match_query() {
+        use super::*;
+
+        let query = MatchQuery::new("hello".to_string()).with_column(Some("text".to_string()));
+        let plan = BooleanMatchPlan::try_build(&FtsQuery::Match(query.clone())).unwrap();
+        assert_eq!(plan.column, "text");
+        assert_eq!(plan.should, vec![query]);
+        assert!(plan.must.is_empty());
+        assert!(plan.must_not.is_empty());
+    }
+
+    #[test]
+    fn test_boolean_match_plan_boolean_query() {
+        use super::*;
+
+        let should = MatchQuery::new("a".to_string()).with_column(Some("text".to_string()));
+        let must = MatchQuery::new("b".to_string()).with_column(Some("text".to_string()));
+        let must_not = MatchQuery::new("c".to_string()).with_column(Some("text".to_string()));
+        let query = BooleanQuery::new(vec![
+            (Occur::Should, should.clone().into()),
+            (Occur::Must, must.clone().into()),
+            (Occur::MustNot, must_not.clone().into()),
+        ]);
+        let plan = BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).unwrap();
+        assert_eq!(plan.column, "text");
+        assert_eq!(plan.should, vec![should]);
+        assert_eq!(plan.must, vec![must]);
+        assert_eq!(plan.must_not, vec![must_not]);
+    }
+
+    #[test]
+    fn test_boolean_match_plan_rejects_mixed_columns() {
+        use super::*;
+
+        let should = MatchQuery::new("a".to_string()).with_column(Some("text".to_string()));
+        let must = MatchQuery::new("b".to_string()).with_column(Some("title".to_string()));
+        let query = BooleanQuery::new(vec![
+            (Occur::Should, should.into()),
+            (Occur::Must, must.into()),
+        ]);
+        assert!(BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).is_none());
+    }
+
+    #[test]
+    fn test_boolean_match_plan_rejects_non_match_queries() {
+        use super::*;
+
+        let phrase =
+            PhraseQuery::new("hello world".to_string()).with_column(Some("text".to_string()));
+        let query = BooleanQuery::new(vec![(Occur::Should, phrase.into())]);
+        assert!(BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).is_none());
+    }
+
+    #[test]
+    fn test_boolean_match_plan_rejects_only_must_not() {
+        use super::*;
+
+        let must_not = MatchQuery::new("c".to_string()).with_column(Some("text".to_string()));
+        let query = BooleanQuery::new(vec![(Occur::MustNot, must_not.into())]);
+        assert!(BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).is_none());
+    }
+
+    #[test]
+    fn test_boolean_match_plan_rejects_missing_column() {
+        use super::*;
+
+        let query = MatchQuery::new("hello".to_string());
+        assert!(BooleanMatchPlan::try_build(&FtsQuery::Match(query)).is_none());
     }
 }

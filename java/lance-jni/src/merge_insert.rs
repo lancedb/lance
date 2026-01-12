@@ -114,6 +114,7 @@ fn extract_when_matched<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> R
             None => Err(Error::input_error("No matched updated expr".to_string())),
         },
         "Fail" => Ok(WhenMatched::Fail),
+        "Delete" => Ok(WhenMatched::Delete),
         _ => Err(Error::input_error(format!(
             "Illegal when_matched: {when_matched}",
         ))),

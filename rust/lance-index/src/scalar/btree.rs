@@ -120,6 +120,38 @@ impl Ord for OrderableScalarValue {
         // any newly added enum variant will require editing this list
         // or else face a compile error
         match (&self.0, &other.0) {
+            (Decimal32(v1, p1, s1), Decimal32(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal32(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal32(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+            (Decimal64(v1, p1, s1), Decimal64(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal64(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal64(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
             (Decimal128(v1, p1, s1), Decimal128(v2, p2, s2)) => {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
@@ -152,6 +184,7 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (Decimal256(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+
             (Boolean(v1), Boolean(v2)) => v1.cmp(v2),
             (Boolean(v1), Null) => {
                 if v1.is_none() {
@@ -1297,7 +1330,7 @@ impl BTreeIndex {
         };
         // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
         // them back into a single partition.
-        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
+        let all_data = UnionExec::try_new(vec![old_input, new_input])?;
         let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
 
         let unchunked = execute_plan(
@@ -1722,19 +1755,21 @@ pub async fn train_btree_index(
         Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
     ]));
 
-    let mut sub_index_file;
-    if partition_id.is_none() {
-        sub_index_file = index_store
-            .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
-            .await?;
-    } else {
-        sub_index_file = index_store
-            .new_index_file(
-                part_page_data_file_path(partition_id.unwrap()).as_str(),
-                flat_schema.clone(),
-            )
-            .await?;
-    }
+    let mut sub_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_page_data_file_path(partition_id).as_str(),
+                    flat_schema.clone(),
+                )
+                .await?
+        }
+    };
 
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
@@ -1769,19 +1804,21 @@ pub async fn train_btree_index(
         RANGE_PARTITIONED_META_KEY.to_string(),
         range_id.is_some().to_string(),
     );
-    let mut btree_index_file;
-    if partition_id.is_none() {
-        btree_index_file = index_store
-            .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
-            .await?;
-    } else {
-        btree_index_file = index_store
-            .new_index_file(
-                part_lookup_file_path(partition_id.unwrap()).as_str(),
-                Arc::new(file_schema),
-            )
-            .await?;
-    }
+    let mut btree_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_lookup_file_path(partition_id).as_str(),
+                    Arc::new(file_schema),
+                )
+                .await?
+        }
+    };
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())
@@ -2164,7 +2201,7 @@ async fn merge_pages(
     }
 
     // Create Union execution plan to combine all partitions
-    let union_inputs = Arc::new(UnionExec::new(inputs));
+    let union_inputs = UnionExec::try_new(inputs)?;
 
     // Create SortPreservingMerge execution plan
     let value_column_index = stream_schema.index_of(VALUE_COLUMN_NAME)?;

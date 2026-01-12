@@ -663,6 +663,11 @@ def test_filter_with_fts_index(dataset):
         assert query == row.as_py()
 
 
+def test_create_scalar_index_fts_alias(dataset):
+    dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
+    assert any(idx["type"] == "Inverted" for idx in dataset.list_indices())
+
+
 def test_multi_index_create(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100

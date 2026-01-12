@@ -110,7 +110,9 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
-use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
+use lance_namespace::models::{
+    CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
+};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{relative_deletion_file_path, DELETIONS_DIR};
 pub use schema_evolution::{
@@ -820,23 +822,45 @@ impl Dataset {
 
         match write_params.mode {
             WriteMode::Create => {
-                let request = CreateEmptyTableRequest {
+                let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
-                    location: None,
-                    properties: None,
+                    ..Default::default()
                 };
-                let response =
-                    namespace
-                        .create_empty_table(request)
-                        .await
-                        .map_err(|e| Error::Namespace {
+                // Try declare_table first, fall back to deprecated create_empty_table
+                // for backward compatibility with older namespace implementations.
+                // create_empty_table support will be removed in 3.0.0.
+                #[allow(deprecated)]
+                let response = match namespace.declare_table(declare_request).await {
+                    Ok(resp) => resp,
+                    Err(Error::NotSupported { .. }) => {
+                        let fallback_request = CreateEmptyTableRequest {
+                            id: Some(table_id.clone()),
+                            ..Default::default()
+                        };
+                        let fallback_resp = namespace
+                            .create_empty_table(fallback_request)
+                            .await
+                            .map_err(|e| Error::Namespace {
+                                source: Box::new(e),
+                                location: location!(),
+                            })?;
+                        DeclareTableResponse {
+                            transaction_id: fallback_resp.transaction_id,
+                            location: fallback_resp.location,
+                            storage_options: fallback_resp.storage_options,
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::Namespace {
                             source: Box::new(e),
                             location: location!(),
-                        })?;
+                        });
+                    }
+                };
 
                 let uri = response.location.ok_or_else(|| Error::Namespace {
                     source: Box::new(std::io::Error::other(
-                        "Table location not found in create_empty_table response",
+                        "Table location not found in declare_table response",
                     )),
                     location: location!(),
                 })?;
@@ -870,8 +894,7 @@ impl Dataset {
             WriteMode::Append | WriteMode::Overwrite => {
                 let request = DescribeTableRequest {
                     id: Some(table_id.clone()),
-                    version: None,
-                    with_table_uri: None,
+                    ..Default::default()
                 };
                 let response =
                     namespace

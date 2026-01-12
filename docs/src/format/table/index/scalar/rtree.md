@@ -64,7 +64,7 @@ Hilbert sorting is performed in three steps:
 The R-Tree index consists of two files:
 
 1. `page_data.lance` - Stores all pages (leaf, branch) as repeated `(bbox, id)` tuples, written bottom-up (leaves first, then branch levels)
-2. `nulls.lance` - Stores a serialized RowIdTreeMap of rows with null
+2. `nulls.lance` - Stores a serialized RowAddrTreeMap of rows with null
 
 ### Page File Schema
 
@@ -75,9 +75,9 @@ The R-Tree index consists of two files:
 
 ### Nulls File Schema
 
-| Column  | Type   | Nullable | Description                                                |
-|:--------|:-------|:---------|:-----------------------------------------------------------|
-| `nulls` | Binary | false    | Serialized RowIdTreeMap of rows with null/invalid geometry |
+| Column  | Type   | Nullable | Description                                                  |
+|:--------|:-------|:---------|:-------------------------------------------------------------|
+| `nulls` | Binary | false    | Serialized RowAddrTreeMap of rows with null/invalid geometry |
 
 ### Schema Metadata
 

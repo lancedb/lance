@@ -57,6 +57,21 @@ impl LanceField {
         Ok(self.0.metadata.clone())
     }
 
+    /// Check if this field is part of an unenforced primary key.
+    pub fn is_unenforced_primary_key(&self) -> bool {
+        self.0.is_unenforced_primary_key()
+    }
+
+    /// Get the position of this field within a composite primary key.
+    ///
+    /// Returns the 1-based position if explicitly set, or None if not part of
+    /// a primary key or using schema field id ordering.
+    pub fn unenforced_primary_key_position(&self) -> Option<u32> {
+        self.0
+            .unenforced_primary_key_position
+            .filter(|&pos| pos > 0)
+    }
+
     pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
         PyArrowType((&self.0).into())
     }
@@ -108,7 +123,7 @@ impl LanceSchema {
         Ok(Self(schema))
     }
 
-    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         // We don't have a single message for the schema, just protobuf message
         // for a field. So, the state will be:
         // (metadata_json, field_protos...)

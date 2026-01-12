@@ -16,13 +16,13 @@ use lance_namespace_reqwest_client::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
-    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
-    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -39,9 +39,26 @@ use lance_namespace_reqwest_client::models::{
 /// This trait defines the interface that all Lance namespace implementations
 /// must provide. Each method corresponds to a specific operation on namespaces
 /// or tables.
+///
+/// # Error Handling
+///
+/// All operations may return the following common errors (via [`crate::NamespaceError`]):
+///
+/// - [`crate::ErrorCode::Unsupported`] - Operation not supported by this backend
+/// - [`crate::ErrorCode::InvalidInput`] - Invalid request parameters
+/// - [`crate::ErrorCode::PermissionDenied`] - Insufficient permissions
+/// - [`crate::ErrorCode::Unauthenticated`] - Invalid credentials
+/// - [`crate::ErrorCode::ServiceUnavailable`] - Service temporarily unavailable
+/// - [`crate::ErrorCode::Internal`] - Unexpected internal error
+///
+/// See individual method documentation for operation-specific errors.
 #[async_trait]
 pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// List namespaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the parent namespace does not exist.
     async fn list_namespaces(
         &self,
         _request: ListNamespacesRequest,
@@ -53,6 +70,10 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Describe a namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
     async fn describe_namespace(
         &self,
         _request: DescribeNamespaceRequest,
@@ -64,6 +85,10 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Create a new namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceAlreadyExists`] if a namespace with the same name already exists.
     async fn create_namespace(
         &self,
         _request: CreateNamespaceRequest,
@@ -75,6 +100,11 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Drop a namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
+    /// - [`crate::ErrorCode::NamespaceNotEmpty`] if the namespace contains tables or child namespaces.
     async fn drop_namespace(
         &self,
         _request: DropNamespaceRequest,
@@ -86,6 +116,10 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Check if a namespace exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
     async fn namespace_exists(&self, _request: NamespaceExistsRequest) -> Result<()> {
         Err(Error::NotSupported {
             source: "namespace_exists not implemented".into(),
@@ -170,7 +204,23 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Declare a table (metadata only operation).
+    async fn declare_table(&self, _request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        Err(Error::NotSupported {
+            source: "declare_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
     /// Create an empty table (metadata only operation).
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`declare_table`](Self::declare_table) instead. Support will be removed in 3.0.0.
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use declare_table instead. Support will be removed in 3.0.0."
+    )]
     async fn create_empty_table(
         &self,
         _request: CreateEmptyTableRequest,

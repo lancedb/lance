@@ -19,13 +19,13 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
-    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
-    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -472,6 +472,7 @@ impl LanceNamespace for RestNamespace {
             request.clone(),
             Some(&self.delimiter),
             request.with_table_uri,
+            request.load_detailed_metadata,
         )
         .await
         .map_err(convert_api_error)
@@ -545,6 +546,14 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
         table_api::create_empty_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::declare_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
             .await
             .map_err(convert_api_error)
     }
@@ -1029,8 +1038,7 @@ mod tests {
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -1152,8 +1160,8 @@ mod tests {
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
             limit: Some(10),
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -1191,8 +1199,8 @@ mod tests {
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
             limit: Some(10),
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -1227,8 +1235,7 @@ mod tests {
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
-            properties: None,
-            mode: None,
+            ..Default::default()
         };
 
         let result = namespace.create_namespace(request).await;
@@ -1269,6 +1276,7 @@ mod tests {
                 "table".to_string(),
             ]),
             mode: Some("Create".to_string()),
+            ..Default::default()
         };
 
         let data = Bytes::from("arrow data here");
@@ -1306,6 +1314,7 @@ mod tests {
                 "table".to_string(),
             ]),
             mode: Some("Append".to_string()),
+            ..Default::default()
         };
 
         let data = Bytes::from("arrow data here");

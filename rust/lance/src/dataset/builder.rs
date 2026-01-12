@@ -136,8 +136,7 @@ impl DatasetBuilder {
     ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
-            version: None,
-            with_table_uri: None,
+            ..Default::default()
         };
 
         let response = namespace

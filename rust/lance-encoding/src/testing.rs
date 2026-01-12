@@ -640,6 +640,9 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
+                if mini_block.dictionary.is_some() {
+                    actual_chain.push("dictionary".to_string());
+                }
                 // Check value compression
                 if let Some(ref value_comp) = mini_block.value_compression {
                     let chain = extract_array_encoding_chain(value_comp);

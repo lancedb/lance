@@ -16,7 +16,10 @@ datafusion.workspace = true
 geoarrow-array.workspace = true
 geoarrow-schema.workspace = true
 geodatafusion.workspace = true
+geo-traits.workspace = true
 geo-types.workspace = true
+lance-core.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

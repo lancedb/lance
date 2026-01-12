@@ -39,6 +39,7 @@ use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
+use lance_index::vector::shared::{write_unified_ivf_and_index_metadata, SupportedIvfIndexType};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::utils::is_finite;
@@ -120,6 +121,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 
+    // fragments for distributed indexing
+    fragment_filter: Option<Vec<u32>>,
+
     // optimize options for only incremental build
     optimize_options: Option<OptimizeOptions>,
     // number of indices merged
@@ -162,6 +166,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
+            fragment_filter: None,
             optimize_options: None,
             merged_num: 0,
         })
@@ -227,6 +232,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
+            fragment_filter: None,
             optimize_options: None,
             merged_num: 0,
         })
@@ -319,6 +325,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     pub fn with_existing_indices(&mut self, indices: Vec<Arc<dyn VectorIndex>>) -> &mut Self {
         self.existing_indices = indices;
+        self
+    }
+
+    /// Set fragment filter for distributed indexing
+    pub fn with_fragment_filter(&mut self, fragment_ids: Vec<u32>) -> &mut Self {
+        self.fragment_filter = Some(fragment_ids);
         self
     }
 
@@ -476,6 +488,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .batch_readahead(get_num_compute_intensive_cpus())
                     .project(&[self.column.as_str()])?
                     .with_row_id();
+
+                // Apply fragment filter for distributed indexing
+                if let Some(fragment_ids) = &self.fragment_filter {
+                    log::info!(
+                        "applying fragment filter for distributed indexing: {:?}",
+                        fragment_ids
+                    );
+                    // Filter fragments by converting fragment_ids to Fragment objects
+                    let all_fragments = dataset.fragments();
+                    let filtered_fragments: Vec<_> = all_fragments
+                        .iter()
+                        .filter(|fragment| fragment_ids.contains(&(fragment.id as u32)))
+                        .cloned()
+                        .collect();
+                    builder.with_fragments(filtered_fragments);
+                }
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
                 let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
@@ -1052,19 +1080,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&storage_partition_metadata)?,
         );
 
-        let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
-        let index_metadata = IndexMetadata {
-            index_type: index_type_string(S::name().try_into()?, Q::quantization_type()),
-            distance_type: self.distance_type.to_string(),
-        };
-        index_writer.add_schema_metadata(
-            INDEX_METADATA_SCHEMA_KEY,
-            serde_json::to_string(&index_metadata)?,
-        );
-        let ivf_buffer_pos = index_writer
-            .add_global_buffer(index_ivf_pb.encode_to_vec().into())
+        let index_type_str = index_type_string(S::name().try_into()?, Q::quantization_type());
+        if let Some(idx_type) = SupportedIvfIndexType::from_index_type_str(&index_type_str) {
+            write_unified_ivf_and_index_metadata(
+                &mut index_writer,
+                &index_ivf,
+                self.distance_type,
+                idx_type,
+            )
             .await?;
-        index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        } else {
+            // Fallback for index types not covered by SupportedIndexType (e.g. IVF_RQ).
+            let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
+            let index_metadata = IndexMetadata {
+                index_type: index_type_str,
+                distance_type: self.distance_type.to_string(),
+            };
+            index_writer.add_schema_metadata(
+                INDEX_METADATA_SCHEMA_KEY,
+                serde_json::to_string(&index_metadata)?,
+            );
+            let ivf_buffer_pos = index_writer
+                .add_global_buffer(index_ivf_pb.encode_to_vec().into())
+                .await?;
+            index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        }
         index_writer.add_schema_metadata(
             S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,

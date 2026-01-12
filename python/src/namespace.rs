@@ -79,7 +79,11 @@ impl PyDirectoryNamespace {
 
     // Namespace operations
 
-    fn list_namespaces(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn list_namespaces<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.list_namespaces(request))?
@@ -87,7 +91,11 @@ impl PyDirectoryNamespace {
         Ok(pythonize(py, &response)?.into())
     }
 
-    fn describe_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn describe_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.describe_namespace(request))?
@@ -95,20 +103,28 @@ impl PyDirectoryNamespace {
         Ok(pythonize(py, &response)?.into())
     }
 
-    fn create_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn create_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_namespace(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn drop_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn drop_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.drop_namespace(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn namespace_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -121,28 +137,40 @@ impl PyDirectoryNamespace {
 
     // Table operations
 
-    fn list_tables(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn list_tables<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.list_tables(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn describe_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn describe_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.describe_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn register_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn register_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.register_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn table_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -153,40 +181,65 @@ impl PyDirectoryNamespace {
         Ok(())
     }
 
-    fn drop_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn drop_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.drop_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn deregister_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn deregister_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.deregister_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn create_table(
+    fn create_table<'py>(
         &self,
-        py: Python,
+        py: Python<'py>,
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_table(request, data))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn create_empty_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    #[allow(deprecated)]
+    fn create_empty_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_empty_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn declare_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.declare_table(request))?
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }
@@ -237,36 +290,52 @@ impl PyRestNamespace {
 
     // Namespace operations
 
-    fn list_namespaces(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn list_namespaces<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.list_namespaces(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn describe_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn describe_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.describe_namespace(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn create_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn create_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_namespace(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn drop_namespace(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn drop_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.drop_namespace(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn namespace_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -279,28 +348,40 @@ impl PyRestNamespace {
 
     // Table operations
 
-    fn list_tables(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn list_tables<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.list_tables(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn describe_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn describe_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.describe_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn register_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn register_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.register_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn table_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -311,40 +392,65 @@ impl PyRestNamespace {
         Ok(())
     }
 
-    fn drop_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn drop_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.drop_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn deregister_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn deregister_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.deregister_table(request))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn create_table(
+    fn create_table<'py>(
         &self,
-        py: Python,
+        py: Python<'py>,
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_table(request, data))?
             .infer_error()?;
-        Ok(pythonize(py, &response)?.into())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn create_empty_table(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    #[allow(deprecated)]
+    fn create_empty_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.create_empty_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn declare_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.declare_table(request))?
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }

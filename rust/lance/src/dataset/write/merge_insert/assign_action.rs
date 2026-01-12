@@ -125,6 +125,9 @@ pub fn merge_insert_action(
         WhenMatched::Fail => {
             cases.push((matched, Action::Fail.as_literal_expr()));
         }
+        WhenMatched::Delete => {
+            cases.push((matched, Action::Delete.as_literal_expr()));
+        }
     }
 
     match &params.delete_not_matched_by_source {

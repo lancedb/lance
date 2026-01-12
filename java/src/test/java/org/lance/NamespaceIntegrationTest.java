@@ -18,6 +18,8 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 import org.lance.operation.Append;
@@ -210,6 +212,16 @@ public class NamespaceIntegrationTest {
       int count = createCallCount.incrementAndGet();
 
       CreateEmptyTableResponse response = inner.createEmptyTable(request);
+      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+
+      return response;
+    }
+
+    @Override
+    public DeclareTableResponse declareTable(DeclareTableRequest request) {
+      int count = createCallCount.incrementAndGet();
+
+      DeclareTableResponse response = inner.declareTable(request);
       response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
 
       return response;

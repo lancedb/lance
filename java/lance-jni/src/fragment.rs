@@ -254,6 +254,7 @@ fn create_fragment<'a>(
         &mode,
         &enable_stable_row_ids,
         &data_storage_version,
+        None,
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,

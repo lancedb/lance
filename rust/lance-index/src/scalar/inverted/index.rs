@@ -236,6 +236,11 @@ impl InvertedIndex {
         &self.params
     }
 
+    /// Returns the number of partitions in this inverted index.
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
@@ -1627,7 +1632,7 @@ impl PostingList {
                     let freq = freq as u32;
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1645,7 +1650,7 @@ impl PostingList {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };

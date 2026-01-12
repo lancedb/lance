@@ -18,7 +18,7 @@ use crate::scalar::{
 use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
 mod as_bytes;
-mod sbbf;
+pub mod sbbf;
 use arrow_schema::{DataType, Field};
 use serde::{Deserialize, Serialize};
 

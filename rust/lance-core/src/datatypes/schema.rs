@@ -111,11 +111,27 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema
+    /// The unenforced primary key fields in the schema, ordered by position.
+    ///
+    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position value.
+    /// Fields without explicit positions (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit positions.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
-        self.fields_pre_order()
-            .filter(|f| f.unenforced_primary_key)
-            .collect::<Vec<_>>()
+        let mut pk_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_primary_key())
+            .collect();
+
+        pk_fields.sort_by_key(|f| {
+            let pk_position = f.unenforced_primary_key_position.unwrap_or(0);
+            if pk_position > 0 {
+                (false, pk_position as i32, f.id)
+            } else {
+                (true, f.id, f.id)
+            }
+        });
+
+        pk_fields
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
@@ -412,7 +428,7 @@ impl Schema {
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_struct() {
+                if field.data_type().is_nested() {
                     if let Some(f) = field.exclude(other_field) {
                         fields.push(f)
                     }
@@ -1517,7 +1533,7 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
 /// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
 /// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to "`field``with``backticks`"
+/// For example: \["field`with`backticks"\] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
@@ -2598,5 +2614,112 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        // When positions are specified, fields are ordered by their position values
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "2".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "b");
+        assert_eq!(pk_fields[1].name, "a");
+
+        // When positions are not specified, fields are ordered by their schema field id
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Int64, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "c");
+        assert_eq!(pk_fields[1].name, "d");
+
+        // Fields with explicit positions are ordered before fields without
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("e", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("f", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("g", DataType::Utf8, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 3);
+        assert_eq!(pk_fields[0].name, "f");
+        assert_eq!(pk_fields[1].name, "e");
+        assert_eq!(pk_fields[2].name, "g");
     }
 }

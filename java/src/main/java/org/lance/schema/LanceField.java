@@ -22,6 +22,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.stream.Collectors;
 
 public class LanceField {
@@ -34,6 +35,7 @@ public class LanceField {
   private final Map<String, String> metadata;
   private final List<LanceField> children;
   private final boolean isUnenforcedPrimaryKey;
+  private final int unenforcedPrimaryKeyPosition;
 
   LanceField(
       int id,
@@ -44,7 +46,8 @@ public class LanceField {
       DictionaryEncoding dictionaryEncoding,
       Map<String, String> metadata,
       List<LanceField> children,
-      boolean isUnenforcedPrimaryKey) {
+      boolean isUnenforcedPrimaryKey,
+      int unenforcedPrimaryKeyPosition) {
     this.id = id;
     this.parentId = parentId;
     this.name = name;
@@ -54,6 +57,7 @@ public class LanceField {
     this.metadata = metadata;
     this.children = children;
     this.isUnenforcedPrimaryKey = isUnenforcedPrimaryKey;
+    this.unenforcedPrimaryKeyPosition = unenforcedPrimaryKeyPosition;
   }
 
   public int getId() {
@@ -92,6 +96,18 @@ public class LanceField {
     return isUnenforcedPrimaryKey;
   }
 
+  /**
+   * Get the position of this field within a composite primary key.
+   *
+   * @return the 1-based position if explicitly set, or empty if using schema field id ordering
+   */
+  public OptionalInt getUnenforcedPrimaryKeyPosition() {
+    if (unenforcedPrimaryKeyPosition > 0) {
+      return OptionalInt.of(unenforcedPrimaryKeyPosition);
+    }
+    return OptionalInt.empty();
+  }
+
   public Field asArrowField() {
     List<Field> arrowChildren =
         children.stream().map(LanceField::asArrowField).collect(Collectors.toList());
@@ -110,6 +126,7 @@ public class LanceField {
         .add("dictionaryEncoding", dictionaryEncoding)
         .add("children", children)
         .add("isUnenforcedPrimaryKey", isUnenforcedPrimaryKey)
+        .add("unenforcedPrimaryKeyPosition", unenforcedPrimaryKeyPosition)
         .add("metadata", metadata)
         .toString();
   }

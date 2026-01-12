@@ -15,7 +15,6 @@
 
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::size_of;
-use paste::paste;
 
 pub const FL_ORDER: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 

@@ -12,7 +12,7 @@ use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, RecordBatch, StringArray,
 };
 use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -231,8 +231,17 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 let key = key.clone();
                 let column = column.clone();
                 async move {
-                    compute_distance(key, dt, &column, batch?)
+                    let batch = compute_distance(key, dt, &column, batch?)
                         .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+                    let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+                    let mask = BooleanArray::from_iter(
+                        distances
+                            .iter()
+                            .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
+                    );
+                    arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
             })

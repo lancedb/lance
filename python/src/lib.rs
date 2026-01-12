@@ -161,9 +161,17 @@ pub fn init_logging(mut log_builder: Builder) {
 
     let max_level = logger.filter();
 
-    let log_level = max_level.to_level().unwrap_or(Level::Error);
+    let trace_level = env::var("LANCE_TRACING").unwrap_or_default().to_lowercase();
+    let trace_level = match trace_level.as_str() {
+        "debug" => Level::Debug,
+        "info" => Level::Info,
+        "warn" => Level::Warn,
+        "error" => Level::Error,
+        "trace" => Level::Trace,
+        _ => Level::Info,
+    };
 
-    tracing::initialize_tracing(log_level);
+    tracing::initialize_tracing(trace_level);
     log::set_boxed_logger(Box::new(logger)).unwrap();
     log::set_max_level(max_level);
 }

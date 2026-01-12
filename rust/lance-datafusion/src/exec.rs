@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -289,6 +290,7 @@ pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + S
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub max_temp_directory_size: Option<u64>,
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
     pub execution_stats_callback: Option<ExecutionStatsCallback>,
@@ -300,6 +302,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
         f.debug_struct("LanceExecutionOptions")
             .field("use_spilling", &self.use_spilling)
             .field("mem_pool_size", &self.mem_pool_size)
+            .field("max_temp_directory_size", &self.max_temp_directory_size)
             .field("batch_size", &self.batch_size)
             .field("target_partition", &self.target_partition)
             .field("skip_logging", &self.skip_logging)
@@ -312,6 +315,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
@@ -325,6 +329,23 @@ impl LanceExecutionOptions {
                     }
                 })
                 .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+        })
+    }
+
+    pub fn max_temp_directory_size(&self) -> u64 {
+        self.max_temp_directory_size.unwrap_or_else(|| {
+            std::env::var("LANCE_MAX_TEMP_DIRECTORY_SIZE")
+                .map(|s| match s.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse LANCE_MAX_TEMP_DIRECTORY_SIZE: {}, using default",
+                            e
+                        );
+                        DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
+                    }
+                })
+                .unwrap_or(DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE)
         })
     }
 
@@ -348,8 +369,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        let disk_manager_builder = DiskManagerBuilder::default()
+            .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .with_disk_manager_builder(disk_manager_builder)
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));
@@ -373,7 +396,9 @@ static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLoc
 });
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE
+        && options.max_temp_directory_size() == DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
+        && options.target_partition.is_none()
     {
         return if options.use_spilling() {
             DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
@@ -545,7 +570,14 @@ pub async fn analyze_plan(
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
     let schema = plan.schema();
-    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+    // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
+    let analyze = Arc::new(AnalyzeExec::new(
+        true,
+        true,
+        vec![MetricType::SUMMARY],
+        plan,
+        schema,
+    ));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);

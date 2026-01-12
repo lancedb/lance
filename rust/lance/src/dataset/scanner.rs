@@ -2712,7 +2712,7 @@ impl Scanner {
                     ROW_ID.to_string(),
                 )];
 
-                let fts_node = Arc::new(UnionExec::new(children));
+                let fts_node = UnionExec::try_new(children)?;
                 let fts_node = Arc::new(RepartitionExec::try_new(
                     fts_node,
                     Partitioning::RoundRobinBatch(1),
@@ -2771,7 +2771,7 @@ impl Scanner {
                 } else if should.len() == 1 {
                     should.pop().unwrap()
                 } else {
-                    let unioned = Arc::new(UnionExec::new(should));
+                    let unioned = UnionExec::try_new(should)?;
                     Arc::new(RepartitionExec::try_new(
                         unioned,
                         Partitioning::RoundRobinBatch(1),
@@ -2824,7 +2824,7 @@ impl Scanner {
                 } else if must_not.len() == 1 {
                     must_not.pop().unwrap()
                 } else {
-                    let unioned = Arc::new(UnionExec::new(must_not));
+                    let unioned = UnionExec::try_new(must_not)?;
                     Arc::new(RepartitionExec::try_new(
                         unioned,
                         Partitioning::RoundRobinBatch(1),
@@ -2944,7 +2944,7 @@ impl Scanner {
         // Combine plans
         let plan = match (match_plan, flat_match_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
-                let match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
+                let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
                 let match_plan = Arc::new(RepartitionExec::try_new(
                     match_plan,
                     Partitioning::RoundRobinBatch(1),
@@ -3189,10 +3189,10 @@ impl Scanner {
                 .schema()
                 .equivalent_names_and_types(&knn_node.schema()));
             // union
-            let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
+            let unioned = UnionExec::try_new(vec![Arc::new(topk_appended), knn_node])?;
             // Enforce only 1 partition.
             let unioned = RepartitionExec::try_new(
-                Arc::new(unioned),
+                unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?;
             // then we do a flat search on KNN(new data) + ANN(indexed data)
@@ -3378,13 +3378,13 @@ impl Scanner {
         };
 
         if let Some(new_data_path) = new_data_path {
-            let unioned = UnionExec::new(vec![plan, new_data_path]);
+            let unioned = UnionExec::try_new(vec![plan, new_data_path])?;
             // Enforce only 1 partition.
-            let unioned = RepartitionExec::try_new(
-                Arc::new(unioned),
+            let unioned = Arc::new(RepartitionExec::try_new(
+                unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?;
-            Ok(Arc::new(unioned))
+            )?);
+            Ok(unioned)
         } else {
             Ok(plan)
         }
