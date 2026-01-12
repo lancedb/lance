@@ -117,6 +117,6 @@ try:
 except Exception as e:
     error_msg = str(e)
     assert "Incorrect datatype for StructArray" in error_msg, f"Unexpected error: {e}"
-    assert "List(Struct" in error_msg, f"Unexpected error: {e}"
+    assert "List(Field" in error_msg, f"Unexpected error: {e}"
 
 print("Test data created successfully and verified issue #5702 is triggered")
