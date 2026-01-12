@@ -94,8 +94,7 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
-use lance_index::mem_wal::{MemWal, MemWalId};
-use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::mem_wal::MergedGeneration;
 use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
@@ -313,9 +312,8 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
-    // If set, this MemWAL should be marked as merged, and will be committed to replace the
-    // MemWAL that is currently in the index with the same ID.
-    mem_wal_to_merge: Option<MemWal>,
+    // List of MemWAL region generations to mark as merged when this commit succeeds.
+    merged_generations: Vec<MergedGeneration>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -426,7 +424,7 @@ impl MergeInsertBuilder {
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 skip_auto_cleanup: false,
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
@@ -513,45 +511,11 @@ impl MergeInsertBuilder {
         self
     }
 
-    /// Indicate that this merge-insert uses data in a flushed MemTable.
-    /// Once write is completed, the corresponding MemTable should also be marked as merged.
-    pub async fn mark_mem_wal_as_merged(
-        &mut self,
-        mem_wal_id: MemWalId,
-        expected_owner_id: &str,
-    ) -> Result<&mut Self> {
-        if let Some(mem_wal_index) = self
-            .dataset
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-        {
-            if let Some(generations) = mem_wal_index.mem_wal_map.get(mem_wal_id.region.as_str()) {
-                if let Some(mem_wal) = generations.get(&mem_wal_id.generation) {
-                    mem_wal.check_state(lance_index::mem_wal::State::Flushed)?;
-                    mem_wal.check_expected_owner_id(expected_owner_id)?;
-                    self.params.mem_wal_to_merge = Some(mem_wal.clone());
-                    Ok(self)
-                } else {
-                    Err(Error::invalid_input(
-                        format!(
-                            "Cannot find MemWAL generation {} for region {}",
-                            mem_wal_id.generation, mem_wal_id.region
-                        ),
-                        location!(),
-                    ))
-                }
-            } else {
-                Err(Error::invalid_input(
-                    format!("Cannot find MemWAL for region {}", mem_wal_id.region),
-                    location!(),
-                ))
-            }
-        } else {
-            Err(Error::NotSupported {
-                source: "MemWAL is not enabled".into(),
-                location: location!(),
-            })
-        }
+    /// Mark MemWAL region generations as merged when this commit succeeds.
+    /// This updates the merged_generations in the MemWAL Index atomically with the data commit.
+    pub fn mark_generations_as_merged(&mut self, generations: Vec<MergedGeneration>) -> &mut Self {
+        self.params.merged_generations.extend(generations);
+        self
     }
 
     /// Crate a merge insert job
@@ -1590,7 +1554,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: self.params.mem_wal_to_merge,
+                merged_generations: self.params.merged_generations.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
@@ -1661,7 +1625,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
-                mem_wal_to_merge: self.params.mem_wal_to_merge,
+                merged_generations: self.params.merged_generations.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields
                     .iter()

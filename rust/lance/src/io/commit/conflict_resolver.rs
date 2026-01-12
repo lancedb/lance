@@ -13,7 +13,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::MemWal;
+use lance_index::mem_wal::MergedGeneration;
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
@@ -343,8 +343,8 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_merge,
             inserted_rows_filter: self_inserted_rows_filter,
+            merged_generations: self_merged_generations,
             ..
         } = &self.transaction.operation
         {
@@ -515,21 +515,14 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
                     self.incompatible_conflict_err(other_transaction, other_version, location!())
                 ),
-                Operation::UpdateMemWalState { added, updated, .. } => {
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        added,
-                        mem_wal_to_merge.as_slice(),
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        updated,
-                        mem_wal_to_merge.as_slice(),
-                        other_transaction,
-                        other_version,
-                    )?;
-                    Ok(())
-                }
+                Operation::UpdateMemWalState {
+                    merged_generations: other_merged_generations,
+                } => self.check_merged_generations_conflict(
+                    other_merged_generations,
+                    self_merged_generations,
+                    other_transaction,
+                    other_version,
+                ),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1205,68 +1198,33 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::UpdateMemWalState {
-            added,
-            updated,
-            removed: _,
-            ..
+            merged_generations: self_merged_generations,
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
-                    added: committed_added,
-                    updated: committed_updated,
-                    removed: _,
+                    merged_generations: other_merged_generations,
                 } => {
-                    // 1. if the current or last committed job is trimming flushed MemWALs,
-                    // it is compatible with any other UpdateMemWalState commits
-                    if (committed_added.is_empty() && committed_updated.is_empty())
-                        || (added.is_empty() && updated.is_empty())
-                    {
-                        return Ok(());
-                    }
-
-                    // 2. MemWALs of different regions can be changed at the same time
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_added,
-                        added,
+                    // Two UpdateMemWalState transactions conflict if they're updating
+                    // the same region's merged_generation
+                    self.check_merged_generations_conflict(
+                        other_merged_generations,
+                        self_merged_generations,
                         other_transaction,
                         other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_added,
-                        updated,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_updated,
-                        added,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_updated,
-                        updated,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    Ok(())
+                    )
                 }
                 Operation::Update {
-                    mem_wal_to_merge, ..
+                    merged_generations: other_merged_generations,
+                    ..
                 } => {
-                    if mem_wal_to_merge.is_some() {
-                        // TODO: This check could be more detailed, there is an assumption that
-                        //  once a MemWAL is sealed, there is no other operation that could change
-                        //  the state back to open, and at that point it can always be flushed.
-                        Ok(())
-                    } else {
-                        Err(self.incompatible_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
-                    }
+                    // Update transactions with merged_generations can conflict
+                    self.check_merged_generations_conflict(
+                        other_merged_generations,
+                        self_merged_generations,
+                        other_transaction,
+                        other_version,
+                    )
                 }
                 Operation::UpdateConfig { .. }
                 | Operation::Rewrite { .. }
@@ -1343,50 +1301,26 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_update_mem_wal_state_not_modify_same_mem_wal(
+    fn check_merged_generations_conflict(
         &self,
-        committed: &[MemWal],
-        to_commit: &[MemWal],
+        committed: &[MergedGeneration],
+        to_commit: &[MergedGeneration],
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if !committed.is_empty() {
-            if to_commit.is_empty() {
-                return Ok(());
-            }
-
-            if committed.len() > 1 {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Committing multiple MemWALs is not supported, but found committed: {:?}",
-                        committed
-                    ),
-                    location: location!(),
-                });
-            }
-
-            if to_commit.len() > 1 {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Committing multiple MemWALs is not supported, but found attempt to commit: {:?}",
-                        to_commit
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-
-            let committed_mem_wal = committed.first().unwrap();
-            let to_commit_mem_wal = to_commit.first().unwrap();
-            if committed_mem_wal.id == to_commit_mem_wal.id {
-                return Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                ));
+        // Check if any region has conflicting updates
+        for committed_mg in committed {
+            for to_commit_mg in to_commit {
+                if committed_mg.region_id == to_commit_mg.region_id {
+                    // Same region being updated - this is a conflict
+                    return Err(self.retryable_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ));
+                }
             }
         }
-
         Ok(())
     }
 
@@ -1861,7 +1795,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
@@ -1873,7 +1807,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -1888,7 +1822,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -1990,7 +1924,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2005,7 +1939,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2127,7 +2061,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2140,7 +2074,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2299,7 +2233,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2495,7 +2429,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2918,7 +2852,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

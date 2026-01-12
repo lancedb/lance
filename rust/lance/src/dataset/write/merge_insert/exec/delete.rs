@@ -260,7 +260,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
+        let merged_generations = self.params.merged_generations.clone();
 
         let result_stream = futures::stream::once(async move {
             let delete_row_addrs = Self::collect_deletions(input_stream, metrics).await?;
@@ -275,7 +275,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields

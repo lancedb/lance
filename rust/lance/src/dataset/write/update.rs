@@ -388,7 +388,7 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
             inserted_rows_filter: None,

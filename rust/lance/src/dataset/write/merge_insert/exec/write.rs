@@ -856,7 +856,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
-        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
+        let merged_generations = self.params.merged_generations.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -927,7 +927,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields
