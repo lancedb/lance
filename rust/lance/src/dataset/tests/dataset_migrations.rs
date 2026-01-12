@@ -386,7 +386,7 @@ async fn test_max_fragment_id_migration() {
 /// "Incorrect datatype for StructArray field expected List(Struct(...)) got List(Struct(...))"
 #[tokio::test]
 async fn test_list_struct_field_reorder_issue_5702() {
-    let test_dir = copy_test_data_to_tmp("list_struct_field_reorder/list_struct_reorder.lance")
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance")
         .expect("Failed to copy test data");
     let test_uri = test_dir.path_str();
 

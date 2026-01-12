@@ -16,7 +16,7 @@ Before the fix, reading would fail with:
 "Incorrect datatype for StructArray field expected List(Struct(...)) got List(Struct(...))"
 
 Usage:
-    pip install pylance==2.0.0-beta.8
+    pip install pylance==1.0.1
     python datagen.py
 """
 
@@ -24,10 +24,7 @@ import lance
 import pyarrow as pa
 
 # Assert the version to document which version was used to create the test data
-assert lance.__version__ == "2.0.0-beta.8", (
-    f"Expected pylance 2.0.0-beta.8, got {lance.__version__}"
-)
-print(f"Lance version: {lance.__version__}")
+assert lance.__version__ == "1.0.1", f"Expected pylance 1.0.1, got {lance.__version__}"
 
 # Schema with List<Struct<a, b, c>> and an extra column
 inner_struct_type = pa.struct(
@@ -64,7 +61,6 @@ fragment0_data = pa.table(
 # Create dataset with first fragment
 dataset_path = "list_struct_reorder.lance"
 lance.write_dataset(fragment0_data, dataset_path, mode="create")
-print("Created dataset with fragment 0")
 
 # Fragment 1: data with inner struct fields reordered AND missing field "a"
 inner_struct_type_reordered = pa.struct(
@@ -98,11 +94,29 @@ fragment1_data = pa.table(
 
 # Append second fragment with reordered and missing inner struct fields
 lance.write_dataset(fragment1_data, dataset_path, mode="append")
-print("Appended fragment 1 with reordered inner struct")
 
-# Verify the test data was created correctly
+# Verify the test data structure
 ds = lance.dataset(dataset_path)
-print(f"\nDataset created with {len(ds.get_fragments())} fragments")
-for i, frag in enumerate(ds.get_fragments()):
-    for df in frag.metadata.data_files():
-        print(f"Fragment {i}: fields={df.fields}")
+assert len(ds.get_fragments()) == 2, "Expected 2 fragments"
+
+frag0_fields = ds.get_fragments()[0].metadata.data_files()[0].fields
+frag1_fields = ds.get_fragments()[1].metadata.data_files()[0].fields
+
+# Fragment 0 should have sequential field IDs: [0, 1, 2, 3, 4, 5, 6]
+# (id=0, data=1, item=2, a=3, b=4, c=5, extra=6)
+assert frag0_fields == [0, 1, 2, 3, 4, 5, 6], f"Fragment 0 fields: {frag0_fields}"
+
+# Fragment 1 should have reordered field IDs: [0, 1, 2, 5, 4]
+# (id=0, data=1, item=2, c=5, b=4) - note: a=3 and extra=6 are missing
+assert frag1_fields == [0, 1, 2, 5, 4], f"Fragment 1 fields: {frag1_fields}"
+
+# Verify that scanning fails with the expected error (issue #5702)
+try:
+    ds.to_table()
+    raise AssertionError("Expected scan to fail with issue #5702 error")
+except Exception as e:
+    error_msg = str(e)
+    assert "Incorrect datatype for StructArray" in error_msg, f"Unexpected error: {e}"
+    assert "List(Struct" in error_msg, f"Unexpected error: {e}"
+
+print("Test data created successfully and verified issue #5702 is triggered")
