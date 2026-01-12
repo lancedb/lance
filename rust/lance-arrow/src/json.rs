@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
-use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema};
 
 use crate::ARROW_EXT_NAME_KEY;
@@ -140,8 +139,8 @@ impl JsonArray {
     pub fn to_arrow_json(&self) -> ArrayRef {
         let mut builder = arrow_array::builder::StringBuilder::new();
 
-        for i in 0..self.len() {
-            if self.is_null(i) {
+        for i in 0..self.inner.len() {
+            if self.inner.is_null(i) {
                 builder.append_null();
             } else {
                 let jsonb_bytes = self.inner.value(i);
@@ -153,53 +152,17 @@ impl JsonArray {
         // Return as UTF-8 string array (Arrow represents JSON as strings)
         Arc::new(builder.finish())
     }
-}
 
-impl Array for JsonArray {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn to_data(&self) -> ArrayData {
-        self.inner.to_data()
-    }
-
-    fn into_data(self) -> ArrayData {
-        self.inner.into_data()
-    }
-
-    fn data_type(&self) -> &DataType {
-        &DataType::LargeBinary
-    }
-
-    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
-        Arc::new(Self {
-            inner: self.inner.slice(offset, length),
-        })
-    }
-
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    fn offset(&self) -> usize {
-        self.inner.offset()
-    }
-
-    fn nulls(&self) -> Option<&arrow_buffer::NullBuffer> {
-        self.inner.nulls()
-    }
-
-    fn get_buffer_memory_size(&self) -> usize {
-        self.inner.get_buffer_memory_size()
-    }
-
-    fn get_array_memory_size(&self) -> usize {
-        self.inner.get_array_memory_size()
+    pub fn is_null(&self, i: usize) -> bool {
+        self.inner.is_null(i)
     }
 }
 
@@ -712,39 +675,14 @@ mod tests {
         let json_array =
             JsonArray::try_from_iter(vec![Some(r#"{"a": 1}"#), Some(r#"{"b": 2}"#)]).unwrap();
 
-        // Test as_any
-        let any_ref = json_array.as_any();
-        assert!(any_ref.downcast_ref::<JsonArray>().is_some());
-
-        // Test data_type
-        assert_eq!(json_array.data_type(), &DataType::LargeBinary);
-
-        // Test len (already covered, but included for completeness)
+        // Wrapper methods
         assert_eq!(json_array.len(), 2);
-
-        // Test is_empty
         assert!(!json_array.is_empty());
+        assert!(!json_array.is_null(0));
 
-        // Test offset
-        assert_eq!(json_array.offset(), 0);
-
-        // Test get_buffer_memory_size
-        assert!(json_array.get_buffer_memory_size() > 0);
-
-        // Test get_array_memory_size
-        assert!(json_array.get_array_memory_size() > 0);
-
-        // Test to_data
-        let data = json_array.clone().to_data();
-        assert_eq!(data.len(), 2);
-
-        // Test into_data
-        let data = json_array.clone().into_data();
-        assert_eq!(data.len(), 2);
-
-        // Test slice
-        let sliced = json_array.slice(0, 1);
-        assert_eq!(sliced.len(), 1);
+        // Underlying Arrow array
+        assert_eq!(json_array.inner().data_type(), &DataType::LargeBinary);
+        assert_eq!(json_array.inner().len(), 2);
     }
 
     #[test]

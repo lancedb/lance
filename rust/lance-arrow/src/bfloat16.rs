@@ -6,10 +6,7 @@
 use std::fmt::Formatter;
 use std::slice;
 
-use arrow_array::{
-    builder::BooleanBufferBuilder, iterator::ArrayIter, Array, ArrayAccessor, ArrayRef,
-    FixedSizeBinaryArray,
-};
+use arrow_array::{builder::BooleanBufferBuilder, Array, FixedSizeBinaryArray};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
@@ -41,9 +38,7 @@ pub struct BFloat16Type {}
 
 /// An array of bfloat16 values
 ///
-/// This implements the [`Array`] trait for bfloat16 values.  Note that
-/// bfloat16 is not the same thing as fp16 which is supported natively
-/// by arrow-rs.
+/// Note that bfloat16 is not the same thing as fp16 which is supported natively by arrow-rs.
 #[derive(Clone)]
 pub struct BFloat16Array {
     inner: FixedSizeBinaryArray,
@@ -72,8 +67,27 @@ impl BFloat16Array {
         values.into()
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn is_null(&self, i: usize) -> bool {
+        self.inner.is_null(i)
+    }
+
+    pub fn null_count(&self) -> usize {
+        self.inner.null_count()
+    }
+
     pub fn iter(&self) -> BFloat16Iter<'_> {
-        BFloat16Iter::new(self)
+        BFloat16Iter {
+            array: self,
+            index: 0,
+        }
     }
 
     pub fn value(&self, i: usize) -> bf16 {
@@ -97,65 +111,6 @@ impl BFloat16Array {
 
     pub fn into_inner(self) -> FixedSizeBinaryArray {
         self.inner
-    }
-}
-
-impl ArrayAccessor for &BFloat16Array {
-    type Item = bf16;
-
-    fn value(&self, index: usize) -> Self::Item {
-        BFloat16Array::value(self, index)
-    }
-
-    unsafe fn value_unchecked(&self, index: usize) -> Self::Item {
-        BFloat16Array::value_unchecked(self, index)
-    }
-}
-
-impl Array for BFloat16Array {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self.inner.as_any()
-    }
-
-    fn to_data(&self) -> arrow_data::ArrayData {
-        self.inner.to_data()
-    }
-
-    fn into_data(self) -> arrow_data::ArrayData {
-        self.inner.into_data()
-    }
-
-    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
-        let inner_array: &dyn Array = &self.inner;
-        inner_array.slice(offset, length)
-    }
-
-    fn nulls(&self) -> Option<&arrow_buffer::NullBuffer> {
-        self.inner.nulls()
-    }
-
-    fn data_type(&self) -> &DataType {
-        self.inner.data_type()
-    }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    fn offset(&self) -> usize {
-        self.inner.offset()
-    }
-
-    fn get_array_memory_size(&self) -> usize {
-        self.inner.get_array_memory_size()
-    }
-
-    fn get_buffer_memory_size(&self) -> usize {
-        self.inner.get_buffer_memory_size()
     }
 }
 
@@ -242,7 +197,27 @@ impl PartialEq<Self> for BFloat16Array {
     }
 }
 
-type BFloat16Iter<'a> = ArrayIter<&'a BFloat16Array>;
+pub struct BFloat16Iter<'a> {
+    array: &'a BFloat16Array,
+    index: usize,
+}
+
+impl<'a> Iterator for BFloat16Iter<'a> {
+    type Item = Option<bf16>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.array.len() {
+            return None;
+        }
+        let i = self.index;
+        self.index += 1;
+        if self.array.is_null(i) {
+            Some(None)
+        } else {
+            Some(Some(self.array.value(i)))
+        }
+    }
+}
 
 /// Methods that are lifted from arrow-rs temporarily until they are made public.
 mod from_arrow {
@@ -290,16 +265,25 @@ mod from_arrow {
     }
 }
 
-impl FloatArray<BFloat16Type> for BFloat16Array {
+impl FloatArray<BFloat16Type> for FixedSizeBinaryArray {
     type FloatType = BFloat16Type;
 
     fn as_slice(&self) -> &[bf16] {
+        assert_eq!(
+            self.value_length(),
+            2,
+            "BFloat16 arrays must use FixedSizeBinary(2) storage"
+        );
         unsafe {
             slice::from_raw_parts(
-                self.inner.value_data().as_ptr() as *const bf16,
-                self.inner.value_data().len() / 2,
+                self.value_data().as_ptr() as *const bf16,
+                self.value_data().len() / 2,
             )
         }
+    }
+
+    fn from_values(values: Vec<bf16>) -> Self {
+        BFloat16Array::from(values).into_inner()
     }
 }
 
@@ -327,6 +311,9 @@ mod tests {
         for (expected, value) in values.as_slice().iter().zip(array2.iter()) {
             assert_eq!(Some(*expected), value);
         }
+
+        let arrow_array = array.into_inner();
+        assert_eq!(arrow_array.as_slice(), values.as_slice());
     }
 
     #[test]

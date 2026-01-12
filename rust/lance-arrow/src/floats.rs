@@ -13,7 +13,7 @@ use std::{
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
-    Array, Float16Array, Float32Array, Float64Array,
+    Array, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array,
 };
 use arrow_schema::{DataType, Field};
 use half::{bf16, f16};
@@ -95,7 +95,7 @@ pub trait ArrowFloatType: Debug {
 
     /// Returns empty array of this type.
     fn empty_array() -> Self::ArrayType {
-        Vec::<Self::Native>::new().into()
+        <Self::ArrayType as FloatArray<Self>>::from_values(Vec::new())
     }
 }
 
@@ -143,7 +143,7 @@ impl ArrowFloatType for BFloat16Type {
     const MIN: Self::Native = bf16::MIN;
     const MAX: Self::Native = bf16::MAX;
 
-    type ArrayType = BFloat16Array;
+    type ArrayType = FixedSizeBinaryArray;
 }
 
 impl ArrowFloatType for Float16Type {
@@ -180,13 +180,22 @@ impl ArrowFloatType for Float64Type {
 ///
 /// This is similar to [`arrow_array::PrimitiveArray`] but applies to all float types (including bfloat16)
 /// and is implemented as a trait and not a struct
-pub trait FloatArray<T: ArrowFloatType + ?Sized>:
-    Array + Clone + From<Vec<T::Native>> + 'static
-{
+pub trait FloatArray<T: ArrowFloatType + ?Sized>: Array + Clone + 'static {
     type FloatType: ArrowFloatType;
 
     /// Returns a reference to the underlying data as a slice.
     fn as_slice(&self) -> &[T::Native];
+
+    /// Construct an array from a vector of values.
+    fn from_values(values: Vec<T::Native>) -> Self;
+
+    /// Construct an array from an iterator of values.
+    fn from_iter_values(values: impl IntoIterator<Item = T::Native>) -> Self
+    where
+        Self: Sized,
+    {
+        Self::from_values(values.into_iter().collect())
+    }
 }
 
 impl FloatArray<Float16Type> for Float16Array {
@@ -194,6 +203,10 @@ impl FloatArray<Float16Type> for Float16Array {
 
     fn as_slice(&self) -> &[<Float16Type as ArrowFloatType>::Native] {
         self.values()
+    }
+
+    fn from_values(values: Vec<<Float16Type as ArrowFloatType>::Native>) -> Self {
+        Self::from(values)
     }
 }
 
@@ -203,6 +216,10 @@ impl FloatArray<Float32Type> for Float32Array {
     fn as_slice(&self) -> &[<Float32Type as ArrowFloatType>::Native] {
         self.values()
     }
+
+    fn from_values(values: Vec<<Float32Type as ArrowFloatType>::Native>) -> Self {
+        Self::from(values)
+    }
 }
 
 impl FloatArray<Float64Type> for Float64Array {
@@ -210,6 +227,10 @@ impl FloatArray<Float64Type> for Float64Array {
 
     fn as_slice(&self) -> &[<Float64Type as ArrowFloatType>::Native] {
         self.values()
+    }
+
+    fn from_values(values: Vec<<Float64Type as ArrowFloatType>::Native>) -> Self {
+        Self::from(values)
     }
 }
 
@@ -219,9 +240,10 @@ impl FloatArray<Float64Type> for Float64Array {
 /// and need to be converted to the appropriate float type for the index.
 pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Arc<dyn Array>> {
     match float_type {
-        FloatType::BFloat16 => Ok(Arc::new(BFloat16Array::from_iter_values(
-            input.values().iter().map(|v| bf16::from_f32(*v)),
-        ))),
+        FloatType::BFloat16 => Ok(Arc::new(
+            BFloat16Array::from_iter_values(input.values().iter().map(|v| bf16::from_f32(*v)))
+                .into_inner(),
+        )),
         FloatType::Float16 => Ok(Arc::new(Float16Array::from_iter_values(
             input.values().iter().map(|v| f16::from_f32(*v)),
         ))),
@@ -229,5 +251,25 @@ pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Resul
         FloatType::Float64 => Ok(Arc::new(Float64Array::from_iter_values(
             input.values().iter().map(|v| *v as f64),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coerce_float_vector_bfloat16() {
+        let input = Float32Array::from(vec![1.0f32, 2.0, 3.0]);
+        let array = coerce_float_vector(&input, FloatType::BFloat16).unwrap();
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(2));
+
+        let fixed = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let expected: Vec<bf16> = input.values().iter().map(|v| bf16::from_f32(*v)).collect();
+        assert_eq!(fixed.as_slice(), expected.as_slice());
     }
 }
