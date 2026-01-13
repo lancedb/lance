@@ -623,7 +623,7 @@ Readers **MUST** merge results from multiple data sources (base table, flushed M
 
 When the same primary key exists in multiple sources, the reader must keep only the newest version based on:
 
-1. **Generation number** (`_gen`): Higher generation wins. The base table has generation -1, flushed MemTables have positive integers starting from 1.
+1. **Generation number** (`_gen`): Higher generation wins. The base table has generation -1, MemTables have positive integers starting from 1.
 2. **Row address** (`_rowaddr`): Within the same generation, higher row address wins (later writes within a batch overwrite earlier ones).
 
 The ordering for "newest" is: highest `_gen` first, then highest `_rowaddr`.
@@ -690,67 +690,27 @@ For example, with a region spec using `bucket(user_id, 10)` and a filter `user_i
 
 Region pruning applies to both scan queries and prefilters in search queries.
 
-#### Indexed Read
+#### Indexed Read Plan
 
 When data is merged from a flushed MemTable to the base table, the base table's indexes are rebuilt asynchronously by the [base table index builders](#base-table-index-builder).
 During this window, the merged data exists in the base table but is not yet covered by the base table's indexes.
 
 Without special handling, indexed queries would fall back to expensive full scans for the unindexed part of the base table.
-To maintain indexed read performance, the query planner should use `index_catchup` progress to determine the optimal data source for each query:
+To maintain indexed read performance, the query planner should use `index_catchup` progress to determine the optimal data source for each query.
 
-```
-For indexed query on region R using index I:
-  merged_gen = merged_generations[R]
-  index_gen = index_catchup[I].caught_up_generations[R]  # defaults to merged_gen if absent
-
-  if index_gen >= merged_gen:
-    # Base table index is caught up - optimal path
-    base_table.indexed_query(I)
-    memtable.query(gen > merged_gen)
-  else:
-    # Base table index is behind - use flushed MemTable indexes for the gap
-    base_table.indexed_query(I)                           # covers data up to index_gen
-    flushed_memtable.indexed_query(gen in (index_gen, merged_gen])  # uses pre-built indexes
-    memtable.query(gen > merged_gen)
-```
-
+The key insight is that flushed MemTables serve as a bridge between the base table's index catchup and the current merged state.
+For a query that requires a specific index for acceleration, when `index_gen < merged_gen`, 
+the generations in the gap `(index_gen, merged_gen]` have data already merged in the base table but are not covered by the base table's index.
 Since flushed MemTables contain pre-built indexes (created during [MemTable flush](#memtable-flush)), queries can use these indexes instead of scanning unindexed data in the base table.
 This ensures all reads remain indexed regardless of how far behind the async index builder is.
 
-The key insight is that flushed MemTables serve as a bridge between the base table's index catchup and the current merged state.
-When `index_gen < merged_gen`, the generations in the gap `(index_gen, merged_gen]` have data in the base table but are not covered by the base table's indexes.
-Instead of falling back to a full scan for this gap, the query planner uses the flushed MemTable indexes which were pre-built during flush.
-This maintains indexed query performance even during periods of heavy write activity where async index rebuilding falls behind.
-
 See [Appendix 4: Index Catchup Example](#appendix-4-index-catchup-example) for a detailed timeline showing how this works in practice.
-
 
 ### Query Execution
 
-Query execution unions datasets within each region and deduplicates by primary key.
-Deduplication uses two virtual columns: `_gen` (generation number, same value for all rows in a generation) and `_rowaddr` (row address within the dataset).
-The ordering for "newest" is: highest `_gen` first, then highest `_rowaddr` (within the same generation, later rows win).
+Query execution unions datasets within each region and deduplicates by primary key according to [LSM tree merge read](#lsm-tree-merge-read).
 
-A single write batch may contain duplicate primary keys. Query execution must deduplicate, keeping only the newest row for each key.
-
-For scan queries with filters, the plan unions datasets from relevant regions (after pruning), deduplicates within each region, then applies any remaining filters.
-Early termination is possible with a streaming deduplicate operator.
-
-For vector search queries, each generation's index is searched independently.
-Results from base table and MemTable generations use the same distance metric since they share identical index configuration.
-The bloom filter is used to detect stale results: for each candidate from generation G, check if the primary key exists in any bloom filter from generations > G.
-If found, the candidate is filtered out because a newer version exists that did not match the query as well.
-
-For full-text search queries, corpus statistics (document count, term frequencies) are aggregated across all generations to compute global BM25 parameters.
-Each generation's FTS index is then searched with the global parameters, producing comparable scores.
-Staleness filtering uses bloom filters similar to vector search.
-
-For point lookups, the planner can short-circuit by checking newest generations first and returning immediately when the key is found.
-
-### Expected Query Plans
-
-This section provides query plan expectations using custom execution nodes optimized for MemWAL's data model.
-See [Appendix 3: Execution Nodes](#appendix-3-execution-nodes) for detailed node descriptions.
+The next few subsections go through the query plan expectations using custom execution nodes optimized for MemWAL's data model.
 
 All query plans assume the following MemWAL setup:
 
@@ -766,6 +726,9 @@ region_B:
   gen 2: flushed_gen_2
   gen 3: in_memory_memtable
 ```
+
+Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each scan and is omitted.
+See [Appendix 3: Execution Nodes](#appendix-3-execution-nodes) for uncommon execution nodes we use here for optimized performance.
 
 #### Scan Queries
 
@@ -785,8 +748,6 @@ DeduplicateExec: partition_by=[pk], order_by=[_gen DESC, _rowaddr DESC]
     ScanExec: region_B[gen=2], filter=[pushed_down]
     ScanExec: region_B[gen=1], filter=[pushed_down]
 ```
-
-Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each scan.
 
 #### Point Lookups
 
@@ -809,8 +770,6 @@ CoalesceFirstExec: return_first_non_null
     TakeLastExec: region_A[gen=1], filter=[pk = target]
   TakeLastExec: base_table[gen=-1], filter=[pk = target]
 ```
-
-Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each lookup.
 
 #### Vector Search Queries
 
@@ -1017,11 +976,11 @@ This example demonstrates how `index_catchup` enables indexed reads during async
 Generation:         1       2       3       4       5       6
                     |       |       |       |       |       |
 State:           merged  merged  merged  merged flushed  active
-                    |       |       |       |       |       |
-Base IVF index:  [-- covers 1-3 --]
-                                    ↑               ↑       ↑
-                              index_gen=3    merged_gen=4   |
-                                                    current_gen=6
+                    |       |       |       |               |
+Base IVF index:  [--   covers 1-3   --]     |               |
+                            ↑               ↑               ↑
+                        index_gen=3    merged_gen=4         |
+                                                      current_gen=6
 ```
 
 In this example:
@@ -1032,7 +991,7 @@ In this example:
 - **Generation 5** is flushed to disk (not yet merged to base table)
 - **Generation 6** is the active in-memory MemTable
 
-#### Read Strategy for Vector Search
+#### Example Read Strategy for Vector Search
 
 Without `index_catchup` tracking, the query planner would need to perform an expensive full scan on the base table for generation 4.
 With `index_catchup`, the planner knows exactly which data is indexed and can use flushed MemTable indexes for the gap:
@@ -1045,12 +1004,3 @@ With `index_catchup`, the planner knows exactly which data is indexed and can us
 | Active MemTable | 6 | Use in-memory IVF index |
 
 All data sources provide indexed access, maintaining query performance during async index rebuild.
-
-#### Why Flushed MemTables Are Retained
-
-Flushed MemTable files are not garbage collected until:
-
-1. Their data has been merged to the base table (`gen <= merged_gen`)
-2. All maintained indexes have caught up (`gen <= index_gen` for all indexes)
-
-This ensures flushed MemTable indexes remain available to bridge the gap between `index_gen` and `merged_gen`.
