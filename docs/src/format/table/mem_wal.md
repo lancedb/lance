@@ -2,6 +2,9 @@
 
 Lance MemTable & WAL (MemWAL) specification describes a Log-Structured-Merge (LSM) tree architecture for Lance tables, enabling high-performance streaming write workloads.
 
+!!!note
+    MemWAL requires the table to have an [unenforced primary key](index.md#unenforced-primary-key) defined.
+
 ## Overall Architecture
 
 ![MemWAL Overview](../../images/mem_wal_overview.png)
@@ -13,9 +16,22 @@ Under the MemWAL setup, the Lance table is called the **base table**.
 ### Region
 
 A **Region** is the main unit to horizontally scale out writes.
+
 Each region has exactly one active writer at any time, using **epoch-based fencing** to guarantee single-writer semantics without distributed coordination.
 Writers claim a region by incrementing the writer epoch, then write data to that region.
 Data in each region is merged into the base table gradually in the background.
+
+Regions must contain rows that are **mutually exclusive**.
+Two regions contain rows with the same primary key, the following scenario can cause data corruption:
+
+1. Region A receives a write with primary key `pk=1` at time T1
+2. Region B receives a write with primary key `pk=1` at time T2 (T2 > T1)
+3. The row in region B is merged into the base table first
+4. The row in region A is merged into the base table second
+5. The row from Region A (older) now overwrites the row from Region B (newer)
+
+This violates the expected "last write wins" semantics.
+By ensuring each primary key is assigned to exactly one region via the region spec, merge order between regions becomes irrelevant for correctness.
 
 ### MemWAL Index
 
@@ -37,7 +53,7 @@ See [MemWAL Index Details](#memwal-index-details) for the complete structure.
 
 ## Region Architecture
 
-![Region Architecture](mem_wal_regional.png)
+![Region Architecture](../../images/mem_wal_regional.png)
 
 Within a region, writes enter its MemTable and are flushed to the regional WAL for durability.
 The MemTable is flushed to storage as a Flushed MemTable based on memory pressure and other conditions.
@@ -47,6 +63,12 @@ Flushed MemTables are then asynchronously merged into the base table.
 
 An in-memory Lance table that buffers incoming writes.
 Each write inserts a fragment in the MemTable, making data immediately queryable without waiting for persistence.
+
+In addition to the data fragments, a MemTable maintains:
+
+- **Primary key bloom filter**: For efficient existence checks during staleness detection
+- **In-memory index builders**: Incremental index structures that mirror base table indexes, enabling indexed queries on unflushed data
+- **WAL fragment mapping**: Tracks correspondence between MemTable fragment IDs and WAL entry IDs for index remapping during flush
 
 ### WAL
 
@@ -131,7 +153,7 @@ To read the latest manifest version:
 This approach uses HEAD requests instead of LIST operations in cloud storage, which is generally faster and is friendly to systems like S3 Express that do not support lexicographically sorted listing.
 
 !!!note
-    This works because the write rate to region manifests is significantly lower than typical read rates. Region manifests are only updated when region metadata changes (MemTable flush, merge completion), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
+    This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush, merge completion), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
 
 All region manifest versions are stored in `_mem_wal/{region_id}/manifest` directory.
 
@@ -144,7 +166,7 @@ The region manifest is updated atomically in the following cases:
 |---------|----------------|---------|
 | [Initialization & Recovery](#initialization--recovery) | `writer_epoch` | Incremented when writer claims the region |
 | [MemTable Flush](#memtable-flush) | `replay_after_wal_id`, `wal_id_last_seen`, `current_generation`, `flushed_generations` | After flushing MemTable to storage |
-| [Merge to Base Table](#merge-workflow) | `merged_generation`, `flushed_generations` | After merging a flushed MemTable; removes merged entry |
+| [MemTable Merger](#merge-workflow) | `merged_generation`, `flushed_generations` | After merging a flushed MemTable; removes merged entry |
 | [MemWAL Index Builder](#memwal-index-builder) | `wal_id_last_seen` | Periodically scans WAL entries and updates hint |
 
 !!!note
@@ -161,7 +183,7 @@ Here is a recap of the storage layout with all the files and concepts defined so
 {table_path}/
 ├── _indices/
 │   └── {index_uuid}/                    # MemWAL Index (uses standard index storage)
-│       └── regions.binpb                # Serialized region snapshots (protobuf binary)
+│       └── index.lance                  # Serialized region snapshots (Lance file)
 │
 └── _mem_wal/
     └── {region_uuid}/                   # Region directory (UUID v4)
@@ -189,18 +211,9 @@ The index stores its data in two parts:
 1. **Index details** (`index_details` in `IndexMetadata`): Contains configuration, merge progress, and snapshot metadata
 2. **Region snapshots**: Stored as a Lance file or inline, depending on region count
 
-### Index Details Schema
+### Index Details
 
-The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` protobuf message with:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `snapshot_timestamp` | int64 | When the index was built (Unix timestamp in seconds) |
-| `num_regions` | uint32 | Number of regions in the snapshot |
-| `inline_snapshots` | bytes | Inline snapshot data for small region counts (optional) |
-| `region_specs` | repeated RegionSpec | Region specs defining how rows map to regions |
-| `maintained_indexes` | repeated string | Index names to maintain in MemTables |
-| `merged_generations` | repeated MergedGeneration | Last generation merged to base table per region |
+The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` protobuf message with the following key fields:
 
 **Configuration fields** (`region_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
 Writers read these fields to determine how to partition data and which indexes to maintain.
@@ -209,7 +222,7 @@ Writers read these fields to determine how to partition data and which indexes t
 This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
 Each entry contains the region UUID and generation number.
 
-**Region snapshot fields** (`snapshot_timestamp`, `num_regions`, `inline_snapshots`) provide a point-in-time snapshot of region states.
+**Region snapshot fields** (`snapshot_ts_millis`, `num_regions`, `inline_snapshots`) provide a point-in-time snapshot of region states.
 The actual region manifests remain authoritative for region state.
 When `num_regions` is 0, the `inline_snapshots` field may be `None` or an empty Lance file with 0 rows but proper schema.
 
@@ -250,22 +263,6 @@ Each region field has the following properties:
 | `transform` | A well-known region expression, specify this or `expression` |
 | `expression` | A DataFusion SQL expression for custom logic, specify this or `transform` |
 | `result_type` | The output type of the region value |
-
-#### Primary Key Constraint
-
-The `source_ids` across all region fields must include all primary key columns.
-This ensures rows with the same primary key always map to the same region, which is required for correctness.
-
-If two regions contain rows with the same primary key, the following scenario can cause data corruption:
-
-1. Region A receives a write with primary key `pk=1` at time T1
-2. Region B receives a write with primary key `pk=1` at time T2 (T2 > T1)
-3. The row in region B is merged into the base table first
-4. The row in region A is merged into the base table second
-5. The row from Region A (older) now overwrites the row from Region B (newer)
-
-This violates the expected "last write wins" semantics.
-By ensuring each primary key is assigned to exactly one region via the region spec, merge order between regions becomes irrelevant for correctness.
 
 #### Region Expression
 
@@ -321,7 +318,7 @@ This keeps the index metadata compact while avoiding an additional file read for
 **External Lance file**: For large region counts, snapshots are stored as a Lance file at `_indices/{UUID}/index.lance`.
 This file uses standard Lance format with the region snapshot schema, enabling efficient columnar access and compression.
 
-### Region Snapshot Schema
+### Region Snapshot Arrow Schema
 
 Region snapshots are stored as a Lance file with one row per region.
 The schema has one column per `RegionManifest` field plus region spec columns:
@@ -337,21 +334,16 @@ The schema has one column per `RegionManifest` field plus region spec columns:
 | `current_generation` | `uint64` | Next generation to flush |
 | `merged_generation` | `uint64` | Last generation merged to base |
 | `flushed_generations` | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths |
-| `region_values` | `struct<{field_id}: {result_type}, ...>` | Region field values from spec |
+| `region_field_{field_id}` | varies | Region field value (one column per field in region spec) |
 
-This schema directly corresponds to the fields in the `RegionManifest` protobuf message plus the computed region values.
+For example, with a region spec containing a field `user_bucket` of type `int32`:
 
-### Staleness Handling
+| Column | Type | Description |
+|--------|------|-------------|
+| ... | ... | (base columns above) |
+| `region_field_user_bucket` | `int32` | Bucket value for this region |
 
-Since the index is eventually consistent, readers should handle stale data:
-
-- A flushed MemTable listed in `flushed_generations` may have been merged and garbage collected
-- New flushed MemTables may exist that are not yet in `flushed_generations`
-- WAL entries may have advanced beyond what the index shows
-
-The `snapshot_timestamp` field indicates when the index was built; readers can use this to estimate staleness and decide whether to refresh.
-
-For authoritative state, readers may load individual region manifests directly from `_mem_wal/{region_uuid}/manifest/`.
+This schema directly corresponds to the fields in the `RegionManifest` protobuf message plus the computed region field values.
 
 ### Vector Index Configuration
 
@@ -363,9 +355,11 @@ For each vector index on the base table, MemTable uses the same index type (IVF-
 This ensures distances are precise and comparable across generations.
 
 The base table vector index should not change the codebook once MemWAL is enabled.
-To switch codebooks, a migration is required: create another vector index with the new codebook, configure MemTable to maintain both indexes, and eventually drop the old index after all data has been merged with the new codebook.
+To switch codebooks, a migration is required: create another vector index with the new codebook, configure MemTable to maintain both indexes, and eventually drop the old index after all readers are using the new codebook and all MemTables have indexes using the new codebook.
 
 ## Writer Expectations
+
+A writer operates on a single region within a single process and may spawn asynchronous tasks for background operations like WAL flush and MemTable flush.
 
 ### Writer Configuration
 
@@ -387,11 +381,11 @@ Writer operations can be categorized by their synchronous or asynchronous nature
 
 | Operation | Mode | Description |
 |-----------|------|-------------|
-| Write to MemTable | Synchronous | Data inserted into in-memory fragments |
-| WAL Flush | Configurable | Synchronous with durable writes, asynchronous otherwise |
-| Index Update | Configurable | Synchronous with indexed writes, asynchronous otherwise |
-| MemTable Flush | Asynchronous | Triggered by thresholds, runs in background |
-| Merge to Base Table | Asynchronous | Background job merges flushed MemTables |
+| [Initialization & Recovery](#initialization--recovery) | Synchronous | Claims region and replays WAL entries |
+| [Write to MemTable](#write-operations) | Synchronous | Data inserted into in-memory fragments |
+| [WAL Flush](#wal-flush) | Configurable | Synchronous with durable writes, asynchronous otherwise |
+| [Index Update](#memtable-indexing) | Configurable | Synchronous with indexed writes, asynchronous otherwise |
+| [MemTable Flush](#memtable-flush) | Asynchronous | Triggered by thresholds, runs in background |
 
 ### Initialization & Recovery
 
@@ -402,9 +396,9 @@ A writer must claim a region before performing any write operations:
 3. Atomically write a new manifest
 4. If the write fails (another writer claimed the epoch), reload the manifest and retry with a higher epoch
 5. After initialization, read WAL entries sequentially from `replay_after_wal_id + 1` until not found
-6. Replay valid WAL entries (those with `writer_epoch` <= current epoch) to reconstruct the MemTable with 1:1 fragment mapping (each WAL entry becomes one MemTable fragment)
+6. Replay valid WAL entries (those with `writer_epoch` <= current epoch) to reconstruct the MemTable with 1:1 [WAL fragment mapping](#wal-fragment-mapping-construction) (each WAL entry becomes one MemTable fragment)
 
-After recovery, the writer tracks subsequent fragment mappings as new WAL flushes occur (see [WAL Flush](#wal-flush)).
+After initialization, the writer updates the [WAL fragment mapping](#wal-fragment-mapping-construction) as new [WAL flushes](#wal-flush) occur.
 
 ### Write Operations
 
@@ -430,7 +424,7 @@ WAL flush batches pending MemTable fragments into a single Lance data file:
 4. Write the footer containing batched data file metadata and `writer_epoch` in schema metadata
 5. Complete the WAL entry write atomically
 6. Mark fragments as flushed in the MemTable
-7. Record fragment mappings (MemTable fragment IDs in this batch -> WAL entry ID relative to last replay) for index remapping during [MemTable Flush](#memtable-flush)
+7. Update the [WAL fragment mapping](#wal-fragment-mapping-construction) (MemTable fragment IDs in this batch -> WAL entry ID and positions) for index remapping during [MemTable Flush](#memtable-flush)
 
 !!!note
     The region manifest is **not** updated on every WAL flush. The `wal_id_last_seen` field is a hint that can be updated:
@@ -468,6 +462,26 @@ When a MemTable is flushed to storage:
 2. The primary key bloom filter is serialized to `bloom_filter.bin` in the generation directory
 3. The in-memory index structures may be retained as a cache for readers in the same process
 
+### WAL Fragment Mapping Construction
+
+The WAL fragment mapping tracks the correspondence between MemTable fragment IDs and WAL entry IDs.
+This mapping is essential for remapping indexes during [MemTable flush](#memtable-flush), since indexes reference MemTable fragment IDs but the flushed MemTable references WAL entry IDs.
+
+The mapping is structured as: `MemTable fragment ID -> (WAL entry ID, position within entry)`
+
+Where:
+
+- **MemTable fragment ID**: The fragment's position in the MemTable (0-indexed within the current generation)
+- **WAL entry ID**: The WAL entry containing this fragment's data (relative to `replay_after_wal_id`)
+- **Position within entry**: The fragment's position within the WAL entry (since multiple fragments may be batched)
+
+The mapping is updated in two scenarios:
+
+1. **[Initialization & Recovery](#initialization--recovery)**: During WAL replay, each replayed WAL entry creates MemTable fragments with 1:1 mapping (one fragment per WAL entry, position 0)
+2. **[WAL Flush](#wal-flush)**: After flushing pending fragments to a new WAL entry, the mapping records which MemTable fragments were written to which WAL entry and their positions
+
+During [MemTable flush](#memtable-flush), indexes are remapped by translating MemTable fragment IDs to the corresponding WAL entry references using this mapping.
+
 ### MemTable Flush
 
 Flushing the MemTable creates a new flushed MemTable (generation) with data and indexes:
@@ -477,9 +491,9 @@ Flushing the MemTable creates a new flushed MemTable (generation) with data and 
 3. Identify WAL entries to include (from `replay_after_wal_id + 1` to the last flushed entry)
 4. Create table manifest with `base_paths` pointing to the WAL directory
 5. Add fragment entries referencing WAL files via `base_id`
-6. Remap indexes using in-memory fragment mappings:
+6. Remap indexes using the [WAL fragment mapping](#wal-fragment-mapping-construction):
     - Read index entries referencing MemTable fragment IDs
-    - Translate to flushed MemTable fragment IDs using mappings (MemTable fragment ID -> WAL entry ID relative to last replay)
+    - Translate to flushed MemTable fragment IDs using the mapping
     - Write remapped indexes to `_mem_wal/{region_uuid}/{random_hash}_gen_{current_generation}/_indices/`
 7. Write the manifest to `_mem_wal/{region_uuid}/{random_hash}_gen_{current_generation}/_versions/{version}.manifest` (using [V2 naming scheme](transaction.md#manifest-naming-schemes))
 8. Update the region manifest:
@@ -490,7 +504,7 @@ Flushing the MemTable creates a new flushed MemTable (generation) with data and 
 
 The random prefix ensures that flush retries write to a new directory, avoiding conflicts with partially written files from failed attempts. Only the directory recorded in `flushed_generations` is considered valid.
 
-If the writer crashes before completing MemTable flush, the new writer replays WAL entries into memory with 1:1 fragment mapping, rebuilds the in-memory indexes, and can then perform a fresh MemTable flush with a new random prefix.
+If the writer crashes before completing MemTable flush, the new writer replays WAL entries into memory with 1:1 [WAL fragment mapping](#wal-fragment-mapping-construction), rebuilds the in-memory indexes, and can then perform a fresh MemTable flush with a new random prefix.
 
 ### Writer Fencing
 
@@ -507,7 +521,7 @@ For a concrete example of fencing between two writers, see [Appendix 1: Writer F
 
 Background jobs run independently from writers and handle asynchronous maintenance tasks.
 
-### Merge to Base Table
+### MemTable Merger
 
 Flushed MemTables are merged to the base table in generation order using Lance's merge-insert operation.
 
@@ -520,31 +534,22 @@ Flushed MemTables are merged to the base table in generation order using Lance's
     - Open it as a Lance table
     - Execute merge-insert into the base table, atomically updating the MemWAL Index:
         - Set `merged_generations[region_id]` to this generation
-    - On commit conflict, apply [conflict resolution rules](#merge-commit-conflict-resolution)
+    - On commit conflict, apply [conflict resolution rules](#conflict-resolution-and-concurrency)
     - On successful commit, update the region manifest: set `merged_generation` to this generation and remove the entry from `flushed_generations`
     - If the region manifest update fails, continue to the next generation (MemWAL Index is authoritative)
-4. After merge, the flushed MemTable and its referenced WAL files may be garbage collected (see [Garbage Collection](#garbage-collection))
+4. After merge, the flushed MemTable and its referenced WAL files may be garbage collected (see [Garbage Collector](#garbage-collector))
 
 Ordered merge ensures correct upsert semantics: flushed MemTables with higher generation numbers overwrite those with lower numbers.
 
-#### Merge Commit Conflict Resolution
-
-When a merge-insert commit to the base table encounters a version conflict, the merger reads the conflicting commit's MemWAL Index:
-
-- **Incompatible conflict**: If the conflicting commit's `merged_generations[region_id] >= my_generation`, abort without retry. The data is either already merged (same generation) or superseded (higher generation).
-- **Compatible conflict**: Otherwise, retry the commit as normal.
-
-After aborting due to an incompatible conflict, reload the MemWAL Index and region manifest, then continue to the next unmerged generation.
-
-This conflict resolution prevents redundant work and ensures mergers don't regress the merge progress.
-
-#### Concurrent Mergers and Idempotency
+#### Conflict Resolution and Concurrency
 
 Multiple mergers may operate on the same region concurrently. This is safe due to:
 
 1. **Atomic MemWAL Index update**: The `merged_generations` in MemWAL Index is updated atomically with the data commit
-2. **Conflict resolution**: Incompatible commits (same region, higher/equal generation) cause abort, not retry
+2. **Conflict resolution**: When a merge-insert commit encounters a version conflict, the merger reads the conflicting commit's MemWAL Index. If `merged_generations[region_id] >= my_generation`, abort without retry (data already merged or superseded). Otherwise, retry the commit as normal.
 3. **Merge-insert idempotency**: If two mergers merge the same generation before either commits, both write identical data (primary key upsert semantics)
+
+After aborting due to a conflict, reload the MemWAL Index and region manifest, then continue to the next unmerged generation.
 
 If a merger crashes after committing to the base table but before updating the region manifest:
 
@@ -567,7 +572,7 @@ A background process periodically builds a new region snapshot:
 3. For each region:
     - Load the region manifest
     - Scan WAL entries sequentially to find the actual last entry ID
-    - If the observed WAL ID is greater than `wal_id_last_seen`, update the region manifest
+    - If the observed WAL ID is greater than `wal_id_last_seen`, update the region manifest (ignore errors since this is best-effort)
     - Copy manifest fields (including `flushed_generations`) into a region snapshot row
 4. Determine storage strategy based on region count:
     - If `num_regions <= threshold`: Serialize as Lance file bytes to `inline_snapshots`
@@ -582,21 +587,9 @@ This process serves two purposes:
 
 The build frequency is implementation-defined. More frequent builds reduce staleness but increase I/O overhead.
 
-#### Configuration Updates
+### Garbage Collector
 
-To update MemWAL configuration (add/remove region specs or maintained indexes):
-
-1. Load the existing MemWAL Index
-2. Modify the configuration fields (`region_specs`, `maintained_indexes`)
-3. Keep the existing `merged_generations` and region snapshots (or rebuild snapshots)
-4. Write the new index with updated configuration
-5. Update the table manifest with the new index metadata
-
-Configuration changes are versioned with the table manifest, ensuring writers and readers see consistent configuration for each table version.
-
-### Garbage Collection
-
-Garbage collection removes obsolete data from the region directory. This is a file-only operation that does not update the region manifest.
+The garbage collector removes obsolete data from the region directory. This is a file-only operation that does not update the region manifest.
 
 Eligible for deletion:
 
@@ -613,14 +606,43 @@ Garbage collection must verify that no flushed MemTable still references a WAL f
 
 ### Reader Consistency
 
-Reader consistency depends on two factors: access to in-memory MemTables and the source of region metadata.
+Reader consistency depends on two factors: 
+
+1. access to in-memory MemTables
+2. the source of region metadata (either through MemWAL index or region manifests)
 
 Strong consistency requires access to in-memory MemTables for all regions involved in the query and reading region manifests directly.
 Otherwise, the query is eventually consistent due to missing unflushed data or stale MemWAL Index snapshots.
 
-### Region Pruning
+Reading a stale MemWAL Index does not impact correctness, only freshness:
 
-Before executing queries, the planner evaluates filter predicates against region specs to determine which regions may contain matching data.
+- **Merged MemTable**: If a flushed MemTable has been merged to the base table but not yet garbage collected, readers query both. Deduplication by primary key ensures correct results since both contain the same data. If the MemTable has been garbage collected, readers fail to open it, which is also safe because the data already exists in the base table.
+- **Stale snapshot**: The snapshot may not reflect the latest region manifest state. Flushed MemTables added after the snapshot was built are not queried. The result is eventually consistent but correct for the snapshot's point in time.
+
+The `snapshot_ts_millis` field indicates when the index was built; readers can use this to estimate staleness and decide whether to refresh.
+For stronger consistency, readers may load individual region manifests directly from `_mem_wal/{region_uuid}/manifest/`.
+
+### Query Planning
+
+#### MemTable Collection
+
+The query planner collects datasets from multiple sources and assembles them for unified query execution.
+Datasets come from:
+
+1. base table (representing already-merged data)
+2. flushed MemTables (persisted but not yet merged)
+3. optionally in-memory MemTables (if accessible).
+
+Each dataset is tagged with a generation number: -1 for the base table, and positive integers for MemTable generations.
+Within a region, the generation number determines data freshness, with higher numbers representing newer data.
+Rows from different regions do not need deduplication since each primary key maps to exactly one region.
+
+The planner also collects bloom filters from each generation for staleness detection during search queries.
+
+#### Region Pruning
+
+Before executing queries, if region spec is available,
+the planner evaluates filter predicates against region specs to determine which regions may contain matching data.
 This pruning step reduces the number of regions to scan.
 
 For each filter predicate:
@@ -636,17 +658,6 @@ For example, with a region spec using `bucket(user_id, 10)` and a filter `user_i
 3. Skip all other regions
 
 Region pruning applies to both scan queries and prefilters in search queries.
-
-### Query Planning
-
-The query planner collects datasets from multiple sources and assembles them for unified query execution.
-Datasets come from the base table (representing already-merged data), flushed MemTables (persisted but not yet merged), and optionally in-memory MemTables (if accessible).
-
-Each dataset is tagged with a generation number: -1 for the base table, and positive integers for MemTable generations.
-Within a region, the generation number determines data freshness, with higher numbers representing newer data.
-Rows from different regions do not need deduplication since each primary key maps to exactly one region.
-
-The planner also collects bloom filters from each generation for staleness detection during search queries.
 
 ### Query Execution
 
@@ -670,7 +681,116 @@ Staleness filtering uses bloom filters similar to vector search.
 
 For point lookups, the planner can short-circuit by checking newest generations first and returning immediately when the key is found.
 
-For detailed query plan examples, see [Appendix 3: Query Execution Examples](#appendix-3-query-execution-examples).
+### Expected Query Plans
+
+This section provides query plan expectations using custom execution nodes optimized for MemWAL's data model.
+See [Appendix 3: Execution Nodes](#appendix-3-execution-nodes) for detailed node descriptions.
+
+All query plans assume the following MemWAL setup:
+
+```
+base_table: shared across all regions (gen -1)
+
+region_A:
+  gen 1: flushed_gen_1
+  gen 2: in_memory_memtable
+
+region_B:
+  gen 1: flushed_gen_1
+  gen 2: flushed_gen_2
+  gen 3: in_memory_memtable
+```
+
+#### Scan Queries
+
+For scan queries, the base table is scanned once and each region's MemTables are scanned separately.
+Deduplication happens per primary key across all generations.
+
+```
+DeduplicateExec: partition_by=[pk], order_by=[_gen DESC, _rowaddr DESC]
+  UnionExec
+    # Base table (shared)
+    ScanExec: base_table[gen=-1], filter=[pushed_down]
+    # Region A MemTables
+    ScanExec: region_A[gen=2], filter=[pushed_down]
+    ScanExec: region_A[gen=1], filter=[pushed_down]
+    # Region B MemTables
+    ScanExec: region_B[gen=3], filter=[pushed_down]
+    ScanExec: region_B[gen=2], filter=[pushed_down]
+    ScanExec: region_B[gen=1], filter=[pushed_down]
+```
+
+Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each scan.
+
+#### Point Lookups
+
+Primary key-based point lookups first determine the target region using the region spec, then short-circuit by checking newest generations first within that region, falling back to the base table.
+
+Bloom filters optimize point lookups by skipping generations that definitely don't contain the key:
+
+1. Check the bloom filter for each MemTable generation (newest first)
+2. If the bloom filter returns negative, skip that generation (key definitely not present)
+3. If the bloom filter returns positive, try to take last matching row of that generation
+4. If the key is found, return immediately without checking older generations
+
+```
+# After region pruning: only region_A needs to be checked
+# Bloom filters checked before each scan to skip unnecessary I/O
+CoalesceFirstExec: return_first_non_null
+  BloomFilterGuard: bf[region_A][gen=2]
+    TakeLast: region_A[gen=2], filter=[pk = target]
+  BloomFilterGuard: bf[region_A][gen=1]
+    TakeLast: region_A[gen=1], filter=[pk = target]
+  TakeLast: base_table[gen=-1], filter=[pk = target]
+```
+
+Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each lookup.
+
+#### Vector Search Queries
+
+Vector search uses bloom filters to detect stale results across all generations.
+
+```
+GlobalLimitExec: limit=k
+  SortExec: order_by=[_dist ASC]
+    FilterStaleExec: bloom_filters=[bf[region_A][gen=2], bf[region_A][gen=1], bf[region_B][gen=3], bf[region_B][gen=2], bf[region_B][gen=1]]
+      UnionExec
+        # Base table (shared)
+        KNNExec: base_table[gen=-1], k=k
+        # Region A MemTables
+        KNNExec: region_A[gen=2], k=k
+        KNNExec: region_A[gen=1], k=k
+        # Region B MemTables
+        KNNExec: region_B[gen=3], k=k
+        KNNExec: region_B[gen=2], k=k
+        KNNExec: region_B[gen=1], k=k
+```
+
+For each candidate from generation G, `FilterStaleExec` checks if the primary key exists in bloom filters of generations > G.
+If found, the candidate is filtered out because a newer version exists that was not as relevant to the query.
+
+#### Full-Text Search Queries
+
+Full-text search aggregates corpus statistics across all generations for globally-comparable BM25 scores.
+
+```
+GlobalLimitExec: limit=k
+  SortExec: order_by=[_bm25 DESC]
+    FilterStaleExec: bloom_filters=[bf[region_A][gen=2], bf[region_A][gen=1], bf[region_B][gen=3], bf[region_B][gen=2], bf[region_B][gen=1]]
+      GlobalBM25Exec                       # Aggregates stats across all generations
+        UnionExec
+          # Base table (shared)
+          FTSExec: base_table[gen=-1], query="search terms"
+          # Region A MemTables
+          FTSExec: region_A[gen=2], query="search terms"
+          FTSExec: region_A[gen=1], query="search terms"
+          # Region B MemTables
+          FTSExec: region_B[gen=3], query="search terms"
+          FTSExec: region_B[gen=2], query="search terms"
+          FTSExec: region_B[gen=1], query="search terms"
+```
+
+`GlobalBM25Exec` collects document counts and term frequencies from all FTS indexes, computes global BM25 parameters, and passes them to each `FTSExec` for comparable scoring.
 
 ## Appendices
 
@@ -792,118 +912,7 @@ The MemWAL Index is authoritative. Even though the region manifest was stale, Me
 
 4. **No progress regression**: Because MemWAL Index is updated atomically with data, concurrent mergers cannot regress the merge progress.
 
-### Appendix 3: Query Execution Examples
-
-This appendix provides query plan examples using custom execution nodes optimized for MemWAL's data model.
-See [Appendix 4: Execution Nodes](#appendix-4-execution-nodes) for detailed node descriptions.
-
-All examples assume multiple regions with datasets organized as:
-
-```
-region_A:
-  gen -1: base_table (rows with region_A's pk range)
-  gen 1: flushed_gen_1
-  gen 2: in_memory_memtable
-
-region_B:
-  gen -1: base_table (rows with region_B's pk range)
-  gen 1: flushed_gen_1
-  gen 2: flushed_gen_2
-  gen 3: in_memory_memtable
-```
-
-#### Scan Queries
-
-For scan queries, each region is processed independently since primary keys don't overlap between regions.
-
-```
-UnionExec                                  # Union results from all regions
-  # Region A
-  DeduplicateExec: partition_by=[pk], order_by=[_gen DESC, _rowaddr DESC]
-    UnionExec
-      ScanExec: region_A[gen=2], filter=[pushed_down]
-      ScanExec: region_A[gen=1], filter=[pushed_down]
-      ScanExec: region_A[gen=-1], filter=[pushed_down]
-  # Region B
-  DeduplicateExec: partition_by=[pk], order_by=[_gen DESC, _rowaddr DESC]
-    UnionExec
-      ScanExec: region_B[gen=3], filter=[pushed_down]
-      ScanExec: region_B[gen=2], filter=[pushed_down]
-      ScanExec: region_B[gen=1], filter=[pushed_down]
-      ScanExec: region_B[gen=-1], filter=[pushed_down]
-```
-
-#### Vector Search Queries
-
-Vector search uses bloom filters to detect stale results across generations within each region.
-
-```
-GlobalLimitExec: limit=k
-  SortExec: order_by=[_dist ASC]
-    UnionExec                              # Union results from all regions
-      # Region A
-      FilterStaleExec: bloom_filters=[bf[gen=2], bf[gen=1]]
-        UnionExec
-          KNNExec: region_A[gen=2], k=k*overfetch
-          KNNExec: region_A[gen=1], k=k*overfetch
-          KNNExec: region_A[gen=-1], k=k*overfetch
-      # Region B
-      FilterStaleExec: bloom_filters=[bf[gen=3], bf[gen=2], bf[gen=1]]
-        UnionExec
-          KNNExec: region_B[gen=3], k=k*overfetch
-          KNNExec: region_B[gen=2], k=k*overfetch
-          KNNExec: region_B[gen=1], k=k*overfetch
-          KNNExec: region_B[gen=-1], k=k*overfetch
-```
-
-For each candidate from generation G, `FilterStaleExec` checks if the primary key exists in bloom filters of generations > G.
-If found, the candidate is filtered out because a newer version exists that was not as relevant to the query.
-
-#### Full-Text Search Queries
-
-Full-text search aggregates corpus statistics across generations for globally-comparable BM25 scores.
-
-```
-GlobalLimitExec: limit=k
-  SortExec: order_by=[_bm25 DESC]
-    UnionExec                              # Union results from all regions
-      # Region A
-      FilterStaleExec: bloom_filters=[bf[gen=2], bf[gen=1]]
-        GlobalBM25Exec                     # Aggregates stats across region A generations
-          UnionExec
-            FTSExec: region_A[gen=2], query="search terms"
-            FTSExec: region_A[gen=1], query="search terms"
-            FTSExec: region_A[gen=-1], query="search terms"
-      # Region B
-      FilterStaleExec: bloom_filters=[bf[gen=3], bf[gen=2], bf[gen=1]]
-        GlobalBM25Exec                     # Aggregates stats across region B generations
-          UnionExec
-            FTSExec: region_B[gen=3], query="search terms"
-            FTSExec: region_B[gen=2], query="search terms"
-            FTSExec: region_B[gen=1], query="search terms"
-            FTSExec: region_B[gen=-1], query="search terms"
-```
-
-`GlobalBM25Exec` collects document counts and term frequencies from all FTS indexes within the region, computes global BM25 parameters, and passes them to each `FTSExec` for comparable scoring.
-
-#### Point Lookups
-
-Point lookups first determine the target region using the region spec, then short-circuit by checking newest generations first.
-
-```
-# After region pruning: only region_A needs to be checked
-CoalesceFirstExec: return_first_non_null
-  TakeLastExec:
-    ScanExec: region_A[gen=2], filter=[pk = target]
-  TakeLastExec:
-    ScanExec: region_A[gen=1], filter=[pk = target]
-  TakeLastExec:
-    ScanExec: region_A[gen=-1], filter=[pk = target]
-```
-
-Point lookups terminate early once the key is found.
-
-### Appendix 4: Execution Nodes
+### Appendix 3: Execution Nodes
 
 This appendix describes custom execution nodes for MemWAL query execution.
 
@@ -912,9 +921,12 @@ This appendix describes custom execution nodes for MemWAL query execution.
 Deduplicates rows by primary key, keeping the row with highest `(_gen, _rowaddr)`.
 Since each dataset has a fixed `_gen` and rows are naturally ordered by `_rowaddr`, this can be implemented as a streaming operator without full materialization.
 
-#### TakeLastExec
+#### TakeLast
 
-Takes the last row from an ordered input stream using O(1) memory.
+Efficiently finds the last matching row for a filter predicate without full scan.
+If the primary key has a btree index, directly queries the btree to get the result.
+Otherwise, scans fragments in reverse order and within each fragment takes the last matching row.
+Returns immediately upon finding a match, avoiding unnecessary I/O on earlier fragments.
 
 #### CoalesceFirstExec
 
@@ -927,3 +939,11 @@ Filters out rows that have a newer version in a higher generation.
 For each candidate with primary key `pk` from generation G, checks bloom filters of generations > G.
 If the bloom filter indicates the key may exist in a newer generation, the candidate is filtered out.
 False positives from bloom filters may cause some valid results to be filtered, but this is acceptable for search workloads where approximate results are expected.
+
+#### BloomFilterGuard
+
+Guards a child execution node with a bloom filter check.
+Given a primary key, checks the bloom filter before executing the child node.
+If the bloom filter returns negative (key definitely not present), returns empty without executing the child.
+If the bloom filter returns positive (key may be present), executes the child node normally.
+Used in point lookups to skip unnecessary scans of generations that don't contain the target key.
