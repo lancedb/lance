@@ -586,8 +586,8 @@ message MergedGeneration {
 //   merged_generation: uint64
 //   flushed_generations: list<struct<generation: uint64, path: string>>
 message MemWalIndexDetails {
-  // Snapshot timestamp (Unix timestamp in seconds).
-  int64 snapshot_timestamp = 1;
+  // Snapshot timestamp (Unix timestamp in milliseconds).
+  int64 snapshot_ts_millis = 1;
 
   // Number of regions in the snapshot.
   // Used to determine storage format without reading the snapshot data.
