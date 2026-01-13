@@ -737,11 +737,11 @@ Bloom filters optimize point lookups by skipping generations that definitely don
 # After region pruning: only region_A needs to be checked
 # Bloom filters checked before each scan to skip unnecessary I/O
 CoalesceFirstExec: return_first_non_null
-  BloomFilterGuard: bf[region_A][gen=2]
-    TakeLast: region_A[gen=2], filter=[pk = target]
-  BloomFilterGuard: bf[region_A][gen=1]
-    TakeLast: region_A[gen=1], filter=[pk = target]
-  TakeLast: base_table[gen=-1], filter=[pk = target]
+  BloomFilterGuardExec: bf[region_A][gen=2]
+    TakeLastExec: region_A[gen=2], filter=[pk = target]
+  BloomFilterGuardExec: bf[region_A][gen=1]
+    TakeLastExec: region_A[gen=1], filter=[pk = target]
+  TakeLastExec: base_table[gen=-1], filter=[pk = target]
 ```
 
 Existing Lance index optimizations (scalar indexes, fragment pruning, etc.) continue to apply within each lookup.
@@ -921,7 +921,7 @@ This appendix describes custom execution nodes for MemWAL query execution.
 Deduplicates rows by primary key, keeping the row with highest `(_gen, _rowaddr)`.
 Since each dataset has a fixed `_gen` and rows are naturally ordered by `_rowaddr`, this can be implemented as a streaming operator without full materialization.
 
-#### TakeLast
+#### TakeLastExec
 
 Efficiently finds the last matching row for a filter predicate without full scan.
 If the primary key has a btree index, directly queries the btree to get the result.
@@ -940,7 +940,7 @@ For each candidate with primary key `pk` from generation G, checks bloom filters
 If the bloom filter indicates the key may exist in a newer generation, the candidate is filtered out.
 False positives from bloom filters may cause some valid results to be filtered, but this is acceptable for search workloads where approximate results are expected.
 
-#### BloomFilterGuard
+#### BloomFilterGuardExec
 
 Guards a child execution node with a bloom filter check.
 Given a primary key, checks the bloom filter before executing the child node.
