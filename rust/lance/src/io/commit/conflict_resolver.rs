@@ -1264,16 +1264,13 @@ impl<'a> TransactionRebase<'a> {
                         .iter()
                         .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
                     {
-                        if let Ok(details) = load_mem_wal_index_details(mem_wal_idx.clone()) {
-                            self.check_merged_generations_conflict(
-                                &details.merged_generations,
-                                self_merged_generations,
-                                other_transaction,
-                                other_version,
-                            )
-                        } else {
-                            Ok(())
-                        }
+                        let details = load_mem_wal_index_details(mem_wal_idx.clone())?;
+                        self.check_merged_generations_conflict(
+                            &details.merged_generations,
+                            self_merged_generations,
+                            other_transaction,
+                            other_version,
+                        )
                     } else {
                         Ok(())
                     }
@@ -1639,7 +1636,8 @@ impl<'a> TransactionRebase<'a> {
                 let mut details = load_mem_wal_index_details(current_meta)?;
 
                 // Merge conflicting merged_generations - for each region, keep higher generation
-                for new_mg in &self.conflicting_mem_wal_merged_gens {
+                // We own self so we can consume conflicting_mem_wal_merged_gens directly
+                for new_mg in self.conflicting_mem_wal_merged_gens {
                     if let Some(existing) = details
                         .merged_generations
                         .iter_mut()
@@ -1649,7 +1647,7 @@ impl<'a> TransactionRebase<'a> {
                             existing.generation = new_mg.generation;
                         }
                     } else {
-                        details.merged_generations.push(new_mg.clone());
+                        details.merged_generations.push(new_mg);
                     }
                 }
 
