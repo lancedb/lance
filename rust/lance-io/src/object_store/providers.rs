@@ -437,7 +437,10 @@ mod tests {
         for (params, (hits, misses, active)) in cases {
             stores.push(registry.get_store(url.clone(), params).await.unwrap());
             let s = registry.stats();
-            assert_eq!((s.hits, s.misses, s.active_stores), (*hits, *misses, *active));
+            assert_eq!(
+                (s.hits, s.misses, s.active_stores),
+                (*hits, *misses, *active)
+            );
         }
 
         // Same params returns same instance

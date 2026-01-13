@@ -856,7 +856,7 @@ impl FileReader {
         &self,
         _projection: &ReaderProjection,
     ) -> Result<Vec<Arc<ColumnInfo>>> {
-        Ok(self.metadata.column_infos.to_vec())
+        Ok(self.metadata.column_infos.clone())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -47,7 +47,7 @@ impl LanceToolFileMetadata {
             .open_file(&path, &CachedFileSize::unknown())
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file_scheduler).await?;
-        let lance_tool_file_metadata = LanceToolFileMetadata { file_metadata };
+        let lance_tool_file_metadata = Self { file_metadata };
         Ok(lance_tool_file_metadata)
     }
 }

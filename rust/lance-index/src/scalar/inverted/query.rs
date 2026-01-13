@@ -794,7 +794,7 @@ pub fn collect_query_tokens(
                 continue;
             }
         }
-        tokens.push(token.text.to_owned());
+        tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }
@@ -813,7 +813,7 @@ pub fn collect_doc_tokens(
                 continue;
             }
         }
-        tokens.push(token.text.to_owned());
+        tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }
