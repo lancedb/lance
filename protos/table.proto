@@ -538,9 +538,8 @@ message RegionManifest {
   // Next generation ID to create (incremented after each MemTable flush).
   uint64 current_generation = 6;
 
-  // Last generation merged to base table.
-  // Generations <= merged_generation can be garbage collected.
-  uint64 merged_generation = 7;
+  // Field 7 removed: merged_generation moved to MemWalIndexDetails.merged_generations
+  // which is the authoritative source for merge progress.
 
   // List of flushed MemTable generations and their directory paths.
   repeated FlushedGeneration flushed_generations = 8;
@@ -562,6 +561,18 @@ message MergedGeneration {
 
   // Last generation merged to base table for this region.
   uint64 generation = 2;
+}
+
+// Tracks which merged generation a base table index has been rebuilt to cover.
+// Used to determine whether to read from flushed MemTable indexes or base table.
+message IndexCatchupProgress {
+  // Name of the base table index (must match an entry in maintained_indexes).
+  string index_name = 1;
+
+  // Per-region progress: the generation up to which this index covers.
+  // If a region is not present, the index is assumed to be fully caught up
+  // (i.e., caught_up_generation >= merged_generation for that region).
+  repeated MergedGeneration caught_up_generations = 2;
 }
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
@@ -620,6 +631,17 @@ message MemWalIndexDetails {
   // 1. merged_generations is updated by mergers (atomic with data commit)
   // 2. region snapshots are updated by background index builder
   repeated MergedGeneration merged_generations = 9;
+
+  // Per-index catchup progress tracking.
+  // When data is merged to the base table, base table indexes are rebuilt
+  // asynchronously. This field tracks which generation each index covers.
+  //
+  // For indexed queries, if an index's caught_up_generation < merged_generation,
+  // readers should use flushed MemTable indexes for the gap instead of
+  // scanning unindexed data in the base table.
+  //
+  // If an index is not present in this list, it is assumed to be fully caught up.
+  repeated IndexCatchupProgress index_catchup = 10;
 }
 
 // Region spec definition.

@@ -1,6 +1,7 @@
 # MemTable & WAL Specification (Experimental)
 
-Lance MemTable & WAL (MemWAL) specification describes a Log-Structured-Merge (LSM) tree architecture for Lance tables, enabling high-performance streaming write workloads.
+Lance MemTable & WAL (MemWAL) specification describes a Log-Structured-Merge (LSM) tree architecture for Lance tables, enabling high-performance streaming write workloads while maintaining indexed read performance for key workloads including
+scan, point lookup, vector search and full-text search.
 
 !!!note
     MemWAL requires the table to have an [unenforced primary key](index.md#unenforced-primary-key) defined.
@@ -41,6 +42,7 @@ It stores:
 
 - **Configuration**: Region specs defining how rows map to regions, and which indexes to maintain
 - **Merge progress**: Last generation merged to base table for each region
+- **Index catchup progress**: Which merged generation each base table index has been rebuilt to cover
 - **Region snapshots**: Point-in-time snapshot of all region states for read optimization
 
 The index is the source of truth for **configuration** and **merge progress**, but region state snapshots are for read-only optimization (each region's manifest is authoritative for its own state).
@@ -118,7 +120,7 @@ The manifest contains:
 
 - **Fencing state**: `writer_epoch` (writer fencing token)
 - **WAL pointers**: `replay_after_wal_id` (last entry flushed to MemTable), `wal_id_last_seen` (last entry seen at manifest update)
-- **Generation trackers**: `current_generation` (next generation to flush), `merged_generation` (last generation merged to base)
+- **Generation trackers**: `current_generation` (next generation to flush)
 - **Flushed generations**: `flushed_generations` list of generation number and directory path pairs (e.g., generation 1 at `a1b2c3d4_gen_1`)
 
 Note: `wal_id_last_seen` is a hint that may be stale since it's not updated on WAL write.
@@ -153,7 +155,7 @@ To read the latest manifest version:
 This approach uses HEAD requests instead of LIST operations in cloud storage, which is generally faster and is friendly to systems like S3 Express that do not support lexicographically sorted listing.
 
 !!!note
-    This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush, merge completion), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
+    This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
 
 All region manifest versions are stored in `_mem_wal/{region_id}/manifest` directory.
 
@@ -166,41 +168,14 @@ The region manifest is updated atomically in the following cases:
 |---------|----------------|---------|
 | [Initialization & Recovery](#initialization--recovery) | `writer_epoch` | Incremented when writer claims the region |
 | [MemTable Flush](#memtable-flush) | `replay_after_wal_id`, `wal_id_last_seen`, `current_generation`, `flushed_generations` | After flushing MemTable to storage |
-| [MemTable Merger](#merge-workflow) | `merged_generation`, `flushed_generations` | After merging a flushed MemTable; removes merged entry |
 | [MemWAL Index Builder](#memwal-index-builder) | `wal_id_last_seen` | Periodically scans WAL entries and updates hint |
+| [Garbage Collector](#garbage-collector) | `flushed_generations` | Removes entries for deleted flushed MemTables |
 
 !!!note
     WAL flush does **not** update the manifest to keep the hot write path fast.
 
 Writers use epoch-based fencing (`writer_epoch`) to ensure single-writer semantics.
 See [Writer Fencing](#writer-fencing) for details.
-
-## Storage Layout
-
-Here is a recap of the storage layout with all the files and concepts defined so far:
-
-```
-{table_path}/
-├── _indices/
-│   └── {index_uuid}/                    # MemWAL Index (uses standard index storage)
-│       └── index.lance                  # Serialized region snapshots (Lance file)
-│
-└── _mem_wal/
-    └── {region_uuid}/                   # Region directory (UUID v4)
-        ├── manifest/
-        │   ├── {bit_reversed_version}.binpb     # Serialized region manifest (bit-reversed naming)
-        │   └── version_hint.json                # Version hint file
-        ├── wal/
-        │   ├── {bit_reversed_entry_id}.lance    # WAL data files (bit-reversed naming)
-        │   └── ...
-        └── {random_hash}_gen_{i}/        # Flushed MemTable (generation i, random prefix)
-            ├── _versions/
-            │   └── {version}.manifest    # Table manifest (V2 naming scheme)
-            ├── _indices/                 # Indexes
-            │   ├── {vector_index}/
-            │   └── {scalar_index}/
-            └── bloom_filter.bin          # Primary key bloom filter
-```
 
 ## MemWAL Index Details
 
@@ -221,6 +196,11 @@ Writers read these fields to determine how to partition data and which indexes t
 **Merge progress** (`merged_generations`) tracks the last generation merged to the base table for each region.
 This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
 Each entry contains the region UUID and generation number.
+
+**Index catchup progress** (`index_catchup`) tracks which merged generation each base table index has been rebuilt to cover.
+When data is merged from a flushed MemTable to the base table, the base table's indexes are rebuilt asynchronously.
+During this window, queries should use the flushed MemTable's pre-built indexes instead of scanning unindexed data in the base table.
+See [Index Catchup and Read Path](#index-catchup-and-read-path) for details.
 
 **Region snapshot fields** (`snapshot_ts_millis`, `num_regions`, `inline_snapshots`) provide a point-in-time snapshot of region states.
 The actual region manifests remain authoritative for region state.
@@ -332,7 +312,6 @@ The schema has one column per `RegionManifest` field plus region spec columns:
 | `replay_after_wal_id` | `uint64` | Last WAL entry flushed to MemTable |
 | `wal_id_last_seen` | `uint64` | Last WAL entry seen (hint) |
 | `current_generation` | `uint64` | Next generation to flush |
-| `merged_generation` | `uint64` | Last generation merged to base |
 | `flushed_generations` | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths |
 | `region_field_{field_id}` | varies | Region field value (one column per field in region spec) |
 
@@ -356,6 +335,33 @@ This ensures distances are precise and comparable across generations.
 
 The base table vector index should not change the codebook once MemWAL is enabled.
 To switch codebooks, a migration is required: create another vector index with the new codebook, configure MemTable to maintain both indexes, and eventually drop the old index after all readers are using the new codebook and all MemTables have indexes using the new codebook.
+
+## Storage Layout
+
+Here is a recap of the storage layout with all the files and concepts defined so far:
+
+```
+{table_path}/
+├── _indices/
+│   └── {index_uuid}/                    # MemWAL Index (uses standard index storage)
+│       └── index.lance                  # Serialized region snapshots (Lance file)
+│
+└── _mem_wal/
+    └── {region_uuid}/                   # Region directory (UUID v4)
+        ├── manifest/
+        │   ├── {bit_reversed_version}.binpb     # Serialized region manifest (bit-reversed naming)
+        │   └── version_hint.json                # Version hint file
+        ├── wal/
+        │   ├── {bit_reversed_entry_id}.lance    # WAL data files (bit-reversed naming)
+        │   └── ...
+        └── {random_hash}_gen_{i}/        # Flushed MemTable (generation i, random prefix)
+            ├── _versions/
+            │   └── {version}.manifest    # Table manifest (V2 naming scheme)
+            ├── _indices/                 # Indexes
+            │   ├── {vector_index}/
+            │   └── {scalar_index}/
+            └── bloom_filter.bin          # Primary key bloom filter
+```
 
 ## Writer Expectations
 
@@ -527,16 +533,14 @@ Flushed MemTables are merged to the base table in generation order using Lance's
 
 #### Merge Workflow
 
-1. Load the MemWAL Index and read `merged_generations[region_id]`
-2. Load the region manifest and identify unmerged flushed MemTables from `flushed_generations`: those with generation numbers in range `(merged_generation, current_generation)`
+1. Read `merged_generations[region_id]`
+2. Load the region manifest and identify unmerged flushed MemTables from `flushed_generations`: those with generation numbers > `merged_generations[region_id]`
 3. For each flushed MemTable in ascending generation order:
     - Look up the directory path from `flushed_generations`
     - Open it as a Lance table
     - Execute merge-insert into the base table, atomically updating the MemWAL Index:
         - Set `merged_generations[region_id]` to this generation
     - On commit conflict, apply [conflict resolution rules](#conflict-resolution-and-concurrency)
-    - On successful commit, update the region manifest: set `merged_generation` to this generation and remove the entry from `flushed_generations`
-    - If the region manifest update fails, continue to the next generation (MemWAL Index is authoritative)
 4. After merge, the flushed MemTable and its referenced WAL files may be garbage collected (see [Garbage Collector](#garbage-collector))
 
 Ordered merge ensures correct upsert semantics: flushed MemTables with higher generation numbers overwrite those with lower numbers.
@@ -545,21 +549,14 @@ Ordered merge ensures correct upsert semantics: flushed MemTables with higher ge
 
 Multiple mergers may operate on the same region concurrently. This is safe due to:
 
-1. **Atomic MemWAL Index update**: The `merged_generations` in MemWAL Index is updated atomically with the data commit
-2. **Conflict resolution**: When a merge-insert commit encounters a version conflict, the merger reads the conflicting commit's MemWAL Index. If `merged_generations[region_id] >= my_generation`, abort without retry (data already merged or superseded). Otherwise, retry the commit as normal.
+1. **Atomic update**: `merged_generations` is updated atomically with the data commit
+2. **Conflict resolution**: When a merge-insert commit encounters a version conflict, the merger reads the conflicting commit's `merged_generations`. If `merged_generations[region_id] >= my_generation`, abort without retry (data already merged or superseded). Otherwise, retry the commit as normal.
 3. **Merge-insert idempotency**: If two mergers merge the same generation before either commits, both write identical data (primary key upsert semantics)
 
 After aborting due to a conflict, reload the MemWAL Index and region manifest, then continue to the next unmerged generation.
 
-If a merger crashes after committing to the base table but before updating the region manifest:
-
-- The MemWAL Index has `merged_generations[region_id] = N`
-- The region manifest still has `merged_generation = N-1`
-- Next merger reads MemWAL Index, sees generation N already merged, skips it
-- Region manifest is eventually updated to catch up
-
-The MemWAL Index `merged_generations` and region manifest `merged_generation` may temporarily differ.
-The MemWAL Index is authoritative for conflict resolution; the region manifest is eventually consistent and used for `flushed_generations` cleanup.
+`merged_generations` is the single source of truth for merge progress.
+If a merger crashes after committing, the next merger reads the MemWAL Index to determine which generations are already merged.
 
 For a concrete example, see [Appendix 2: Concurrent Merger Example](#appendix-2-concurrent-merger-example).
 
@@ -587,22 +584,57 @@ This process serves two purposes:
 
 The build frequency is implementation-defined. More frequent builds reduce staleness but increase I/O overhead.
 
+### Base Table Index Builder
+
+A background process rebuilds base table indexes to cover newly merged data and updates `index_catchup` progress in the MemWAL Index.
+Typically there is a dedicated builder for each index.
+
+The index builder workflow is expected to be:
+1. Rebuild the base table index to the latest state, this automatically covers all merged generations
+2. Read the current `merged_generations`
+3. Update the MemWAL Index atomically:
+    - Set `index_catchup[index_name].caught_up_generations` to match `merged_generations`
+4. On commit conflict, reload the MemWAL Index and retry
+
 ### Garbage Collector
 
-The garbage collector removes obsolete data from the region directory. This is a file-only operation that does not update the region manifest.
+The garbage collector removes obsolete data from the region directory and updates the region manifest to remove entries from `flushed_generations` for deleted flushed MemTables.
 
 Eligible for deletion:
 
-1. **Flushed MemTable directories**: Generation directories where `generation <= merged_generation`
+1. **Flushed MemTable directories**: Generation directories where `generation <= merged_generations[region_id]` AND `generation <= min(index_catchup[I].caught_up_generation)` for all maintained indexes
 2. **WAL data files**: Files referenced only by deleted generations
 3. **Old region manifest versions**: Versions older than the current version minus a retention threshold
 4. **Orphaned directories**: Directories matching `*_gen_*` pattern but not in `flushed_generations` (from failed flush attempts)
 
-**Time travel consideration**: Garbage collection must not remove generations that are reachable by any retained base table version. When a reader opens an older table version, the MemWAL Index snapshot from that version references specific `merged_generation` values. Generations that satisfy `generation > merged_generation` for any retained table version must be preserved.
+**Index catchup consideration**: Flushed MemTables must be retained until all base table indexes have caught up.
+Since flushed MemTables contain pre-built indexes, they are used for indexed queries when the base table index has not yet been rebuilt to cover the merged data.
+Only after all indexes in `maintained_indexes` have `caught_up_generation >= generation` can a flushed MemTable be safely deleted.
+
+**Time travel consideration**: Garbage collection must not remove generations that are reachable by any retained base table version. When a reader opens an older table version, the MemWAL Index snapshot from that version references specific `merged_generations` values. Generations that satisfy `generation > merged_generations[region_id]` for any retained table version must be preserved.
 
 Garbage collection must verify that no flushed MemTable still references a WAL file before deletion.
 
 ## Reader Expectations
+
+### LSM Tree Merging Read
+
+Readers **MUST** merge results from multiple data sources (base table, flushed MemTables, in-memory MemTables) by primary key to ensure correctness.
+
+When the same primary key exists in multiple sources, the reader must keep only the newest version based on:
+
+1. **Generation number** (`_gen`): Higher generation wins. The base table has generation -1, flushed MemTables have positive integers starting from 1.
+2. **Row address** (`_rowaddr`): Within the same generation, higher row address wins (later writes within a batch overwrite earlier ones).
+
+The ordering for "newest" is: highest `_gen` first, then highest `_rowaddr`.
+
+This deduplication is essential because:
+
+- A row updated in a MemTable also exists (with older data) in the base table
+- A flushed MemTable that has been merged to the base table may not yet be garbage collected, causing the same row to appear in both
+- A single write batch may contain multiple updates to the same primary key
+
+Without proper merging, queries would return duplicate or stale rows.
 
 ### Reader Consistency
 
@@ -614,13 +646,12 @@ Reader consistency depends on two factors:
 Strong consistency requires access to in-memory MemTables for all regions involved in the query and reading region manifests directly.
 Otherwise, the query is eventually consistent due to missing unflushed data or stale MemWAL Index snapshots.
 
-Reading a stale MemWAL Index does not impact correctness, only freshness:
-
-- **Merged MemTable**: If a flushed MemTable has been merged to the base table but not yet garbage collected, readers query both. Deduplication by primary key ensures correct results since both contain the same data. If the MemTable has been garbage collected, readers fail to open it, which is also safe because the data already exists in the base table.
-- **Stale snapshot**: The snapshot may not reflect the latest region manifest state. Flushed MemTables added after the snapshot was built are not queried. The result is eventually consistent but correct for the snapshot's point in time.
-
-The `snapshot_ts_millis` field indicates when the index was built; readers can use this to estimate staleness and decide whether to refresh.
-For stronger consistency, readers may load individual region manifests directly from `_mem_wal/{region_uuid}/manifest/`.
+!!!note
+    Reading a stale MemWAL Index does not impact correctness, only freshness:
+    
+    - **Merged MemTable still in index**: If a flushed MemTable has been merged to the base table but still shows in the MemWAL index, readers query both. This results in some inefficiency for querying the same data twice, but [LSM-tree merging](#lsm-tree-merging-read) ensures correct results since both contain the same data. The inefficiency is also compensated by the fact that the data is covered by index and we rarely end up scanning both data.
+    - **Garbage collected MemTable still in index**: If a flushed MemTable has been garbage collected, but is still in the MemWAL index, readers would fail to open it and skip it. This is also safe because if it is garbage collected, the data must already exist in the base table.
+    - **Newly flushed MemTable not in index**: If a newly flushed MemTable is added after the snapshot was built, it is not queried. The result is eventually consistent but correct for the snapshot's point in time.
 
 ### Query Planning
 
@@ -658,6 +689,41 @@ For example, with a region spec using `bucket(user_id, 10)` and a filter `user_i
 3. Skip all other regions
 
 Region pruning applies to both scan queries and prefilters in search queries.
+
+#### Indexed Read
+
+When data is merged from a flushed MemTable to the base table, the base table's indexes are rebuilt asynchronously by the [base table index builders](#base-table-index-builder).
+During this window, the merged data exists in the base table but is not yet covered by the base table's indexes.
+
+Without special handling, indexed queries would fall back to expensive full scans for the unindexed part of the base table.
+To maintain indexed read performance, the query planner should use `index_catchup` progress to determine the optimal data source for each query:
+
+```
+For indexed query on region R using index I:
+  merged_gen = merged_generations[R]
+  index_gen = index_catchup[I].caught_up_generations[R]  # defaults to merged_gen if absent
+
+  if index_gen >= merged_gen:
+    # Base table index is caught up - optimal path
+    base_table.indexed_query(I)
+    memtable.query(gen > merged_gen)
+  else:
+    # Base table index is behind - use flushed MemTable indexes for the gap
+    base_table.indexed_query(I)                           # covers data up to index_gen
+    flushed_memtable.indexed_query(gen in (index_gen, merged_gen])  # uses pre-built indexes
+    memtable.query(gen > merged_gen)
+```
+
+Since flushed MemTables contain pre-built indexes (created during [MemTable flush](#memtable-flush)), queries can use these indexes instead of scanning unindexed data in the base table.
+This ensures all reads remain indexed regardless of how far behind the async index builder is.
+
+The key insight is that flushed MemTables serve as a bridge between the base table's index catchup and the current merged state.
+When `index_gen < merged_gen`, the generations in the gap `(index_gen, merged_gen]` have data in the base table but are not covered by the base table's indexes.
+Instead of falling back to a full scan for this gap, the query planner uses the flushed MemTable indexes which were pre-built during flush.
+This maintains indexed query performance even during periods of heavy write activity where async index rebuilding falls behind.
+
+See [Appendix 4: Index Catchup Example](#appendix-4-index-catchup-example) for a detailed timeline showing how this works in practice.
+
 
 ### Query Execution
 
@@ -857,7 +923,6 @@ MemWAL Index:
   merged_generations: {region: 5}
 
 Region manifest (version 1):
-  merged_generation: 5
   current_generation: 8
   flushed_generations: [(6, "abc123_gen_6"), (7, "def456_gen_7")]
 ```
@@ -866,51 +931,45 @@ Region manifest (version 1):
 
 Two mergers both try to merge generation 6 concurrently.
 
-| Step | Merger A | Merger B | MemWAL Index | Region Manifest |
-|------|----------|----------|--------------|-----------------|
-| 1 | Reads index: merged_gen=5 | | merged_gen=5 | merged_gen=5 |
-| 2 | Reads region manifest | | | |
-| 3 | Starts merging gen 6 | | | |
-| 4 | | Reads index: merged_gen=5 | merged_gen=5 | merged_gen=5 |
-| 5 | | Reads region manifest | | |
-| 6 | | Starts merging gen 6 | | |
-| 7 | Commits (merged_gen=6) | | **merged_gen=6** | merged_gen=5 |
-| 8 | | Tries to commit | | |
-| 9 | | **Conflict**: reads new index | | |
-| 10 | | Sees merged_gen=6 >= 6, aborts | | |
-| 11 | Updates region manifest | | merged_gen=6 | **merged_gen=6** |
-| 12 | | Reloads, continues to gen 7 | | |
+| Step | Merger A | Merger B | MemWAL Index |
+|------|----------|----------|--------------|
+| 1 | Reads index: merged_gen=5 | | merged_gen=5 |
+| 2 | Reads region manifest | | |
+| 3 | Starts merging gen 6 | | |
+| 4 | | Reads index: merged_gen=5 | merged_gen=5 |
+| 5 | | Reads region manifest | |
+| 6 | | Starts merging gen 6 | |
+| 7 | Commits (merged_gen=6) | | **merged_gen=6** |
+| 8 | | Tries to commit | |
+| 9 | | **Conflict**: reads new index | |
+| 10 | | Sees merged_gen=6 >= 6, aborts | |
+| 11 | | Reloads, continues to gen 7 | |
 
 Merger B's conflict resolution detected that generation 6 was already merged by checking the MemWAL Index in the conflicting commit.
 
 #### Scenario 2: Crash After Table Commit
 
-Merger A crashes after committing to the table but before updating the region manifest.
+Merger A crashes after committing to the table.
 
-| Step | Merger A | Merger B | MemWAL Index | Region Manifest |
-|------|----------|----------|--------------|-----------------|
-| 1 | Reads index: merged_gen=5 | | merged_gen=5 | merged_gen=5 |
-| 2 | Merges gen 6, commits | | **merged_gen=6** | merged_gen=5 |
-| 3 | **CRASH** before region update | | merged_gen=6 | merged_gen=5 |
-| 4 | | Reads index: merged_gen=6 | merged_gen=6 | merged_gen=5 |
-| 5 | | Reads region manifest | | |
-| 6 | | Region says gen 6 unmerged... | | |
-| 7 | | But index says merged_gen=6 | | |
-| 8 | | **Skips gen 6** (index authoritative) | | |
-| 9 | | Merges gen 7, commits | | **merged_gen=7** |
-| 10 | | Updates region manifest | | **merged_gen=7** |
+| Step | Merger A | Merger B | MemWAL Index |
+|------|----------|----------|--------------|
+| 1 | Reads index: merged_gen=5 | | merged_gen=5 |
+| 2 | Merges gen 6, commits | | **merged_gen=6** |
+| 3 | **CRASH** | | merged_gen=6 |
+| 4 | | Reads index: merged_gen=6 | merged_gen=6 |
+| 5 | | Reads region manifest | |
+| 6 | | **Skips gen 6** (already merged) | |
+| 7 | | Merges gen 7, commits | **merged_gen=7** |
 
-The MemWAL Index is authoritative. Even though the region manifest was stale, Merger B correctly used the MemWAL Index to determine that generation 6 was already merged.
+The MemWAL Index is the single source of truth. Merger B correctly used it to determine that generation 6 was already merged.
 
 #### Key Points
 
-1. **MemWAL Index is authoritative**: The `merged_generations` in MemWAL Index is the source of truth for merge progress, updated atomically with data.
+1. **Single source of truth**: `merged_generations` is the authoritative source for merge progress, updated atomically with data.
 
-2. **Region manifest is eventually consistent**: It may lag behind MemWAL Index after crashes, but is eventually updated by subsequent mergers.
+2. **Conflict resolution uses MemWAL Index**: When a commit conflicts, the merger checks the conflicting commit's MemWAL Index.
 
-3. **Conflict resolution uses MemWAL Index**: When a commit conflicts, the merger checks the conflicting commit's MemWAL Index, not the region manifest.
-
-4. **No progress regression**: Because MemWAL Index is updated atomically with data, concurrent mergers cannot regress the merge progress.
+3. **No progress regression**: Because MemWAL Index is updated atomically with data, concurrent mergers cannot regress the merge progress.
 
 ### Appendix 3: Execution Nodes
 
@@ -947,3 +1006,51 @@ Given a primary key, checks the bloom filter before executing the child node.
 If the bloom filter returns negative (key definitely not present), returns empty without executing the child.
 If the bloom filter returns positive (key may be present), executes the child node normally.
 Used in point lookups to skip unnecessary scans of generations that don't contain the target key.
+
+### Appendix 4: Index Catchup Example
+
+This example demonstrates how `index_catchup` enables indexed reads during async index rebuilding.
+
+#### Scenario Setup
+
+```
+Generation:         1       2       3       4       5       6
+                    |       |       |       |       |       |
+State:           merged  merged  merged  merged flushed  active
+                    |       |       |       |       |       |
+Base IVF index:  [-- covers 1-3 --]
+                                    ↑               ↑       ↑
+                              index_gen=3    merged_gen=4   |
+                                                    current_gen=6
+```
+
+In this example:
+
+- **Generations 1-4** have been merged to the base table (`merged_gen=4`)
+- **Base IVF index** has only been rebuilt to cover generations 1-3 (`index_gen=3`)
+- **Generation 4** is in the base table but NOT covered by the base IVF index
+- **Generation 5** is flushed to disk (not yet merged to base table)
+- **Generation 6** is the active in-memory MemTable
+
+#### Read Strategy for Vector Search
+
+Without `index_catchup` tracking, the query planner would need to perform an expensive full scan on the base table for generation 4.
+With `index_catchup`, the planner knows exactly which data is indexed and can use flushed MemTable indexes for the gap:
+
+| Data Source | Generations | Strategy |
+|-------------|-------------|----------|
+| Base table with IVF index | 1-3 | Use base table's IVF index |
+| Flushed MemTable gen 4 | 4 | Use flushed MemTable's IVF index |
+| Flushed MemTable gen 5 | 5 | Use flushed MemTable's IVF index |
+| Active MemTable | 6 | Use in-memory IVF index |
+
+All data sources provide indexed access, maintaining query performance during async index rebuild.
+
+#### Why Flushed MemTables Are Retained
+
+Flushed MemTable files are not garbage collected until:
+
+1. Their data has been merged to the base table (`gen <= merged_gen`)
+2. All maintained indexes have caught up (`gen <= index_gen` for all indexes)
+
+This ensures flushed MemTable indexes remain available to bridge the gap between `index_gen` and `merged_gen`.

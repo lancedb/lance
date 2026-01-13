@@ -91,6 +91,60 @@ impl TryFrom<pb::MergedGeneration> for MergedGeneration {
     }
 }
 
+/// Tracks which merged generation a base table index has been rebuilt to cover.
+/// Used to determine whether to read from flushed MemTable indexes or base table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct IndexCatchupProgress {
+    pub index_name: String,
+    pub caught_up_generations: Vec<MergedGeneration>,
+}
+
+impl IndexCatchupProgress {
+    pub fn new(index_name: String, caught_up_generations: Vec<MergedGeneration>) -> Self {
+        Self {
+            index_name,
+            caught_up_generations,
+        }
+    }
+
+    /// Get the caught up generation for a specific region.
+    /// Returns None if the region is not present (assumed fully caught up).
+    pub fn caught_up_generation_for_region(&self, region_id: &Uuid) -> Option<u64> {
+        self.caught_up_generations
+            .iter()
+            .find(|mg| &mg.region_id == region_id)
+            .map(|mg| mg.generation)
+    }
+}
+
+impl From<&IndexCatchupProgress> for pb::IndexCatchupProgress {
+    fn from(icp: &IndexCatchupProgress) -> Self {
+        Self {
+            index_name: icp.index_name.clone(),
+            caught_up_generations: icp
+                .caught_up_generations
+                .iter()
+                .map(|mg| mg.into())
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
+    type Error = Error;
+
+    fn try_from(icp: pb::IndexCatchupProgress) -> lance_core::Result<Self> {
+        Ok(Self {
+            index_name: icp.index_name,
+            caught_up_generations: icp
+                .caught_up_generations
+                .into_iter()
+                .map(MergedGeneration::try_from)
+                .collect::<lance_core::Result<_>>()?,
+        })
+    }
+}
+
 /// Region manifest containing epoch-based fencing and WAL state.
 /// Each region has exactly one active writer at any time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +156,6 @@ pub struct RegionManifest {
     pub replay_after_wal_id: u64,
     pub wal_id_last_seen: u64,
     pub current_generation: u64,
-    pub merged_generation: u64,
     pub flushed_generations: Vec<FlushedGeneration>,
 }
 
@@ -122,7 +175,6 @@ impl From<&RegionManifest> for pb::RegionManifest {
             replay_after_wal_id: rm.replay_after_wal_id,
             wal_id_last_seen: rm.wal_id_last_seen,
             current_generation: rm.current_generation,
-            merged_generation: rm.merged_generation,
             flushed_generations: rm.flushed_generations.iter().map(|fg| fg.into()).collect(),
         }
     }
@@ -143,7 +195,6 @@ impl TryFrom<pb::RegionManifest> for RegionManifest {
             replay_after_wal_id: rm.replay_after_wal_id,
             wal_id_last_seen: rm.wal_id_last_seen,
             current_generation: rm.current_generation,
-            merged_generation: rm.merged_generation,
             flushed_generations: rm
                 .flushed_generations
                 .into_iter()
@@ -224,6 +275,7 @@ pub struct MemWalIndexDetails {
     pub region_specs: Vec<RegionSpec>,
     pub maintained_indexes: Vec<String>,
     pub merged_generations: Vec<MergedGeneration>,
+    pub index_catchup: Vec<IndexCatchupProgress>,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -239,6 +291,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .iter()
                 .map(|mg| mg.into())
                 .collect(),
+            index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
         }
     }
 }
@@ -262,6 +315,11 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .into_iter()
                 .map(MergedGeneration::try_from)
                 .collect::<lance_core::Result<_>>()?,
+            index_catchup: details
+                .index_catchup
+                .into_iter()
+                .map(IndexCatchupProgress::try_from)
+                .collect::<lance_core::Result<_>>()?,
         })
     }
 }
@@ -284,6 +342,26 @@ impl MemWalIndex {
             .find(|mg| &mg.region_id == region_id)
             .map(|mg| mg.generation)
     }
+
+    /// Get the caught up generation for a specific index and region.
+    /// Returns None if the index is not tracked (assumed fully caught up).
+    pub fn index_caught_up_generation(&self, index_name: &str, region_id: &Uuid) -> Option<u64> {
+        self.details
+            .index_catchup
+            .iter()
+            .find(|icp| icp.index_name == index_name)
+            .and_then(|icp| icp.caught_up_generation_for_region(region_id))
+    }
+
+    /// Check if an index is fully caught up for a region.
+    /// Returns true if the index covers all merged data for the region.
+    pub fn is_index_caught_up(&self, index_name: &str, region_id: &Uuid) -> bool {
+        let merged_gen = self.merged_generation_for_region(region_id).unwrap_or(0);
+        let caught_up_gen = self.index_caught_up_generation(index_name, region_id);
+
+        // If not tracked in index_catchup, assumed fully caught up
+        caught_up_gen.is_none_or(|gen| gen >= merged_gen)
+    }
 }
 
 #[derive(Serialize)]
@@ -292,6 +370,7 @@ struct MemWalStatistics {
     num_merged_generations: usize,
     num_region_specs: usize,
     num_maintained_indexes: usize,
+    num_index_catchup_entries: usize,
 }
 
 #[async_trait]
@@ -317,6 +396,7 @@ impl Index for MemWalIndex {
             num_merged_generations: self.details.merged_generations.len(),
             num_region_specs: self.details.region_specs.len(),
             num_maintained_indexes: self.details.maintained_indexes.len(),
+            num_index_catchup_entries: self.details.index_catchup.len(),
         };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
             message: format!("failed to serialize MemWAL index statistics: {}", e),
