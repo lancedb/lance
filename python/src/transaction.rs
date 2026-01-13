@@ -229,7 +229,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    mem_wal_to_merge: None,
+                    merged_generations: vec![],
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
