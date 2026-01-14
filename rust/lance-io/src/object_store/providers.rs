@@ -3,7 +3,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock, Weak,
+    },
 };
 
 use object_store::path::Path;
@@ -67,6 +70,17 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     }
 }
 
+/// Statistics for the object store registry cache.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectStoreRegistryStats {
+    /// Number of cache hits (store was already cached and reused).
+    pub hits: u64,
+    /// Number of cache misses (new store had to be created).
+    pub misses: u64,
+    /// Number of currently active object stores in the cache.
+    pub active_stores: usize,
+}
+
 /// A registry of object store providers.
 ///
 /// Use [`Self::default()`] to create one with the available default providers.
@@ -93,6 +107,9 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    // Cache statistics
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl ObjectStoreRegistry {
@@ -104,6 +121,8 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -147,6 +166,24 @@ impl ObjectStoreRegistry {
         output
     }
 
+    /// Get cache statistics for monitoring and debugging.
+    ///
+    /// Returns the number of cache hits, misses, and currently active stores.
+    /// This is useful for detecting configuration issues that cause excessive
+    /// cache misses (e.g., storage options that vary per-request).
+    pub fn stats(&self) -> ObjectStoreRegistryStats {
+        let active_stores = self
+            .active_stores
+            .read()
+            .map(|s| s.values().filter(|w| w.strong_count() > 0).count())
+            .unwrap_or(0);
+        ObjectStoreRegistryStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            active_stores,
+        }
+    }
+
     fn scheme_not_found_error(&self, scheme: &str) -> Error {
         let mut message = format!("No object store provider found for scheme: '{}'", scheme);
         if let Ok(providers) = self.providers.read() {
@@ -186,6 +223,7 @@ impl ObjectStoreRegistry {
                 .cloned();
             if let Some(store) = maybe_store {
                 if let Some(store) = store.upgrade() {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(store);
                 } else {
                     // Remove the weak reference if it is no longer valid
@@ -202,6 +240,8 @@ impl ObjectStoreRegistry {
                 }
             }
         }
+
+        self.misses.fetch_add(1, Ordering::Relaxed);
 
         let mut store = provider.new_store(base_path, params).await?;
 
@@ -279,6 +319,8 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 }
@@ -296,6 +338,8 @@ impl ObjectStoreRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[derive(Debug)]
@@ -369,5 +413,37 @@ mod tests {
                 .calculate_object_store_prefix("dummy://mybucket/my/long/path", None)
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_stats_hit_miss_tracking() {
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+
+        let params1 = ObjectStoreParams::default();
+        let params2 = ObjectStoreParams {
+            storage_options: Some(HashMap::from([("k".into(), "v".into())])),
+            ..Default::default()
+        };
+
+        // (hits, misses, active)
+        let cases: &[(&ObjectStoreParams, (u64, u64, usize))] = &[
+            (&params1, (0, 1, 1)), // miss: new params
+            (&params1, (1, 1, 1)), // hit: same params
+            (&params2, (1, 2, 2)), // miss: different storage_options
+        ];
+
+        let mut stores = vec![]; // retain the stores
+        for (params, (hits, misses, active)) in cases {
+            stores.push(registry.get_store(url.clone(), params).await.unwrap());
+            let s = registry.stats();
+            assert_eq!(
+                (s.hits, s.misses, s.active_stores),
+                (*hits, *misses, *active)
+            );
+        }
+
+        // Same params returns same instance
+        assert!(Arc::ptr_eq(&stores[0], &stores[1]));
     }
 }

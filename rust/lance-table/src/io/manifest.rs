@@ -57,13 +57,15 @@ pub async fn read_manifest(
     }
 
     if buf.len() < 16 {
-        return Err(Error::io(
+        return Err(Error::corrupt_file(
+            path.clone(),
             "Invalid format: file size is smaller than 16 bytes".to_string(),
             location!(),
         ));
     }
     if !buf.ends_with(MAGIC) {
-        return Err(Error::io(
+        return Err(Error::corrupt_file(
+            path.clone(),
             "Invalid format: magic number does not match".to_string(),
             location!(),
         ));
@@ -98,7 +100,7 @@ pub async fn read_manifest(
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::io(
+        return Err(Error::invalid_input(
             format!(
                 "Invalid format: manifest length does not match. Expected {}, got {}",
                 recorded_length,
@@ -206,7 +208,7 @@ pub async fn write_manifest(
                         encoder.encode(&[value_arr]).await?
                     }
                     _ => {
-                        return Err(Error::io(
+                        return Err(Error::schema(
                             format!(
                                 "Does not support {} as dictionary value type",
                                 value_arr.data_type()

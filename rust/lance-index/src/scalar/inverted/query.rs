@@ -71,16 +71,11 @@ impl Default for FtsSearchParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Operator {
     And,
+    #[default]
     Or,
-}
-
-impl Default for Operator {
-    fn default() -> Self {
-        Self::Or
-    }
 }
 
 impl TryFrom<&str> for Operator {
@@ -799,7 +794,7 @@ pub fn collect_query_tokens(
                 continue;
             }
         }
-        tokens.push(token.text.to_owned());
+        tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }
@@ -818,7 +813,7 @@ pub fn collect_doc_tokens(
                 continue;
             }
         }
-        tokens.push(token.text.to_owned());
+        tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }

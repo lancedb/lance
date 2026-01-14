@@ -45,7 +45,13 @@ impl From<&pb::Field> for Field {
             nullable: field.nullable,
             children: vec![],
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
-            unenforced_primary_key: field.unenforced_primary_key,
+            unenforced_primary_key_position: if field.unenforced_primary_key_position > 0 {
+                Some(field.unenforced_primary_key_position)
+            } else if field.unenforced_primary_key {
+                Some(0)
+            } else {
+                None
+            },
         }
     }
 }
@@ -77,7 +83,8 @@ impl From<&Field> for pb::Field {
                 .map(|name| name.to_owned())
                 .unwrap_or_default(),
             r#type: 0,
-            unenforced_primary_key: field.unenforced_primary_key,
+            unenforced_primary_key: field.unenforced_primary_key_position.is_some(),
+            unenforced_primary_key_position: field.unenforced_primary_key_position.unwrap_or(0),
         }
     }
 }

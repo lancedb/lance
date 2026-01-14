@@ -97,7 +97,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::io(
+                Error::invalid_input(
                     "uuid field does not exist in Index metadata".to_string(),
                     location!(),
                 )

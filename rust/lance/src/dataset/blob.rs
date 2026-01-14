@@ -480,10 +480,10 @@ impl BlobFile {
                 *cursor = new_cursor;
                 Ok(data)
             }
-            ReaderState::Closed => Err(Error::IO {
-                location: location!(),
-                source: "Blob file is already closed".into(),
-            }),
+            ReaderState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+                location!(),
+            )),
             _ => unreachable!(),
         }
     }
@@ -529,10 +529,10 @@ impl BlobFile {
                 *cursor = new_cursor;
                 Ok(())
             }
-            ReaderState::Closed => Err(Error::IO {
-                location: location!(),
-                source: "Blob file is already closed".into(),
-            }),
+            ReaderState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+                location!(),
+            )),
             ReaderState::Uninitialized(cursor) => {
                 *cursor = new_cursor;
                 Ok(())
@@ -545,10 +545,10 @@ impl BlobFile {
         let reader = self.reader.lock().await;
         match *reader {
             ReaderState::Open((cursor, _)) => Ok(cursor),
-            ReaderState::Closed => Err(Error::IO {
-                location: location!(),
-                source: "Blob file is already closed".into(),
-            }),
+            ReaderState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+                location!(),
+            )),
             ReaderState::Uninitialized(cursor) => Ok(cursor),
         }
     }

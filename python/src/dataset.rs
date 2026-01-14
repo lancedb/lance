@@ -347,11 +347,14 @@ pub fn transforms_from_python(
                 let result = udf_obj
                     .call_method1(py, "_call", (py_batch,))
                     .map_err(|err| {
-                        lance::Error::io(format_python_error(err, py).unwrap(), location!())
+                        lance::Error::invalid_input(
+                            format_python_error(err, py).unwrap(),
+                            location!(),
+                        )
                     })?;
                 let result_batch: PyArrowType<RecordBatch> = result
                     .extract(py)
-                    .map_err(|err| lance::Error::io(err.to_string(), location!()))?;
+                    .map_err(|err| lance::Error::invalid_input(err.to_string(), location!()))?;
                 Ok(result_batch.0)
             })
         };
@@ -1551,6 +1554,15 @@ impl Dataset {
         Ok(())
     }
 
+    /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
+    fn truncate_table(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.truncate_table())?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     /// Cleanup old versions from the dataset
     #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
@@ -1822,7 +1834,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
-            "INVERTED" => IndexType::Inverted,
+            "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -1879,7 +1891,7 @@ impl Dataset {
                     params: Some(config.config.clone()),
                 })
             }
-            "INVERTED" => {
+            "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
@@ -2031,7 +2043,7 @@ impl Dataset {
                 index_type_up
             );
             match index_type_up.as_str() {
-                "INVERTED" => {
+                "INVERTED" | "FTS" => {
                     // Call merge_index_files function for inverted index
                     lance_index::scalar::inverted::builder::merge_index_files(
                         self.ds.object_store(),
@@ -3398,7 +3410,7 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::io(
+            lance::Error::invalid_input(
                 format!("Failed to call begin() on WriteFragmentProgress: {}", e),
                 location!(),
             )
@@ -3415,7 +3427,7 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::io(
+            lance::Error::invalid_input(
                 format!("Failed to call complete() on WriteFragmentProgress: {}", e),
                 location!(),
             )
@@ -3459,7 +3471,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(batch.map(|b| b.0))
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3475,7 +3487,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(fragment)
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3483,7 +3495,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         fragment_data
             .map(|data| {
                 serde_json::from_str(&data).map_err(|err| {
-                    lance::Error::io(
+                    lance_core::Error::invalid_input(
                         format!("Failed to deserialize fragment data: {}", err),
                         location!(),
                     )
@@ -3500,7 +3512,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3520,7 +3532,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!(
                     "Failed to call insert_fragment() on UDFCheckpointer: {}",
                     err

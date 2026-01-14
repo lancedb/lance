@@ -375,3 +375,37 @@ async fn test_max_fragment_id_migration() {
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
     }
 }
+
+/// Regression test for issue #5702: project_by_schema should reorder fields inside List<Struct>.
+///
+/// This test reads a dataset with:
+/// - Fragment 0: List<Struct<a, b, c>> with all fields + "extra" column
+/// - Fragment 1: List<Struct<c, b>> with reordered/missing inner struct fields
+///
+/// Before the fix, reading would fail with:
+/// "Incorrect datatype for StructArray field expected List(Struct(...)) got List(Struct(...))"
+#[tokio::test]
+async fn test_list_struct_field_reorder_issue_5702() {
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance")
+        .expect("Failed to copy test data");
+    let test_uri = test_dir.path_str();
+
+    let dataset = Dataset::open(&test_uri)
+        .await
+        .expect("Failed to open dataset");
+
+    // Verify we have 2 fragments
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // This read would fail before the fix for #5702
+    let batches = scan_dataset(&test_uri)
+        .await
+        .expect("Failed to scan dataset");
+    let batch = concat_batches(&batches[0].schema(), batches.iter()).expect("Failed to concat");
+
+    // Verify we got all 4 rows
+    assert_eq!(batch.num_rows(), 4);
+
+    // Verify schema has expected columns
+    assert_eq!(batch.schema().fields().len(), 3); // id, data, extra
+}

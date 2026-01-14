@@ -91,6 +91,10 @@ impl LogicalType {
         self.0 == "large_list" || self.0 == "large_list.struct"
     }
 
+    fn is_fixed_size_list_struct(&self) -> bool {
+        self.0.starts_with("fixed_size_list:struct:")
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }

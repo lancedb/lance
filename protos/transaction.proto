@@ -235,8 +235,8 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// The MemWAL (pre-image) that should be marked as merged after this transaction
-    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// List of MemWAL region generations to mark as merged after this transaction
+    repeated MergedGeneration merged_generations = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
     repeated uint32 fields_for_preserving_frag_bitmap = 6;
@@ -305,15 +305,12 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
-  // Update the state of the MemWal index
+  // Update the merged generations in MemWAL index.
+  // This operation is used during merge-insert to atomically record which
+  // generations have been merged to the base table.
   message UpdateMemWalState {
-
-    repeated MemWalIndexDetails.MemWal added = 1;
-
-    repeated MemWalIndexDetails.MemWal updated = 2;
-
-    // If a MemWAL is updated, its pre-image should be in the removed list.
-    repeated MemWalIndexDetails.MemWal removed = 3;
+    // Regions and generations being marked as merged.
+    repeated MergedGeneration merged_generations = 1;
   }
 
   // An operation that updates base paths in the dataset.

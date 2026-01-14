@@ -21,6 +21,7 @@ import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
+import org.lance.index.OptimizeOptions;
 import org.lance.io.StorageOptionsProvider;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
@@ -655,6 +656,19 @@ public class Dataset implements Closeable {
   private native void nativeDelete(String predicate);
 
   /**
+   * Truncate the dataset by deleting all rows. The schema is preserved and a new version is
+   * created.
+   */
+  public void truncateTable() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeTruncateTable();
+    }
+  }
+
+  private native void nativeTruncateTable();
+
+  /**
    * Gets the URI of the dataset.
    *
    * @return the URI of the dataset
@@ -975,6 +989,21 @@ public class Dataset implements Closeable {
   }
 
   private native Transaction nativeReadTransaction();
+
+  /**
+   * Optimize index metadata and segments for this dataset.
+   *
+   * @param options options controlling index optimization behavior
+   */
+  public void optimizeIndices(OptimizeOptions options) {
+    Preconditions.checkNotNull(options);
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeOptimizeIndices(options);
+    }
+  }
+
+  private native void nativeOptimizeIndices(OptimizeOptions options);
 
   /**
    * @return all the created indexes names

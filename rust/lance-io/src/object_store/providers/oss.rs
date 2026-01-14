@@ -70,6 +70,10 @@ impl ObjectStoreProvider for OssStoreProvider {
             config_map.insert("region".to_string(), region.clone());
         }
 
+        if let Some(security_token) = storage_options.0.get("oss_security_token") {
+            config_map.insert("security_token".to_string(), security_token.clone());
+        }
+
         if !config_map.contains_key("endpoint") {
             return Err(Error::invalid_input(
                 "OSS endpoint is required. Please provide 'oss_endpoint' in storage options or set OSS_ENDPOINT environment variable",

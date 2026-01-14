@@ -25,7 +25,7 @@ a monotonically increasing version number, and an optional reference to the inde
 
 ## Schema & Fields
 
-The schema of the table is written as a series of fields, plus a schema metadata map. 
+The schema of the table is written as a series of fields, plus a schema metadata map.
 The data types generally have a 1-1 correspondence with the Apache Arrow data types.
 Each field, including nested fields, have a unique integer id. At initial table creation time, fields are assigned ids in depth-first order.
 Afterwards, field IDs are assigned incrementally for newly added fields.
@@ -41,6 +41,31 @@ See [File Format Encoding Specification](../file/encoding.md) for details on ava
 ```
 
 </details>
+
+### Unenforced Primary Key
+
+Lance supports defining an unenforced primary key through field metadata.
+This is useful for deduplication during merge-insert operations and other use cases that benefit from logical row identity.
+The primary key is "unenforced" meaning Lance does not always validate uniqueness constraints.
+Users can use specific workloads like merge-insert to enforce it if necessary.
+The primary key is fixed after initial setting and must not be updated or removed.
+
+A primary key field must satisfy:
+
+- The field, and all its ancestors, must not be nullable.
+- The field must be a leaf field (primitive data type without children).
+- The field must not be within a list or map type.
+
+When using an Arrow schema to create a Lance table, add the following metadata to the Arrow field to mark it as part of the primary key:
+
+- `lance-schema:unenforced-primary-key`: Set to `true`, `1`, or `yes` (case-insensitive) to indicate the field is part of the primary key.
+- `lance-schema:unenforced-primary-key:position` (optional): A 1-based integer specifying the position within a composite primary key.
+
+For composite primary keys with multiple columns, the position determines the primary key field ordering:
+
+- When positions are specified, fields are ordered by their position values (1, 2, 3, ...).
+- When positions are not specified, fields are ordered by their schema field id.
+- Fields with explicit positions are ordered before fields without.
 
 ## Fragments
 
