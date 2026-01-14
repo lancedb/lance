@@ -53,7 +53,10 @@ impl HashJoiner {
         .await
         .unwrap()?;
         if batches.is_empty() {
-            return Err(Error::io("HashJoiner: No data".to_string(), location!()));
+            return Err(Error::invalid_input(
+                "HashJoiner: No data".to_string(),
+                location!(),
+            ));
         };
 
         let map = DashMap::new();
@@ -95,7 +98,10 @@ impl HashJoiner {
                     match task_result {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
+                        Err(err) => Err(Error::invalid_input(
+                            format!("HashJoiner: {}", err),
+                            location!(),
+                        )),
                     }
                 }
             })
@@ -175,7 +181,7 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::io(
+                            .map_err(|err| Error::invalid_input(
                                 format!("HashJoiner: {}", err),
                                 location!(),
                             ))
@@ -258,8 +264,9 @@ impl HashJoiner {
                 async move {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-                        interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::io(format!("HashJoiner: {}", err), location!()))
+                        interleave(array_refs.as_ref(), indices.as_ref()).map_err(|err| {
+                            Error::invalid_input(format!("HashJoiner: {}", err), location!())
+                        })
                     })
                     .await;
                     match task_result {
@@ -286,7 +293,10 @@ impl HashJoiner {
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
+                        Err(err) => Err(Error::invalid_input(
+                            format!("HashJoiner: {}", err),
+                            location!(),
+                        )),
                     }
                 }
             })

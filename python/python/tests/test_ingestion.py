@@ -14,7 +14,7 @@ def test_nullability(tmp_path, data_storage_version):
         lance.write_dataset(pa.table(data, schema=schema), dataset.uri, mode="append")
 
     def cannot_write(data, dataset, schema=None):
-        with pytest.raises(Exception, match="contained null values"):
+        with pytest.raises(Exception, match=r"contain(ed|s) null values"):
             can_write(data, dataset, schema)
 
     nullable_dataset = lance.write_dataset(

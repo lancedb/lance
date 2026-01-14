@@ -39,6 +39,7 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
@@ -977,6 +978,54 @@ fn inner_merge_index_metadata(
     })
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    options_obj: JObject, // OptimizeOptions
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_optimize_indices(&mut env, java_dataset, options_obj)
+    );
+}
+
+fn inner_optimize_indices(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_options: JObject, // OptimizeOptions
+) -> Result<()> {
+    let mut options = OptimizeOptions::default();
+
+    if !java_options.is_null() {
+        options.num_indices_to_merge =
+            env.get_optional_usize_from_method(&java_options, "getNumIndicesToMerge")?;
+
+        // getIndexNames(): Optional<List<String>>
+        let index_names_obj = env
+            .call_method(
+                &java_options,
+                "getIndexNames",
+                "()Ljava/util/Optional;",
+                &[],
+            )?
+            .l()?;
+        let index_names = env.get_strings_opt(&index_names_obj)?;
+        options.index_names = index_names;
+
+        // isRetrain(): boolean
+        let retrain = env
+            .call_method(&java_options, "isRetrain", "()Z", &[])?
+            .z()?;
+        options.retrain = retrain;
+    }
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.optimize_indices(&options))?;
+    Ok(())
+}
+
 //////////////////
 // Read Methods //
 //////////////////
@@ -1575,6 +1624,21 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     RT.block_on(dataset_guard.inner.delete(&predicate_str))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeTruncateTable(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_truncate_table(&mut env, java_dataset))
+}
+
+fn inner_truncate_table(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.truncate_table())?;
     Ok(())
 }
 

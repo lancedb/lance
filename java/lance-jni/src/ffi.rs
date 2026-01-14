@@ -296,7 +296,7 @@ impl JNIEnvExt for JNIEnv<'_> {
             .l()?;
         let operator_str = self.get_string_from_method(&operator_obj, "name")?;
         Operator::try_from(operator_str.as_str())
-            .map_err(|e| Error::io_error(format!("Invalid operator: {:?}", e)))
+            .map_err(|e| Error::input_error(format!("Invalid operator: {:?}", e)))
     }
 
     fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur> {
@@ -310,7 +310,7 @@ impl JNIEnvExt for JNIEnv<'_> {
             .l()?;
         let occur_str = self.get_string_from_method(&occur_obj, "name")?;
         Occur::try_from(occur_str.as_str())
-            .map_err(|e| Error::io_error(format!("Invalid occur: {:?}", e)))
+            .map_err(|e| Error::input_error(format!("Invalid occur: {:?}", e)))
     }
 
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
@@ -388,7 +388,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
             let inner_value = env.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
             T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
             })
         })
     }
@@ -421,7 +421,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
             let inner_value = env.call_method(&inner_jobj, "longValue", "()J", &[])?.j()?;
             T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
             })
         })
     }

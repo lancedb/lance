@@ -441,7 +441,7 @@ impl Manifest {
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "fragments_since: given version {} is newer than manifest version {}",
                     since.version, self.version

@@ -52,7 +52,7 @@ impl TryFrom<&pb::Uuid> for Uuid {
 
     fn try_from(p: &pb::Uuid) -> Result<Self> {
         if p.uuid.len() != 16 {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 "Protobuf UUID is malformed".to_string(),
                 location!(),
             ));

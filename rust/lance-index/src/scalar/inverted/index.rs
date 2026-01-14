@@ -1385,8 +1385,7 @@ impl PostingListReader {
                 let batch = self.posting_batch(token_id, false).await?;
                 self.posting_list_from_batch(&batch, token_id)
             })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .await?
             .as_ref()
             .clone();
 

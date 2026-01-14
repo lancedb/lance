@@ -24,6 +24,7 @@ pub(super) struct MergeInsertMetrics {
     pub num_deleted_rows: Count,
     pub bytes_written: Count,
     pub num_files_written: Count,
+    pub num_skipped_duplicates: Count,
 }
 
 impl From<&MergeInsertMetrics> for MergeStats {
@@ -34,6 +35,7 @@ impl From<&MergeInsertMetrics> for MergeStats {
             num_updated_rows: value.num_updated_rows.value() as u64,
             bytes_written: value.bytes_written.value() as u64,
             num_files_written: value.num_files_written.value() as u64,
+            num_skipped_duplicates: value.num_skipped_duplicates.value() as u64,
             num_attempts: 1,
         }
     }
@@ -46,12 +48,15 @@ impl MergeInsertMetrics {
         let num_deleted_rows = MetricBuilder::new(metrics).counter("num_deleted_rows", partition);
         let bytes_written = MetricBuilder::new(metrics).counter("bytes_written", partition);
         let num_files_written = MetricBuilder::new(metrics).counter("num_files_written", partition);
+        let num_skipped_duplicates =
+            MetricBuilder::new(metrics).counter("num_skipped_duplicates", partition);
         Self {
             num_inserted_rows,
             num_updated_rows,
             num_deleted_rows,
             bytes_written,
             num_files_written,
+            num_skipped_duplicates,
         }
     }
 }

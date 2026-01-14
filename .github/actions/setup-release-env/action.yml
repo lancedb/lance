@@ -11,7 +11,7 @@ runs:
     - name: Install dependencies
       shell: bash
       run: |
-        pip install bump-my-version packaging PyGithub
+        pip install bump-my-version packaging PyGithub PyYAML
 
     - name: Set up Rust
       uses: actions-rs/toolchain@v1

@@ -30,7 +30,7 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     extract_key_value_from_batch, KeyExistenceFilter, KeyExistenceFilterBuilder,
 };
 use crate::dataset::write::merge_insert::{
-    create_duplicate_row_error, format_key_values_on_columns,
+    create_duplicate_row_error, format_key_values_on_columns, SourceDedupeBehavior,
 };
 use crate::{
     dataset::{
@@ -64,6 +64,8 @@ struct MergeState {
     processed_row_ids: HashSet<u64>,
     /// The "on" column names for merge operation
     on_columns: Vec<String>,
+    /// How to handle duplicate source rows
+    source_dedupe_behavior: SourceDedupeBehavior,
 }
 
 impl MergeState {
@@ -72,6 +74,7 @@ impl MergeState {
         stable_row_ids: bool,
         on_columns: Vec<String>,
         field_ids: Vec<i32>,
+        source_dedupe_behavior: SourceDedupeBehavior,
     ) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
@@ -81,6 +84,7 @@ impl MergeState {
             stable_row_ids,
             processed_row_ids: HashSet::new(),
             on_columns,
+            source_dedupe_behavior,
         }
     }
 
@@ -111,7 +115,19 @@ impl MergeState {
 
                     // Check for duplicate _rowid in the current merge operation
                     if !self.processed_row_ids.insert(row_id) {
-                        return Err(create_duplicate_row_error(batch, row_idx, &self.on_columns));
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                                return Ok(None); // Skip this duplicate row
+                            }
+                        }
                     }
 
                     self.delete_row_addrs.insert(row_addr);
@@ -829,6 +845,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             self.dataset.manifest.uses_stable_row_ids(),
             self.params.on.clone(),
             field_ids,
+            self.params.source_dedupe_behavior,
         )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
@@ -839,7 +856,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
-        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
+        let merged_generations = self.params.merged_generations.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -910,7 +927,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields
@@ -970,9 +987,15 @@ mod tests {
     use arrow_array::UInt64Array;
 
     #[test]
-    fn test_merge_state_duplicate_rowid_detection() {
+    fn test_merge_state_duplicate_rowid_detection_fail() {
         let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let mut merge_state = MergeState::new(metrics, false, Vec::new(), Vec::new());
+        let mut merge_state = MergeState::new(
+            metrics,
+            false,
+            Vec::new(),
+            Vec::new(),
+            SourceDedupeBehavior::Fail,
+        );
 
         let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
         let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
@@ -1017,5 +1040,67 @@ mod tests {
             result3.is_ok(),
             "Third call with different _rowid should succeed"
         );
+    }
+
+    #[test]
+    fn test_merge_state_duplicate_rowid_first_seen() {
+        let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let mut merge_state = MergeState::new(
+            metrics,
+            false,
+            Vec::new(),
+            Vec::new(),
+            SourceDedupeBehavior::FirstSeen,
+        );
+
+        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+
+        let result1 = merge_state.process_row_action(
+            Action::UpdateAll,
+            0,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(result1.is_ok(), "First call should succeed");
+        assert_eq!(result1.unwrap(), Some(0), "First row should be kept");
+
+        let result2 = merge_state.process_row_action(
+            Action::UpdateAll,
+            1,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(
+            result2.is_ok(),
+            "Second call with duplicate _rowid should succeed with FirstSeen"
+        );
+        assert_eq!(
+            result2.unwrap(),
+            None,
+            "Duplicate row should be skipped (return None)"
+        );
+
+        // Verify the metric was incremented
+        assert_eq!(
+            merge_state.metrics.num_skipped_duplicates.value(),
+            1,
+            "num_skipped_duplicates should be 1"
+        );
+
+        let result3 = merge_state.process_row_action(
+            Action::UpdateAll,
+            2,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(
+            result3.is_ok(),
+            "Third call with different _rowid should succeed"
+        );
+        assert_eq!(result3.unwrap(), Some(2), "Third row should be kept");
     }
 }

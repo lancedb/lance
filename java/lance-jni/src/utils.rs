@@ -182,12 +182,13 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
 
-        let distance_type_jstr: JString = env
-            .call_method(&java_obj, "getDistanceType", "()Ljava/lang/String;", &[])?
-            .l()?
-            .into();
-        let distance_type_str: String = env.get_string(&distance_type_jstr)?.into();
-        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
+        let distance_type = if let Some(distance_type_str) =
+            env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
+        {
+            Some(DistanceType::try_from(distance_type_str.as_str())?)
+        } else {
+            None
+        };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
 

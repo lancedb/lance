@@ -724,7 +724,7 @@ impl FileFragment {
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
         if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                     dataset.manifest.data_storage_format.lance_file_version()?,
@@ -876,14 +876,11 @@ impl FileFragment {
         let row_id_sequence = row_id_sequence?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
-            return Err(Error::io(
-                format!(
-                    "Did not find any data files for schema: {}\nfragment_id={}",
-                    projection,
-                    self.id()
-                ),
-                location!(),
-            ));
+            return Err(Error::not_found(format!(
+                "No data files found for schema: {}, fragment_id={}",
+                projection,
+                self.id()
+            )));
         }
 
         let num_physical_rows = self.physical_rows().await?;
@@ -1158,10 +1155,10 @@ impl FileFragment {
     /// fragment.
     pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            return Err(Error::io(
-                format!("Fragment {} does not contain any data", self.id()),
-                location!(),
-            ));
+            return Err(Error::not_found(format!(
+                "Fragment {} does not contain any data",
+                self.id()
+            )));
         };
 
         // Early versions that did not write the writer version also could write
@@ -1996,7 +1993,7 @@ impl std::fmt::Display for FragmentReader {
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
-        return Err(Error::io(
+        return Err(Error::invalid_input(
             "Cannot merge empty batches".to_string(),
             location!(),
         ));
@@ -2026,14 +2023,14 @@ impl FragmentReader {
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
-                        return Err(Error::io(
+                        return Err(Error::invalid_input(
                                 "Cannot create FragmentReader from data files with different number of batches"
                                     .to_string(),
                             location!(),
                         ));
                     }
                 } else {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         "Cannot mix legacy and non-legacy readers".to_string(),
                         location!(),
                     ));
@@ -2855,7 +2852,7 @@ mod tests {
             updated_fragments: vec![updated_fragment1],
             new_fragments: vec![],
             fields_modified: fields_modified1,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -2928,7 +2925,7 @@ mod tests {
             updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
             fields_modified: fields_modified2,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -3833,7 +3830,7 @@ mod tests {
                 FragReadConfig::default(),
             )
             .await;
-        assert!(matches!(res, Err(Error::IO { .. })));
+        assert!(matches!(res, Err(Error::NotFound { .. })));
 
         Ok(())
     }

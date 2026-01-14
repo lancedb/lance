@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
+use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     dataset::transaction::{Operation, Transaction},
@@ -13,7 +14,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::MemWal;
+use lance_index::mem_wal::{MergedGeneration, MEM_WAL_INDEX_NAME};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
@@ -33,6 +34,9 @@ pub struct TransactionRebase<'a> {
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowAddrTreeMap>,
     conflicting_frag_reuse_indices: Vec<IndexMetadata>,
+    /// Merged generations from conflicting UpdateMemWalState transactions.
+    /// Used when rebasing CreateIndex of MemWalIndex.
+    conflicting_mem_wal_merged_gens: Vec<MergedGeneration>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -58,6 +62,7 @@ impl<'a> TransactionRebase<'a> {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -85,6 +90,7 @@ impl<'a> TransactionRebase<'a> {
                         modified_fragment_ids,
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
+                        conflicting_mem_wal_merged_gens: Vec::new(),
                     });
                 }
 
@@ -97,6 +103,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -114,6 +121,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -128,6 +136,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -141,6 +150,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
         }
@@ -343,8 +353,8 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_merge,
             inserted_rows_filter: self_inserted_rows_filter,
+            merged_generations: self_merged_generations,
             ..
         } = &self.transaction.operation
         {
@@ -515,21 +525,14 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
                     self.incompatible_conflict_err(other_transaction, other_version, location!())
                 ),
-                Operation::UpdateMemWalState { added, updated, .. } => {
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        added,
-                        mem_wal_to_merge.as_slice(),
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        updated,
-                        mem_wal_to_merge.as_slice(),
-                        other_transaction,
-                        other_version,
-                    )?;
-                    Ok(())
-                }
+                Operation::UpdateMemWalState {
+                    merged_generations: other_merged_generations,
+                } => self.check_merged_generations_conflict(
+                    other_merged_generations,
+                    self_merged_generations,
+                    other_transaction,
+                    other_version,
+                ),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -552,17 +555,25 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
-                // unless it is the same frag reuse index
+                // unless it is the same frag reuse index or MemWAL index
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
                 } => {
-                    if new_indices
+                    let self_has_frag_reuse = new_indices
                         .iter()
-                        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-                        && created_indices
-                            .iter()
-                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+                    let other_has_frag_reuse = created_indices
+                        .iter()
+                        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+                    let self_has_mem_wal =
+                        new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    let other_has_mem_wal = created_indices
+                        .iter()
+                        .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+
+                    if (self_has_frag_reuse && other_has_frag_reuse)
+                        || (self_has_mem_wal && other_has_mem_wal)
                     {
                         Err(self.retryable_conflict_err(
                             other_transaction,
@@ -664,13 +675,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Overwrite { .. }
-                | Operation::Restore { .. }
-                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                )),
+                Operation::UpdateMemWalState {
+                    merged_generations: other_merged_gens,
+                } => {
+                    // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
+                    // as they can be rebased on each other
+                    if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                        // Collect merged_generations from UpdateMemWalState for rebasing
+                        self.conflicting_mem_wal_merged_gens
+                            .extend(other_merged_gens.iter().cloned());
+                        Ok(())
+                    } else {
+                        Err(self.incompatible_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    }
+                }
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
+                    self.incompatible_conflict_err(other_transaction, other_version, location!())
+                ),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1205,72 +1230,53 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::UpdateMemWalState {
-            added,
-            updated,
-            removed: _,
-            ..
+            merged_generations: self_merged_generations,
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
-                    added: committed_added,
-                    updated: committed_updated,
-                    removed: _,
+                    merged_generations: other_merged_generations,
                 } => {
-                    // 1. if the current or last committed job is trimming flushed MemWALs,
-                    // it is compatible with any other UpdateMemWalState commits
-                    if (committed_added.is_empty() && committed_updated.is_empty())
-                        || (added.is_empty() && updated.is_empty())
-                    {
-                        return Ok(());
-                    }
-
-                    // 2. MemWALs of different regions can be changed at the same time
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_added,
-                        added,
+                    // Two UpdateMemWalState transactions conflict if they're updating
+                    // the same region's merged_generation
+                    self.check_merged_generations_conflict(
+                        other_merged_generations,
+                        self_merged_generations,
                         other_transaction,
                         other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_added,
-                        updated,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_updated,
-                        added,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
-                        committed_updated,
-                        updated,
-                        other_transaction,
-                        other_version,
-                    )?;
-                    Ok(())
+                    )
                 }
                 Operation::Update {
-                    mem_wal_to_merge, ..
+                    merged_generations: other_merged_generations,
+                    ..
                 } => {
-                    if mem_wal_to_merge.is_some() {
-                        // TODO: This check could be more detailed, there is an assumption that
-                        //  once a MemWAL is sealed, there is no other operation that could change
-                        //  the state back to open, and at that point it can always be flushed.
-                        Ok(())
-                    } else {
-                        Err(self.incompatible_conflict_err(
+                    // Update transactions with merged_generations can conflict
+                    self.check_merged_generations_conflict(
+                        other_merged_generations,
+                        self_merged_generations,
+                        other_transaction,
+                        other_version,
+                    )
+                }
+                Operation::CreateIndex { new_indices, .. } => {
+                    // Check if CreateIndex has a MemWalIndex with merged_generations
+                    if let Some(mem_wal_idx) = new_indices
+                        .iter()
+                        .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    {
+                        let details = load_mem_wal_index_details(mem_wal_idx.clone())?;
+                        self.check_merged_generations_conflict(
+                            &details.merged_generations,
+                            self_merged_generations,
                             other_transaction,
                             other_version,
-                            location!(),
-                        ))
+                        )
+                    } else {
+                        Ok(())
                     }
                 }
                 Operation::UpdateConfig { .. }
                 | Operation::Rewrite { .. }
-                | Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Append { .. }
@@ -1343,50 +1349,36 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_update_mem_wal_state_not_modify_same_mem_wal(
+    fn check_merged_generations_conflict(
         &self,
-        committed: &[MemWal],
-        to_commit: &[MemWal],
+        committed: &[MergedGeneration],
+        to_commit: &[MergedGeneration],
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if !committed.is_empty() {
-            if to_commit.is_empty() {
-                return Ok(());
-            }
-
-            if committed.len() > 1 {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Committing multiple MemWALs is not supported, but found committed: {:?}",
-                        committed
-                    ),
-                    location: location!(),
-                });
-            }
-
-            if to_commit.len() > 1 {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Committing multiple MemWALs is not supported, but found attempt to commit: {:?}",
-                        to_commit
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-
-            let committed_mem_wal = committed.first().unwrap();
-            let to_commit_mem_wal = to_commit.first().unwrap();
-            if committed_mem_wal.id == to_commit_mem_wal.id {
-                return Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                ));
+        // Check if any region has conflicting updates
+        for committed_mg in committed {
+            for to_commit_mg in to_commit {
+                if committed_mg.region_id == to_commit_mg.region_id {
+                    // Same region being updated
+                    // If committed >= to_commit, data already merged or superseded - abort without retry
+                    // If committed < to_commit, can retry with new state
+                    if committed_mg.generation >= to_commit_mg.generation {
+                        return Err(self.incompatible_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ));
+                    } else {
+                        return Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ));
+                    }
+                }
             }
         }
-
         Ok(())
     }
 
@@ -1582,57 +1574,87 @@ impl<'a> TransactionRebase<'a> {
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
         if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
-            if !new_indices
+            // Handle FRAG_REUSE_INDEX rebasing
+            let has_frag_reuse = new_indices
                 .iter()
-                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            {
-                return Ok(self.transaction);
-            }
+                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
 
-            if self.conflicting_frag_reuse_indices.is_empty() {
-                return Ok(self.transaction);
-            }
+            if has_frag_reuse && !self.conflicting_frag_reuse_indices.is_empty() {
+                // had at least 1 previous rewrite conflict
+                // get the max reuse version from each run to be added to the cleaned up index
+                let mut max_versions =
+                    Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
+                for committed_fri in &self.conflicting_frag_reuse_indices {
+                    let committed_fri_details = Arc::try_unwrap(
+                        load_frag_reuse_index_details(dataset, committed_fri)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let max_version = committed_fri_details
+                        .versions
+                        .into_iter()
+                        .max_by_key(|v| v.dataset_version)
+                        .unwrap();
+                    max_versions.push(max_version);
+                }
 
-            // had at least 1 previous rewrite conflict
-            // get the max reuse version from each run to be added to the cleaned up index
-            let mut max_versions = Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
-            for committed_fri in &self.conflicting_frag_reuse_indices {
-                let committed_fri_details = Arc::try_unwrap(
-                    load_frag_reuse_index_details(dataset, committed_fri)
+                // there should be only 1 frag_reuse_index in new indices
+                let new_fri = &new_indices[0];
+                let mut new_fri_details = Arc::try_unwrap(
+                    load_frag_reuse_index_details(dataset, new_fri)
                         .await
                         .unwrap(),
                 )
                 .unwrap();
-                let max_version = committed_fri_details
-                    .versions
-                    .into_iter()
-                    .max_by_key(|v| v.dataset_version)
-                    .unwrap();
-                max_versions.push(max_version);
+                new_fri_details.versions.extend(max_versions);
+
+                let new_frag_bitmap = new_fri_details.new_frag_bitmap();
+
+                let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
+                    dataset,
+                    Some(new_fri),
+                    new_fri_details,
+                    new_frag_bitmap,
+                )
+                .await?;
+
+                new_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
+                new_indices.push(new_frag_reuse_index_meta);
             }
 
-            // there should be only 1 frag_reuse_index in new indices
-            let new_fri = &new_indices[0];
-            let mut new_fri_details = Arc::try_unwrap(
-                load_frag_reuse_index_details(dataset, new_fri)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            new_fri_details.versions.extend(max_versions);
+            // Handle MEM_WAL_INDEX rebasing
+            let has_mem_wal = new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
 
-            let new_frag_bitmap = new_fri_details.new_frag_bitmap();
+            if has_mem_wal && !self.conflicting_mem_wal_merged_gens.is_empty() {
+                let pos = new_indices
+                    .iter()
+                    .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .unwrap();
 
-            let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
-                dataset,
-                Some(new_fri),
-                new_fri_details,
-                new_frag_bitmap,
-            )
-            .await?;
+                let current_meta = new_indices.remove(pos);
+                let mut details = load_mem_wal_index_details(current_meta)?;
 
-            new_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
-            new_indices.push(new_frag_reuse_index_meta);
+                // Merge conflicting merged_generations - for each region, keep higher generation
+                // We own self so we can consume conflicting_mem_wal_merged_gens directly
+                for new_mg in self.conflicting_mem_wal_merged_gens {
+                    if let Some(existing) = details
+                        .merged_generations
+                        .iter_mut()
+                        .find(|mg| mg.region_id == new_mg.region_id)
+                    {
+                        if new_mg.generation > existing.generation {
+                            existing.generation = new_mg.generation;
+                        }
+                    } else {
+                        details.merged_generations.push(new_mg);
+                    }
+                }
+
+                let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
+                new_indices.push(new_meta);
+            }
+
             Ok(self.transaction)
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1767,6 +1789,7 @@ mod tests {
     use lance_core::Error;
     use lance_file::version::LanceFileVersion;
     use lance_io::assert_io_eq;
+    use uuid::Uuid;
 
     use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
@@ -1861,7 +1884,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
@@ -1873,7 +1896,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -1888,7 +1911,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -1990,7 +2013,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2005,7 +2028,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2127,7 +2150,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2140,7 +2163,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2299,7 +2322,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2495,7 +2518,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    mem_wal_to_merge: None,
+                    merged_generations: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2688,6 +2711,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -2918,7 +2942,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -3208,6 +3232,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&op1).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -3238,5 +3263,288 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_merged_generations_conflict_lower_generation_fails() {
+        // Test: committed generation >= to_commit generation should be incompatible (no retry)
+        let region = Uuid::new_v4();
+
+        // Committed has generation 10, we're trying to commit generation 5
+        let committed_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 10)],
+            },
+            None,
+        );
+
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 5)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected non-retryable CommitConflict for lower generation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_merged_generations_conflict_equal_generation_fails() {
+        // Test: committed generation == to_commit generation should be incompatible (no retry)
+        let region = Uuid::new_v4();
+
+        let committed_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 10)],
+            },
+            None,
+        );
+
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 10)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected non-retryable CommitConflict for equal generation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_merged_generations_conflict_higher_generation_retryable() {
+        // Test: committed generation < to_commit generation should be retryable
+        let region = Uuid::new_v4();
+
+        // Committed has generation 5, we're trying to commit generation 10
+        let committed_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 5)],
+            },
+            None,
+        );
+
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 10)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict for higher generation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_merged_generations_different_regions_ok() {
+        // Test: different regions should not conflict
+        let region1 = Uuid::new_v4();
+        let region2 = Uuid::new_v4();
+
+        let committed_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region1, 10)],
+            },
+            None,
+        );
+
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region2, 5)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            result.is_ok(),
+            "Expected OK for different regions, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_mem_wal_state_vs_create_index_with_merged_generations() {
+        use crate::index::mem_wal::new_mem_wal_index_meta;
+        use lance_index::mem_wal::MemWalIndexDetails;
+
+        let region = Uuid::new_v4();
+
+        // Create a MemWalIndex with merged_generations
+        let details = MemWalIndexDetails {
+            merged_generations: vec![MergedGeneration::new(region, 10)],
+            ..Default::default()
+        };
+        let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
+
+        // CreateIndex with MemWalIndex that has generation 10
+        let committed_txn = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        // UpdateMemWalState trying to set generation 5 (lower than committed)
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 5)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected non-retryable CommitConflict when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
+            result
+        );
+
+        // Now test with higher generation (should be retryable)
+        let to_commit_txn_higher = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 15)],
+            },
+            None,
+        );
+
+        let mut rebase_higher = TransactionRebase {
+            transaction: to_commit_txn_higher,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result_higher = rebase_higher.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result_higher, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict when UpdateMemWalState generation is higher than CreateIndex, got {:?}",
+            result_higher
+        );
+    }
+
+    #[test]
+    fn test_create_index_vs_update_mem_wal_state_rebase() {
+        use crate::index::mem_wal::new_mem_wal_index_meta;
+        use lance_index::mem_wal::MemWalIndexDetails;
+
+        let region = Uuid::new_v4();
+
+        // CreateIndex with MemWalIndex (no merged_generations initially)
+        let details = MemWalIndexDetails::default();
+        let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
+
+        let to_commit_txn = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        // UpdateMemWalState with generation 10
+        let committed_txn = Transaction::new(
+            0,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(region, 10)],
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
+        // and should collect the merged_generations for rebasing
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            result.is_ok(),
+            "Expected OK for CreateIndex vs UpdateMemWalState, got {:?}",
+            result
+        );
+
+        // Verify that merged_generations were collected
+        assert_eq!(rebase.conflicting_mem_wal_merged_gens.len(), 1);
+        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].region_id, region);
+        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].generation, 10);
     }
 }

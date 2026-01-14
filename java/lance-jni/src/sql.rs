@@ -35,7 +35,7 @@ pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
             with_row_addr,
             stream_addr,
         )
-        .map_err(|e| Error::io_error(e.to_string()))
+        .map_err(|e| Error::input_error(e.to_string()))
     )
 }
 

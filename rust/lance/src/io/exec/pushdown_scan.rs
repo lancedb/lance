@@ -353,7 +353,7 @@ impl FragmentScanner {
                     .map(|res| match res {
                         Ok(Ok(batch)) => Ok(batch),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(DataFusionError::Execution(err.to_string())),
+                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
                     })
             });
 

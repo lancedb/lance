@@ -79,15 +79,14 @@ async fn main() {
     let max_level = 7;
 
     // 1. Generate a synthetic test data of specified dimensions
-    let dataset = if uri.is_none() {
-        println!("No uri is provided, generating test dataset...");
-        let output = "test_vectors.lance";
-        create_test_vector_dataset(output, 1000, 64).await;
-        Dataset::open(output).await.expect("Failed to open dataset")
-    } else {
-        Dataset::open(uri.as_ref().unwrap())
-            .await
-            .expect("Failed to open dataset")
+    let dataset = match uri.as_deref() {
+        None => {
+            println!("No uri is provided, generating test dataset...");
+            let output = "test_vectors.lance";
+            create_test_vector_dataset(output, 1000, 64).await;
+            Dataset::open(output).await.expect("Failed to open dataset")
+        }
+        Some(uri) => Dataset::open(uri).await.expect("Failed to open dataset"),
     };
 
     println!("Dataset schema: {:#?}", dataset.schema());

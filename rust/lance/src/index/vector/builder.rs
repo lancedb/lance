@@ -943,10 +943,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // This can happen after a split creates a new partition
         if let Some(reader) = reader {
             if reader.partition_size(part_id)? > 0 {
-                let mut partition_data = reader.read_partition(part_id).await?.ok_or(Error::io(
-                    format!("partition {} is empty", part_id).as_str(),
-                    location!(),
-                ))?;
+                let mut partition_data =
+                    reader
+                        .read_partition(part_id)
+                        .await?
+                        .ok_or(Error::invalid_input(
+                            format!("partition {} is empty", part_id),
+                            location!(),
+                        ))?;
                 while let Some(batch) = partition_data.try_next().await? {
                     loss += batch
                         .metadata()

@@ -14,6 +14,11 @@
 package org.lance;
 
 import org.lance.compaction.CompactionOptions;
+import org.lance.index.Index;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.OptimizeOptions;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
@@ -1700,6 +1705,63 @@ public class DatasetTest {
               }
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testOptimizingIndices(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("optimize_scalar").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // version 1, empty dataset
+      try (Dataset ignored = testDataset.createEmptyDataset()) {
+        // write first fragment at version 1 -> dataset version 2
+        try (Dataset dsWithData = testDataset.write(1, 10)) {
+          ScalarIndexParams scalarParams =
+              ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+          IndexParams indexParams =
+              IndexParams.builder().setScalarIndexParams(scalarParams).build();
+
+          dsWithData.createIndex(
+              Collections.singletonList("id"),
+              IndexType.BTREE,
+              Optional.of("id_idx"),
+              indexParams,
+              true);
+
+          List<Index> beforeIndexes = dsWithData.getIndexes();
+          Index idIndexBefore =
+              beforeIndexes.stream()
+                  .filter(idx -> "id_idx".equals(idx.name()))
+                  .findFirst()
+                  .orElse(null);
+          assertNotNull(idIndexBefore);
+          List<Integer> beforeFragments = idIndexBefore.fragments().orElse(Collections.emptyList());
+          assertTrue(beforeFragments.contains(0));
+          assertEquals(1, beforeFragments.size());
+        }
+
+        // append new fragment using readVersion 2 -> dataset version 3
+        try (Dataset dsAppended = testDataset.write(2, 10)) {
+          OptimizeOptions options = OptimizeOptions.builder().numIndicesToMerge(0).build();
+          dsAppended.optimizeIndices(options);
+
+          List<Index> afterIndexes = dsAppended.getIndexes();
+          Index idIndexAfter =
+              afterIndexes.stream()
+                  .filter(idx -> "id_idx".equals(idx.name()))
+                  .findFirst()
+                  .orElse(null);
+          assertNotNull(idIndexAfter);
+          List<Integer> afterFragments = idIndexAfter.fragments().orElse(Collections.emptyList());
+
+          assertTrue(afterFragments.contains(0));
+          assertTrue(afterFragments.contains(1));
+          assertEquals(2, afterFragments.size());
         }
       }
     }

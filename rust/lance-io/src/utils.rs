@@ -50,7 +50,7 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!("Unsupported binary type: {}", data_type),
                 location!(),
             ));

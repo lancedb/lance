@@ -188,7 +188,7 @@ impl std::fmt::Debug for Dataset {
 }
 
 /// Dataset Version
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Version {
     /// version number
     pub version: u64,
@@ -1560,6 +1560,11 @@ impl Dataset {
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
+    }
+
+    /// Truncate the dataset by deleting all rows.
+    pub async fn truncate_table(&mut self) -> Result<()> {
+        self.delete("true").await
     }
 
     /// Add new base paths to the dataset.

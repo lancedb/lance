@@ -300,7 +300,7 @@ impl UpdateJob {
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(e) => Err(DataFusionError::Execution(e.to_string())),
+                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
@@ -388,7 +388,7 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
             inserted_rows_filter: None,

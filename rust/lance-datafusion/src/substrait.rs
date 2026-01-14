@@ -82,11 +82,17 @@ fn remove_extension_types(
     for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
         let num_fields = count_fields(substrait_field);
 
+        let kind = substrait_field.kind.as_ref().unwrap();
+        let is_user_defined = match kind {
+            Kind::UserDefined(_) => true,
+            // Keep compatibility with older Substrait plans.
+            #[allow(deprecated)]
+            Kind::UserDefinedTypeReference(_) => true,
+            _ => false,
+        };
+
         if !substrait_schema.names[field_index].starts_with("__unlikely_name_placeholder")
-            && !matches!(
-                substrait_field.kind.as_ref().unwrap(),
-                Kind::UserDefined(_) | Kind::UserDefinedTypeReference(_)
-            )
+            && !is_user_defined
         {
             kept_substrait_fields.push(substrait_field.clone());
             kept_arrow_fields.push(arrow_field.clone());
@@ -118,10 +124,10 @@ fn remove_extension_types(
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
     match expr.rex_type.as_mut().unwrap() {
         // Simple, no field references possible
-        RexType::Literal(_)
-        | RexType::Nested(_)
-        | RexType::Enum(_)
-        | RexType::DynamicParameter(_) => Ok(()),
+        RexType::Literal(_) | RexType::Nested(_) | RexType::DynamicParameter(_) => Ok(()),
+        // Enum literals are deprecated in Substrait and should only appear in older plans.
+        #[allow(deprecated)]
+        RexType::Enum(_) => Ok(()),
         // Complex operators not supported in filters
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",

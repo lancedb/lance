@@ -516,7 +516,7 @@ fn get_page_info<'a>(
     batch_id: i32,
 ) -> Result<&'a PageInfo> {
     page_table.get(field.id, batch_id).ok_or_else(|| {
-        Error::io(
+        Error::invalid_input(
             format!(
                 "No page info found for field: {}, field_id={} batch={}",
                 field.name, field.id, batch_id
@@ -560,7 +560,7 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length as u64 {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!(
                             "NullArray Reader: request([{}]) out of range: [0..{}]",
                             idx_max, page_info.length
@@ -580,7 +580,7 @@ fn read_null_array(
                 _ => unreachable!(),
             };
             if idx_end > page_info.length {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     format!(
                         "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
                         // and wrap it in here.

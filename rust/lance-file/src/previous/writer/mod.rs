@@ -204,7 +204,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 .iter()
                 .map(|batch| {
                     batch.column_by_name(&field.name).ok_or_else(|| {
-                        Error::io(
+                        Error::invalid_input(
                             format!("FileWriter::write: Field '{}' not found", field.name),
                             location!(),
                         )
@@ -639,9 +639,9 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                     })?;
 
                     let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                        Error::io(
+                        Error::invalid_input(
                             format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array", 
+                        "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name),
                             location!(),
                         )
@@ -658,7 +658,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            return Err(Error::io(
+                            return Err(Error::schema(
                                 format!(
                                     "Does not support {} as dictionary value type",
                                     value_arr.data_type()
