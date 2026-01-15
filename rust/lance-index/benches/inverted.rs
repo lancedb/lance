@@ -61,7 +61,9 @@ fn bench_inverted(c: &mut Criterion) {
         let num_words = rng.random_range(MIN_WORDS..=MAX_WORDS);
         let mut doc = String::with_capacity(num_words * 8);
         for i in 0..num_words {
-            let idx = rng.sample(word_zipf) as usize - 1;
+            let idx = (rng.sample(word_zipf) as usize)
+                .clamp(1, VOCAB_SIZE)
+                - 1;
             if i > 0 {
                 doc.push(' ');
             }
