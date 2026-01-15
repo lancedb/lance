@@ -108,18 +108,21 @@ fn bench_inverted(c: &mut Criterion) {
         .split_whitespace()
         .map(|s| s.to_owned())
         .collect();
+    let sample_words_len = sample_words.len();
+    const TOKENS_PER_QUERY: usize = 15;
 
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
-            // Pick a random word from our sample
-            let word_idx = rand::random_range(0..sample_words.len());
+            // Pick random tokens from our sample (with replacement).
+            let mut query_tokens = Vec::with_capacity(TOKENS_PER_QUERY);
+            for _ in 0..TOKENS_PER_QUERY {
+                let word_idx = rand::random_range(0..sample_words_len);
+                query_tokens.push(sample_words[word_idx].clone());
+            }
             black_box(
                 invert_index
                     .bm25_search(
-                        Arc::new(Tokens::new(
-                            vec![sample_words[word_idx].clone()],
-                            DocType::Text,
-                        )),
+                        Arc::new(Tokens::new(query_tokens, DocType::Text)),
                         params.clone().into(),
                         Operator::Or,
                         no_filter.clone(),
