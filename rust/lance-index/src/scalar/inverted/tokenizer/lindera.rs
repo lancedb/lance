@@ -12,8 +12,8 @@ pub const LINDERA_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.yml";
 pub trait LinderaTokenizerBuilder: Sized {
     fn load(p: &Path) -> Result<Self> {
         if !p.is_dir() {
-            return Err(Error::io(
-                format!("{} is not a valid directory", p.display()),
+            return Err(Error::invalid_input(
+                format!("Invalid directory path: {}", p.display()),
                 snafu::location!(),
             ));
         }

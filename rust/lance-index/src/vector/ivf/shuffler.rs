@@ -322,8 +322,11 @@ pub async fn shuffle_dataset(
             .buffer_unordered(get_num_compute_intensive_cpus())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
-                Err(err) => Err(Error::io(err.to_string(), location!())),
+                Ok(Err(err)) => Err(err),
+                Err(join_err) => Err(Error::Execution {
+                    message: join_err.to_string(),
+                    location: location!(),
+                }),
             })
             .boxed();
 
@@ -448,13 +451,17 @@ impl IvfShuffler {
         let writer = object_store.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
-        let schema = match data.as_mut().peek().await {
+        let schema = match data.as_mut().peek_mut().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
-                return Err(Error::io(err.to_string(), location!()));
+                // Using Error::Stop as dummy value to take the error out.
+                return Err(std::mem::replace(err, Error::Stop));
             }
             None => {
-                return Err(Error::io("empty stream".to_string(), location!()));
+                return Err(Error::InvalidInput {
+                    source: "data must not be empty".into(),
+                    location: location!(),
+                })
             }
         };
 

@@ -106,8 +106,9 @@ pub struct Query {
     /// TODO: should we support fraction / float number here?
     pub refine_factor: Option<u32>,
 
-    /// Distance metric type
-    pub metric_type: DistanceType,
+    /// Distance metric type. If None, uses the index's metric (if available)
+    /// or the default for the data type.
+    pub metric_type: Option<DistanceType>,
 
     /// Whether to use an ANN index if available
     pub use_index: bool,

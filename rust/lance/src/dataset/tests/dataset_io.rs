@@ -44,6 +44,35 @@ use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
 
+#[tokio::test]
+async fn test_truncate_table() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let path = tmpdir.path();
+    create_file(path, WriteMode::Create, LanceFileVersion::V2_2).await;
+
+    let uri = path.to_str().unwrap();
+    let mut ds = Dataset::open(uri).await.unwrap();
+    let rows_before = ds.count_rows(None).await.unwrap();
+    assert!(rows_before > 0);
+
+    ds.truncate_table().await.unwrap();
+
+    let rows_after = ds.count_rows(None).await.unwrap();
+    assert_eq!(rows_after, 0);
+    assert_eq!(ds.count_fragments(), 0);
+
+    let expected_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            false,
+        ),
+    ]));
+    let actual_schema = ArrowSchema::from(ds.schema());
+    assert_eq!(&actual_schema, expected_schema.as_ref());
+}
+
 #[rstest]
 #[lance_test_macros::test(tokio::test)]
 async fn test_create_dataset(

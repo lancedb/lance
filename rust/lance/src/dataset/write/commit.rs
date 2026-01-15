@@ -55,7 +55,7 @@ impl<'a> CommitBuilder<'a> {
         Self {
             dest: dest.into(),
             use_stable_row_ids: None,
-            enable_v2_manifest_paths: false,
+            enable_v2_manifest_paths: true,
             storage_format: None,
             commit_handler: None,
             store_params: None,
@@ -128,7 +128,7 @@ impl<'a> CommitBuilder<'a> {
     ///  If set to true, and this is a new dataset, uses the new v2 manifest
     ///  paths. These allow constant-time lookups for the latest manifest on object storage.
     ///  This parameter has no effect on existing datasets. To migrate an existing
-    ///  dataset, use the [`Dataset::migrate_manifest_paths_v2`] method. **Default is False.**
+    ///  dataset, use the [`Dataset::migrate_manifest_paths_v2`] method. **Default is True.**
     ///
     /// <div class="warning">
     ///  WARNING: turning this on will make the dataset unreadable for older
@@ -758,7 +758,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge: None,
+                merged_generations: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

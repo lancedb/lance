@@ -272,18 +272,19 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    let training_data = if preprocessed_data.is_none() {
-        load_training_data(
-            dataset,
-            column,
-            training_request.criteria(),
-            None,
-            train,
-            fragment_ids.clone(),
-        )
-        .await?
-    } else {
-        preprocessed_data.unwrap()
+    let training_data = match preprocessed_data {
+        Some(preprocessed_data) => preprocessed_data,
+        None => {
+            load_training_data(
+                dataset,
+                column,
+                training_request.criteria(),
+                None,
+                train,
+                fragment_ids.clone(),
+            )
+            .await?
+        }
     };
 
     plugin

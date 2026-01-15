@@ -21,6 +21,7 @@ import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
+import org.lance.index.OptimizeOptions;
 import org.lance.io.StorageOptionsProvider;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
@@ -455,7 +456,7 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(Transaction transaction) {
-    return commitTransaction(transaction, false);
+    return commitTransaction(transaction, false, true);
   }
 
   /**
@@ -464,12 +465,18 @@ public class Dataset implements Closeable {
    *
    * @param transaction The transaction to commit
    * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, and this is a new dataset, uses the new V2 manifest
+   *     paths. These paths provide more efficient opening of datasets with many versions on object
+   *     stores. This parameter has no effect if the dataset already exists. To migrate an existing
+   *     dataset, instead use the `migrateManifestPathsV2` method. Default is true. WARNING: turning
+   *     this on will make the dataset unreadable for older versions of Lance (prior to 0.17.0).
    * @return A new instance of {@link Dataset} linked to committed version.
    */
-  public Dataset commitTransaction(Transaction transaction, boolean detached) {
+  public Dataset commitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
     try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached);
+      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
       if (selfManagedAllocator) {
         dataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -481,7 +488,8 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native Dataset nativeCommitTransaction(Transaction transaction, boolean detached);
+  private native Dataset nativeCommitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.
@@ -490,6 +498,26 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Migrate the manifest paths to the new format.
+   *
+   * <p>This will update the manifest to use the new v2 format for paths.
+   *
+   * <p>This function is idempotent, and can be run multiple times without changing the state of the
+   * object store.
+   *
+   * <p>DANGER: this should not be run while other concurrent operations are happening. And it
+   * should also run until completion before resuming other operations.
+   */
+  public void migrateManifestPathsV2() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateManifestPathsV2();
+    }
+  }
+
+  private native void nativeMigrateManifestPathsV2();
 
   /**
    * Add columns to the dataset.
@@ -653,6 +681,19 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeDelete(String predicate);
+
+  /**
+   * Truncate the dataset by deleting all rows. The schema is preserved and a new version is
+   * created.
+   */
+  public void truncateTable() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeTruncateTable();
+    }
+  }
+
+  private native void nativeTruncateTable();
 
   /**
    * Gets the URI of the dataset.
@@ -975,6 +1016,21 @@ public class Dataset implements Closeable {
   }
 
   private native Transaction nativeReadTransaction();
+
+  /**
+   * Optimize index metadata and segments for this dataset.
+   *
+   * @param options options controlling index optimization behavior
+   */
+  public void optimizeIndices(OptimizeOptions options) {
+    Preconditions.checkNotNull(options);
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeOptimizeIndices(options);
+    }
+  }
+
+  private native void nativeOptimizeIndices(OptimizeOptions options);
 
   /**
    * @return all the created indexes names

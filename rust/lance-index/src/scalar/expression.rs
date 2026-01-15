@@ -965,9 +965,9 @@ impl PartialEq for ScalarIndexSearch {
 /// modify the results of scalar lookups
 #[derive(Debug, Clone)]
 pub enum ScalarIndexExpr {
-    Not(Box<ScalarIndexExpr>),
-    And(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Or(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
     Query(ScalarIndexSearch),
 }
 

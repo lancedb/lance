@@ -214,7 +214,16 @@ async fn test_migrate_v2_manifest_paths() {
     let data = lance_datagen::gen_batch()
         .col("key", array::step::<Int32Type>())
         .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let mut dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         dataset.manifest_location().naming_scheme,
         ManifestNamingScheme::V1

@@ -70,7 +70,7 @@ impl ProjectionBuilder {
 
     fn check_duplicate_column(&self, name: &str) -> Result<()> {
         if self.output.contains_key(name) {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!("Duplicate column name: {}", name),
                 location!(),
             ));
@@ -280,7 +280,7 @@ impl ProjectionPlan {
             } else {
                 // Regular data column - validate it exists in base schema
                 if base.schema().field(&field.name).is_none() {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!("Column '{}' not found in schema", field.name),
                         location!(),
                     ));

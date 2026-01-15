@@ -241,7 +241,7 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
                     start, end, self.length

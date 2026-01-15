@@ -298,13 +298,14 @@ mod test {
         let dir = TempStrDir::default();
         let ds_uri = &dir;
 
-        let mut ds = Dataset::write(
-            data_gen.batch(10),
-            ds_uri,
-            Some(write_params(handler.clone())),
-        )
-        .await
-        .unwrap();
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            enable_v2_manifest_paths: false,
+            ..Default::default()
+        };
+        let mut ds = Dataset::write(data_gen.batch(10), ds_uri, Some(params))
+            .await
+            .unwrap();
 
         for _ in 0..5 {
             let data = data_gen.batch(10);

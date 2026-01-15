@@ -559,7 +559,7 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            mem_wal_to_merge: _,
+            merged_generations: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
@@ -729,6 +729,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
     java_dataset: JObject,
     java_transaction: JObject,
     detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -737,6 +738,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
             java_dataset,
             java_transaction,
             detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
         )
     )
 }
@@ -746,6 +748,7 @@ fn inner_commit_transaction<'local>(
     java_dataset: JObject,
     java_transaction: JObject,
     detached: bool,
+    enable_v2_manifest_paths: bool,
 ) -> Result<JObject<'local>> {
     let write_param_jobj = env
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
@@ -779,7 +782,12 @@ fn inner_commit_transaction<'local>(
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params, detached)?
+        dataset_guard.commit_transaction(
+            transaction,
+            store_params,
+            detached,
+            enable_v2_manifest_paths,
+        )?
     };
     new_blocking_ds.into_java(env)
 }
@@ -1048,7 +1056,7 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: None,
+                merged_generations: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,

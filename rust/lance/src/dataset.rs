@@ -84,7 +84,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
-mod write;
+pub mod write;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -188,7 +188,7 @@ impl std::fmt::Debug for Dataset {
 }
 
 /// Dataset Version
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Version {
     /// version number
     pub version: u64,
@@ -1562,6 +1562,11 @@ impl Dataset {
         write::delete::delete(self, predicate).await
     }
 
+    /// Truncate the dataset by deleting all rows.
+    pub async fn truncate_table(&mut self) -> Result<()> {
+        self.delete("true").await
+    }
+
     /// Add new base paths to the dataset.
     ///
     /// This method allows you to register additional storage locations (buckets)
@@ -2123,11 +2128,16 @@ impl Dataset {
     /// # use lance_table::io::commit::ManifestNamingScheme;
     /// # use lance_datagen::{array, RowCount, BatchCount};
     /// # use arrow_array::types::Int32Type;
+    /// # use lance::dataset::write::WriteParams;
     /// # let data = lance_datagen::gen_batch()
     /// #  .col("key", array::step::<Int32Type>())
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
-    /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+    /// # let params = WriteParams {
+    /// #     enable_v2_manifest_paths: false,
+    /// #     ..Default::default()
+    /// # };
+    /// let mut dataset = Dataset::write(data, "memory://test", Some(params)).await.unwrap();
     /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V1);
     ///
     /// dataset.migrate_manifest_paths_v2().await.unwrap();

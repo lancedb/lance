@@ -264,7 +264,7 @@ mod test {
                 maximum_nprobes: None,
                 ef: None,
                 refine_factor: None,
-                metric_type: metric,
+                metric_type: Some(metric),
                 use_index: true,
                 dist_q_c: 0.0,
             };

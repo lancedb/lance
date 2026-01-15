@@ -80,8 +80,9 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection
-        .ok_or_else(|| Error::io(format!("Expression is not valid: {expr}"), location!()))?;
+    let expr = selection.ok_or_else(|| {
+        Error::invalid_input(format!("Expression is not valid: {expr}"), location!())
+    })?;
     Ok(expr.clone())
 }
 
