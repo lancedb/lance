@@ -14,8 +14,6 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
-use rand::{rngs::StdRng, Rng, SeedableRng};
-use rand_distr::Zipf;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::lance_tokenizer::DocType;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
@@ -28,6 +26,8 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand_distr::Zipf;
 
 fn bench_inverted(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
@@ -61,9 +61,7 @@ fn bench_inverted(c: &mut Criterion) {
         let num_words = rng.random_range(MIN_WORDS..=MAX_WORDS);
         let mut doc = String::with_capacity(num_words * 8);
         for i in 0..num_words {
-            let idx = (rng.sample(word_zipf) as usize)
-                .clamp(1, VOCAB_SIZE)
-                - 1;
+            let idx = (rng.sample(word_zipf) as usize).clamp(1, VOCAB_SIZE) - 1;
             if i > 0 {
                 doc.push(' ');
             }
