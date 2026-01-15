@@ -110,27 +110,41 @@ fn bench_inverted(c: &mut Criterion) {
         .collect();
     let sample_words_len = sample_words.len();
     const TOKENS_PER_QUERY: usize = 15;
+    const QUERY_SET_SIZE: usize = 1024;
+    let mut query_rng = StdRng::seed_from_u64(7);
+    let mut queries = Vec::with_capacity(QUERY_SET_SIZE);
+    for _ in 0..QUERY_SET_SIZE {
+        let mut query_tokens = Vec::with_capacity(TOKENS_PER_QUERY);
+        for _ in 0..TOKENS_PER_QUERY {
+            let word_idx = query_rng.random_range(0..sample_words_len);
+            query_tokens.push(sample_words[word_idx].clone());
+        }
+        queries.push(Arc::new(Tokens::new(query_tokens, DocType::Text)));
+    }
+    let mut query_idx = 0usize;
 
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
-        b.to_async(&rt).iter(|| async {
-            // Pick random tokens from our sample (with replacement).
-            let mut query_tokens = Vec::with_capacity(TOKENS_PER_QUERY);
-            for _ in 0..TOKENS_PER_QUERY {
-                let word_idx = rand::random_range(0..sample_words_len);
-                query_tokens.push(sample_words[word_idx].clone());
+        b.to_async(&rt).iter(|| {
+            // Cycle through pre-generated queries to avoid skewing benchmark results.
+            let query = queries[query_idx % queries.len()].clone();
+            query_idx = query_idx.wrapping_add(1);
+            let invert_index = invert_index.clone();
+            let params = params.clone();
+            let no_filter = no_filter.clone();
+            async move {
+                black_box(
+                    invert_index
+                        .bm25_search(
+                            query,
+                            params.clone().into(),
+                            Operator::Or,
+                            no_filter.clone(),
+                            Arc::new(NoOpMetricsCollector),
+                        )
+                        .await
+                        .unwrap(),
+                );
             }
-            black_box(
-                invert_index
-                    .bm25_search(
-                        Arc::new(Tokens::new(query_tokens, DocType::Text)),
-                        params.clone().into(),
-                        Operator::Or,
-                        no_filter.clone(),
-                        Arc::new(NoOpMetricsCollector),
-                    )
-                    .await
-                    .unwrap(),
-            );
         })
     });
 }
