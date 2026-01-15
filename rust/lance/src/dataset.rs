@@ -1821,8 +1821,6 @@ impl Dataset {
     }
 
     /// Get fragments.
-    ///
-    /// If `filter` is provided, only fragments with the given name will be returned.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
         self.manifest
