@@ -118,6 +118,12 @@ fn bench_reader(c: &mut Criterion) {
     }
 }
 
+#[cfg(target_os != "linux")]
+pub fn drop_file_from_cache(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    println!("drop_file_from_cache: not implemented on this platform");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn drop_file_from_cache(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
