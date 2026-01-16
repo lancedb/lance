@@ -101,6 +101,7 @@ use lance_datafusion::substrait::parse_substrait;
 use snafu::location;
 
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
+const BATCH_SIZE_FALLBACK_STR: &str = "8192";
 
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
@@ -127,23 +128,36 @@ where
 // For backwards compatibility / historical reasons we re-calculate the default batch size
 // on each call
 pub fn get_default_batch_size() -> Option<usize> {
-    parse_env_var("LANCE_DEFAULT_BATCH_SIZE", "Using default.")
+    parse_env_var("LANCE_DEFAULT_BATCH_SIZE", BATCH_SIZE_FALLBACK_STR)
 }
 
 pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+const LEGACY_DEFAULT_FRAGMENT_READAHEAD_STR: &str = "4";
 
-pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> =
-    LazyLock::new(|| parse_env_var("LANCE_DEFAULT_FRAGMENT_READAHEAD", "Using default."));
+pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|| {
+    parse_env_var(
+        "LANCE_DEFAULT_FRAGMENT_READAHEAD",
+        LEGACY_DEFAULT_FRAGMENT_READAHEAD_STR,
+    )
+});
 
-pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> =
-    LazyLock::new(|| parse_env_var("LANCE_XTR_OVERFETCH", "Using default value 10.").unwrap_or(10));
+const DEFAULT_XTR_OVERFETCH_VALUE: u32 = 10;
+const DEFAULT_XTR_OVERFETCH_STR: &str = "10";
+
+pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
+    parse_env_var("LANCE_XTR_OVERFETCH", DEFAULT_XTR_OVERFETCH_STR)
+        .unwrap_or(DEFAULT_XTR_OVERFETCH_VALUE)
+});
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
+const DEFAULT_IO_BUFFER_SIZE_VALUE: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_IO_BUFFER_SIZE_STR: &str = "2147483648";
+
 pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    parse_env_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "Using default value 2GiB.")
-        .unwrap_or(2 * 1024 * 1024 * 1024)
+    parse_env_var("LANCE_DEFAULT_IO_BUFFER_SIZE", DEFAULT_IO_BUFFER_SIZE_STR)
+        .unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
 });
 
 /// Defines an ordering for a single column
