@@ -21,6 +21,7 @@ use lance_io::{
     utils::CachedFileSize,
 };
 use object_store::path::Path;
+use std::collections::HashMap;
 use tokio::runtime::Runtime;
 
 fn bench_reader(c: &mut Criterion) {
@@ -158,6 +159,8 @@ struct CachedReaders {
     readers: Vec<CachedReader>,
 }
 
+type FileCache = HashMap<(String, String), Arc<CachedReaders>>;
+
 /// Get or create a lance file for benchmarking.
 ///
 /// This function caches the results so files are only created once per (filesystem, version) combination.
@@ -168,11 +171,9 @@ fn get_cached_readers(
     rt: &Runtime,
     version: LanceFileVersion,
 ) -> Arc<CachedReaders> {
-    use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
-    static FILE_CACHE: LazyLock<Mutex<HashMap<(String, String), Arc<CachedReaders>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static FILE_CACHE: LazyLock<Mutex<FileCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let key = (filesystem.to_string(), version.to_string());
 
@@ -223,10 +224,10 @@ fn get_cached_readers(
         .collect::<Vec<_>>();
     let all_indices = UInt32Array::from(indices);
 
-    let rows_per_thread = TOTAL_ROWS / num_threads as usize;
+    let rows_per_thread = TOTAL_ROWS / num_threads;
 
     let mut readers = Vec::with_capacity(num_threads);
-    for i in 0..num_threads as usize {
+    for i in 0..num_threads {
         let indices = all_indices.slice(i * rows_per_thread, rows_per_thread);
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -376,7 +377,7 @@ fn bench_random_access(c: &mut Criterion) {
                         } else {
                             1
                         };
-                        let rows_per_thread = TOTAL_ROWS / num_threads as usize;
+                        let rows_per_thread = TOTAL_ROWS / num_threads;
                         group.throughput(Throughput::Elements(
                             rows_per_thread as u64 * num_threads as u64,
                         ));
@@ -404,8 +405,7 @@ fn bench_random_access(c: &mut Criterion) {
                                     |_| {
                                         let cached_readers = cached_readers.clone();
                                         global_runtime.block_on(async move {
-                                            let mut handles =
-                                                Vec::with_capacity(num_threads as usize);
+                                            let mut handles = Vec::with_capacity(num_threads);
                                             if multithreaded {
                                                 for reader in &cached_readers.readers {
                                                     let runtime = reader.runtime.clone();
