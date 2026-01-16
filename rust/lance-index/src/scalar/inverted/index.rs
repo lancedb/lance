@@ -328,8 +328,8 @@ impl InvertedIndex {
                 let mut score = 0.0;
                 for (term_index, freq) in freqs.into_iter() {
                     debug_assert!((term_index as usize) < idf_by_position.len());
-                    score += idf_by_position[term_index as usize]
-                        * scorer.doc_weight(freq, doc_length);
+                    score +=
+                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
