@@ -113,12 +113,10 @@ fn get_or_create_dataset(rt: &Runtime, version: LanceFileVersion) -> Arc<CachedD
         // Generate query vectors
         let query_vectors = generate_query_vectors();
 
-        let cached = Arc::new(CachedDataset {
+        Arc::new(CachedDataset {
             dataset: Arc::new(dataset),
             query_vectors,
-        });
-
-        cached
+        })
     })
 }
 
