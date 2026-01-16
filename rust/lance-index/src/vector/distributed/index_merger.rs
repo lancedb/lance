@@ -292,7 +292,7 @@ fn decode_fragment_id_from_row_id(row_id_u64: u64) -> u32 {
     addr.fragment_id()
 }
 
-/// Compute a content-derived shard sort key for a partial auxiliary file.
+/// Compute a content-derived shard key for a partial auxiliary file.
 ///
 /// The key is `(min_fragment_id, min_row_id, parent_dir_name)` where:
 /// - `min_fragment_id` is the minimum fragment id observed among the first row
@@ -300,10 +300,12 @@ fn decode_fragment_id_from_row_id(row_id_u64: u64) -> u32 {
 /// - `min_row_id` is the minimum encoded row id (as `u64`) among the same
 ///   representative rows.
 /// - `parent_dir_name` is the `partial_*` directory name extracted from
-///   `aux_path` and used only as a final lexicographic tie-breaker.
+///   `aux_path`.
 ///
 /// This helper reads exactly one row per non-empty partition (the first row in
-/// that partition) and never scans entire shards.
+/// that partition) and is intended for diagnostics; the merge order is
+/// determined separately (e.g. by lexicographic parent directory names) and
+/// does not depend on this key.
 async fn compute_shard_content_key(
     sched: &std::sync::Arc<ScanScheduler>,
     _store: &lance_io::object_store::ObjectStore,
@@ -319,7 +321,7 @@ async fn compute_shard_content_key(
         &lance_core::cache::LanceCache::no_cache(),
         V2ReaderOptions::default(),
     )
-    .await?;
+        .await?;
 
     // Locate the ROW_ID_FIELD column to decode fragment / row ids.
     let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
@@ -417,6 +419,13 @@ pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     index_dir: &object_store::path::Path,
 ) -> Result<()> {
+    let index_uuid = index_dir
+        .parts()
+        .last()
+        .map(|p| p.as_ref().to_string())
+        .unwrap_or_default();
+    // Debug flag to control detailed IVF/PQ merge logging for diagnostics.
+    let debug_ivfpq = std::env::var("LANCE_IVFPQ_DEBUG").is_ok();
     let mut aux_paths: Vec<object_store::path::Path> = Vec::new();
     let mut stream = object_store.list(Some(index_dir.clone()));
     while let Some(item) = stream.next().await {
@@ -435,6 +444,14 @@ pub async fn merge_partial_vector_auxiliary_files(
             }
         }
     }
+
+    log::info!(
+        "merge_partial_vector_auxiliary_files: index_uuid={} index_dir={:?} found {} partial auxiliary shards: {:?}",
+        index_uuid,
+        index_dir,
+        aux_paths.len(),
+        &aux_paths
+    );
 
     if aux_paths.is_empty() {
         // If a unified auxiliary file already exists at the root, no merge is required.
@@ -476,19 +493,25 @@ pub async fn merge_partial_vector_auxiliary_files(
         SchedulerConfig::max_bandwidth(object_store),
     );
 
-    // Compute content-derived sort keys for each shard once while opening the
-    // auxiliary readers. These keys will be reused both for ordering the
-    // enumeration of shards and for per-partition writes.
-    let mut shard_keys: Vec<(object_store::path::Path, (u32, u64, String))> =
-        Vec::with_capacity(aux_paths.len());
-    for aux in aux_paths.into_iter() {
-        let key = compute_shard_content_key(&sched, object_store, &aux).await?;
-        shard_keys.push((aux, key));
-    }
+    // Sort partial shards by their parent directory name (e.g. `partial_*`) to
+    // obtain a deterministic, content-independent ordering between shards.
+    aux_paths.sort_by(|a, b| {
+        let a_parts: Vec<_> = a.parts().collect();
+        let b_parts: Vec<_> = b.parts().collect();
+        let a_name = a_parts
+            .get(a_parts.len().saturating_sub(2))
+            .map(|p| p.as_ref())
+            .unwrap_or("");
+        let b_name = b_parts
+            .get(b_parts.len().saturating_sub(2))
+            .map(|p| p.as_ref())
+            .unwrap_or("");
+        a_name.cmp(&b_name)
+    });
 
-    // Sort shards by their content-derived keys (min_fragment_id, min_row_id,
-    // parent_dir_name) to detach from underlying listing order.
-    shard_keys.sort_by(|a, b| a.1.cmp(&b.1));
+    // Content-derived shard keys (min_fragment_id, min_row_id) are no longer
+    // used for ordering; merge order is determined by the lexicographic
+    // parent directory sort above.
 
     // Track IVF partition count consistency and accumulate lengths per partition
     let mut nlist_opt: Option<usize> = None;
@@ -497,10 +520,10 @@ pub async fn merge_partial_vector_auxiliary_files(
 
     // Track per-shard IVF lengths to reorder writing to partitions later
     #[allow(clippy::type_complexity)]
-    let mut shard_infos: Vec<(object_store::path::Path, Vec<u32>, (u32, u64, String))> = Vec::new();
+    let mut shard_infos: Vec<(object_store::path::Path, Vec<u32>)> = Vec::new();
 
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
-    for (aux, key) in &shard_keys {
+    for aux in &aux_paths {
         let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
         let reader = V2Reader::try_open(
             fh,
@@ -509,7 +532,7 @@ pub async fn merge_partial_vector_auxiliary_files(
             &lance_core::cache::LanceCache::no_cache(),
             V2ReaderOptions::default(),
         )
-        .await?;
+            .await?;
         let meta = reader.metadata();
 
         // Read distance type
@@ -559,7 +582,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                     &lance_core::cache::LanceCache::no_cache(),
                     V2ReaderOptions::default(),
                 )
-                .await?;
+                    .await?;
                 if let Some(idx_meta_json) = idx_reader
                     .metadata()
                     .file_schema
@@ -613,6 +636,24 @@ pub async fn merge_partial_vector_auxiliary_files(
         let lengths = pb_ivf.lengths.clone();
         let nlist = lengths.len();
 
+        if debug_ivfpq {
+            // Debug logging to summarize per-shard IVF partition layout to compare
+            // structural consistency between different distributed build modes.
+            let preview_len = usize::min(16, nlist);
+            let total_length_shard: u64 =
+                lengths.iter().map(|v| *v as u64).sum();
+            let lengths_preview_shard: Vec<u32> =
+                lengths.iter().take(preview_len).cloned().collect();
+            log::info!(
+                "merge_partial_vector_auxiliary_files: shard summary index_uuid={} aux_path={:?} nlist={} total_length_shard={} lengths_preview_shard={:?}",
+                index_uuid,
+                aux,
+                nlist,
+                total_length_shard,
+                lengths_preview_shard
+            );
+        }
+
         if nlist_opt.is_none() {
             nlist_opt = Some(nlist);
             accumulated_lengths = vec![0; nlist];
@@ -637,6 +678,12 @@ pub async fn merge_partial_vector_auxiliary_files(
             message: "Unable to detect index type".to_string(),
             location: location!(),
         })?;
+        log::info!(
+            "merge_partial_vector_auxiliary_files: shard aux_path={:?} idx_type={:?} dim={:?}",
+            aux,
+            idx_type,
+            dim
+        );
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -762,6 +809,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     let codebook_tensor: crate::pb::Tensor = prost::Message::decode(tensor_bytes)?;
                     pm.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
                 }
+                log::info!(
+                    "merge_partial_vector_auxiliary_files: shard aux_path={:?} PQ metadata dimension={} num_sub_vectors={} nbits={}",
+                    aux,
+                    pm.dimension,
+                    pm.num_sub_vectors,
+                    pm.nbits
+                );
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim {
@@ -968,6 +1022,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     let codebook_tensor: crate::pb::Tensor = prost::Message::decode(tensor_bytes)?;
                     pm.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
                 }
+                log::info!(
+                    "merge_partial_vector_auxiliary_files: shard aux_path={:?} HNSW_PQ metadata dimension={} num_sub_vectors={} nbits={}",
+                    aux,
+                    pm.dimension,
+                    pm.num_sub_vectors,
+                    pm.nbits
+                );
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim {
@@ -1093,7 +1154,7 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
 
         // Collect per-shard lengths to write grouped by partition later
-        shard_infos.push((aux.clone(), lengths.clone(), key.clone()));
+        shard_infos.push((aux.clone(), lengths.clone()));
         // Accumulate overall lengths per partition for unified IVF model
         for pid in 0..nlist {
             let part_len = lengths[pid];
@@ -1101,9 +1162,21 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
     }
 
-    // Re-sort shard_infos using content-derived keys to decouple per-partition
-    // write ordering from discovery order.
-    shard_infos.sort_by(|a, b| a.2.cmp(&b.2));
+    // Re-sort shard_infos by parent directory name to ensure deterministic
+    // per-partition write ordering independent of shard contents.
+    shard_infos.sort_by(|(path_a, _lens_a), (path_b, _lens_b)| {
+        let a_parts: Vec<_> = path_a.parts().collect();
+        let b_parts: Vec<_> = path_b.parts().collect();
+        let a_name = a_parts
+            .get(a_parts.len().saturating_sub(2))
+            .map(|p| p.as_ref())
+            .unwrap_or("");
+        let b_name = b_parts
+            .get(b_parts.len().saturating_sub(2))
+            .map(|p| p.as_ref())
+            .unwrap_or("");
+        a_name.cmp(&b_name)
+    });
 
     // Write rows grouped by partition across all shards to ensure contiguous ranges per partition
 
@@ -1117,8 +1190,46 @@ pub async fn merge_partial_vector_auxiliary_files(
         message: "Missing IVF partition count".to_string(),
         location: location!(),
     })?;
+    let sample_pids: Vec<usize> = if debug_ivfpq {
+        // Sample a few representative partitions to validate that offsets and
+        // row_id boundaries are aligned across shards for the same global
+        // partition id.
+        let mut candidates = Vec::new();
+        if nlist > 0 {
+            candidates.push(0usize);
+        }
+        if nlist > 1 {
+            candidates.push(1usize);
+        }
+        if nlist > 2 {
+            candidates.push(nlist / 2);
+        }
+        if nlist > 1 {
+            candidates.push(nlist - 1);
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    } else {
+        Vec::new()
+    };
+
     for pid in 0..nlist {
-        for (path, lens, _) in shard_infos.iter() {
+        // Local per-partition view of shard contribution. We keep the reader
+        // attached so we can both sample row_ids and stream the full partition
+        // slice without reopening the file.
+        struct ShardPart {
+            path: object_store::path::Path,
+            offset: usize,
+            part_len: usize,
+            first_row_id: Option<u64>,
+            reader: V2Reader,
+        }
+
+        let is_sample_pid = debug_ivfpq && sample_pids.contains(&pid);
+        let mut shard_parts: Vec<ShardPart> = Vec::new();
+
+        for (path, lens) in shard_infos.iter() {
             let part_len = lens[pid] as usize;
             if part_len == 0 {
                 continue;
@@ -1132,15 +1243,252 @@ pub async fn merge_partial_vector_auxiliary_files(
                 &lance_core::cache::LanceCache::no_cache(),
                 V2ReaderOptions::default(),
             )
-            .await?;
+                .await?;
+
+            // Try to fetch the first row_id for this partition slice. Any failure
+            // is handled by falling back to the original parent directory
+            // ordering for this shard, with diagnostics gated on LANCE_IVFPQ_DEBUG.
+            let mut first_row_id: Option<u64> = None;
+            let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
+            let row_id_idx_opt = schema_arrow
+                .fields
+                .iter()
+                .position(|f| f.name() == ROW_ID_FIELD.name());
+
+            if let Some(row_id_idx) = row_id_idx_opt {
+                match reader.read_stream(
+                    lance_io::ReadBatchParams::Range(offset..offset + 1),
+                    u32::MAX,
+                    4,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                ) {
+                    Ok(mut stream_first) => {
+                        if let Some(batch_res) = stream_first.next().await {
+                            match batch_res {
+                                Ok(batch) => {
+                                    if batch.num_rows() > 0 {
+                                        if let Some(arr) = batch
+                                            .column(row_id_idx)
+                                            .as_any()
+                                            .downcast_ref::<UInt64Array>()
+                                        {
+                                            first_row_id = Some(arr.value(0));
+                                        } else if debug_ivfpq {
+                                            log::warn!(
+                                                "merge_partial_vector_auxiliary_files: pid={} aux_path={:?} ROW_ID_FIELD is not UInt64; falling back to directory order for this shard",
+                                                pid,
+                                                path,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if debug_ivfpq {
+                                        log::warn!(
+                                            "merge_partial_vector_auxiliary_files: failed to read first row_id for pid={} aux_path={:?}: {}; falling back to directory order for this shard",
+                                            pid,
+                                            path,
+                                            e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if debug_ivfpq {
+                            log::warn!(
+                                "merge_partial_vector_auxiliary_files: failed to create stream for first row_id pid={} aux_path={:?}: {}; falling back to directory order for this shard",
+                                pid,
+                                path,
+                                e,
+                            );
+                        }
+                    }
+                }
+
+                if is_sample_pid {
+                    // Per-partition sampling of first/last row_id for diagnostics.
+                    let mut first_sample = first_row_id;
+                    let mut last_row_id: Option<u64> = None;
+
+                    if first_sample.is_none() {
+                        // If we could not obtain first_row_id above (e.g. empty batch),
+                        // try again for sampling purposes.
+                        match reader.read_stream(
+                            lance_io::ReadBatchParams::Range(offset..offset + 1),
+                            u32::MAX,
+                            4,
+                            lance_encoding::decoder::FilterExpression::no_filter(),
+                        ) {
+                            Ok(mut stream_first) => {
+                                if let Some(batch_res) = stream_first.next().await {
+                                    if let Ok(batch) = batch_res {
+                                        if batch.num_rows() > 0 {
+                                            if let Some(arr) = batch
+                                                .column(row_id_idx)
+                                                .as_any()
+                                                .downcast_ref::<UInt64Array>()
+                                            {
+                                                first_sample = Some(arr.value(0));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Already logged above; keep fallback.
+                            }
+                        }
+                    }
+
+                    let last_index = offset + part_len - 1;
+                    match reader.read_stream(
+                        lance_io::ReadBatchParams::Range(last_index..last_index + 1),
+                        u32::MAX,
+                        4,
+                        lance_encoding::decoder::FilterExpression::no_filter(),
+                    ) {
+                        Ok(mut stream_last) => {
+                            if let Some(batch_res) = stream_last.next().await {
+                                if let Ok(batch) = batch_res {
+                                    if batch.num_rows() > 0 {
+                                        if let Some(arr) = batch
+                                            .column(row_id_idx)
+                                            .as_any()
+                                            .downcast_ref::<UInt64Array>()
+                                        {
+                                            last_row_id = Some(arr.value(0));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Already logged above; keep fallback.
+                        }
+                    }
+
+                    log::info!(
+                        "merge_partial_vector_auxiliary_files: partition sampling index_uuid={} pid={} aux_path={:?} part_len={} offset={} row_id_first={:?} row_id_last={:?}",
+                        index_uuid,
+                        pid,
+                        path,
+                        part_len,
+                        offset,
+                        first_sample,
+                        last_row_id
+                    );
+                }
+            } else if debug_ivfpq {
+                log::warn!(
+                    "merge_partial_vector_auxiliary_files: pid={} aux_path={:?} missing ROW_ID_FIELD; falling back to directory order for this shard",
+                    pid,
+                    path,
+                );
+            }
+
+            shard_parts.push(ShardPart {
+                path: path.clone(),
+                offset,
+                part_len,
+                first_row_id,
+                reader,
+            });
+        }
+
+        // Sort shards for this partition by their first_row_id ascending.
+        // Shards without a valid first_row_id are placed at the end while
+        // preserving the original (parent directory) ordering.
+        shard_parts.sort_by(|a, b| match (a.first_row_id, b.first_row_id) {
+            (Some(ra), Some(rb)) => ra.cmp(&rb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        if debug_ivfpq && !shard_parts.is_empty() {
+            let mut order_desc = Vec::with_capacity(shard_parts.len());
+            for part in &shard_parts {
+                let parent_name = {
+                    let parts: Vec<_> = part.path.parts().collect();
+                    if parts.len() >= 2 {
+                        parts[parts.len() - 2].as_ref().to_string()
+                    } else {
+                        format!("{:?}", part.path)
+                    }
+                };
+                let rid_display = part
+                    .first_row_id
+                    .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                order_desc.push(format!(
+                    "(aux_parent={}, first_row_id={}, len={})",
+                    parent_name, rid_display, part.part_len
+                ));
+            }
+            log::info!(
+                "merge_partial_vector_auxiliary_files: index_uuid={} pid={} sorted shard order: [{}]",
+                index_uuid,
+                pid,
+                order_desc.join(", ")
+            );
+        }
+
+        for part in shard_parts.iter_mut() {
             if let Some(w) = v2w_opt.as_mut() {
-                write_partition_rows(&reader, w, offset..offset + part_len).await?;
+                write_partition_rows(&part.reader, w, part.offset..part.offset + part.part_len)
+                    .await?;
             }
         }
     }
 
     // Write unified IVF metadata into global buffer & set schema metadata
     if let Some(w) = v2w_opt.as_mut() {
+        let nlist_unified = accumulated_lengths.len();
+        let total_length: u64 = accumulated_lengths.iter().map(|v| *v as u64).sum();
+        let preview_len = 16usize;
+        let lengths_preview: Vec<u32> = accumulated_lengths
+            .iter()
+            .take(preview_len)
+            .cloned()
+            .collect();
+        log::info!(
+            "merge_partial_vector_auxiliary_files: unified IVF summary index_uuid={} nlist={} total_length={} lengths_preview={:?}",
+            index_uuid,
+            nlist_unified,
+            total_length,
+            lengths_preview
+        );
+
+        if debug_ivfpq {
+            // Debug logging to highlight the most and least populated partitions in the
+            // unified IVF model for distribution skew analysis.
+            let mut partition_pairs: Vec<(usize, u32)> = accumulated_lengths
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect();
+            partition_pairs.sort_by_key(|&(_pid, len)| len);
+            let top_k = 8usize;
+            let top_k_min_partitions: Vec<(usize, u32)> = partition_pairs
+                .iter()
+                .take(top_k)
+                .cloned()
+                .collect();
+            let top_k_max_partitions: Vec<(usize, u32)> = partition_pairs
+                .iter()
+                .rev()
+                .take(top_k)
+                .cloned()
+                .collect();
+            log::info!(
+                "merge_partial_vector_auxiliary_files: unified IVF extremes index_uuid={} top_k_max_partitions={:?} top_k_min_partitions={:?}",
+                index_uuid,
+                top_k_max_partitions,
+                top_k_min_partitions
+            );
+        }
+
         let mut ivf_model = if let Some(c) = first_centroids {
             IvfStorageModel::new(c, None)
         } else {
@@ -1251,7 +1599,7 @@ mod tests {
             Arc::new(arrow_schema),
             vec![Arc::new(row_id_arr), Arc::new(fsl)],
         )
-        .unwrap();
+            .unwrap();
 
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
@@ -1302,8 +1650,8 @@ mod tests {
             &lance_core::cache::LanceCache::no_cache(),
             V2ReaderOptions::default(),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let meta = reader.metadata();
 
         // Validate IVF lengths aggregation.
@@ -1374,8 +1722,8 @@ mod tests {
             100,
             DistanceType::Cosine,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(&object_store, &index_dir).await;
         match res {
@@ -1490,7 +1838,7 @@ mod tests {
             Arc::new(arrow_schema),
             vec![Arc::new(row_id_arr), Arc::new(codes_fsl)],
         )
-        .unwrap();
+            .unwrap();
 
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
@@ -1534,8 +1882,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         write_pq_partial_aux(
             &object_store,
@@ -1548,8 +1896,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Merge PQ auxiliary files.
         merge_partial_vector_auxiliary_files(&object_store, &index_dir)
@@ -1576,8 +1924,8 @@ mod tests {
             &lance_core::cache::LanceCache::no_cache(),
             V2ReaderOptions::default(),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let meta = reader.metadata();
 
         // 4) Unified IVF metadata lengths equal shard-wise sums.
@@ -1663,8 +2011,8 @@ mod tests {
             DistanceType::L2,
             &codebook0,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         write_pq_partial_aux(
             &object_store,
@@ -1677,8 +2025,8 @@ mod tests {
             DistanceType::L2,
             &codebook1,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(&object_store, &index_dir).await;
         match res {
@@ -1736,8 +2084,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Shard B: base_row_id = 1_000, identical lengths and PQ metadata.
         write_pq_partial_aux(
@@ -1751,8 +2099,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Merge must succeed and produce a unified auxiliary file.
         merge_partial_vector_auxiliary_files(&object_store, &index_dir)
@@ -1781,8 +2129,8 @@ mod tests {
             &lance_core::cache::LanceCache::no_cache(),
             V2ReaderOptions::default(),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let mut stream = reader
             .read_stream(
@@ -1856,8 +2204,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         write_pq_partial_aux(
             &object_store,
@@ -1870,8 +2218,8 @@ mod tests {
             DistanceType::L2,
             &codebook,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Merge must succeed and produce a unified auxiliary file.
         merge_partial_vector_auxiliary_files(&object_store, &index_dir)
@@ -1897,8 +2245,8 @@ mod tests {
             &lance_core::cache::LanceCache::no_cache(),
             V2ReaderOptions::default(),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let mut stream = reader
             .read_stream(

@@ -57,7 +57,7 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::ivf::storage::{IvfModel, IVF_METADATA_KEY};
 use lance_index::vector::kmeans::KMeansParams;
-use lance_index::vector::pq::storage::transpose;
+use lance_index::vector::pq::storage::{transpose, ProductQuantizationMetadata, PQ_METADATA_KEY};
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -1869,6 +1869,18 @@ pub async fn finalize_distributed_merge(
     index_dir: &object_store::path::Path,
     requested_index_type: Option<&str>,
 ) -> Result<()> {
+    let index_uuid = index_dir
+        .parts()
+        .last()
+        .map(|p| p.as_ref().to_string())
+        .unwrap_or_default();
+    log::info!(
+        "finalize_distributed_merge: start index_uuid={} index_dir={:?} requested_index_type={:?}",
+        index_uuid,
+        index_dir,
+        requested_index_type
+    );
+
     // Merge per-shard auxiliary files into a unified auxiliary.idx.
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
@@ -1878,6 +1890,11 @@ pub async fn finalize_distributed_merge(
 
     // Open the unified auxiliary file.
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    log::info!(
+        "finalize_distributed_merge: opening unified auxiliary file index_uuid={} aux_path={:?}",
+        index_uuid,
+        aux_path
+    );
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
@@ -1908,6 +1925,11 @@ pub async fn finalize_distributed_merge(
             message: "IVF index parse error".to_string(),
             location: location!(),
         })?;
+    log::info!(
+        "finalize_distributed_merge: IVF_METADATA_KEY buffer index {} for index_uuid={}",
+        ivf_buf_idx,
+        index_uuid
+    );
 
     let raw_ivf_bytes = aux_reader.read_global_buffer(ivf_buf_idx).await?;
     let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
@@ -1915,6 +1937,10 @@ pub async fn finalize_distributed_merge(
     // If the unified IVF metadata does not contain centroids, try to source them
     // from any partial_* index.idx under this index directory.
     if pb_ivf.centroids_tensor.is_none() {
+        log::info!(
+            "finalize_distributed_merge: centroids missing in unified IVF metadata, scanning partial index files for index_uuid={}",
+            index_uuid
+        );
         let mut stream = object_store.list(Some(index_dir.clone()));
         let mut partial_index_path = None;
 
@@ -1935,6 +1961,11 @@ pub async fn finalize_distributed_merge(
         }
 
         if let Some(partial_index_path) = partial_index_path {
+            log::info!(
+                "finalize_distributed_merge: found partial index with potential centroids at {:?} for index_uuid={}",
+                partial_index_path,
+                index_uuid
+            );
             let fh = scheduler
                 .open_file(&partial_index_path, &CachedFileSize::unknown())
                 .await?;
@@ -1953,14 +1984,46 @@ pub async fn finalize_distributed_merge(
                     let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
                     if partial_pb_ivf.centroids_tensor.is_some() {
                         pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
+                        log::info!(
+                            "finalize_distributed_merge: restored IVF centroids from partial index {:?} for index_uuid={}",
+                            partial_index_path,
+                            index_uuid
+                        );
                     }
                 }
             }
         }
     }
 
+    if pb_ivf.centroids_tensor.is_none() {
+        log::warn!(
+            "finalize_distributed_merge: IVF centroids still missing after scanning partial index files for index_uuid={}",
+            index_uuid
+        );
+    }
+
     let ivf_model: IvfModel = IvfModel::try_from(pb_ivf.clone())?;
     let nlist = ivf_model.num_partitions();
+    let lengths_preview: Vec<u32> = pb_ivf.lengths.iter().copied().take(16).collect();
+    let total_length: u64 = pb_ivf.lengths.iter().map(|v| *v as u64).sum();
+
+    // Try to extract PQ metadata for logging (if present).
+    let pq_meta_summary = meta
+        .file_schema
+        .metadata
+        .get(PQ_METADATA_KEY)
+        .and_then(|json| serde_json::from_str::<ProductQuantizationMetadata>(json).ok())
+        .map(|pm| (pm.dimension, pm.num_sub_vectors, pm.nbits));
+
+    log::info!(
+        "finalize_distributed_merge: unified IVF summary index_uuid={} nlist={} total_length={} lengths_preview={:?} pq_meta={:?}",
+        index_uuid,
+        nlist,
+        total_length,
+        lengths_preview,
+        pq_meta_summary
+    );
+
     let ivf_bytes = pb_ivf.encode_to_vec().into();
 
     // Determine index metadata JSON from auxiliary or requested index type.
@@ -2005,6 +2068,14 @@ pub async fn finalize_distributed_merge(
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.
     let idx_meta: IndexMetadata = serde_json::from_str(&index_meta_json)?;
+    log::info!(
+        "finalize_distributed_merge: index metadata index_uuid={} index_type={} distance_type={} nlist={} total_length={}",
+        index_uuid,
+        idx_meta.index_type,
+        idx_meta.distance_type,
+        nlist,
+        total_length
+    );
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),

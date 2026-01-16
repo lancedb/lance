@@ -204,7 +204,12 @@ pub async fn write_vector_storage(
     writer: ObjectWriter,
     precomputed_partitions_ds_uri: Option<&str>,
 ) -> Result<()> {
-    info!("Transforming {} vectors for storage", num_rows);
+    info!(
+        "Transforming {} vectors for storage (column={}, has_precomputed_partitions={})",
+        num_rows,
+        column,
+        precomputed_partitions_ds_uri.is_some()
+    );
     let ivf_transformer = Arc::new(lance_index::vector::ivf::IvfTransformer::with_pq(
         centroids,
         distance_type,
@@ -236,6 +241,12 @@ pub async fn write_vector_storage(
         info!("Transform progress: {}/{}", total_rows_written, num_rows);
     }
     writer.finish().await?;
+    info!(
+        "Finished write_vector_storage: column={} total_rows_written={} expected_num_rows={}",
+        column,
+        total_rows_written,
+        num_rows
+    );
     Ok(())
 }
 

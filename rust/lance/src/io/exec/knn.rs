@@ -515,6 +515,21 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
 
+                    // Debug logging to inspect coarse IVF partition selection and probe
+                    // configuration per index delta.
+                    let preview_len = usize::min(16, partitions.len());
+                    let mut preview = Vec::with_capacity(preview_len);
+                    for pid in partitions.values().iter().take(preview_len) {
+                        preview.push(*pid);
+                    }
+                    log::info!(
+                            "ANNIvfPartitionExec::execute: index_uuid={} nprobes(min={}, max={:?}) chosen_partitions_preview={:?}",
+                            uuid,
+                            query.minimum_nprobes,
+                            query.maximum_nprobes,
+                            preview
+                        );
+
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
                     part_list_builder.append_value(partitions.iter());
@@ -788,7 +803,7 @@ impl ANNIvfSubIndexExec {
                                 KNN_INDEX_SCHEMA.clone(),
                                 vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
                             )
-                            .unwrap();
+                                .unwrap();
                             return futures::stream::once(async move { Ok(not_found_batch) })
                                 .boxed();
                         } else {
@@ -837,6 +852,44 @@ impl ANNIvfSubIndexExec {
                                 ))
                             })
                             .await?;
+
+                        // Debug logging to inspect late-search per-partition result sizes
+                        // and a small sample of (row_id, distance) pairs.
+                        let num_rows = batch.num_rows();
+                        let mut samples = Vec::new();
+                        let sample_rows = usize::min(3, num_rows);
+                        if sample_rows > 0 {
+                            let dist_arr = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Float32Array>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "ANNIvfSubIndexExec late_search: DIST_COL must be Float32"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let row_id_arr = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "ANNIvfSubIndexExec late_search: ROW_ID column must be UInt64"
+                                            .to_string(),
+                                    )
+                                })?;
+                            for i in 0..sample_rows {
+                                samples.push((row_id_arr.value(i), dist_arr.value(i)));
+                            }
+                        }
+                        log::info!(
+                                "ANNIvfSubIndexExec::late_search: partition_id={} num_rows={} sample_row_id_distance={:?}",
+                                part_id,
+                                num_rows,
+                                samples
+                            );
+
                         metrics.baseline_metrics.record_output(batch.num_rows());
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
@@ -863,6 +916,25 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
+
+        if std::env::var("LANCE_IVFPQ_DEBUG").is_ok() {
+            // Debug logging to inspect which IVF partitions are probed during the
+            // initial search phase and how many candidates they contribute.
+            let preview_len = usize::min(16, minimum_nprobes);
+            let mut preview = Vec::with_capacity(preview_len);
+            let mut candidate_count_sum: usize = 0;
+            for idx in 0..preview_len {
+                let pid = partitions.value(idx);
+                preview.push(pid);
+                candidate_count_sum += index.partition_size(pid as usize);
+            }
+            log::info!(
+                "ANNIvfSubIndexExec::initial_search: minimum_nprobes={} preview_partitions={:?} candidate_count_sum={}",
+                minimum_nprobes,
+                preview,
+                candidate_count_sum
+            );
+        }
 
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
@@ -1100,11 +1172,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
                     * self
-                        .input
-                        .partition_statistics(partition)?
-                        .num_rows
-                        .get_value()
-                        .unwrap_or(&1),
+                    .input
+                    .partition_statistics(partition)?
+                    .num_rows
+                    .get_value()
+                    .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
@@ -1447,14 +1519,14 @@ mod tests {
                                 generate_random_array(128 * 20),
                                 128,
                             )
-                            .unwrap(),
+                                .unwrap(),
                         ),
                         Arc::new(StringArray::from_iter_values(
                             (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
                         )),
                     ],
                 )
-                .unwrap()
+                    .unwrap()
             })
             .collect();
 
@@ -1528,7 +1600,7 @@ mod tests {
             Arc::new(generate_random_array(dim)),
             DistanceType::L2,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![
@@ -1595,7 +1667,7 @@ mod tests {
                         Arc::new(UInt64Array::from(vec![i + 1, i + 2])),
                     ],
                 )
-                .unwrap()
+                    .unwrap()
             })
             .collect::<Vec<_>>();
 
@@ -1675,14 +1747,14 @@ mod tests {
                         ..Default::default()
                     }),
                 )
-                .await
-                .unwrap();
+                    .await
+                    .unwrap();
 
                 let ivf_params = IvfBuildParams::try_with_centroids(
                     num_centroids,
                     Arc::new(centroids.as_fixed_size_list().clone()),
                 )
-                .unwrap();
+                    .unwrap();
 
                 let codebook = array::rand::<Float32Type>()
                     .generate_default(RowCount::from(256 * 2))

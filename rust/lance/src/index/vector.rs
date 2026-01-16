@@ -16,6 +16,7 @@ pub mod utils;
 mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
+use arrow_array::Array;
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_core::utils::tempfile::TempStdDir;
@@ -352,14 +353,14 @@ for concurrent distributed create_index"
     let num_rows = dataset.count_rows(None).await?;
     let index_type = params.index_type();
 
-    let num_partitions = ivf_params0.num_partitions.unwrap_or_else(|| {
-        recommended_num_partitions(
-            num_rows,
-            ivf_params0
-                .target_partition_size
-                .unwrap_or(index_type.target_partition_size()),
-        )
-    });
+    let target_partition_size = ivf_params0
+        .target_partition_size
+        .unwrap_or(index_type.target_partition_size());
+    let recommended_num_partitions =
+        recommended_num_partitions(num_rows, target_partition_size);
+    let num_partitions = ivf_params0
+        .num_partitions
+        .unwrap_or(recommended_num_partitions);
 
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
@@ -367,9 +368,27 @@ for concurrent distributed create_index"
     let ivf_centroids = ivf_params
         .centroids
         .as_ref()
-        .expect("precomputed IVF centroids required for distributed indexing; checked above")
+        .expect(
+            "precomputed IVF centroids required for distributed indexing; checked above",
+        )
         .as_ref()
         .clone();
+    let ivf_dim = ivf_centroids.value_length();
+    let num_centroids = ivf_centroids.len();
+
+    log::info!(
+        "build_distributed_vector_index: uuid={} column={} index_type={:?} metric_type={:?} num_rows={} fragment_ids={:?} recommended_num_partitions={} final_num_partitions={} ivf_centroids={{num_centroids={}, dim={}}}",
+        uuid,
+        column,
+        index_type,
+        params.metric_type,
+        num_rows,
+        fragment_ids,
+        recommended_num_partitions,
+        num_partitions,
+        num_centroids,
+        ivf_dim,
+    );
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
@@ -378,6 +397,11 @@ for concurrent distributed create_index"
     let filtered_dataset = dataset.clone();
 
     let out_base = dataset.indices_dir().child(uuid);
+    log::info!(
+        "build_distributed_vector_index: uuid={} out_base_dir={}",
+        uuid,
+        out_base
+    );
 
     let make_partial_index_dir = |out_base: &Path| -> Path {
         let shard_uuid = Uuid::new_v4();
@@ -427,6 +451,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let index_dir = new_index_dir();
                 let ivf_model = make_ivf_model();
+                log::info!(
+                    "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                    uuid,
+                    index_type,
+                    index_dir,
+                    fragment_ids,
+                );
 
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     filtered_dataset,
@@ -447,6 +478,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             DataType::UInt8 => {
                 let index_dir = new_index_dir();
                 let ivf_model = make_ivf_model();
+                log::info!(
+                    "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                    uuid,
+                    index_type,
+                    index_dir,
+                    fragment_ids,
+                );
 
                 IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     filtered_dataset,
@@ -487,6 +525,14 @@ please provide PQBuildParams.codebook for distributed indexing"
                 });
             };
 
+            log::info!(
+                "build_distributed_vector_index: uuid={} IVF_PQ params: has_codebook={} num_sub_vectors={} nbits={}",
+                uuid,
+                pq_params.codebook.is_some(),
+                pq_params.num_sub_vectors,
+                pq_params.num_bits,
+            );
+
             match params.version {
                 IndexFileVersion::Legacy => {
                     return Err(Error::Index {
@@ -499,6 +545,13 @@ please provide PQBuildParams.codebook for distributed indexing"
                     let index_dir = new_index_dir();
                     let ivf_model = make_ivf_model();
                     let global_pq = make_global_pq(pq_params)?;
+                    log::info!(
+                        "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                        uuid,
+                        index_type,
+                        index_dir,
+                        fragment_ids,
+                    );
 
                     IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         filtered_dataset,
@@ -532,6 +585,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             };
 
             let index_dir = new_index_dir();
+            log::info!(
+                "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                uuid,
+                index_type,
+                index_dir,
+                fragment_ids,
+            );
 
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
@@ -561,6 +621,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             };
 
             let index_dir = new_index_dir();
+            log::info!(
+                "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                uuid,
+                index_type,
+                index_dir,
+                fragment_ids,
+            );
 
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                 filtered_dataset,
@@ -601,6 +668,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             let index_dir = new_index_dir();
             let ivf_model = make_ivf_model();
             let global_pq = make_global_pq(pq_params)?;
+            log::info!(
+                "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                uuid,
+                index_type,
+                index_dir,
+                fragment_ids,
+            );
 
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 filtered_dataset,
@@ -641,6 +715,13 @@ please provide PQBuildParams.codebook for distributed indexing"
             };
 
             let index_dir = new_index_dir();
+            log::info!(
+                "build_distributed_vector_index: uuid={} index_type={:?} shard_index_dir={} fragment_ids={:?}",
+                uuid,
+                index_type,
+                index_dir,
+                fragment_ids,
+            );
 
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
@@ -679,6 +760,15 @@ is not supported in distributed mode; skipping this shard",
             });
         }
     };
+
+    log::info!(
+        "build_distributed_vector_index: uuid={} completed for index_type={:?} column={} num_partitions={} fragment_ids={:?}",
+        uuid,
+        index_type,
+        column,
+        num_partitions,
+        fragment_ids,
+    );
 
     Ok(())
 }
