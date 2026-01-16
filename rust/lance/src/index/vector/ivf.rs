@@ -3,8 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
-
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -97,6 +95,8 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::location;
+use std::collections::HashSet;
+use std::{any::Any, collections::HashMap, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -2027,6 +2027,69 @@ pub async fn finalize_distributed_merge(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
+
+    if let Err(err) = cleanup_partial_vector_dirs(object_store, index_dir).await {
+        warn!(
+            "Failed to cleanup partial_* vector index directories under '{}': {}",
+            index_dir.as_ref(),
+            err
+        );
+    }
+
+    Ok(())
+}
+
+/// Cleanup for distributed partial vector index directories after
+/// a distributed merge.
+///
+/// This helper scans `index_dir` for direct child directories whose names
+/// start with `partial_` (e.g. `<index_dir>/partial_0`, `<index_dir>/partial_1`)
+/// and attempts to recursively delete them via [`ObjectStore::remove_dir_all`].
+///
+/// Listing and deletion failures are logged with [`warn!`] and ignored so that
+/// index finalization is never blocked by cleanup. The function always returns
+/// `Ok(())`.
+async fn cleanup_partial_vector_dirs(
+    object_store: &ObjectStore,
+    index_dir: &object_store::path::Path,
+) -> Result<()> {
+    let mut partial_dirs: HashSet<Path> = HashSet::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                if let Some(relative_parts) = meta.location.prefix_match(index_dir) {
+                    let rel_parts: Vec<_> = relative_parts.collect();
+                    // Expect paths like: <index_dir>/partial_*/<file>
+                    if rel_parts.len() >= 2 {
+                        let parent_name = rel_parts[0].as_ref();
+                        if parent_name.starts_with("partial_") {
+                            partial_dirs.insert(index_dir.child(parent_name));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to list index directory '{}' while collecting partial_* dirs: {}",
+                    index_dir.as_ref(),
+                    e
+                );
+            }
+        }
+    }
+
+    for dir in partial_dirs {
+        if let Err(e) = object_store.remove_dir_all(dir.clone()).await {
+            warn!(
+                "Failed to remove partial_* directory '{}' after distributed merge: {}",
+                dir.as_ref(),
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 
