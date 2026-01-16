@@ -139,14 +139,27 @@ pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|
     )
 });
 
-pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> =
-    LazyLock::new(|| parse_env_var("LANCE_XTR_OVERFETCH", "10").unwrap_or(10));
+const DEFAULT_XTR_OVERFETCH_VALUE: u32 = 10;
+
+pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
+    parse_env_var(
+        "LANCE_XTR_OVERFETCH",
+        &DEFAULT_XTR_OVERFETCH_VALUE.to_string(),
+    )
+    .unwrap_or(DEFAULT_XTR_OVERFETCH_VALUE)
+});
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
+const DEFAULT_IO_BUFFER_SIZE_VALUE: u64 = 2 * 1024 * 1024 * 1024;
+
 pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    parse_env_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "2147483648").unwrap_or(2 * 1024 * 1024 * 1024)
+    parse_env_var(
+        "LANCE_DEFAULT_IO_BUFFER_SIZE",
+        &DEFAULT_IO_BUFFER_SIZE_VALUE.to_string(),
+    )
+    .unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
 });
 
 /// Defines an ordering for a single column
