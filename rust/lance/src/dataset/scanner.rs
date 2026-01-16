@@ -127,13 +127,17 @@ where
 // For backwards compatibility / historical reasons we re-calculate the default batch size
 // on each call
 pub fn get_default_batch_size() -> Option<usize> {
-    parse_env_var("LANCE_DEFAULT_BATCH_SIZE", "8192")
+    parse_env_var("LANCE_DEFAULT_BATCH_SIZE", &BATCH_SIZE_FALLBACK.to_string())
 }
 
 pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 
-pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> =
-    LazyLock::new(|| parse_env_var("LANCE_DEFAULT_FRAGMENT_READAHEAD", "4"));
+pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|| {
+    parse_env_var(
+        "LANCE_DEFAULT_FRAGMENT_READAHEAD",
+        &LEGACY_DEFAULT_FRAGMENT_READAHEAD.to_string(),
+    )
+});
 
 pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> =
     LazyLock::new(|| parse_env_var("LANCE_XTR_OVERFETCH", "10").unwrap_or(10));
