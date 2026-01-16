@@ -3601,4 +3601,69 @@ mod tests {
 
         assert!(correct_times >= 9, "correct: {}", correct_times);
     }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_only_partial_dirs() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup");
+
+        // partial_* directories that should be removed
+        let partial0_file = index_dir.child("partial_0").child("file.bin");
+        let partial_abc_file = index_dir.child("partial_abc").child("file.bin");
+
+        // Non-partial paths that must be preserved
+        let partialx_file = index_dir.child("partialX").child("file.bin");
+        let shard_file = index_dir.child("shard_0").child("file.bin");
+        let keep_root_file = index_dir.child("keep_root.txt");
+
+        object_store.put(&partial0_file, b"partial0").await.unwrap();
+        object_store
+            .put(&partial_abc_file, b"partial_abc")
+            .await
+            .unwrap();
+        object_store.put(&partialx_file, b"partialx").await.unwrap();
+        object_store.put(&shard_file, b"shard").await.unwrap();
+        object_store.put(&keep_root_file, b"root").await.unwrap();
+
+        // Sanity: all files exist before cleanup
+        assert!(object_store.exists(&partial0_file).await.unwrap());
+        assert!(object_store.exists(&partial_abc_file).await.unwrap());
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+
+        // partial_* directories should be removed
+        assert!(!object_store.exists(&partial0_file).await.unwrap());
+        assert!(!object_store.exists(&partial_abc_file).await.unwrap());
+
+        // Non-partial directories and root files must be preserved
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_idempotent() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup_idempotent");
+
+        let partial_file = index_dir.child("partial_0").child("file.bin");
+        object_store.put(&partial_file, b"partial").await.unwrap();
+
+        assert!(object_store.exists(&partial_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+        assert!(!object_store.exists(&partial_file).await.unwrap());
+
+        // Second call should succeed even when there are no partial_* directories left.
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+    }
 }
