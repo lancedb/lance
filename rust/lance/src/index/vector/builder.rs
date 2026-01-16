@@ -88,6 +88,26 @@ use super::{
     utils::{self, get_vector_type},
 };
 
+/// Stably sort a RecordBatch by the ROW_ID column in ascending order.
+///
+/// If the batch has no ROW_ID column or has fewer than 2 rows, it is
+/// returned unchanged. When sorting, the relative order of rows with the
+/// same ROW_ID is preserved.
+fn stable_sort_batch_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
+    if let Some(row_id_col) = batch.column_by_name(ROW_ID) {
+        let row_ids = row_id_col.as_primitive::<UInt64Type>();
+        if row_ids.len() > 1 {
+            let mut order: Vec<usize> = (0..row_ids.len()).collect();
+            // Vec::sort_by is stable, so equal ROW_IDs keep their
+            // original relative order.
+            order.sort_by(|&i, &j| row_ids.value(i).cmp(&row_ids.value(j)));
+            let indices = UInt32Array::from_iter_values(order.into_iter().map(|i| i as u32));
+            return Ok(batch.take(&indices)?);
+        }
+    }
+    Ok(batch.clone())
+}
+
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
 
@@ -935,6 +955,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
                 _ => {}
             }
+
+            // Normalize each batch for this partition to be stably sorted by ROW_ID.
+            for batch in part_batches.iter_mut() {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                *batch = stable_sort_batch_by_row_id(batch)?;
+            }
+
             batches.extend(part_batches);
         }
 
@@ -958,6 +987,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .map(|s| s.parse::<f64>().unwrap_or(0.0))
                         .unwrap_or(0.0);
                     let batch = batch.drop_column(PART_ID_COLUMN)?;
+                    let batch = stable_sort_batch_by_row_id(&batch)?;
                     batches.push(batch);
                 }
             }
@@ -980,6 +1010,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 location!(),
             ));
         };
+
+        let is_pq = Q::quantization_type() == QuantizationType::Product;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1024,7 +1056,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 storage_ivf.add_partition(0);
             } else {
                 let batches = storage.to_batches()?.collect::<Vec<_>>();
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+                let mut batch =
+                    arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+
+                if is_pq && batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+                    // The PQ storage keeps codes in a transposed layout (bytes grouped
+                    // across all rows). Convert them back to per-row layout so that a
+                    // stable ROW_ID sort moves PQ_CODE_COLUMN together with ROW_ID.
+                    let codes_fsl = batch
+                        .column_by_name(PQ_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let num_rows = batch.num_rows();
+                    let bytes_per_code = codes_fsl.value_length() as usize;
+                    let codes = codes_fsl.values().as_primitive::<datatypes::UInt8Type>();
+                    let original_codes = transpose(codes, bytes_per_code, num_rows);
+                    let original_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                        original_codes,
+                        bytes_per_code as i32,
+                    )?);
+                    batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
+                }
+
+                // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
+                // PQ code column moves together with ROW_ID.
+                batch = stable_sort_batch_by_row_id(&batch)?;
+
                 storage_writer.write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
@@ -1071,7 +1128,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
             codebook_position: Some(0),
             codebook: None,
-            transposed: true,
+            transposed: !is_pq,
         }));
         if let Some(extra_metadata) = metadata.extra_metadata()? {
             let idx = storage_writer.add_global_buffer(extra_metadata).await?;
