@@ -262,7 +262,7 @@ pub trait RowSetOps: Clone + Sized {
     fn len(&self) -> Option<u64>;
 
     /// Remove a value from the row set.
-    fn remove(&mut self, value: u64) -> bool;
+    fn remove(&mut self, row: Self::Row) -> bool;
 
     /// Returns whether this set contains the given row.
     fn contains(&self, row: Self::Row) -> bool;
@@ -352,9 +352,9 @@ impl RowSetOps for RowAddrTreeMap {
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
 
-    fn remove(&mut self, value: u64) -> bool {
-        let upper = (value >> 32) as u32;
-        let lower = value as u32;
+    fn remove(&mut self, row: Self::Row) -> bool {
+        let upper = (row >> 32) as u32;
+        let lower = row as u32;
         match self.inner.get_mut(&upper) {
             None => false,
             Some(RowAddrSelection::Full) => {
