@@ -44,7 +44,7 @@ lance-index = { path = "../rust/lance-index", features = [
 lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-namespace = { path = "../rust/lance-namespace" }
-lance-namespace-impls = { path = "../rust/lance-namespace-impls" }
+lance-namespace-impls = { path = "../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 libc = "0.2.176"
@@ -73,15 +73,9 @@ url = "2.5.0"
 bytes = "1.4"
 
 [features]
-default = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"]
+default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
-rest = ["lance-namespace-impls/rest"]
-rest-adapter = ["lance-namespace-impls/rest-adapter"]
-# Credential vending features for DirectoryNamespace
-credential-vendor-aws = ["lance-namespace-impls/credential-vendor-aws"]
-credential-vendor-gcp = ["lance-namespace-impls/credential-vendor-gcp"]
-credential-vendor-azure = ["lance-namespace-impls/credential-vendor-azure"]
 
 [profile.ci]
 debug = "line-tables-only"

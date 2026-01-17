@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(feature = "rest")]
 use lance_namespace_impls::RestNamespaceBuilder;
-#[cfg(feature = "rest-adapter")]
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
 use pyo3::prelude::*;
@@ -282,14 +280,12 @@ impl PyDirectoryNamespace {
     }
 }
 
-#[cfg(feature = "rest")]
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
     inner: Arc<dyn lance_namespace::LanceNamespace>,
 }
 
-#[cfg(feature = "rest")]
 #[pymethods]
 impl PyRestNamespace {
     /// Create a new RestNamespace from properties
@@ -466,7 +462,6 @@ impl PyRestNamespace {
     }
 }
 
-#[cfg(feature = "rest-adapter")]
 /// Python wrapper for REST adapter server
 #[pyclass(name = "PyRestAdapter", module = "lance.lance")]
 pub struct PyRestAdapter {
@@ -475,7 +470,6 @@ pub struct PyRestAdapter {
     handle: Option<RestAdapterHandle>,
 }
 
-#[cfg(feature = "rest-adapter")]
 #[pymethods]
 impl PyRestAdapter {
     /// Create a new REST adapter server with namespace configuration.
