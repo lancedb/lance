@@ -425,8 +425,8 @@ impl VectorStore for RabitQuantizationStorage {
         let sum_q = rotated_qr.into_iter().sum();
 
         let q_factor = match self.distance_type {
-            DistanceType::L2 => dist_q_c,
-            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
+            DistanceType::L2 | DistanceType::Cosine => dist_q_c,
+            DistanceType::Dot => dist_q_c - 1.0,
             _ => unimplemented!(
                 "RabitQ does not support distance type: {}",
                 self.distance_type
