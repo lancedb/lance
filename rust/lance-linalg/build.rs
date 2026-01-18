@@ -21,6 +21,16 @@ fn main() -> Result<(), String> {
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
 
+    // Early exit if fp16kernels feature is not enabled.
+    // This allows the crate to build on any platform (iOS, Android, etc.)
+    // when the feature is disabled, without requiring platform-specific kernel support.
+    //
+    // Note: We use CARGO_FEATURE_* env var instead of cfg!() because cfg!()
+    // checks the build script's features, not the library's features.
+    if env::var("CARGO_FEATURE_FP16KERNELS").is_err() {
+        return Ok(());
+    }
+
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
     // for the build script, not the target_arch for the library. Similar story for
     // target_os.
