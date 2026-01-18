@@ -765,20 +765,22 @@ pub async fn commit_handler_from_url(
                 }
             };
             let options = options.clone().unwrap_or_default();
-            let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
-            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
-            let expires_at_millis = storage_options.expires_at_millis();
-            let storage_options = storage_options.as_s3_options();
+            let storage_options_raw =
+                StorageOptions(options.storage_options().cloned().unwrap_or_default());
+            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options_raw);
+            let storage_options = storage_options_raw.as_s3_options();
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
+
+            // Get accessor from the options
+            let accessor = options.get_accessor();
 
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
-                options.storage_options_provider.clone(),
-                expires_at_millis,
+                accessor,
             )
             .await?;
 

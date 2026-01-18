@@ -31,6 +31,18 @@ use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
 
+/// Generate default index name from field path.
+///
+/// Joins field names with `.` to create the base index name.
+/// For example: `["meta-data", "user-id"]` -> `"meta-data.user-id"`
+fn default_index_name(fields: &[&str]) -> String {
+    if fields.iter().any(|f| f.contains('.')) {
+        format_field_path(fields)
+    } else {
+        fields.join(".")
+    }
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -135,7 +147,24 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = if let Some(name) = self.name.take() {
+            name
+        } else {
+            // Generate default name with collision handling
+            let column_path = default_index_name(&names);
+            let base_name = format!("{column_path}_idx");
+            let mut candidate = base_name.clone();
+            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
+                                 // Find unique name by appending numeric suffix if needed
+            while indices
+                .iter()
+                .any(|idx| idx.name == candidate && idx.fields != [field.id])
+            {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        };
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -405,8 +434,9 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     #[instrument(skip_all)]
-    async fn execute(mut self) -> Result<()> {
+    async fn execute(mut self) -> Result<IndexMetadata> {
         let new_idx = self.execute_uncommitted().await?;
+        let index_uuid = new_idx.uuid;
         let transaction = Transaction::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
@@ -420,13 +450,23 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        Ok(())
+        // Fetch the committed index metadata from the dataset.
+        // This ensures we return the version that may have been modified by the commit.
+        let indices = self.dataset.load_indices().await?;
+        indices
+            .iter()
+            .find(|idx| idx.uuid == index_uuid)
+            .cloned()
+            .ok_or_else(|| Error::Internal {
+                message: format!("Index with UUID {} not found after commit", index_uuid),
+                location: location!(),
+            })
     }
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
-    type Output = Result<()>;
-    type IntoFuture = BoxFuture<'a, Result<()>>;
+    type Output = Result<IndexMetadata>;
+    type IntoFuture = BoxFuture<'a, Result<IndexMetadata>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -437,16 +477,140 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::RecordBatchIterator;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen;
+    use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+
+    #[test]
+    fn test_default_index_name() {
+        // Single field - preserved as-is
+        assert_eq!(default_index_name(&["user-id"]), "user-id");
+        assert_eq!(default_index_name(&["user:id"]), "user:id");
+        assert_eq!(default_index_name(&["userId"]), "userId");
+
+        // Nested paths - joined with dot
+        assert_eq!(
+            default_index_name(&["meta-data", "user-id"]),
+            "meta-data.user-id"
+        );
+        assert_eq!(
+            default_index_name(&["MetaData", "userId"]),
+            "MetaData.userId"
+        );
+
+        // Path with dots in field names - escape
+        assert_eq!(
+            default_index_name(&["meta.data", "user.id"]),
+            "`meta.data`.`user.id`"
+        );
+
+        // Empty input
+        assert_eq!(default_index_name(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn test_default_index_name_with_special_chars() {
+        // Verify default index names preserve special characters in column names.
+        let mut dataset = gen_batch()
+            .col("user-id", lance_datagen::array::step::<Int32Type>())
+            .col("user:id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // Create index on column with hyphen
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["user-id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "user-id_idx");
+
+        // Create index on column with colon
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["user:id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx2.name, "user:id_idx");
+
+        // Verify both indices exist
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_index_name_collision_with_explicit_name() {
+        // Test collision handling when explicit name conflicts with default name.
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // (a) Explicit name on first index, default on second that would collide
+        // Create index on "a" with explicit name "b_idx"
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("b_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "b_idx");
+
+        // Create index on "b" with default name - would be "b_idx" but that's taken
+        // so it should get "b_idx_2"
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx2.name, "b_idx_2");
+
+        // Verify both indices exist
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_index_name_collision_explicit_errors() {
+        // Test that explicit name collision with existing index errors.
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // (b) Default name on first, explicit same name on second should error
+        // Create index on "a" with default name "a_idx"
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "a_idx");
+
+        // Try to create index on "b" with explicit name "a_idx" - should error
+        let result = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {

@@ -37,7 +37,6 @@ import java.util.Map;
  *     .allocator(allocator)
  *     .data(vectorSchemaRoot)
  *     .storageOptions(storageOptions)
- *     .s3CredentialsRefreshOffsetSeconds(10)
  *     .execute();
  * }</pre>
  */
@@ -131,21 +130,6 @@ public class WriteFragmentBuilder {
    */
   public WriteFragmentBuilder storageOptionsProvider(StorageOptionsProvider provider) {
     this.storageOptionsProvider = provider;
-    return this;
-  }
-
-  /**
-   * Set the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param seconds refresh offset in seconds
-   * @return this builder
-   */
-  public WriteFragmentBuilder s3CredentialsRefreshOffsetSeconds(long seconds) {
-    ensureWriteParamsBuilder();
-    this.writeParamsBuilder.withS3CredentialsRefreshOffsetSeconds(seconds);
     return this;
   }
 

@@ -112,7 +112,9 @@ fn inner_open<'local>(
     let storage_options = to_rust_map(env, &jmap)?;
     let reader = RT.block_on(async move {
         let object_params = ObjectStoreParams {
-            storage_options: Some(storage_options),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+            )),
             ..Default::default()
         };
         let (obj_store, path) = ObjectStore::from_uri_and_params(

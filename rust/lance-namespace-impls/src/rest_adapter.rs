@@ -2695,15 +2695,10 @@ mod tests {
             .unwrap();
 
             let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
-            let dataset = Dataset::write_into_namespace(
-                reader1,
-                namespace.clone(),
-                table_id.clone(),
-                None,
-                false,
-            )
-            .await
-            .unwrap();
+            let dataset =
+                Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+                    .await
+                    .unwrap();
 
             assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
             assert_eq!(dataset.version().version, 1);
@@ -2729,7 +2724,6 @@ mod tests {
                 namespace.clone(),
                 table_id.clone(),
                 Some(params_append),
-                false,
             )
             .await
             .unwrap();
@@ -2758,7 +2752,6 @@ mod tests {
                 namespace.clone(),
                 table_id.clone(),
                 Some(params_overwrite),
-                false,
             )
             .await
             .unwrap();
@@ -2775,6 +2768,132 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             assert_eq!(a_col.values(), &[100, 200]);
+        }
+
+        // ============================================================================
+        // DynamicContextProvider Integration Test
+        // ============================================================================
+
+        use crate::context::{DynamicContextProvider, OperationInfo};
+        use std::collections::HashMap;
+
+        /// Test context provider that adds custom headers to every request.
+        #[derive(Debug)]
+        struct TestDynamicContextProvider {
+            headers: HashMap<String, String>,
+        }
+
+        impl DynamicContextProvider for TestDynamicContextProvider {
+            fn provide_context(&self, _info: &OperationInfo) -> HashMap<String, String> {
+                self.headers.clone()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_rest_namespace_with_context_provider() {
+            let temp_dir = TempDir::new().unwrap();
+            let temp_path = temp_dir.path().to_str().unwrap().to_string();
+
+            // Create DirectoryNamespace backend with manifest enabled
+            let backend = DirectoryNamespaceBuilder::new(&temp_path)
+                .manifest_enabled(true)
+                .build()
+                .await
+                .unwrap();
+            let backend = Arc::new(backend);
+
+            // Start REST server
+            let config = RestAdapterConfig {
+                port: 0,
+                ..Default::default()
+            };
+
+            let server = RestAdapter::new(backend.clone(), config);
+            let server_handle = server.start().await.unwrap();
+            let actual_port = server_handle.port();
+
+            // Create context provider that adds custom headers
+            let mut context_headers = HashMap::new();
+            context_headers.insert(
+                "headers.X-Custom-Auth".to_string(),
+                "test-auth-token".to_string(),
+            );
+            context_headers.insert(
+                "headers.X-Request-Source".to_string(),
+                "integration-test".to_string(),
+            );
+
+            let provider = Arc::new(TestDynamicContextProvider {
+                headers: context_headers,
+            });
+
+            // Create RestNamespace client with context provider and base headers
+            let server_url = format!("http://127.0.0.1:{}", actual_port);
+            let namespace = RestNamespaceBuilder::new(&server_url)
+                .delimiter("$")
+                .header("X-Base-Header", "base-value")
+                .context_provider(provider)
+                .build();
+
+            // Create a namespace - should work with context provider
+            let create_req = CreateNamespaceRequest {
+                id: Some(vec!["context_test_ns".to_string()]),
+                properties: None,
+                mode: None,
+                identity: None,
+                context: None,
+            };
+            let result = namespace.create_namespace(create_req).await;
+            assert!(result.is_ok(), "Failed to create namespace: {:?}", result);
+
+            // List namespaces - should also work
+            let list_req = ListNamespacesRequest {
+                id: Some(vec![]),
+                limit: Some(10),
+                page_token: None,
+                identity: None,
+                context: None,
+            };
+            let result = namespace.list_namespaces(list_req).await;
+            assert!(result.is_ok(), "Failed to list namespaces: {:?}", result);
+            let response = result.unwrap();
+            assert!(
+                response.namespaces.contains(&"context_test_ns".to_string()),
+                "Namespace not found in list"
+            );
+
+            // Create a table - should work with context provider
+            let table_data = create_test_arrow_data();
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "context_test_ns".to_string(),
+                    "test_table".to_string(),
+                ]),
+                mode: Some("create".to_string()),
+                identity: None,
+                context: None,
+            };
+            let result = namespace.create_table(create_table_req, table_data).await;
+            assert!(result.is_ok(), "Failed to create table: {:?}", result);
+
+            // Describe the table - should work with context provider
+            let describe_req = DescribeTableRequest {
+                id: Some(vec![
+                    "context_test_ns".to_string(),
+                    "test_table".to_string(),
+                ]),
+                with_table_uri: None,
+                load_detailed_metadata: None,
+                vend_credentials: None,
+                version: None,
+                identity: None,
+                context: None,
+            };
+            let result = namespace.describe_table(describe_req).await;
+            assert!(result.is_ok(), "Failed to describe table: {:?}", result);
+
+            // Cleanup
+            server_handle.shutdown();
         }
     }
 }

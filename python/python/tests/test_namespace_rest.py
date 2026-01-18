@@ -680,3 +680,66 @@ class TestLanceNamespaceConnect:
                 ipc_data = table_to_ipc_bytes(table_data)
                 response = ns.create_table(create_req, ipc_data)
                 assert response is not None
+
+
+class TestDynamicContextProvider:
+    """Tests for DynamicContextProvider with RestNamespace."""
+
+    def test_rest_namespace_with_explicit_provider(self):
+        """Test RestNamespace with an explicit context provider."""
+        call_count = {"count": 0}
+
+        class TestProvider(lance.namespace.DynamicContextProvider):
+            def provide_context(self, info):
+                call_count["count"] += 1
+                return {
+                    "headers.Authorization": "Bearer test-token",
+                    "headers.X-Request-Id": f"req-{info.get('operation', 'unknown')}",
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                ns = lance.namespace.RestNamespace(
+                    uri=f"http://127.0.0.1:{adapter.port}",
+                    context_provider=TestProvider(),
+                )
+
+                # Perform operations
+                create_req = CreateNamespaceRequest(id=["workspace"])
+                ns.create_namespace(create_req)
+
+                list_req = ListNamespacesRequest(id=[])
+                ns.list_namespaces(list_req)
+
+                # Context provider should have been called
+                assert call_count["count"] >= 2
+
+    def test_explicit_provider_takes_precedence(self):
+        """Test that explicit provider takes precedence over class path."""
+        explicit_called = {"called": False}
+
+        class ExplicitProvider(lance.namespace.DynamicContextProvider):
+            def provide_context(self, info):
+                explicit_called["called"] = True
+                return {"headers.Authorization": "Bearer explicit"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                # Pass both explicit provider and class path - explicit should win
+                ns = lance.namespace.RestNamespace(
+                    context_provider=ExplicitProvider(),
+                    **{
+                        "uri": f"http://127.0.0.1:{adapter.port}",
+                        "dynamic_context_provider.impl": "nonexistent.Provider",
+                    },
+                )
+
+                create_req = CreateNamespaceRequest(id=["workspace"])
+                ns.create_namespace(create_req)
+
+                # Explicit provider should have been used
+                assert explicit_called["called"]

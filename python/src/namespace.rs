@@ -7,17 +7,82 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lance_namespace_impls::DirectoryNamespaceBuilder;
-#[cfg(feature = "rest")]
 use lance_namespace_impls::RestNamespaceBuilder;
-#[cfg(feature = "rest-adapter")]
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
+use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
 
 use crate::error::PythonErrorExt;
 use crate::session::Session;
+
+/// Python-implemented dynamic context provider.
+///
+/// Wraps a Python object that has a `provide_context(info: dict) -> dict` method.
+/// For RestNamespace, context keys that start with `headers.` are converted to
+/// HTTP headers by stripping the prefix.
+pub struct PyDynamicContextProvider {
+    provider: Py<PyAny>,
+}
+
+impl Clone for PyDynamicContextProvider {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            provider: self.provider.clone_ref(py),
+        })
+    }
+}
+
+impl PyDynamicContextProvider {
+    /// Create a new Python context provider wrapper.
+    pub fn new(provider: Py<PyAny>) -> Self {
+        Self { provider }
+    }
+}
+
+impl std::fmt::Debug for PyDynamicContextProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PyDynamicContextProvider")
+    }
+}
+
+impl DynamicContextProvider for PyDynamicContextProvider {
+    fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
+        Python::attach(|py| {
+            // Create Python dict for operation info
+            let py_info = PyDict::new(py);
+            if py_info.set_item("operation", &info.operation).is_err() {
+                return HashMap::new();
+            }
+            if py_info.set_item("object_id", &info.object_id).is_err() {
+                return HashMap::new();
+            }
+
+            // Call the provider's provide_context method
+            let result = self
+                .provider
+                .call_method1(py, "provide_context", (py_info,));
+
+            match result {
+                Ok(headers_py) => {
+                    // Convert Python dict to Rust HashMap
+                    let bound_headers = headers_py.bind(py);
+                    if let Ok(dict) = bound_headers.downcast::<PyDict>() {
+                        dict_to_hashmap(dict).unwrap_or_default()
+                    } else {
+                        log::warn!("Context provider did not return a dict");
+                        HashMap::new()
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to call context provider: {}", e);
+                    HashMap::new()
+                }
+            }
+        })
+    }
+}
 
 /// Convert Python dict to HashMap<String, String>
 fn dict_to_hashmap(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>> {
@@ -39,10 +104,18 @@ pub struct PyDirectoryNamespace {
 #[pymethods]
 impl PyDirectoryNamespace {
     /// Create a new DirectoryNamespace from properties
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Optional Lance session for sharing storage connections
+    /// * `context_provider` - Optional object with `provide_context(info: dict) -> dict` method
+    ///   for providing dynamic per-request context
+    /// * `**properties` - Namespace configuration properties
     #[new]
-    #[pyo3(signature = (session = None, **properties))]
+    #[pyo3(signature = (session = None, context_provider = None, **properties))]
     fn new(
         session: Option<&Bound<'_, Session>>,
+        context_provider: Option<&Bound<'_, PyAny>>,
         properties: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let mut props = HashMap::new();
@@ -53,13 +126,19 @@ impl PyDirectoryNamespace {
 
         let session_arc = session.map(|s| s.borrow().inner.clone());
 
-        let builder =
+        let mut builder =
             DirectoryNamespaceBuilder::from_properties(props, session_arc).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "Failed to create DirectoryNamespace: {}",
                     e
                 ))
             })?;
+
+        // Add context provider if provided
+        if let Some(provider) = context_provider {
+            let py_provider = PyDynamicContextProvider::new(provider.clone().unbind());
+            builder = builder.context_provider(Arc::new(py_provider));
+        }
 
         let namespace = crate::rt().block_on(None, builder.build())?.infer_error()?;
 
@@ -245,32 +324,47 @@ impl PyDirectoryNamespace {
     }
 }
 
-#[cfg(feature = "rest")]
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
     inner: Arc<dyn lance_namespace::LanceNamespace>,
 }
 
-#[cfg(feature = "rest")]
 #[pymethods]
 impl PyRestNamespace {
     /// Create a new RestNamespace from properties
+    ///
+    /// # Arguments
+    ///
+    /// * `context_provider` - Optional object with `provide_context(info: dict) -> dict` method
+    ///   for providing dynamic per-request context. Context keys that start with `headers.`
+    ///   are converted to HTTP headers by stripping the prefix. For example,
+    ///   `{"headers.Authorization": "Bearer token"}` becomes the `Authorization` header.
+    /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*, etc.)
     #[new]
-    #[pyo3(signature = (**properties))]
-    fn new(properties: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+    #[pyo3(signature = (context_provider = None, **properties))]
+    fn new(
+        context_provider: Option<&Bound<'_, PyAny>>,
+        properties: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let mut props = HashMap::new();
 
         if let Some(dict) = properties {
             props = dict_to_hashmap(dict)?;
         }
 
-        let builder = RestNamespaceBuilder::from_properties(props).map_err(|e| {
+        let mut builder = RestNamespaceBuilder::from_properties(props).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Failed to create RestNamespace: {}",
                 e
             ))
         })?;
+
+        // Add context provider if provided
+        if let Some(provider) = context_provider {
+            let py_provider = PyDynamicContextProvider::new(provider.clone().unbind());
+            builder = builder.context_provider(Arc::new(py_provider));
+        }
 
         let namespace = builder.build();
 
@@ -456,7 +550,6 @@ impl PyRestNamespace {
     }
 }
 
-#[cfg(feature = "rest-adapter")]
 /// Python wrapper for REST adapter server
 #[pyclass(name = "PyRestAdapter", module = "lance.lance")]
 pub struct PyRestAdapter {
@@ -465,7 +558,6 @@ pub struct PyRestAdapter {
     handle: Option<RestAdapterHandle>,
 }
 
-#[cfg(feature = "rest-adapter")]
 #[pymethods]
 impl PyRestAdapter {
     /// Create a new REST adapter server with namespace configuration.

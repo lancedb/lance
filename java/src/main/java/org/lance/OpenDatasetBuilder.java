@@ -58,7 +58,6 @@ public class OpenDatasetBuilder {
   private LanceNamespace namespace;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
-  private boolean ignoreNamespaceTableStorageOptions = false;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
   OpenDatasetBuilder() {}
@@ -129,19 +128,6 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describeTable().
-   *
-   * @param ignoreNamespaceTableStorageOptions If true, storage options returned from
-   *     describeTable() will be ignored (treated as null)
-   * @return this builder instance
-   */
-  public OpenDatasetBuilder ignoreNamespaceTableStorageOptions(
-      boolean ignoreNamespaceTableStorageOptions) {
-    this.ignoreNamespaceTableStorageOptions = ignoreNamespaceTableStorageOptions;
-    return this;
-  }
-
-  /**
    * Opens the dataset with the configured parameters.
    *
    * <p>If a namespace is configured, this automatically fetches the table location and storage
@@ -204,8 +190,7 @@ public class OpenDatasetBuilder {
       throw new IllegalArgumentException("Namespace did not return a table location");
     }
 
-    Map<String, String> namespaceStorageOptions =
-        ignoreNamespaceTableStorageOptions ? null : response.getStorageOptions();
+    Map<String, String> namespaceStorageOptions = response.getStorageOptions();
 
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
@@ -221,9 +206,6 @@ public class OpenDatasetBuilder {
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-    options
-        .getS3CredentialsRefreshOffsetSeconds()
-        .ifPresent(optionsBuilder::setS3CredentialsRefreshOffsetSeconds);
 
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
     if (namespaceStorageOptions != null) {

@@ -69,6 +69,7 @@
 //! ```
 
 pub mod connect;
+pub mod context;
 pub mod credentials;
 pub mod dir;
 
@@ -80,6 +81,7 @@ pub mod rest_adapter;
 
 // Re-export connect builder
 pub use connect::ConnectBuilder;
+pub use context::{DynamicContextProvider, OperationInfo};
 pub use dir::{manifest::ManifestNamespace, DirectoryNamespace, DirectoryNamespaceBuilder};
 
 // Re-export credential vending

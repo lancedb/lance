@@ -65,7 +65,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         } = parse_hf_url(&base_path)?;
 
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
 
         // Build OpenDAL config with allowed keys only.
@@ -115,7 +115,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?,
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 
@@ -159,12 +159,13 @@ mod tests {
 
     #[test]
     fn storage_option_revision_takes_precedence() {
+        use crate::object_store::StorageOptionsAccessor;
+        use std::sync::Arc;
         let url = Url::parse("hf://datasets/acme/repo/data/file").unwrap();
         let params = ObjectStoreParams {
-            storage_options: Some(HashMap::from([(
-                String::from("hf_revision"),
-                String::from("stable"),
-            )])),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(String::from("hf_revision"), String::from("stable"))]),
+            ))),
             ..Default::default()
         };
         // new_store should accept without creating operator; test precedence via builder config
@@ -177,8 +178,7 @@ mod tests {
         config_map.insert("repo_type".to_string(), repo_type);
         config_map.insert("repo".to_string(), repo_id);
         if let Some(rev) = params
-            .storage_options
-            .as_ref()
+            .storage_options()
             .unwrap()
             .get("hf_revision")
             .cloned()

@@ -87,6 +87,7 @@ class TestMixedCaseColumnNames:
         indices = mixed_case_dataset.list_indices()
         assert len(indices) == 1
         assert indices[0]["fields"] == ["userId"]
+        assert indices[0]["name"] == "userId_idx"
 
         # Query using the indexed column
         result = mixed_case_dataset.to_table(filter="userId = 50")
@@ -95,6 +96,9 @@ class TestMixedCaseColumnNames:
         # Verify the index is actually used in the query plan
         plan = mixed_case_dataset.scanner(filter="userId = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
+
+        stats = mixed_case_dataset.stats.index_stats("userId_idx")
+        assert stats["index_type"] == "BTree"
 
     def test_alter_column_with_mixed_case(self, mixed_case_dataset):
         """Altering columns works with mixed-case column names."""
@@ -347,6 +351,7 @@ class TestSpecialCharacterColumnNames:
         assert len(indices) == 1
         # Field with special chars is returned in quoted format for SQL compatibility
         assert indices[0]["fields"] == ["`user-id`"]
+        assert indices[0]["name"] == "user-id_idx"
 
         # Query using the indexed column (requires backticks in filter)
         result = special_char_dataset.to_table(filter="`user-id` = 50")
@@ -355,6 +360,9 @@ class TestSpecialCharacterColumnNames:
         # Verify the index is actually used in the query plan
         plan = special_char_dataset.scanner(filter="`user-id` = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
+
+        stats = special_char_dataset.stats.index_stats("user-id_idx")
+        assert stats["index_type"] == "BTree"
 
     def test_alter_column_with_special_chars(self, special_char_dataset):
         """Altering columns works with special character column names."""
@@ -455,6 +463,7 @@ class TestNestedFieldColumnNames:
         indices = nested_mixed_case_dataset.list_indices()
         assert len(indices) == 1
         assert indices[0]["fields"] == ["MetaData.userId"]
+        assert indices[0]["name"] == "MetaData.userId_idx"
 
         # Query using the indexed column
         result = nested_mixed_case_dataset.to_table(filter="MetaData.userId = 50")
@@ -466,6 +475,9 @@ class TestNestedFieldColumnNames:
         ).explain_plan()
         assert "ScalarIndexQuery" in plan
 
+        stats = nested_mixed_case_dataset.stats.index_stats("MetaData.userId_idx")
+        assert stats["index_type"] == "BTree"
+
     def test_scalar_index_on_top_level_mixed_case(self, nested_mixed_case_dataset):
         """Scalar index on top-level mixed-case column works."""
         nested_mixed_case_dataset.create_scalar_index("rowId", index_type="BTREE")
@@ -473,12 +485,16 @@ class TestNestedFieldColumnNames:
         indices = nested_mixed_case_dataset.list_indices()
         assert len(indices) == 1
         assert indices[0]["fields"] == ["rowId"]
+        assert indices[0]["name"] == "rowId_idx"
 
         result = nested_mixed_case_dataset.to_table(filter="rowId = 50")
         assert result.num_rows == 1
 
         plan = nested_mixed_case_dataset.scanner(filter="rowId = 50").explain_plan()
         assert "ScalarIndexQuery" in plan
+
+        stats = nested_mixed_case_dataset.stats.index_stats("rowId_idx")
+        assert stats["index_type"] == "BTree"
 
     def test_scalar_index_with_lowercased_nested_path(self, nested_mixed_case_dataset):
         """Scalar index creation should work even when path is lowercased.
@@ -562,6 +578,7 @@ class TestNestedFieldColumnNames:
         assert len(indices) == 1
         # Fields with special chars are returned in quoted format for SQL compatibility
         assert indices[0]["fields"] == ["`meta-data`.`user-id`"]
+        assert indices[0]["name"] == "meta-data.user-id_idx"
 
         # Query using the indexed column (backticks required in filter)
         result = nested_special_char_dataset.to_table(
@@ -574,6 +591,9 @@ class TestNestedFieldColumnNames:
             filter="`meta-data`.`user-id` = 50"
         ).explain_plan()
         assert "ScalarIndexQuery" in plan
+
+        stats = nested_special_char_dataset.stats.index_stats("meta-data.user-id_idx")
+        assert stats["index_type"] == "BTree"
 
     def test_scalar_index_on_top_level_special_chars(self, nested_special_char_dataset):
         """Scalar index on top-level special char column works."""

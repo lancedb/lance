@@ -47,6 +47,7 @@ rstest.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
 test-log.workspace = true
+libc.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

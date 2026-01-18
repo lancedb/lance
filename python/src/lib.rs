@@ -277,10 +277,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
-    #[cfg(feature = "rest")]
     m.add_class::<namespace::PyRestNamespace>()?;
-    #[cfg(feature = "rest-adapter")]
     m.add_class::<namespace::PyRestAdapter>()?;
+    m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

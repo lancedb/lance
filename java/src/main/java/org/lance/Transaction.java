@@ -118,7 +118,6 @@ public class Transaction {
     private Operation operation;
     private Map<String, String> writeParams;
     private Map<String, String> transactionProperties;
-    private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
 
     public Builder(Dataset dataset) {
       this.dataset = dataset;
@@ -140,21 +139,6 @@ public class Transaction {
       return this;
     }
 
-    /**
-     * Sets the S3 credentials refresh offset in seconds.
-     *
-     * <p>This parameter controls how long before credential expiration to refresh them. For
-     * example, if credentials expire at T+60s and this is set to 10, credentials will be refreshed
-     * at T+50s.
-     *
-     * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
-     * @return this builder instance
-     */
-    public Builder s3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
-      this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-      return this;
-    }
-
     public Builder operation(Operation operation) {
       validateState();
       this.operation = operation;
@@ -171,15 +155,8 @@ public class Transaction {
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
 
-      // Merge s3_credentials_refresh_offset_seconds into writeParams if present
-      Map<String, String> finalWriteParams =
-          writeParams != null ? new HashMap<>(writeParams) : new HashMap<>();
-      s3CredentialsRefreshOffsetSeconds.ifPresent(
-          value ->
-              finalWriteParams.put("s3_credentials_refresh_offset_seconds", String.valueOf(value)));
-
       return new Transaction(
-          dataset, readVersion, uuid, operation, finalWriteParams, transactionProperties);
+          dataset, readVersion, uuid, operation, writeParams, transactionProperties);
     }
   }
 }

@@ -2078,6 +2078,51 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert dataset.to_table().sort_by("a") == expected
 
 
+def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
+    base_dir = tmp_path / "merge_insert_pk_default"
+
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+
+    base_table = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}, schema=schema)
+    dataset = lance.write_dataset(base_table, base_dir)
+
+    new_table = pa.table({"id": [2, 3, 4], "value": [200, 300, 400]}, schema=schema)
+
+    builder = dataset.merge_insert()
+    builder = builder.when_matched_update_all().when_not_matched_insert_all()
+    stats = builder.execute(new_table)
+
+    assert stats["num_inserted_rows"] == 1
+    assert stats["num_updated_rows"] == 2
+    assert stats["num_deleted_rows"] == 0
+
+    result = dataset.to_table().sort_by("id")
+    assert result.to_pydict() == {"id": [1, 2, 3, 4], "value": [10, 200, 300, 400]}
+
+
+def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
+    base_dir = tmp_path / "merge_insert_no_pk"
+
+    table = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset = lance.write_dataset(table, base_dir)
+
+    with pytest.raises(ValueError) as excinfo:
+        dataset.merge_insert()
+
+    msg = str(excinfo.value)
+    assert "join keys" in msg or "primary key" in msg
+
+
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
         {

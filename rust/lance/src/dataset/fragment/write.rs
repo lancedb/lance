@@ -303,12 +303,12 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
         let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        let storage_options = self
+        let accessor = self
             .write_params
             .and_then(|p| p.store_params.as_ref())
-            .and_then(|p| p.storage_options.clone());
-        if let Some(storage_options) = storage_options {
-            builder = builder.with_storage_options(storage_options);
+            .and_then(|p| p.storage_options_accessor.clone());
+        if let Some(accessor) = accessor {
+            builder = builder.with_storage_options_accessor(accessor);
         }
         match builder.load().await {
             Ok(dataset) => {

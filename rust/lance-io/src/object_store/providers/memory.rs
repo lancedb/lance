@@ -19,7 +19,7 @@ pub struct MemoryStoreProvider;
 impl ObjectStoreProvider for MemoryStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
@@ -32,7 +32,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?,
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 

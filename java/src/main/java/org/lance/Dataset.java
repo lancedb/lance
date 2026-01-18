@@ -144,7 +144,6 @@ public class Dataset implements Closeable {
               params.getDataStorageVersion(),
               params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds(),
               params.getInitialBases(),
               params.getTargetBases());
       dataset.allocator = allocator;
@@ -206,7 +205,6 @@ public class Dataset implements Closeable {
             params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
             Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds(),
             params.getInitialBases(),
             params.getTargetBases());
     dataset.allocator = allocator;
@@ -224,7 +222,6 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -239,7 +236,6 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -255,7 +251,6 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -335,8 +330,7 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider(),
-            options.getS3CredentialsRefreshOffsetSeconds());
+            options.getStorageOptionsProvider());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -350,8 +344,7 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   /**
    * Creates a builder for opening a dataset.
@@ -758,6 +751,42 @@ public class Dataset implements Closeable {
 
   private native long nativeGetLatestVersionId();
 
+  /**
+   * Get the initial storage options used to open this dataset.
+   *
+   * <p>This returns the options that were provided when the dataset was opened, without any refresh
+   * from the provider. Returns null if no storage options were provided.
+   *
+   * @return the initial storage options, or null if none were provided
+   */
+  public Map<String, String> getInitialStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetInitialStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetInitialStorageOptions();
+
+  /**
+   * Get the latest storage options, potentially refreshed from the provider.
+   *
+   * <p>If a storage options provider was configured and credentials are expiring, this will refresh
+   * them.
+   *
+   * @return the latest storage options (static or refreshed from provider), or null if no storage
+   *     options were configured for this dataset
+   * @throws RuntimeException if an error occurs while fetching/refreshing options from the provider
+   */
+  public Map<String, String> getLatestStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLatestStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetLatestStorageOptions();
+
   /** Checkout the dataset to the latest version. */
   public void checkoutLatest() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
@@ -823,16 +852,17 @@ public class Dataset implements Closeable {
    * @param name the name of the created index
    * @param params index params
    * @param replace whether to replace the existing index
+   * @return the metadata of the created index
    * @deprecated please use {@link Dataset#createIndex(IndexOptions)} instead.
    */
   @Deprecated
-  public void createIndex(
+  public Index createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
       boolean replace) {
-    createIndex(
+    return createIndex(
         IndexOptions.builder(columns, indexType, params)
             .replace(replace)
             .withIndexName(name.orElse(null))
@@ -843,11 +873,12 @@ public class Dataset implements Closeable {
    * Creates a new index on the dataset.
    *
    * @param options options for building index
+   * @return the metadata of the created index
    */
-  public void createIndex(IndexOptions options) {
+  public Index createIndex(IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(
+      return nativeCreateIndex(
           options.getColumns(),
           options.getIndexType().ordinal(),
           options.getIndexName(),
@@ -860,7 +891,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native void nativeCreateIndex(
+  private native Index nativeCreateIndex(
       List<String> columns,
       int indexTypeCode,
       Optional<String> name,

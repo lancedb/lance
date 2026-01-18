@@ -91,7 +91,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -108,7 +107,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
         ),
         JObject::default()
     )
@@ -128,7 +126,6 @@ fn inner_create_with_ffi_array<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -154,7 +151,6 @@ fn inner_create_with_ffi_array<'local>(
         data_storage_version,
         storage_options_obj,
         storage_options_provider_obj,
-        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
@@ -173,7 +169,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -189,7 +184,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
         ),
         JObject::null()
     )
@@ -208,7 +202,6 @@ fn inner_create_with_ffi_stream<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -224,7 +217,6 @@ fn inner_create_with_ffi_stream<'local>(
         data_storage_version,
         storage_options_obj,
         storage_options_provider_obj,
-        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
@@ -241,7 +233,6 @@ fn create_fragment<'a>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -257,7 +248,6 @@ fn create_fragment<'a>(
         None,
         &storage_options_obj,
         &storage_options_provider_obj,
-        &s3_credentials_refresh_offset_seconds_obj,
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
     )?;

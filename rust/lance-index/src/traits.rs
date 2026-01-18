@@ -153,6 +153,8 @@ pub trait DatasetIndexExt {
     ///            if not provided, it will auto-generate one.
     ///  - `params`: index parameters.
     ///  - `replace`: replace the existing index if it exists.
+    ///
+    /// Returns the metadata of the created index.
     async fn create_index(
         &mut self,
         columns: &[&str],
@@ -160,7 +162,7 @@ pub trait DatasetIndexExt {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()>;
+    ) -> Result<IndexMetadata>;
 
     /// Drop indices by name.
     ///

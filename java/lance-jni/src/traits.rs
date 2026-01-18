@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
+
 use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::JNIEnv;
 
@@ -221,6 +223,26 @@ impl IntoJava for &JLance<i64> {
 impl IntoJava for &String {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_string(self)?.into())
+    }
+}
+
+impl IntoJava for HashMap<String, String> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
+        for (key, value) in self {
+            let java_key = env.new_string(&key)?;
+            let java_value = env.new_string(&value)?;
+            env.call_method(
+                &hash_map,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    JValueGen::Object(&java_key.into()),
+                    JValueGen::Object(&java_value.into()),
+                ],
+            )?;
+        }
+        Ok(hash_map)
     }
 }
 

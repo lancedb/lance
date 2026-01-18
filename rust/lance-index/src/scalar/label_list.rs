@@ -57,8 +57,8 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
 /// A scalar index that can be used on `List<T>` columns to
-/// support queries with array_contains_all and array_contains_any
-/// using an underlying bitmap index.
+/// accelerate list membership filters such as `array_has_all`, `array_has_any`,
+/// and `array_has` / `array_contains`, using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct LabelListIndex {
     values_index: Arc<dyn LabelListSubIndex>,

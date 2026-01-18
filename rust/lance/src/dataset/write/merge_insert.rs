@@ -341,7 +341,12 @@ pub struct MergeInsertJob {
 /// This operation is similar to SQL's MERGE statement. It allows you to merge
 /// new data with existing data.
 ///
-/// Use the [MergeInsertBuilder] to construct an merge insert job. For example:
+/// Use the [MergeInsertBuilder] to construct an merge insert job.
+///
+/// If the `on` parameter is empty, the builder will fall back to the
+/// schema's unenforced primary key (if configured). If neither `on` nor a
+/// primary key is available, this constructor returns an error.
+/// For example:
 ///
 /// ```
 /// # use lance::{Dataset, Result};
@@ -390,30 +395,44 @@ impl MergeInsertBuilder {
     ///
     /// Use the methods on this builder to customize that behavior
     pub fn try_new(dataset: Arc<Dataset>, on: Vec<String>) -> Result<Self> {
-        if on.is_empty() {
-            return Err(Error::invalid_input(
-                "A merge insert operation must specify at least one on key",
-                location!(),
-            ));
-        }
+        // Determine the join keys to use. If `on` is empty, fall back to the
+        // schema's unenforced primary key (if configured).
+        let resolved_on = if on.is_empty() {
+            let schema = dataset.schema();
+            let pk_fields = schema.unenforced_primary_key();
 
-        // Resolve column names using case-insensitive matching to handle
-        // lowercased column names from SQL parsing or user input
-        let resolved_on = on
-            .iter()
-            .map(|col| {
-                dataset
-                    .schema()
-                    .field_case_insensitive(col)
-                    .map(|f| f.name.clone())
-                    .ok_or_else(|| {
-                        Error::invalid_input(
-                            format!("Merge insert key column '{}' does not exist in schema", col),
-                            location!(),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            if pk_fields.is_empty() {
+                return Err(Error::invalid_input(
+                    "A merge insert operation requires join keys: specify `on` columns explicitly or configure a primary key in the dataset schema",
+                    location!(),
+                ));
+            }
+
+            pk_fields
+                .iter()
+                .map(|field| schema.field_path(field.id))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            // Resolve column names using case-insensitive matching to handle
+            // lowercased column names from SQL parsing or user input
+            on.iter()
+                .map(|col| {
+                    dataset
+                        .schema()
+                        .field_case_insensitive(col)
+                        .map(|f| f.name.clone())
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                format!(
+                                    "Merge insert key column '{}' does not exist in schema",
+                                    col
+                                ),
+                                location!(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
         Ok(Self {
             dataset,
@@ -2479,6 +2498,103 @@ mod tests {
                 assert_ne!(row_ids_before, row_ids_after);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_requires_on_or_primary_key() {
+        let test_uri = "memory://merge_insert_requires_keys";
+
+        let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+
+        let err = MergeInsertBuilder::try_new(ds, Vec::new()).unwrap_err();
+        if let crate::Error::InvalidInput { source, .. } = err {
+            let msg = source.to_string();
+            assert!(
+                msg.contains("requires join keys") && msg.contains("primary key"),
+                "unexpected error message: {}",
+                msg
+            );
+        } else {
+            panic!("expected InvalidInput error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_defaults_to_unenforced_primary_key() {
+        // Define a simple schema with an unenforced primary key on `id`.
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(
+            [(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )]
+            .into(),
+        );
+        let value_field = Field::new("value", DataType::Int32, false);
+        let schema = Arc::new(Schema::new(vec![id_field, value_field]));
+
+        let initial_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://merge_insert_pk_default",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // New data: update ids 2 and 3, insert id 4.
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 3, 4])),
+                Arc::new(Int32Array::from(vec![200, 300, 400])),
+            ],
+        )
+        .unwrap();
+
+        let mut builder = MergeInsertBuilder::try_new(dataset.clone(), Vec::new()).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        let job = builder.try_build().unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (updated_dataset, stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_deleted_rows, 0);
+
+        let result_batch = updated_dataset.scan().try_into_batch().await.unwrap();
+        let ids = result_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let values = result_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+
+        let mut pairs = (0..ids.len())
+            .map(|i| (ids.value(i), values.value(i)))
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+
+        assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
     }
 
     #[rstest::rstest]

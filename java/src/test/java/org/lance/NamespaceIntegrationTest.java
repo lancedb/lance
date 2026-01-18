@@ -203,6 +203,8 @@ public class NamespaceIntegrationTest {
 
       long expiresAtMillis = System.currentTimeMillis() + (credentialExpiresInSeconds * 1000L);
       modified.put("expires_at_millis", String.valueOf(expiresAtMillis));
+      // Set refresh offset to 1 second (1000ms) for short-lived credential tests
+      modified.put("refresh_offset_millis", "1000");
 
       return modified;
     }
@@ -326,11 +328,7 @@ public class NamespaceIntegrationTest {
       assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
 
       // Open dataset through namespace WITH refresh enabled
-      // Use 10-second refresh offset, so credentials effectively expire at T+50s
-      ReadOptions readOptions =
-          new ReadOptions.Builder()
-              .setS3CredentialsRefreshOffsetSeconds(10) // Refresh 10s before expiration
-              .build();
+      ReadOptions readOptions = new ReadOptions.Builder().build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -451,7 +449,6 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
-                .s3CredentialsRefreshOffsetSeconds(2) // Refresh 2s before expiration
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
@@ -461,11 +458,7 @@ public class NamespaceIntegrationTest {
       assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
 
       // Open dataset through namespace with refresh enabled
-      // Use 2-second refresh offset so credentials effectively expire at T+3s (5s - 2s)
-      ReadOptions readOptions =
-          new ReadOptions.Builder()
-              .setS3CredentialsRefreshOffsetSeconds(2) // Refresh 2s before expiration
-              .build();
+      ReadOptions readOptions = new ReadOptions.Builder().build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -692,7 +685,6 @@ public class NamespaceIntegrationTest {
             };
 
         // Use the write builder to create a dataset through namespace
-        // Set a 1-second refresh offset. Credentials expire at T+60s, so refresh at T+59s.
         // Write completes instantly, so NO describeTable call should happen for refresh.
         try (Dataset dataset =
             Dataset.write()
@@ -701,7 +693,6 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
-                .s3CredentialsRefreshOffsetSeconds(1)
                 .execute()) {
 
           // Verify createEmptyTable was called exactly ONCE
@@ -732,9 +723,7 @@ public class NamespaceIntegrationTest {
           "describeTable should still be 0 after close (no refresh needed)");
 
       // Now open the dataset through namespace with long-lived credentials (60s expiration)
-      // With 1s refresh offset, credentials are valid for 59s - plenty of time for reads
-      ReadOptions readOptions =
-          new ReadOptions.Builder().setS3CredentialsRefreshOffsetSeconds(1).build();
+      ReadOptions readOptions = new ReadOptions.Builder().build();
 
       try (Dataset dsFromNamespace =
           Dataset.open()

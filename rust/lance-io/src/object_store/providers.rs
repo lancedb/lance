@@ -209,7 +209,7 @@ impl ObjectStoreRegistry {
         };
 
         let cache_path =
-            provider.calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?;
+            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params
@@ -417,12 +417,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_hit_miss_tracking() {
+        use crate::object_store::StorageOptionsAccessor;
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
 
         let params1 = ObjectStoreParams::default();
         let params2 = ObjectStoreParams {
-            storage_options: Some(HashMap::from([("k".into(), "v".into())])),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("k".into(), "v".into())]),
+            ))),
             ..Default::default()
         };
 

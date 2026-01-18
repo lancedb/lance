@@ -58,7 +58,6 @@ public class WriteParams {
   private final Optional<LanceFileVersion> dataStorageVersion;
   private final Optional<Boolean> enableV2ManifestPaths;
   private Map<String, String> storageOptions = new HashMap<>();
-  private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
   private final Optional<List<BasePath>> initialBases;
   private final Optional<List<String>> targetBases;
 
@@ -71,7 +70,6 @@ public class WriteParams {
       Optional<LanceFileVersion> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases) {
     this.maxRowsPerFile = maxRowsPerFile;
@@ -82,7 +80,6 @@ public class WriteParams {
     this.dataStorageVersion = dataStorageVersion;
     this.enableV2ManifestPaths = enableV2ManifestPaths;
     this.storageOptions = storageOptions;
-    this.s3CredentialsRefreshOffsetSeconds = s3CredentialsRefreshOffsetSeconds;
     this.initialBases = initialBases;
     this.targetBases = targetBases;
   }
@@ -124,10 +121,6 @@ public class WriteParams {
     return storageOptions;
   }
 
-  public Optional<Long> getS3CredentialsRefreshOffsetSeconds() {
-    return s3CredentialsRefreshOffsetSeconds;
-  }
-
   public Optional<List<BasePath>> getInitialBases() {
     return initialBases;
   }
@@ -157,7 +150,6 @@ public class WriteParams {
     private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
     private Optional<Boolean> enableV2ManifestPaths;
     private Map<String, String> storageOptions = new HashMap<>();
-    private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
     private Optional<List<BasePath>> initialBases = Optional.empty();
     private Optional<List<String>> targetBases = Optional.empty();
 
@@ -201,11 +193,6 @@ public class WriteParams {
       return this;
     }
 
-    public Builder withS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
-      this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-      return this;
-    }
-
     public Builder withInitialBases(List<BasePath> initialBases) {
       this.initialBases = Optional.of(initialBases);
       return this;
@@ -226,7 +213,6 @@ public class WriteParams {
           dataStorageVersion,
           enableV2ManifestPaths,
           storageOptions,
-          s3CredentialsRefreshOffsetSeconds,
           initialBases,
           targetBases);
     }

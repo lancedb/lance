@@ -10,6 +10,8 @@ use lance::session::Session;
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 
+use crate::context::DynamicContextProvider;
+
 /// Builder for creating Lance namespace connections.
 ///
 /// This builder provides a fluent API for configuring and establishing
@@ -46,11 +48,53 @@ use lance_namespace::LanceNamespace;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+///
+/// ## With Dynamic Context Provider
+///
+/// ```no_run
+/// # use lance_namespace_impls::{ConnectBuilder, DynamicContextProvider, OperationInfo};
+/// # use std::collections::HashMap;
+/// # use std::sync::Arc;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// #[derive(Debug)]
+/// struct MyProvider;
+///
+/// impl DynamicContextProvider for MyProvider {
+///     fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
+///         let mut ctx = HashMap::new();
+///         ctx.insert("headers.Authorization".to_string(), "Bearer token".to_string());
+///         ctx
+///     }
+/// }
+///
+/// let namespace = ConnectBuilder::new("rest")
+///     .property("uri", "https://api.example.com")
+///     .context_provider(Arc::new(MyProvider))
+///     .connect()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
 pub struct ConnectBuilder {
     impl_name: String,
     properties: HashMap<String, String>,
     session: Option<Arc<Session>>,
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+}
+
+impl std::fmt::Debug for ConnectBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectBuilder")
+            .field("impl_name", &self.impl_name)
+            .field("properties", &self.properties)
+            .field("session", &self.session)
+            .field(
+                "context_provider",
+                &self.context_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
 }
 
 impl ConnectBuilder {
@@ -64,6 +108,7 @@ impl ConnectBuilder {
             impl_name: impl_name.into(),
             properties: HashMap::new(),
             session: None,
+            context_provider: None,
         }
     }
 
@@ -102,6 +147,20 @@ impl ConnectBuilder {
         self
     }
 
+    /// Set a dynamic context provider for per-request context.
+    ///
+    /// The provider will be called before each operation to generate
+    /// additional context. For RestNamespace, context keys that start with
+    /// `headers.` are converted to HTTP headers by stripping the prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The context provider implementation
+    pub fn context_provider(mut self, provider: Arc<dyn DynamicContextProvider>) -> Self {
+        self.context_provider = Some(provider);
+        self
+    }
+
     /// Build and establish the connection to the namespace.
     ///
     /// # Returns
@@ -119,8 +178,12 @@ impl ConnectBuilder {
             #[cfg(feature = "rest")]
             "rest" => {
                 // Create REST implementation (REST doesn't use session)
-                crate::rest::RestNamespaceBuilder::from_properties(self.properties)
-                    .map(|builder| Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
+                let mut builder =
+                    crate::rest::RestNamespaceBuilder::from_properties(self.properties)?;
+                if let Some(provider) = self.context_provider {
+                    builder = builder.context_provider(provider);
+                }
+                Ok(Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
             }
             #[cfg(not(feature = "rest"))]
             "rest" => Err(Error::Namespace {
@@ -130,13 +193,17 @@ impl ConnectBuilder {
             }),
             "dir" => {
                 // Create directory implementation (always available)
-                crate::dir::DirectoryNamespaceBuilder::from_properties(
+                let mut builder = crate::dir::DirectoryNamespaceBuilder::from_properties(
                     self.properties,
                     self.session,
-                )?
-                .build()
-                .await
-                .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+                )?;
+                if let Some(provider) = self.context_provider {
+                    builder = builder.context_provider(provider);
+                }
+                builder
+                    .build()
+                    .await
+                    .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
             }
             _ => Err(Error::Namespace {
                 source: format!(

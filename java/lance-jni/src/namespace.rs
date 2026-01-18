@@ -1,22 +1,120 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use bytes::Bytes;
-use jni::objects::{JByteArray, JMap, JObject, JString};
+use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use lance_namespace::models::*;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace_impls::{
-    ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, RestAdapter, RestAdapterConfig,
-    RestNamespace, RestNamespaceBuilder,
+    ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider,
+    OperationInfo, RestAdapter, RestAdapterConfig, RestNamespace, RestNamespaceBuilder,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::utils::to_rust_map;
 use crate::RT;
+
+/// Java-implemented dynamic context provider.
+///
+/// Wraps a Java object that implements the DynamicContextProvider interface.
+pub struct JavaDynamicContextProvider {
+    java_provider: GlobalRef,
+    jvm: Arc<jni::JavaVM>,
+}
+
+impl JavaDynamicContextProvider {
+    /// Create a new Java context provider wrapper.
+    pub fn new(env: &mut JNIEnv, java_provider: &JObject) -> Result<Self> {
+        let java_provider = env.new_global_ref(java_provider)?;
+        let jvm = Arc::new(env.get_java_vm()?);
+        Ok(Self { java_provider, jvm })
+    }
+}
+
+impl std::fmt::Debug for JavaDynamicContextProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JavaDynamicContextProvider")
+    }
+}
+
+impl DynamicContextProvider for JavaDynamicContextProvider {
+    fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
+        // Attach to JVM
+        let mut env = match self.jvm.attach_current_thread() {
+            Ok(env) => env,
+            Err(e) => {
+                log::error!("Failed to attach to JVM: {}", e);
+                return HashMap::new();
+            }
+        };
+
+        // Create Java strings for parameters
+        let operation = match env.new_string(&info.operation) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Failed to create operation string: {}", e);
+                return HashMap::new();
+            }
+        };
+
+        let object_id = match env.new_string(&info.object_id) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Failed to create object_id string: {}", e);
+                return HashMap::new();
+            }
+        };
+
+        // Call provideContext(String, String) -> Map<String, String>
+        let result = env.call_method(
+            &self.java_provider,
+            "provideContext",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/Map;",
+            &[JValue::Object(&operation), JValue::Object(&object_id)],
+        );
+
+        match result {
+            Ok(jvalue) => match jvalue.l() {
+                Ok(obj) if !obj.is_null() => {
+                    // Convert Java Map to Rust HashMap
+                    convert_java_map_to_hashmap(&mut env, &obj).unwrap_or_default()
+                }
+                Ok(_) => HashMap::new(),
+                Err(e) => {
+                    log::error!("provideContext did not return object: {}", e);
+                    HashMap::new()
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to call provideContext: {}", e);
+                HashMap::new()
+            }
+        }
+    }
+}
+
+fn convert_java_map_to_hashmap(
+    env: &mut JNIEnv,
+    map_obj: &JObject,
+) -> Result<HashMap<String, String>> {
+    let jmap = JMap::from_env(env, map_obj)?;
+    let mut result = HashMap::new();
+
+    let mut iter = jmap.iter(env)?;
+    while let Some((key, value)) = iter.next(env)? {
+        let key_str: String = env.get_string(&JString::from(key))?.into();
+        let value_str: String = env.get_string(&JString::from(value))?.into();
+        result.insert(key_str, value_str);
+    }
+
+    Ok(result)
+}
 
 /// Blocking wrapper for DirectoryNamespace
 pub struct BlockingDirectoryNamespace {
@@ -40,20 +138,47 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createNative(
 ) -> jlong {
     ok_or_throw_with_return!(
         env,
-        create_directory_namespace_internal(&mut env, properties_map),
+        create_directory_namespace_internal(&mut env, properties_map, None),
         0
     )
 }
 
-fn create_directory_namespace_internal(env: &mut JNIEnv, properties_map: JObject) -> Result<jlong> {
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createNativeWithProvider(
+    mut env: JNIEnv,
+    _obj: JObject,
+    properties_map: JObject,
+    context_provider: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        create_directory_namespace_internal(&mut env, properties_map, Some(context_provider)),
+        0
+    )
+}
+
+fn create_directory_namespace_internal(
+    env: &mut JNIEnv,
+    properties_map: JObject,
+    context_provider: Option<JObject>,
+) -> Result<jlong> {
     // Convert Java HashMap to Rust HashMap
     let jmap = JMap::from_env(env, &properties_map)?;
     let properties = to_rust_map(env, &jmap)?;
 
     // Build DirectoryNamespace using builder
-    let builder = DirectoryNamespaceBuilder::from_properties(properties, None).map_err(|e| {
-        Error::runtime_error(format!("Failed to create DirectoryNamespaceBuilder: {}", e))
-    })?;
+    let mut builder =
+        DirectoryNamespaceBuilder::from_properties(properties, None).map_err(|e| {
+            Error::runtime_error(format!("Failed to create DirectoryNamespaceBuilder: {}", e))
+        })?;
+
+    // Add context provider if provided
+    if let Some(provider_obj) = context_provider {
+        if !provider_obj.is_null() {
+            let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
+            builder = builder.context_provider(Arc::new(java_provider));
+        }
+    }
 
     let namespace = RT
         .block_on(builder.build())
@@ -537,20 +662,46 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createNative(
 ) -> jlong {
     ok_or_throw_with_return!(
         env,
-        create_rest_namespace_internal(&mut env, properties_map),
+        create_rest_namespace_internal(&mut env, properties_map, None),
         0
     )
 }
 
-fn create_rest_namespace_internal(env: &mut JNIEnv, properties_map: JObject) -> Result<jlong> {
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createNativeWithProvider(
+    mut env: JNIEnv,
+    _obj: JObject,
+    properties_map: JObject,
+    context_provider: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        create_rest_namespace_internal(&mut env, properties_map, Some(context_provider)),
+        0
+    )
+}
+
+fn create_rest_namespace_internal(
+    env: &mut JNIEnv,
+    properties_map: JObject,
+    context_provider: Option<JObject>,
+) -> Result<jlong> {
     // Convert Java HashMap to Rust HashMap
     let jmap = JMap::from_env(env, &properties_map)?;
     let properties = to_rust_map(env, &jmap)?;
 
     // Build RestNamespace using builder
-    let builder = RestNamespaceBuilder::from_properties(properties).map_err(|e| {
+    let mut builder = RestNamespaceBuilder::from_properties(properties).map_err(|e| {
         Error::runtime_error(format!("Failed to create RestNamespaceBuilder: {}", e))
     })?;
+
+    // Add context provider if provided
+    if let Some(provider_obj) = context_provider {
+        if !provider_obj.is_null() {
+            let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
+            builder = builder.context_provider(Arc::new(java_provider));
+        }
+    }
 
     let namespace = builder.build();
 

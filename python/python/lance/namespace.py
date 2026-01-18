@@ -7,11 +7,13 @@ This module provides:
 1. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
 2. Storage options integration with LanceNamespace for automatic credential refresh
 3. Plugin registry for external namespace implementations
+4. Dynamic context provider registry for per-request context injection
 
 The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
-from typing import Dict, List
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
 
 from lance_namespace import (
     CreateEmptyTableRequest,
@@ -61,7 +63,146 @@ __all__ = [
     "RestNamespace",
     "RestAdapter",
     "LanceNamespaceStorageOptionsProvider",
+    "DynamicContextProvider",
 ]
+
+
+# =============================================================================
+# Dynamic Context Provider
+# =============================================================================
+
+
+class DynamicContextProvider(ABC):
+    """Abstract base class for dynamic context providers.
+
+    Implementations provide per-request context (e.g., authentication headers)
+    based on the operation being performed. The provider is called synchronously
+    before each namespace operation.
+
+    For RestNamespace, context keys that start with `headers.` are converted to
+    HTTP headers by stripping the prefix. For example, `{"headers.Authorization":
+    "Bearer token"}` becomes the `Authorization: Bearer token` header.
+
+    Example
+    -------
+    >>> # Define a provider class
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {
+    ...             "headers.Authorization": f"Bearer {self.api_key}",
+    ...         }
+    ...
+    >>> # Create provider instance and use directly
+    >>> provider = MyProvider(api_key="secret")
+    >>> provider.provide_context({"operation": "list_tables", "object_id": "ns"})
+    {'headers.Authorization': 'Bearer secret'}
+    """
+
+    @abstractmethod
+    def provide_context(self, info: Dict[str, str]) -> Dict[str, str]:
+        """Provide context for a namespace operation.
+
+        Parameters
+        ----------
+        info : dict
+            Information about the operation:
+            - operation: The operation name (e.g., "list_tables", "describe_table")
+            - object_id: The object identifier (namespace or table ID)
+
+        Returns
+        -------
+        dict
+            Context key-value pairs. For HTTP headers, use keys with the
+            "headers." prefix (e.g., "headers.Authorization").
+        """
+        pass
+
+
+def _create_context_provider_from_properties(
+    properties: Dict[str, str],
+) -> Optional[DynamicContextProvider]:
+    """Create a context provider instance from properties.
+
+    Extracts `dynamic_context_provider.*` properties and creates a provider
+    instance by dynamically loading the class from the given class path.
+
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict that may contain dynamic_context_provider.* keys.
+
+    Returns
+    -------
+    DynamicContextProvider or None
+        The created provider instance, or None if no provider is configured.
+
+    Raises
+    ------
+    ValueError
+        If dynamic_context_provider.impl is set but the class cannot be loaded.
+    """
+    import importlib
+
+    prefix = "dynamic_context_provider."
+    impl_key = "dynamic_context_provider.impl"
+
+    impl_path = properties.get(impl_key)
+    if not impl_path:
+        return None
+
+    # Parse the class path (e.g., "my_module.submodule.MyClass")
+    if "." not in impl_path:
+        raise ValueError(
+            f"Invalid context provider class path '{impl_path}'. "
+            f"Expected format: 'module.ClassName' (e.g., 'my_module.MyProvider')"
+        )
+
+    module_path, class_name = impl_path.rsplit(".", 1)
+
+    try:
+        module = importlib.import_module(module_path)
+        provider_class = getattr(module, class_name)
+    except ModuleNotFoundError as e:
+        raise ValueError(
+            f"Failed to import module '{module_path}' for context provider: {e}"
+        ) from e
+    except AttributeError as e:
+        raise ValueError(
+            f"Class '{class_name}' not found in module '{module_path}': {e}"
+        ) from e
+
+    # Extract provider-specific properties (strip prefix, exclude impl key)
+    provider_props = {}
+    for key, value in properties.items():
+        if key.startswith(prefix) and key != impl_key:
+            prop_name = key[len(prefix) :]
+            provider_props[prop_name] = value
+
+    # Create the provider instance
+    return provider_class(**provider_props)
+
+
+def _filter_context_provider_properties(properties: Dict[str, str]) -> Dict[str, str]:
+    """Remove dynamic_context_provider.* properties from the dict.
+
+    These properties are handled at the Python level and should not be
+    passed to the Rust layer.
+
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict.
+
+    Returns
+    -------
+    dict
+        Properties with dynamic_context_provider.* keys removed.
+    """
+    prefix = "dynamic_context_provider."
+    return {k: v for k, v in properties.items() if not k.startswith(prefix)}
 
 
 class DirectoryNamespace(LanceNamespace):
@@ -140,14 +281,40 @@ class DirectoryNamespace(LanceNamespace):
     ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
     ...     "credential_vendor.aws_duration_millis": "3600000",
     ... })
+
+    With dynamic context provider:
+
+    >>> import tempfile
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, token: str):
+    ...         self.token = token
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.token}"}
+    ...
+    >>> provider = MyProvider(token="secret-token")
+    >>> with tempfile.TemporaryDirectory() as tmpdir:
+    ...     ns = lance.namespace.DirectoryNamespace(
+    ...         root=tmpdir,
+    ...         context_provider=provider,
+    ...     )
+    ...     _ = ns.namespace_id()  # verify it works
     """
 
-    def __init__(self, session=None, **properties):
+    def __init__(self, session=None, context_provider=None, **properties):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyDirectoryNamespace(session=session, **str_properties)
+        self._inner = PyDirectoryNamespace(
+            session=session, context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""
@@ -254,9 +421,25 @@ class RestNamespace(LanceNamespace):
     >>> # Using the connect() factory function from lance_namespace
     >>> import lance_namespace
     >>> ns = lance_namespace.connect("rest", {"uri": "http://localhost:4099"})
+
+    With dynamic context provider:
+
+    >>> class AuthProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.api_key}"}
+    ...
+    >>> provider = AuthProvider(api_key="my-secret-key")
+    >>> ns = lance.namespace.RestNamespace(
+    ...     uri="http://localhost:4099",
+    ...     context_provider=provider,
+    ... )
+    >>> ns.namespace_id()  # verify it works
+    'RestNamespace { endpoint: "http://localhost:4099", delimiter: "$" }'
     """
 
-    def __init__(self, **properties):
+    def __init__(self, context_provider=None, **properties):
         if PyRestNamespace is None:
             raise RuntimeError(
                 "RestNamespace is not available. "
@@ -266,8 +449,17 @@ class RestNamespace(LanceNamespace):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyRestNamespace(**str_properties)
+        self._inner = PyRestNamespace(
+            context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""

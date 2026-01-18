@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
@@ -85,7 +86,7 @@ pub(crate) struct TableStatus {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DirectoryNamespaceBuilder {
     root: String,
     storage_options: Option<HashMap<String, String>>,
@@ -94,6 +95,26 @@ pub struct DirectoryNamespaceBuilder {
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+}
+
+impl std::fmt::Debug for DirectoryNamespaceBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryNamespaceBuilder")
+            .field("root", &self.root)
+            .field("storage_options", &self.storage_options)
+            .field("manifest_enabled", &self.manifest_enabled)
+            .field("dir_listing_enabled", &self.dir_listing_enabled)
+            .field(
+                "inline_optimization_enabled",
+                &self.inline_optimization_enabled,
+            )
+            .field(
+                "context_provider",
+                &self.context_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
 }
 
 impl DirectoryNamespaceBuilder {
@@ -111,6 +132,7 @@ impl DirectoryNamespaceBuilder {
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: true,
             credential_vendor_properties: HashMap::new(),
+            context_provider: None,
         }
     }
 
@@ -271,6 +293,7 @@ impl DirectoryNamespaceBuilder {
             dir_listing_enabled,
             inline_optimization_enabled,
             credential_vendor_properties,
+            context_provider: None,
         })
     }
 
@@ -362,6 +385,20 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
+    /// Set a dynamic context provider for per-request context.
+    ///
+    /// The provider can be used to generate additional context for operations.
+    /// For DirectoryNamespace, the context is stored but not directly used
+    /// in operations (unlike RestNamespace where it's converted to HTTP headers).
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The context provider implementation
+    pub fn context_provider(mut self, provider: Arc<dyn DynamicContextProvider>) -> Self {
+        self.context_provider = Some(provider);
+        self
+    }
+
     /// Build the DirectoryNamespace.
     ///
     /// # Returns
@@ -423,6 +460,7 @@ impl DirectoryNamespaceBuilder {
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
             credential_vendor,
+            context_provider: self.context_provider,
         })
     }
 
@@ -433,8 +471,11 @@ impl DirectoryNamespaceBuilder {
         session: &Option<Arc<Session>>,
     ) -> Result<(Arc<ObjectStore>, Path)> {
         // Build ObjectStoreParams from storage options
+        let accessor = storage_options.clone().map(|opts| {
+            Arc::new(lance_io::object_store::StorageOptionsAccessor::with_static_options(opts))
+        });
         let params = ObjectStoreParams {
-            storage_options: storage_options.clone(),
+            storage_options_accessor: accessor,
             ..Default::default()
         };
 
@@ -492,6 +533,10 @@ pub struct DirectoryNamespace {
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
     credential_vendor: Option<Arc<dyn CredentialVendor>>,
+    /// Dynamic context provider for per-request context.
+    /// Stored but not directly used in operations (available for future extensions).
+    #[allow(dead_code)]
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
 }
 
 impl std::fmt::Debug for DirectoryNamespace {
@@ -1220,7 +1265,9 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options: Some(opts.clone()),
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
             ..Default::default()
         });
 
@@ -3064,15 +3111,10 @@ mod tests {
         .unwrap();
 
         let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write_into_namespace(
-            reader1,
-            namespace.clone(),
-            table_id.clone(),
-            None,
-            false,
-        )
-        .await
-        .unwrap();
+        let dataset =
+            Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+                .await
+                .unwrap();
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
         assert_eq!(dataset.version().version, 1);
@@ -3098,7 +3140,6 @@ mod tests {
             namespace.clone(),
             table_id.clone(),
             Some(params_append),
-            false,
         )
         .await
         .unwrap();
@@ -3127,7 +3168,6 @@ mod tests {
             namespace.clone(),
             table_id.clone(),
             Some(params_overwrite),
-            false,
         )
         .await
         .unwrap();
