@@ -40,6 +40,11 @@ jobs:
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
       - name: Checkout lance-namespace-impls
         uses: actions/checkout@v4
         with:
@@ -84,6 +89,9 @@ jobs:
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
           EOF
+      - name: Copy lance-huggingface docs
+        run: |
+          cp lance-huggingface/docs/src/index.md docs/src/integrations/huggingface.md
       - name: Copy contributing docs
         run: |
           mkdir -p docs/src/community/project-specific/lance
