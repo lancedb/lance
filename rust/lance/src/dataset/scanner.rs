@@ -512,6 +512,14 @@ pub struct Scanner {
     /// Number of bytes to allow to queue up in the I/O buffer
     io_buffer_size: Option<u64>,
 
+    /// Capacity of the decode channel between scheduler and decoder.
+    ///
+    /// If set, a bounded channel of this capacity is used, providing
+    /// backpressure to prevent unbounded memory growth when the decoder can't
+    /// keep up with the scheduler. If None (default), an unbounded channel is
+    /// used for backward compatibility.
+    decode_channel_capacity: Option<usize>,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -775,6 +783,7 @@ impl Scanner {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
+            decode_channel_capacity: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -1078,6 +1087,19 @@ impl Scanner {
     /// This is only used if ``scan_in_order`` is set to false.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
         self.fragment_readahead = Some(nfragments);
+        self
+    }
+
+    /// Set the decode channel capacity.
+    ///
+    /// This controls the size of the bounded channel between the scheduler
+    /// and decoder. A smaller capacity limits memory usage but may reduce
+    /// throughput. If not set, an unbounded channel is used.
+    ///
+    /// This is particularly useful for KNN scans where decode tasks can
+    /// accumulate faster than they're consumed, causing memory growth.
+    pub fn decode_channel_capacity(&mut self, capacity: usize) -> &mut Self {
+        self.decode_channel_capacity = Some(capacity);
         self
     }
 
@@ -3521,6 +3543,7 @@ impl Scanner {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self.fragment_readahead,
             io_buffer_size: self.get_io_buffer_size(),
+            decode_channel_capacity: self.decode_channel_capacity,
             with_row_id,
             with_row_address,
             with_row_last_updated_at_version,

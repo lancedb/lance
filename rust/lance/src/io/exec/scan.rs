@@ -34,6 +34,7 @@ use snafu::location;
 use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
+use lance_file::reader::FileReaderOptions;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
     LEGACY_DEFAULT_FRAGMENT_READAHEAD,
@@ -287,6 +288,10 @@ impl LanceStream {
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
                 > = tokio::spawn(
                     (async move {
+                        let file_reader_options = FileReaderOptions {
+                            decode_channel_capacity: config.decode_channel_capacity,
+                            ..Default::default()
+                        };
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,
@@ -296,7 +301,8 @@ impl LanceStream {
                                 .with_row_last_updated_at_version(
                                     config.with_row_last_updated_at_version,
                                 )
-                                .with_row_created_at_version(config.with_row_created_at_version),
+                                .with_row_created_at_version(config.with_row_created_at_version)
+                                .with_file_reader_options(file_reader_options),
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
@@ -376,8 +382,13 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
+            let file_reader_options = FileReaderOptions {
+                decode_channel_capacity: config.decode_channel_capacity,
+                ..Default::default()
+            };
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
+                    let file_reader_options = file_reader_options.clone();
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
@@ -387,7 +398,8 @@ impl LanceStream {
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                            .with_row_created_at_version(config.with_row_created_at_version)
+                            .with_file_reader_options(file_reader_options),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -409,8 +421,13 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
+            let file_reader_options = FileReaderOptions {
+                decode_channel_capacity: config.decode_channel_capacity,
+                ..Default::default()
+            };
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
+                    let file_reader_options = file_reader_options.clone();
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
@@ -420,7 +437,8 @@ impl LanceStream {
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                            .with_row_created_at_version(config.with_row_created_at_version)
+                            .with_file_reader_options(file_reader_options),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -497,6 +515,16 @@ pub struct LanceScanConfig {
     pub batch_readahead: usize,
     pub fragment_readahead: Option<usize>,
     pub io_buffer_size: u64,
+    /// Capacity of the decode channel between scheduler and decoder.
+    ///
+    /// If set to Some(n), a bounded channel of capacity n is used, providing
+    /// backpressure to prevent unbounded memory growth when the decoder can't
+    /// keep up with the scheduler. If None (default), an unbounded channel is
+    /// used for backward compatibility.
+    ///
+    /// Recommended value: 2-4 (matching batch_readahead) for memory-constrained
+    /// workloads like KNN scans.
+    pub decode_channel_capacity: Option<usize>,
     pub with_row_id: bool,
     pub with_row_address: bool,
     pub with_row_last_updated_at_version: bool,
@@ -514,6 +542,7 @@ impl Default for LanceScanConfig {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
+            decode_channel_capacity: None, // unbounded by default for backward compatibility
             with_row_id: false,
             with_row_address: false,
             with_row_last_updated_at_version: false,
