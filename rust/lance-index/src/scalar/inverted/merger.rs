@@ -194,14 +194,14 @@ impl<'a> SizeBasedMerger<'a> {
                 PostingListBuilder::new(part.inverted_list.has_positions())
             });
 
+        let postings = part
+            .inverted_list
+            .read_batch(part.inverted_list.has_positions())
+            .await?;
         for token_id in 0..part.tokens.len() as u32 {
-            let batch = part
-                .inverted_list
-                .posting_batch(token_id, part.inverted_list.has_positions())
-                .await?;
             let posting_list = part
                 .inverted_list
-                .posting_list_from_batch(&batch, token_id)?;
+                .posting_list_from_batch(&postings.slice(token_id as usize, 1), token_id)?;
             let new_token_id = token_id_map[token_id as usize];
             debug_assert_ne!(new_token_id, u32::MAX);
             let builder = &mut builder.posting_lists[new_token_id as usize];
