@@ -232,7 +232,8 @@ impl IvfShufflerReader {
         loss: f64,
     ) -> Self {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        // Safe to unwrap since SchedulerConfig::max_bandwidth is always valid
+        let scheduler = ScanScheduler::try_new(object_store, scheduler_config).unwrap();
         Self {
             scheduler,
             output_dir,

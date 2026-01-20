@@ -1878,10 +1878,10 @@ pub async fn finalize_distributed_merge(
 
     // Open the unified auxiliary file.
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-    let scheduler = ScanScheduler::new(
+    let scheduler = ScanScheduler::try_new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
-    );
+    )?;
     let fh = scheduler
         .open_file(&aux_path, &CachedFileSize::unknown())
         .await?;

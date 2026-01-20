@@ -536,7 +536,8 @@ impl ExecutionPlan for TakeExec {
         let lazy_take_stream = futures::stream::once(async move {
             let obj_store = dataset.object_store.clone();
             let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
-            let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+            // unwrap is safe since SchedulerConfig::max_bandwidth is always valid
+            let scan_scheduler = ScanScheduler::try_new(obj_store, scheduler_config).unwrap();
 
             let take_stream = Arc::new(TakeStream::new(
                 dataset,

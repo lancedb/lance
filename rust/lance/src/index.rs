@@ -1369,10 +1369,10 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
+                let scheduler = ScanScheduler::try_new(
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
-                );
+                )?;
                 let file = scheduler
                     .open_file(&index_file, &CachedFileSize::unknown())
                     .await?;

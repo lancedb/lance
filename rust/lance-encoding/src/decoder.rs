@@ -1382,6 +1382,7 @@ impl BatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1718,6 +1719,7 @@ impl StructuralBatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1793,15 +1795,7 @@ impl StructuralBatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    // Real decode work happens inside into_batch, which can block the current
-                    // thread for a long time. By spawning it as a new task, we allow Tokio's
-                    // worker threads to keep making progress.
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                    async move { next_task.into_batch(emitted_batch_size_warning) }.await
                 };
                 (task, num_rows)
             });
@@ -1848,6 +1842,8 @@ pub struct DecoderConfig {
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+    /// If true then scheduling will happen on the same thread as the decoder.
+    pub serialized_scheduling: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1966,7 +1962,9 @@ fn create_scheduler_decoder(
         rx,
     )?;
 
-    let scheduler_handle = tokio::task::spawn(async move {
+    let serialized_scheduling = config.decoder_config.serialized_scheduling;
+
+    let do_schedule = async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -1996,9 +1994,23 @@ fn create_scheduler_decoder(
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
-    });
+    };
 
-    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    let serialized_scheduling = serialized_scheduling
+        .unwrap_or_else(|| std::env::var("LANCE_USE_SERIALIZED_SCHEDULING").is_ok());
+
+    if serialized_scheduling {
+        // Schedule then decode
+        let schedule_first = async move {
+            do_schedule.await;
+            decode_stream
+        };
+        Ok(futures::stream::once(schedule_first).flatten().boxed())
+    } else {
+        // Schedule and decode in parallel
+        let scheduler_handle = tokio::task::spawn(do_schedule);
+        Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    }
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to

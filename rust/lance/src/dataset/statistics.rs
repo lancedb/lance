@@ -47,10 +47,10 @@ impl DatasetStatisticsExt for Dataset {
                 )
             }));
         if !self.is_legacy_storage() {
-            let scan_scheduler = ScanScheduler::new(
+            let scan_scheduler = ScanScheduler::try_new(
                 self.object_store.clone(),
                 SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
-            );
+            )?;
             for fragment in self.fragments().as_ref() {
                 let file_fragment = FileFragment::new(self.clone(), fragment.clone());
                 file_fragment

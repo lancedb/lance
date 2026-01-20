@@ -1,0 +1,607 @@
+use std::{
+    collections::{BinaryHeap, HashMap},
+    fmt::Debug,
+    future::Future,
+    ops::Range,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    task::{Context, Poll, Waker},
+    time::Instant,
+};
+
+use bytes::Bytes;
+use lance_core::{Error, Result};
+use snafu::location;
+
+use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN};
+
+type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
+
+enum TaskState {
+    Broken,
+    Initial {
+        idle_waker: Option<Waker>,
+        run_fn: RunFn,
+    },
+    Reserved {
+        idle_waker: Option<Waker>,
+        backpressure_reservation: BackpressureReservation,
+        run_fn: RunFn,
+    },
+    Running {
+        backpressure_reservation: BackpressureReservation,
+        inner: Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>,
+    },
+    Finished {
+        backpressure_reservation: BackpressureReservation,
+        data: Result<Bytes>,
+    },
+}
+
+impl TaskState {
+    // Take out any reservations that were made for this task so they can be cleaned up
+    fn break_into_error(self, message: String) -> BrokenTaskError {
+        match self {
+            Self::Reserved {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Running {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Finished {
+                backpressure_reservation,
+                ..
+            } => BrokenTaskError {
+                message,
+                backpressure_reservation: Some(backpressure_reservation),
+            },
+            _ => BrokenTaskError {
+                message,
+                backpressure_reservation: None,
+            },
+        }
+    }
+}
+
+struct BrokenTaskError {
+    message: String,
+    backpressure_reservation: Option<BackpressureReservation>,
+}
+
+type TaskResult = std::result::Result<(), BrokenTaskError>;
+
+pub(super) struct IoTask {
+    id: u64,
+    num_bytes: u64,
+    priority: u128,
+    state: TaskState,
+}
+
+impl IoTask {
+    fn is_reserved(&self) -> bool {
+        !matches!(self.state, TaskState::Initial { .. })
+    }
+
+    fn cancel(&mut self) -> bool {
+        let was_running = matches!(self.state, TaskState::Running { .. });
+        self.state = TaskState::Finished {
+            backpressure_reservation: BackpressureReservation {
+                num_bytes: 0,
+                priority: 0,
+            },
+            data: Err(Error::IO {
+                source: Box::new(Error::IO {
+                    source: "I/O Task cancelled".to_string().into(),
+                    location: location!(),
+                }),
+                location: location!(),
+            }),
+        };
+        was_running
+    }
+
+    fn reserve(&mut self, backpressure_reservation: BackpressureReservation) -> TaskResult {
+        let state = std::mem::replace(&mut self.state, TaskState::Broken);
+        let TaskState::Initial { idle_waker, run_fn } = state else {
+            return Err(
+                state.break_into_error(format!("Task with id {} not in initial state", self.id))
+            );
+        };
+        self.state = TaskState::Reserved {
+            idle_waker,
+            backpressure_reservation,
+            run_fn,
+        };
+        Ok(())
+    }
+
+    fn start(&mut self) -> TaskResult {
+        let state = std::mem::replace(&mut self.state, TaskState::Broken);
+        let TaskState::Reserved {
+            backpressure_reservation,
+            idle_waker,
+            run_fn,
+        } = state
+        else {
+            return Err(
+                state.break_into_error(format!("Task with id {} not in reserved state", self.id))
+            );
+        };
+        let inner = run_fn();
+        self.state = TaskState::Running {
+            backpressure_reservation,
+            inner,
+        };
+
+        // If someone is already waiting for this task let them know it is now running
+        // so they can poll it
+        if let Some(idle_waker) = idle_waker {
+            idle_waker.wake();
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        match &mut self.state {
+            TaskState::Broken => Poll::Ready(false),
+            TaskState::Initial { idle_waker, .. } | TaskState::Reserved { idle_waker, .. } => {
+                idle_waker.replace(cx.waker().clone());
+                Poll::Pending
+            }
+            TaskState::Running {
+                inner,
+                backpressure_reservation,
+            } => match inner.as_mut().poll(cx) {
+                Poll::Ready(data) => {
+                    self.state = TaskState::Finished {
+                        data,
+                        backpressure_reservation: *backpressure_reservation,
+                    };
+                    Poll::Ready(true)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            TaskState::Finished { .. } => Poll::Ready(false),
+        }
+    }
+
+    fn consume(self) -> Result<(Result<Bytes>, BackpressureReservation)> {
+        let TaskState::Finished {
+            data,
+            backpressure_reservation,
+        } = self.state
+        else {
+            return Err(Error::Internal {
+                message: format!("Task with id {} not in finished state", self.id),
+                location: location!(),
+            });
+        };
+        Ok((data, backpressure_reservation))
+    }
+}
+
+// TODO: Re-enable this before merging.  If enabled as-is there is a potential deadlock.
+// This is because when scheduler X finishes a task it might need to notify scheduler Y
+// that the process limit has been lifted enough to run.  However, there is no mechanism
+// to do so.
+
+// static PROCESS_CONCURRENCY_LIMIT: LazyLock<Mutex<u64>> = LazyLock::new(|| {
+//     let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
+//         .map(|s| {
+//             s.parse::<u64>().unwrap_or_else(|_| {
+//                 log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
+//                 DEFAULT_PROCESS_IOPS_LIMIT as u64
+//             })
+//         })
+//         .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT as u64);
+//     Mutex::new(initial_capacity)
+// });
+
+/// A throttle to control how many IOPS can be issued concurrently
+trait ConcurrencyThrottle: Send {
+    fn try_acquire(&mut self) -> bool;
+    fn release(&mut self);
+}
+
+/// The default concurrency throttle combines a per-scan limit with a per-process limit
+struct SimpleConcurrencyThrottle {
+    concurrency_available: u64,
+}
+
+impl SimpleConcurrencyThrottle {
+    fn new(max_concurrency: u64) -> Self {
+        Self {
+            concurrency_available: max_concurrency,
+        }
+    }
+}
+
+impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
+    fn try_acquire(&mut self) -> bool {
+        if self.concurrency_available > 0 {
+            // let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
+            // if *process_concurrency_limit == 0 {
+            //     return false;
+            // }
+            // *process_concurrency_limit -= 1;
+            // self.concurrency_available -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self) {
+        // let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
+        // *process_concurrency_limit += 1;
+        // self.concurrency_available += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackpressureReservation {
+    num_bytes: u64,
+    priority: u128,
+}
+
+/// A throttle to control how many bytes can be read before we pause to let compute catch up
+trait BackpressureThrottle: Send {
+    fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation>;
+    fn release(&mut self, reservation: BackpressureReservation);
+}
+
+// We want to allow requests that have a lower priority than any
+// currently in-flight request.  This helps avoid potential deadlocks
+// related to backpressure.  Unfortunately, it is quite expensive to
+// keep track of which priorities are in-flight.
+//
+// TODO: At some point it would be nice if we can optimize this away but
+// in_flight should remain relatively small (generally less than 256 items)
+// and has not shown itself to be a bottleneck yet.
+struct PrioritiesInFlight {
+    in_flight: Vec<u128>,
+}
+
+impl PrioritiesInFlight {
+    fn new(capacity: u64) -> Self {
+        Self {
+            in_flight: Vec::with_capacity(capacity as usize * 2),
+        }
+    }
+
+    fn min_in_flight(&self) -> u128 {
+        self.in_flight.first().copied().unwrap_or(u128::MAX)
+    }
+
+    fn push(&mut self, prio: u128) {
+        let pos = match self.in_flight.binary_search(&prio) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+        self.in_flight.insert(pos, prio);
+    }
+
+    fn remove(&mut self, prio: u128) {
+        if let Ok(pos) = self.in_flight.binary_search(&prio) {
+            self.in_flight.remove(pos);
+        }
+    }
+}
+
+struct SimpleBackpressureThrottle {
+    start: Instant,
+    last_warn: AtomicU64,
+    bytes_available: i64,
+    priorities_in_flight: PrioritiesInFlight,
+}
+
+impl SimpleBackpressureThrottle {
+    fn try_new(max_bytes: u64, max_concurrency: u64) -> Result<Self> {
+        if max_bytes > i64::MAX as u64 {
+            return Err(Error::Internal {
+                message: format!("Max bytes must be less than {}", i64::MAX),
+                location: location!(),
+            });
+        }
+        Ok(Self {
+            start: Instant::now(),
+            last_warn: AtomicU64::new(0),
+            bytes_available: max_bytes as i64,
+            priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
+        })
+    }
+
+    fn warn_if_needed(&self) {
+        let seconds_elapsed = self.start.elapsed().as_secs();
+        let last_warn = self.last_warn.load(Ordering::Acquire);
+        let since_last_warn = seconds_elapsed - last_warn;
+        if (last_warn == 0
+            && seconds_elapsed > BACKPRESSURE_MIN
+            && seconds_elapsed < BACKPRESSURE_DEBOUNCE)
+            || since_last_warn > BACKPRESSURE_DEBOUNCE
+        {
+            tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
+            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            self.last_warn
+                .store(seconds_elapsed.max(1), Ordering::Release);
+        }
+    }
+}
+
+impl BackpressureThrottle for SimpleBackpressureThrottle {
+    fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation> {
+        if self.bytes_available >= num_bytes as i64
+            || self.priorities_in_flight.min_in_flight() >= priority
+        {
+            self.bytes_available -= num_bytes as i64;
+            self.priorities_in_flight.push(priority);
+            Some(BackpressureReservation {
+                num_bytes,
+                priority,
+            })
+        } else {
+            self.warn_if_needed();
+            None
+        }
+    }
+
+    fn release(&mut self, reservation: BackpressureReservation) {
+        self.bytes_available += reservation.num_bytes as i64;
+        self.priorities_in_flight.remove(reservation.priority);
+    }
+}
+
+struct TaskEntry {
+    task_id: u64,
+    priority: u128,
+    reserved: bool,
+}
+
+impl Ord for TaskEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Prefer reserved tasks over unreserved tasks and then highest priority tasks over lowest
+        // priority tasks.
+        //
+        // This is a max-heap so we sort by reserved in normal order (true > false) and priority
+        // in reverse order (lowest priority first)
+        self.reserved
+            .cmp(&other.reserved)
+            .then(other.priority.cmp(&self.priority))
+    }
+}
+
+impl PartialOrd for TaskEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TaskEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl Eq for TaskEntry {}
+
+struct IoQueueState {
+    concurrency_throttle: Box<dyn ConcurrencyThrottle>,
+    backpressure_throttle: Box<dyn BackpressureThrottle>,
+    pending_tasks: BinaryHeap<TaskEntry>,
+    tasks: HashMap<u64, IoTask>,
+    next_task_id: u64,
+}
+
+impl IoQueueState {
+    fn try_new(max_concurrency: u64, max_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            concurrency_throttle: Box::new(SimpleConcurrencyThrottle::new(max_concurrency)),
+            backpressure_throttle: Box::new(SimpleBackpressureThrottle::try_new(
+                max_bytes,
+                max_concurrency,
+            )?),
+            pending_tasks: BinaryHeap::new(),
+            tasks: HashMap::new(),
+            next_task_id: 0,
+        })
+    }
+
+    // If a task is in an unexpected state then we need to release any reservations that were made
+    // before we return an error.
+    //
+    // Note: this is perhaps a bit paranoid as a task should never be in an unexpected state.
+    fn handle_result(&mut self, result: TaskResult, started: bool) -> Result<()> {
+        if let Err(error) = result {
+            if let Some(reservation) = error.backpressure_reservation {
+                self.backpressure_throttle.release(reservation);
+            }
+            if started {
+                self.concurrency_throttle.release();
+            }
+            Err(Error::Internal {
+                message: error.message,
+                location: location!(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A queue of I/O tasks to be shared between the I/O scheduler and the I/O decoder.
+///
+/// The queue is protected by two different throttles.  The first controls memory backpressure, and
+/// will only allow a certain number of bytes to be allocated for reads.  This throttle is released
+/// as soon as the decoder consumes the bytes (not when the bytes have been fully processed).  This
+/// throttle is currently scoped to the scheduler and not shared across the process.  This will likely
+/// change in the future.
+///
+/// The second throttle controls how many IOPS can be issued concurrently.  This throttle is released
+/// as soon as the IOP is finished.  This throttle has both a local per-scheduler limit and also a
+/// process-wide limit.
+///
+/// Note: unlike the standard scheduler, there is no dedicated I/O loop thread.  If the decoder is not
+/// polling the I/O tasks then nothing else will.  This scheduler is currently intended for use with I/O
+/// uring where I/O tasks are bunched together and polling one task advances all outstanding I/O.  It
+/// would not be suitable for cloud storage where each task is an independent HTTP request and needs to
+/// be polled individually (though presumably one could use I/O uring for networked cloud storage some
+/// day as well)
+pub(super) struct IoQueue {
+    state: Arc<Mutex<IoQueueState>>,
+}
+
+impl IoQueue {
+    pub fn try_new(max_concurrency: u64, max_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            state: Arc::new(Mutex::new(IoQueueState::try_new(
+                max_concurrency,
+                max_bytes,
+            )?)),
+        })
+    }
+
+    fn push(&self, mut task: IoTask, mut state: MutexGuard<IoQueueState>) -> Result<()> {
+        let task_id = task.id;
+        if let Some(reservation) = state
+            .backpressure_throttle
+            .try_acquire(task.num_bytes, task.priority)
+        {
+            state.handle_result(task.reserve(reservation), false)?;
+            if state.concurrency_throttle.try_acquire() {
+                state.handle_result(task.start(), true)?;
+                state.tasks.insert(task_id, task);
+                return Ok(());
+            }
+        }
+
+        state.pending_tasks.push(TaskEntry {
+            task_id,
+            priority: task.priority,
+            reserved: task.is_reserved(),
+        });
+        state.tasks.insert(task_id, task);
+        Ok(())
+    }
+
+    pub(super) fn submit(
+        self: Arc<Self>,
+        range: Range<u64>,
+        priority: u128,
+        run_fn: RunFn,
+    ) -> Result<TaskHandle> {
+        log::trace!(
+            "Submitting I/O task with range {:?}, priority {:?}",
+            range,
+            priority
+        );
+        let mut state = self.state.lock().unwrap();
+        let task_id = state.next_task_id;
+        state.next_task_id += 1;
+
+        let task = IoTask {
+            id: task_id,
+            num_bytes: range.end - range.start,
+            priority,
+            state: TaskState::Initial {
+                idle_waker: None,
+                run_fn,
+            },
+        };
+        self.push(task, state)?;
+        Ok(TaskHandle {
+            task_id,
+            queue: self,
+        })
+    }
+
+    // When a task completes we should check to see if any other tasks are now runnable
+    fn on_task_complete(&self, mut state: MutexGuard<IoQueueState>) -> Result<()> {
+        let state_ref = &mut *state;
+        let mut task_result = (TaskResult::Ok(()), false);
+        while !state_ref.pending_tasks.is_empty() {
+            // Unwrap safe here since we just checked the queue is not empty
+            let next_task = state_ref.pending_tasks.peek().unwrap();
+            let Some(task) = state_ref.tasks.get_mut(&next_task.task_id) else {
+                log::warn!("Task with id {} was lost", next_task.task_id);
+                continue;
+            };
+            if !task.is_reserved() {
+                let Some(reservation) = state_ref
+                    .backpressure_throttle
+                    .try_acquire(task.num_bytes, task.priority)
+                else {
+                    break;
+                };
+                if let Err(e) = task.reserve(reservation) {
+                    task_result = (Err(e), false);
+                    break;
+                }
+            }
+            if !state_ref.concurrency_throttle.try_acquire() {
+                break;
+            };
+            state_ref.pending_tasks.pop();
+            if let Err(e) = task.start() {
+                task_result = (Err(e), true);
+                break;
+            }
+        }
+        state_ref.handle_result(task_result.0, task_result.1)
+    }
+
+    fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Bytes>> {
+        let mut state = self.state.lock().unwrap();
+        let Some(task) = state.tasks.get_mut(&task_id) else {
+            // This should never happen and indicates a bug
+            return Poll::Ready(Err(Error::Internal {
+                message: format!("Task with id {} was lost", task_id),
+                location: location!(),
+            }));
+        };
+        match task.poll(cx) {
+            Poll::Ready(newly_finished) => {
+                if newly_finished {
+                    // Only release the concurrency throttle if we just finished the task
+                    state.concurrency_throttle.release();
+                }
+                let task = state.tasks.remove(&task_id).unwrap();
+                let (bytes, reservation) = task.consume()?;
+                state.backpressure_throttle.release(reservation);
+                // We run on_task_complete even if not newly finished because we released the backpressure reservation
+                match self.on_task_complete(state) {
+                    Ok(_) => Poll::Ready(bytes),
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub(super) fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        for task in std::mem::take(&mut state.tasks).values_mut() {
+            if task.cancel() {
+                state.concurrency_throttle.release();
+                // At the moment we don't need to worry about any potential backpressure reservations
+                // because the backpressure queue is local.  In the future this may change.
+            }
+        }
+    }
+}
+
+pub(super) struct TaskHandle {
+    task_id: u64,
+    queue: Arc<IoQueue>,
+}
+
+impl Future for TaskHandle {
+    type Output = Result<Bytes>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.queue.poll(self.task_id, cx)
+    }
+}
