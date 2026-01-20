@@ -28,11 +28,9 @@ pub struct ZoneBound {
     ///
     /// To get the actual first row address, use `(fragment_id << 32) | start`.
     pub start: u64,
-    /// Span of row offsets between the first and last row in the zone
+    /// Physical row count in the zone (includes deleted rows)
     ///
-    /// Calculated as (last_row_offset - first_row_offset + 1). This is not
-    /// the count of physical rows, since deletions may create gaps within
-    /// the span.
+    /// Calculated as (last_row_offset - first_row_offset + 1)
     pub length: usize,
 }
 
@@ -56,15 +54,9 @@ pub trait ZoneProcessor {
     /// Emit statistics when the zone is full or the fragment changes.
     ///
     /// The provided `bound` describes the row range covered by this zone.
-    /// After calling this method, the processor should be ready to start
-    /// accumulating statistics for the next zone (via `reset()`).
+    /// Implementations should automatically reset internal state after emitting
+    /// statistics, preparing for the next zone.
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics>;
-
-    /// Reset state so the processor can handle the next zone.
-    ///
-    /// This is called after `finish_zone()` to prepare for processing
-    /// the next zone's data.
-    fn reset(&mut self) -> Result<()>;
 }
 
 /// Builds zones from batches during file writing.
@@ -131,8 +123,7 @@ impl<P: ZoneProcessor> FileZoneBuilder<P> {
     /// Flushes the current zone if it contains any data.
     ///
     /// Creates a `ZoneBound` with the current zone's position and length,
-    /// calls the processor's `finish_zone` to compute final statistics,
-    /// and resets state for the next zone.
+    /// calls the processor's `finish_zone` to compute final statistics
     fn flush_zone(&mut self) -> Result<()> {
         if self.current_zone_rows > 0 {
             let bound = ZoneBound {
@@ -143,8 +134,6 @@ impl<P: ZoneProcessor> FileZoneBuilder<P> {
             let stats = self.processor.finish_zone(bound)?;
             self.zones.push(stats);
 
-            // Reset for next zone
-            self.processor.reset()?;
             self.zone_start += self.current_zone_rows;
             self.current_zone_rows = 0;
         }
@@ -158,13 +147,6 @@ impl<P: ZoneProcessor> FileZoneBuilder<P> {
     pub fn finalize(mut self) -> Result<Vec<P::ZoneStatistics>> {
         self.flush_zone()?;
         Ok(self.zones)
-    }
-
-    /// Returns a reference to the collected zone statistics so far.
-    ///
-    /// Note: This does not include the current partial zone being accumulated.
-    pub fn zones(&self) -> &[P::ZoneStatistics] {
-        &self.zones
     }
 }
 
@@ -201,15 +183,13 @@ mod tests {
         }
 
         fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
-            Ok(MockStats {
+            let stats = MockStats {
                 sum: self.current_sum,
                 bound,
-            })
-        }
-
-        fn reset(&mut self) -> Result<()> {
+            };
+            // Auto-reset for next zone
             self.current_sum = 0;
-            Ok(())
+            Ok(stats)
         }
     }
 
@@ -226,14 +206,11 @@ mod tests {
         let arr = array_from_vec(vec![1, 2, 3, 4]);
         builder.process_chunk(&arr).unwrap();
 
-        // Zone should be flushed automatically when it reaches capacity
-        assert_eq!(builder.zones().len(), 1);
-        assert_eq!(builder.zones()[0].sum, 10); // 1+2+3+4
-        assert_eq!(builder.zones()[0].bound.start, 0);
-        assert_eq!(builder.zones()[0].bound.length, 4);
-
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].sum, 10); // 1+2+3+4
+        assert_eq!(zones[0].bound.start, 0);
+        assert_eq!(zones[0].bound.length, 4);
     }
 
     #[test]
@@ -246,19 +223,16 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 1);
 
         // Second zone: 3 rows
         builder
             .process_chunk(&array_from_vec(vec![4, 5, 6]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 2);
 
         // Third zone: 3 rows
         builder
             .process_chunk(&array_from_vec(vec![7, 8, 9]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 3);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 3);
@@ -280,11 +254,9 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 1);
 
         // Second zone: only 2 rows (partial)
         builder.process_chunk(&array_from_vec(vec![5, 6])).unwrap();
-        assert_eq!(builder.zones().len(), 1); // Partial zone not flushed yet
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);
@@ -305,8 +277,6 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4]))
             .unwrap();
-        // 4 rows < 5, so zone shouldn't be flushed yet
-        assert_eq!(builder.zones().len(), 0);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 1);
@@ -326,13 +296,10 @@ mod tests {
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4, 5, 6]))
             .unwrap();
 
-        // First zone should be flushed automatically (4 rows)
-        assert_eq!(builder.zones().len(), 1);
-        assert_eq!(builder.zones()[0].sum, 10); // 1+2+3+4
-        assert_eq!(builder.zones()[0].bound.length, 4);
-
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].sum, 10); // 1+2+3+4
+        assert_eq!(zones[0].bound.length, 4);
         assert_eq!(zones[1].sum, 11); // 5+6
         assert_eq!(zones[1].bound.start, 4);
         assert_eq!(zones[1].bound.length, 2);
@@ -346,22 +313,17 @@ mod tests {
 
         // Chunk 1: 2 rows
         builder.process_chunk(&array_from_vec(vec![1, 2])).unwrap();
-        assert_eq!(builder.zones().len(), 0);
 
         // Chunk 2: 2 rows (total: 4, still under)
         builder.process_chunk(&array_from_vec(vec![3, 4])).unwrap();
-        assert_eq!(builder.zones().len(), 0);
 
         // Chunk 3: 2 rows (total: 6, exceeds zone size)
         builder.process_chunk(&array_from_vec(vec![5, 6])).unwrap();
-        // After chunk 3, total is 6 which >= 5, so first zone is flushed (5 rows)
-        // Remaining 1 row stays in current zone
-        assert_eq!(builder.zones().len(), 1);
-        assert_eq!(builder.zones()[0].sum, 15); // 1+2+3+4+5
-        assert_eq!(builder.zones()[0].bound.length, 5);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].sum, 15); // 1+2+3+4+5
+        assert_eq!(zones[0].bound.length, 5);
         assert_eq!(zones[1].sum, 6); // Just row 6
         assert_eq!(zones[1].bound.start, 5);
         assert_eq!(zones[1].bound.length, 1);
@@ -375,19 +337,14 @@ mod tests {
 
         // Process one row at a time
         builder.process_chunk(&array_from_vec(vec![10])).unwrap();
-        assert_eq!(builder.zones().len(), 1);
-        assert_eq!(builder.zones()[0].sum, 10);
-
         builder.process_chunk(&array_from_vec(vec![20])).unwrap();
-        assert_eq!(builder.zones().len(), 2);
-        assert_eq!(builder.zones()[1].sum, 20);
-
         builder.process_chunk(&array_from_vec(vec![30])).unwrap();
-        assert_eq!(builder.zones().len(), 3);
-        assert_eq!(builder.zones()[2].sum, 30);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 3);
+        assert_eq!(zones[0].sum, 10);
+        assert_eq!(zones[1].sum, 20);
+        assert_eq!(zones[2].sum, 30);
         assert_eq!(zones[0].bound.start, 0);
         assert_eq!(zones[1].bound.start, 1);
         assert_eq!(zones[2].bound.start, 2);
@@ -400,8 +357,6 @@ mod tests {
         let mut builder = FileZoneBuilder::new(processor, 100).unwrap();
 
         builder.process_chunk(&array_from_vec(vec![1; 10])).unwrap();
-        // Zone not full yet
-        assert_eq!(builder.zones().len(), 0);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 1);
@@ -417,13 +372,11 @@ mod tests {
         let mut builder = FileZoneBuilder::new(processor, 4).unwrap();
 
         builder.process_chunk(&array_from_vec(vec![])).unwrap();
-        assert_eq!(builder.zones().len(), 0);
 
         // Add some real data
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 1);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 1);
@@ -440,18 +393,16 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3]))
             .unwrap();
-        assert_eq!(builder.zones()[0].sum, 6);
 
         // Second zone - processor should have reset, so sum starts from 0
         builder
             .process_chunk(&array_from_vec(vec![4, 5, 6]))
             .unwrap();
-        assert_eq!(builder.zones()[1].sum, 15); // 4+5+6, not 6+15=21
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);
         assert_eq!(zones[0].sum, 6);
-        assert_eq!(zones[1].sum, 15);
+        assert_eq!(zones[1].sum, 15); // 4+5+6, not 6+15=21
     }
 
     #[test]
@@ -465,16 +416,13 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 1);
 
         builder
             .process_chunk(&array_from_vec(vec![4, 5, 6]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 2);
 
         // Last chunk: 2 rows (partial)
         builder.process_chunk(&array_from_vec(vec![7, 8])).unwrap();
-        assert_eq!(builder.zones().len(), 2); // Partial not flushed yet
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 3);
@@ -510,27 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zones_method_excludes_partial() {
-        // Verify zones() doesn't include the current partial zone
-        let processor = MockProcessor::new();
-        let mut builder = FileZoneBuilder::new(processor, 4).unwrap();
-
-        // Add exactly one full zone
-        builder
-            .process_chunk(&array_from_vec(vec![1, 2, 3, 4]))
-            .unwrap();
-        assert_eq!(builder.zones().len(), 1);
-
-        // Add partial zone (not yet flushed)
-        builder.process_chunk(&array_from_vec(vec![5, 6])).unwrap();
-        assert_eq!(builder.zones().len(), 1); // Still only 1, partial not included
-
-        // Finalize should include the partial
-        let zones = builder.finalize().unwrap();
-        assert_eq!(zones.len(), 2);
-    }
-
-    #[test]
     fn test_edge_case_one_row_short() {
         // Zone size = 5, data = 4 rows (exactly one short)
         let processor = MockProcessor::new();
@@ -539,7 +466,6 @@ mod tests {
         builder
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4]))
             .unwrap();
-        assert_eq!(builder.zones().len(), 0); // Not flushed yet
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 1);
@@ -557,13 +483,10 @@ mod tests {
             .process_chunk(&array_from_vec(vec![1, 2, 3, 4, 5]))
             .unwrap();
 
-        // First zone should be flushed (4 rows)
-        assert_eq!(builder.zones().len(), 1);
-        assert_eq!(builder.zones()[0].sum, 10); // 1+2+3+4
-        assert_eq!(builder.zones()[0].bound.length, 4);
-
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].sum, 10); // 1+2+3+4
+        assert_eq!(zones[0].bound.length, 4);
         assert_eq!(zones[1].sum, 5); // Just row 5
         assert_eq!(zones[1].bound.start, 4);
         assert_eq!(zones[1].bound.length, 1);
@@ -579,11 +502,6 @@ mod tests {
         for i in 1..=20 {
             builder.process_chunk(&array_from_vec(vec![i])).unwrap();
         }
-
-        // After 10 rows: first zone flushed
-        // After 20 rows: second zone flushed
-        // Should have 2 full zones (10 rows each)
-        assert_eq!(builder.zones().len(), 2);
 
         let zones = builder.finalize().unwrap();
         assert_eq!(zones.len(), 2);

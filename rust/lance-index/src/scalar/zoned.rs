@@ -70,8 +70,6 @@ where
         let mut zone_start_offset: Option<u64> = None;
         let mut zone_end_offset: Option<u64> = None;
 
-        self.processor.reset()?;
-
         while let Some(batch) = batches.try_next().await? {
             if batch.num_rows() == 0 {
                 continue;
@@ -171,8 +169,6 @@ where
                     &mut zone_start_offset,
                     &mut zone_end_offset,
                 )?;
-            } else {
-                self.processor.reset()?;
             }
         }
 
@@ -204,7 +200,7 @@ where
         *current_zone_len = 0;
         *zone_start_offset = None;
         *zone_end_offset = None;
-        processor.reset()?;
+        // finish_zone() resets the processor internally
         Ok(())
     }
 }
@@ -297,15 +293,13 @@ mod tests {
         }
 
         fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
-            Ok(MockStats {
+            let stats = MockStats {
                 sum: self.current_sum,
                 bound,
-            })
-        }
-
-        fn reset(&mut self) -> Result<()> {
+            };
+            // Auto-reset for next zone
             self.current_sum = 0;
-            Ok(())
+            Ok(stats)
         }
     }
 

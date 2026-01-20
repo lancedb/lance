@@ -48,7 +48,10 @@ use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
-    writer::{COLUMN_STATS_BUFFER_INDEX_KEY, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        COLUMN_STATS_BUFFER_INDEX_KEY, COLUMN_STATS_VERSION, COLUMN_STATS_VERSION_KEY,
+        PAGE_BUFFER_ALIGNMENT,
+    },
 };
 
 /// Default chunk size for reading large pages (8MiB)
@@ -2430,15 +2433,15 @@ impl ProjectedFileReader {
 
     /// Check if the file contains column statistics.
     ///
-    /// Column statistics are stored in the schema metadata under the key
-    /// `lance:column_stats:buffer_index`. If this key exists, the file
-    /// has column statistics that can be read with `read_column_stats()`.
+    /// Column statistics are stored in the schema metadata. If the metadata
+    /// contains the buffer index key, the file has column statistics that can
+    /// be read with `read_column_stats()`.
     ///
     pub fn has_column_stats(&self) -> bool {
         self.metadata
             .file_schema
             .metadata
-            .contains_key("lance:column_stats:buffer_index")
+            .contains_key(COLUMN_STATS_BUFFER_INDEX_KEY)
     }
 
     /// Read column statistics from the file.
@@ -2491,19 +2494,28 @@ impl ProjectedFileReader {
             )
             .await?;
 
-        // TODO: Is it needed?
-        // Combine all bytes into a single buffer (usually should be just one chunk)
-        let stats_bytes = if stats_bytes_vec.len() == 1 {
-            stats_bytes_vec.into_iter().next().unwrap()
-        } else {
-            // Concatenate multiple chunks
-            let total_size: usize = stats_bytes_vec.iter().map(|b| b.len()).sum();
-            let mut combined = BytesMut::with_capacity(total_size);
-            for chunk in stats_bytes_vec {
-                combined.extend_from_slice(&chunk);
-            }
-            combined.freeze()
-        };
+        // The buffer is returned as a single chunk since we requested one range
+        let stats_bytes = stats_bytes_vec.into_iter().next().unwrap();
+
+        // Check version for forward compatibility
+        let version = self
+            .metadata
+            .file_schema
+            .metadata
+            .get(COLUMN_STATS_VERSION_KEY)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        // Skip stats from newer versions for forward compatibility
+        if version > COLUMN_STATS_VERSION {
+            log::warn!(
+                "Column stats version {} is newer than supported version {}. \
+                 Skipping column stats for forward compatibility.",
+                version,
+                COLUMN_STATS_VERSION
+            );
+            return Ok(None);
+        }
 
         // Decode Arrow IPC format
         let cursor = Cursor::new(stats_bytes.as_ref());

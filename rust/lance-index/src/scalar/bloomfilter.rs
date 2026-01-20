@@ -708,13 +708,12 @@ struct BloomFilterProcessor {
 
 impl BloomFilterProcessor {
     fn new(params: BloomFilterIndexBuilderParams) -> Result<Self> {
-        let mut processor = Self {
+        let sbbf = Self::build_filter(&params)?;
+        Ok(Self {
             params,
-            sbbf: None,
+            sbbf: Some(sbbf),
             statistics: None,
-        };
-        processor.reset()?;
-        Ok(processor)
+        })
     }
 
     fn build_filter(params: &BloomFilterIndexBuilderParams) -> Result<Sbbf> {
@@ -1020,17 +1019,17 @@ impl ZoneProcessor for BloomFilterProcessor {
             .as_ref()
             .map(|statistics| statistics.statistics().null_count > 0)
             .unwrap_or(false);
-        Ok(BloomFilterStatistics {
+        let stats = BloomFilterStatistics {
             bound,
             has_null,
             bloom_filter: bloom_filter.clone(),
-        })
-    }
+        };
 
-    fn reset(&mut self) -> Result<()> {
+        // Auto-reset for next zone
         self.sbbf = Some(Self::build_filter(&self.params)?);
         self.statistics = None;
-        Ok(())
+
+        Ok(stats)
     }
 }
 

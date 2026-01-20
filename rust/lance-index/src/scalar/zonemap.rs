@@ -947,7 +947,7 @@ impl ZoneProcessor for ZoneMapProcessor {
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         let statistics = self.statistics.statistics();
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
-        Ok(ZoneMapStatistics {
+        let stats = ZoneMapStatistics {
             min: Self::scalar_value_from_stat(
                 statistics.min.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
@@ -960,12 +960,12 @@ impl ZoneProcessor for ZoneMapProcessor {
             null_count: Self::stat_count_to_u32("null_count", statistics.null_count)?,
             nan_count,
             bound,
-        })
-    }
+        };
 
-    fn reset(&mut self) -> Result<()> {
+        // Auto-reset for next zone
         self.statistics.reset();
-        Ok(())
+
+        Ok(stats)
     }
 }
 
