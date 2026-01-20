@@ -43,6 +43,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
+use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
@@ -2556,6 +2557,76 @@ fn inner_get_indexes<'local>(
     }
 
     Ok(array_list)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexStatistics<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_index_statistics(&mut env, java_dataset, jindex_name),
+        JString::from(JObject::null())
+    )
+}
+
+fn inner_get_index_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+) -> Result<JString<'local>> {
+    let index_name: String = jindex_name.extract(env)?;
+    let stats_json = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        RT.block_on(dataset_guard.inner.index_statistics(&index_name))?
+    };
+    let jstats = env.new_string(stats_json)?;
+    Ok(jstats)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeDescribeIndices<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    criteria_obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_describe_indices(&mut env, java_dataset, criteria_obj)
+    )
+}
+
+fn inner_describe_indices<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    java_index_criteria: JObject,
+) -> Result<JObject<'local>> {
+    let mut for_column = None;
+    let mut has_name = None;
+    let index_criteria = env.get_optional(&java_index_criteria, |env, obj| {
+        for_column = env.get_optional_string_from_method(&obj, "getForColumn")?;
+        has_name = env.get_optional_string_from_method(&obj, "getHasName")?;
+        let must_support_fts = env.get_boolean_from_method(&obj, "mustSupportFts")?;
+        let must_support_exact_equality =
+            env.get_boolean_from_method(&obj, "mustSupportExactEquality")?;
+        Ok(RustIndexCriteria {
+            for_column: for_column.as_deref(),
+            has_name: has_name.as_deref(),
+            must_support_fts,
+            must_support_exact_equality,
+        })
+    })?;
+
+    let descriptions = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        RT.block_on(dataset_guard.inner.describe_indices(index_criteria))?
+    };
+
+    export_vec(env, &descriptions)
 }
 
 #[no_mangle]

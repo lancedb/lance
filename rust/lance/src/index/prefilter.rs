@@ -278,6 +278,7 @@ impl PreFilter for DatasetPreFilter {
 
 #[cfg(test)]
 mod test {
+    use lance_core::utils::mask::RowSetOps;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::dataset::WriteParams;

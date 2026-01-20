@@ -3,7 +3,7 @@
 
 use super::{
     index::*,
-    merger::{Merger, SizeBasedMerger},
+    merger::{Merger, PartitionSource, SizeBasedMerger},
     InvertedIndexParams,
 };
 use crate::scalar::inverted::json::JsonTextStream;
@@ -357,30 +357,16 @@ impl InvertedIndexBuilder {
             return Ok(());
         }
 
-        let no_cache = LanceCache::no_cache();
-        let partitions = futures::future::try_join_all(
-            self.partitions
-                .iter()
-                .map(|part| {
-                    InvertedPartition::load(
-                        self.src_store.clone(),
-                        *part,
-                        None,
-                        &no_cache,
-                        self.token_set_format,
-                    )
-                })
-                .chain(self.new_partitions.iter().map(|part| {
-                    InvertedPartition::load(
-                        self.local_store.clone(),
-                        *part,
-                        None,
-                        &no_cache,
-                        self.token_set_format,
-                    )
-                })),
-        )
-        .await?;
+        let partitions = self
+            .partitions
+            .iter()
+            .map(|part| PartitionSource::new(self.src_store.clone(), *part))
+            .chain(
+                self.new_partitions
+                    .iter()
+                    .map(|part| PartitionSource::new(self.local_store.clone(), *part)),
+            )
+            .collect::<Vec<_>>();
         let mut merger = SizeBasedMerger::new(
             dest_store,
             partitions,

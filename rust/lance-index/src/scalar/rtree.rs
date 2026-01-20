@@ -33,7 +33,7 @@ use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_concat_stream;
