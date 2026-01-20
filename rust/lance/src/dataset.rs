@@ -35,7 +35,8 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
@@ -808,15 +809,11 @@ impl Dataset {
     /// * `namespace` - The namespace to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
-    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
-    ///   by the namespace and only use the storage options in params. The storage options
-    ///   provider will not be created, so credentials will not be automatically refreshed.
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
         namespace: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
-        ignore_namespace_table_storage_options: bool,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
@@ -865,28 +862,30 @@ impl Dataset {
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace, table_id,
-                        ));
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                    );
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 Self::write(batches, uri.as_str(), Some(write_params)).await
@@ -912,29 +911,32 @@ impl Dataset {
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> =
+                        Arc::new(LanceNamespaceStorageOptionsProvider::new(
                             namespace.clone(),
                             table_id.clone(),
                         ));
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 // For APPEND/OVERWRITE modes, we must open the existing dataset first
@@ -942,11 +944,8 @@ impl Dataset {
                 // assumes no dataset exists and converts the mode to CREATE.
                 let mut builder = DatasetBuilder::from_uri(uri.as_str());
                 if let Some(ref store_params) = write_params.store_params {
-                    if let Some(ref storage_options) = store_params.storage_options {
-                        builder = builder.with_storage_options(storage_options.clone());
-                    }
-                    if let Some(ref provider) = store_params.storage_options_provider {
-                        builder = builder.with_storage_options_provider(provider.clone());
+                    if let Some(accessor) = &store_params.storage_options_accessor {
+                        builder = builder.with_storage_options_accessor(accessor.clone());
                     }
                 }
                 let dataset = Arc::new(builder.load().await?);
@@ -1612,11 +1611,22 @@ impl Dataset {
         &self.object_store
     }
 
-    /// Returns the storage options used when opening this dataset, if any.
+    /// Returns the initial storage options used when opening this dataset, if any.
+    ///
+    /// This returns the static initial options without triggering any refresh.
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    #[deprecated(since = "0.25.0", note = "Use initial_storage_options() instead")]
     pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.initial_storage_options()
+    }
+
+    /// Returns the initial storage options without triggering any refresh.
+    ///
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    pub fn initial_storage_options(&self) -> Option<&HashMap<String, String>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options.as_ref())
+            .and_then(|params| params.storage_options())
     }
 
     /// Returns the storage options provider used when opening this dataset, if any.
@@ -1625,7 +1635,42 @@ impl Dataset {
     ) -> Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options_provider.clone())
+            .and_then(|params| params.storage_options_accessor.as_ref())
+            .and_then(|accessor| accessor.provider().cloned())
+    }
+
+    /// Returns the unified storage options accessor for this dataset, if any.
+    ///
+    /// The accessor handles both static and dynamic storage options with automatic
+    /// caching and refresh. Use [`StorageOptionsAccessor::get_storage_options`] to
+    /// get the latest options.
+    pub fn storage_options_accessor(&self) -> Option<Arc<StorageOptionsAccessor>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.get_accessor())
+    }
+
+    /// Returns the latest (possibly refreshed) storage options.
+    ///
+    /// If a dynamic storage options provider is configured, this will return
+    /// the cached options if still valid, or fetch fresh options if expired.
+    ///
+    /// For the initial static options without refresh, use [`Self::storage_options`].
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(options))` - Storage options are available (static or refreshed)
+    /// - `Ok(None)` - No storage options were configured for this dataset
+    /// - `Err(...)` - Error occurred while fetching/refreshing options from provider
+    pub async fn latest_storage_options(&self) -> Result<Option<StorageOptions>> {
+        // First check if we have an accessor (handles both static and dynamic options)
+        if let Some(accessor) = self.storage_options_accessor() {
+            let options = accessor.get_storage_options().await?;
+            return Ok(Some(options));
+        }
+
+        // Fallback to initial storage options if no accessor
+        Ok(self.initial_storage_options().cloned().map(StorageOptions))
     }
 
     pub fn data_dir(&self) -> Path {

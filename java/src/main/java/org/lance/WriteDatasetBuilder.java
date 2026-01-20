@@ -80,7 +80,6 @@ public class WriteDatasetBuilder {
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
-  private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
 
@@ -276,21 +275,6 @@ public class WriteDatasetBuilder {
     return this;
   }
 
-  /**
-   * Sets the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder s3CredentialsRefreshOffsetSeconds(
-      long s3CredentialsRefreshOffsetSeconds) {
-    this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-    return this;
-  }
-
   public WriteDatasetBuilder initialBases(List<BasePath> bases) {
     this.initialBases = Optional.of(bases);
     return this;
@@ -424,8 +408,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
@@ -451,8 +433,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
 

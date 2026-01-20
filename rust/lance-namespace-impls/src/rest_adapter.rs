@@ -2695,15 +2695,10 @@ mod tests {
             .unwrap();
 
             let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
-            let dataset = Dataset::write_into_namespace(
-                reader1,
-                namespace.clone(),
-                table_id.clone(),
-                None,
-                false,
-            )
-            .await
-            .unwrap();
+            let dataset =
+                Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+                    .await
+                    .unwrap();
 
             assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
             assert_eq!(dataset.version().version, 1);
@@ -2729,7 +2724,6 @@ mod tests {
                 namespace.clone(),
                 table_id.clone(),
                 Some(params_append),
-                false,
             )
             .await
             .unwrap();
@@ -2758,7 +2752,6 @@ mod tests {
                 namespace.clone(),
                 table_id.clone(),
                 Some(params_overwrite),
-                false,
             )
             .await
             .unwrap();

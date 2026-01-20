@@ -90,18 +90,18 @@ async fn test_create_index(
 
     // Make sure valid arguments should create index successfully
     let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
-    dataset
+    let index_meta = dataset
         .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
     dataset.validate().await.unwrap();
 
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
     // The version should match the table version it was created from.
-    let indices = dataset.load_indices().await.unwrap();
-    let actual = indices.first().unwrap().dataset_version;
     let expected = dataset.manifest.version - 1;
-    assert_eq!(actual, expected);
-    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
     assert_eq!(fragment_bitmap.len(), 1);
     assert!(fragment_bitmap.contains(0));
 
@@ -313,18 +313,18 @@ async fn test_create_int8_index(
 
     // Make sure valid arguments should create index successfully
     let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
-    dataset
+    let index_meta = dataset
         .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
     dataset.validate().await.unwrap();
 
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
     // The version should match the table version it was created from.
-    let indices = dataset.load_indices().await.unwrap();
-    let actual = indices.first().unwrap().dataset_version;
     let expected = dataset.manifest.version - 1;
-    assert_eq!(actual, expected);
-    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
     assert_eq!(fragment_bitmap.len(), 1);
     assert!(fragment_bitmap.contains(0));
 

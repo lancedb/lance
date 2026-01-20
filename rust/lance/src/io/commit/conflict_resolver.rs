@@ -9,6 +9,7 @@ use crate::{
     Dataset,
 };
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
     Error, Result,

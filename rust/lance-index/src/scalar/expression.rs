@@ -490,6 +490,26 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // DataFusion normalizes array_contains to array_has
+        if func.name() == "array_has" {
+            let inner_type = match data_type {
+                DataType::List(field) | DataType::LargeList(field) => field.data_type(),
+                _ => return None,
+            };
+            let scalar = maybe_scalar(&args[1], inner_type)?;
+            // array_has(..., NULL) returns no matches in datafusion, but the index would
+            // match rows containing NULL. Fallback to match datafusion behavior.
+            if scalar.is_null() {
+                return None;
+            }
+            let query = LabelListQuery::HasAnyLabel(vec![scalar]);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
+        }
+
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
@@ -1651,6 +1671,7 @@ fn visit_node(
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
+        Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),

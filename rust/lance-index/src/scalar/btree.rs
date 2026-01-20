@@ -2567,6 +2567,7 @@ mod tests {
     use deepsize::DeepSizeOf;
     use futures::stream;
     use futures::TryStreamExt;
+    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};

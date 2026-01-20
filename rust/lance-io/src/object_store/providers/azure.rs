@@ -95,7 +95,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options.clone().unwrap_or_default());
+            StorageOptions(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_azure();
         let download_retry_count = storage_options.download_retry_count();
 
@@ -124,7 +124,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?,
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 
@@ -232,21 +232,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_use_opendal_flag() {
+        use crate::object_store::StorageOptionsAccessor;
         let provider = AzureBlobStoreProvider;
         let url = Url::parse("az://test-container/path").unwrap();
         let params_with_flag = ObjectStoreParams {
-            storage_options: Some(HashMap::from([
-                ("use_opendal".to_string(), "true".to_string()),
-                ("account_name".to_string(), "test_account".to_string()),
-                (
-                    "endpoint".to_string(),
-                    "https://test_account.blob.core.windows.net".to_string(),
-                ),
-                (
-                    "account_key".to_string(),
-                    "dGVzdF9hY2NvdW50X2tleQ==".to_string(),
-                ),
-            ])),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("account_name".to_string(), "test_account".to_string()),
+                    (
+                        "endpoint".to_string(),
+                        "https://test_account.blob.core.windows.net".to_string(),
+                    ),
+                    (
+                        "account_key".to_string(),
+                        "dGVzdF9hY2NvdW50X2tleQ==".to_string(),
+                    ),
+                ]),
+            ))),
             ..Default::default()
         };
 

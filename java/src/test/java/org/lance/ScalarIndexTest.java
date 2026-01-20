@@ -53,6 +53,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
@@ -79,12 +80,18 @@ public class ScalarIndexTest {
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create BTree index on 'id' column
-        dataset.createIndex(
-            Collections.singletonList("id"),
-            IndexType.BTREE,
-            Optional.of("btree_id_index"),
-            indexParams,
-            true);
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("id"),
+                IndexType.BTREE,
+                Optional.of("btree_id_index"),
+                indexParams,
+                true);
+
+        // Verify the returned Index object
+        assertEquals("btree_id_index", index.name());
+        assertNotNull(index.uuid());
+        assertFalse(index.fields().isEmpty());
 
         // Verify index was created and is in the list
         assertTrue(
@@ -343,12 +350,17 @@ public class ScalarIndexTest {
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create Zonemap index on 'value' column
-        dataset.createIndex(
-            Collections.singletonList("value"),
-            IndexType.ZONEMAP,
-            Optional.of("zonemap_value_index"),
-            indexParams,
-            true);
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("value"),
+                IndexType.ZONEMAP,
+                Optional.of("zonemap_value_index"),
+                indexParams,
+                true);
+
+        // Verify the returned Index object
+        assertEquals("zonemap_value_index", index.name());
+        assertNotNull(index.uuid());
 
         // Verify index was created
         assertTrue(

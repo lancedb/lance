@@ -471,8 +471,11 @@ impl DirectoryNamespaceBuilder {
         session: &Option<Arc<Session>>,
     ) -> Result<(Arc<ObjectStore>, Path)> {
         // Build ObjectStoreParams from storage options
+        let accessor = storage_options.clone().map(|opts| {
+            Arc::new(lance_io::object_store::StorageOptionsAccessor::with_static_options(opts))
+        });
         let params = ObjectStoreParams {
-            storage_options: storage_options.clone(),
+            storage_options_accessor: accessor,
             ..Default::default()
         };
 
@@ -1262,7 +1265,9 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options: Some(opts.clone()),
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
             ..Default::default()
         });
 
@@ -3106,15 +3111,10 @@ mod tests {
         .unwrap();
 
         let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write_into_namespace(
-            reader1,
-            namespace.clone(),
-            table_id.clone(),
-            None,
-            false,
-        )
-        .await
-        .unwrap();
+        let dataset =
+            Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+                .await
+                .unwrap();
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
         assert_eq!(dataset.version().version, 1);
@@ -3140,7 +3140,6 @@ mod tests {
             namespace.clone(),
             table_id.clone(),
             Some(params_append),
-            false,
         )
         .await
         .unwrap();
@@ -3169,7 +3168,6 @@ mod tests {
             namespace.clone(),
             table_id.clone(),
             Some(params_overwrite),
-            false,
         )
         .await
         .unwrap();

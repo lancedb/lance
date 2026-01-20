@@ -12,7 +12,7 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
-    DEFAULT_CLOUD_IO_PARALLELISM,
+    StorageOptionsAccessor, DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace::LanceNamespace;
@@ -95,8 +95,6 @@ impl DatasetBuilder {
     /// # Arguments
     /// * `namespace` - The namespace implementation to fetch table info from
     /// * `table_id` - The table identifier (e.g., vec!["my_table"])
-    /// * `ignore_namespace_table_storage_options` - If true, storage options returned from
-    ///   the namespace's `describe_table()` will be ignored (treated as None). Defaults to false.
     ///
     /// # Example
     /// ```ignore
@@ -111,28 +109,17 @@ impl DatasetBuilder {
     ///
     /// // Load a dataset using storage options from namespace
     /// let dataset = DatasetBuilder::from_namespace(
-    ///     namespace.clone(),
-    ///     vec!["my_table".to_string()],
-    ///     false,
-    /// )
-    /// .await?
-    /// .load()
-    /// .await?;
-    ///
-    /// // Load a dataset ignoring namespace storage options
-    /// let dataset = DatasetBuilder::from_namespace(
     ///     namespace,
     ///     vec!["my_table".to_string()],
-    ///     true,
     /// )
     /// .await?
     /// .load()
     /// .await?;
     /// ```
+    #[allow(deprecated)]
     pub async fn from_namespace(
         namespace: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
-        ignore_namespace_table_storage_options: bool,
     ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
@@ -156,17 +143,17 @@ impl DatasetBuilder {
 
         let mut builder = Self::from_uri(table_uri);
 
-        let namespace_storage_options = if ignore_namespace_table_storage_options {
-            None
-        } else {
-            response.storage_options
-        };
+        // Use namespace storage options if available
+        let namespace_storage_options = response.storage_options;
 
         builder.storage_options_override = namespace_storage_options.clone();
 
-        if namespace_storage_options.is_some() {
-            builder.options.storage_options_provider = Some(Arc::new(
+        if let Some(initial_opts) = namespace_storage_options {
+            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+            );
+            builder.options.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(initial_opts, provider),
             ));
         }
 
@@ -289,7 +276,27 @@ impl DatasetBuilder {
     /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
     /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
-        self.options.storage_options = Some(storage_options);
+        // Merge with existing options if accessor exists, otherwise create new static accessor
+        if let Some(existing) = self.options.storage_options_accessor.take() {
+            let mut merged = existing
+                .initial_storage_options()
+                .cloned()
+                .unwrap_or_default();
+            merged.extend(storage_options);
+            if let Some(provider) = existing.provider().cloned() {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(merged, provider),
+                ));
+            } else {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(merged),
+                ));
+            }
+        } else {
+            self.options.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            ));
+        }
         self
     }
 
@@ -301,9 +308,25 @@ impl DatasetBuilder {
     ///     .with_storage_option("region", "us-east-1");
     /// ```
     pub fn with_storage_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        let mut storage_options = self.options.storage_options.unwrap_or_default();
+        let mut storage_options = self.options.storage_options().cloned().unwrap_or_default();
         storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
-        self.options.storage_options = Some(storage_options);
+
+        // Merge with existing accessor if present
+        if let Some(existing) = self.options.storage_options_accessor.take() {
+            if let Some(provider) = existing.provider().cloned() {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
+                ));
+            } else {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(storage_options),
+                ));
+            }
+        } else {
+            self.options.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            ));
+        }
         self
     }
 
@@ -355,7 +378,50 @@ impl DatasetBuilder {
         mut self,
         provider: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
     ) -> Self {
-        self.options.storage_options_provider = Some(provider);
+        // Preserve existing storage options if any
+        if let Some(existing) = self.options.storage_options_accessor.take() {
+            if let Some(initial) = existing.initial_storage_options().cloned() {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(initial, provider),
+                ));
+            } else {
+                self.options.storage_options_accessor =
+                    Some(Arc::new(StorageOptionsAccessor::with_provider(provider)));
+            }
+        } else {
+            self.options.storage_options_accessor =
+                Some(Arc::new(StorageOptionsAccessor::with_provider(provider)));
+        }
+        self
+    }
+
+    /// Set a unified storage options accessor for credential management
+    ///
+    /// The accessor bundles static storage options with an optional dynamic provider,
+    /// handling all caching and refresh logic internally.
+    ///
+    /// # Arguments
+    /// * `accessor` - The storage options accessor
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use lance_io::object_store::StorageOptionsAccessor;
+    ///
+    /// // Create an accessor with a dynamic provider
+    /// let accessor = Arc::new(StorageOptionsAccessor::with_provider(
+    ///     provider,
+    ///     Duration::from_secs(300), // 5 minute refresh offset
+    /// ));
+    ///
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_storage_options_accessor(accessor)
+    ///     .load()
+    ///     .await?;
+    /// ```
+    pub fn with_storage_options_accessor(mut self, accessor: Arc<StorageOptionsAccessor>) -> Self {
+        self.options.storage_options_accessor = Some(accessor);
         self
     }
 
@@ -418,8 +484,8 @@ impl DatasetBuilder {
 
         let storage_options = self
             .options
-            .storage_options
-            .clone()
+            .storage_options()
+            .cloned()
             .map(StorageOptions::new)
             .unwrap_or_default();
         let download_retry_count = storage_options.download_retry_count();
@@ -478,12 +544,29 @@ impl DatasetBuilder {
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
-        // Apply storage_options_override last to ensure namespace options take precedence
+        // Apply storage_options_override to merge namespace options with any existing accessor
         if let Some(override_opts) = self.storage_options_override.take() {
-            let mut merged_opts = self.options.storage_options.clone().unwrap_or_default();
+            // Get existing options and merge
+            let mut merged_opts = self.options.storage_options().cloned().unwrap_or_default();
             // Override with namespace storage options - they take precedence
             merged_opts.extend(override_opts);
-            self.options.storage_options = Some(merged_opts);
+
+            // Update accessor with merged options
+            if let Some(accessor) = &self.options.storage_options_accessor {
+                if let Some(provider) = accessor.provider().cloned() {
+                    self.options.storage_options_accessor = Some(Arc::new(
+                        StorageOptionsAccessor::with_initial_and_provider(merged_opts, provider),
+                    ));
+                } else {
+                    self.options.storage_options_accessor = Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(merged_opts),
+                    ));
+                }
+            } else {
+                self.options.storage_options_accessor = Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(merged_opts),
+                ));
+            }
         }
 
         let session = match self.session.as_ref() {

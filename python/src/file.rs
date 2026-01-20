@@ -241,7 +241,6 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
@@ -249,7 +248,6 @@ impl LanceFileWriter {
             uri_or_path,
             storage_options,
             storage_options_provider,
-            s3_credentials_refresh_offset_seconds,
         )
         .await?;
         Self::open_with_store(
@@ -299,7 +297,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, keep_original_array=None, max_page_bytes=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, keep_original_array=None, max_page_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: String,
@@ -308,7 +306,6 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
@@ -326,7 +323,6 @@ impl LanceFileWriter {
                 version,
                 storage_options,
                 provider,
-                s3_credentials_refresh_offset_seconds,
                 keep_original_array,
                 max_page_bytes,
             ),
@@ -383,25 +379,33 @@ pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
-    object_store_from_uri_or_path_with_provider(uri_or_path, storage_options, None, None).await
+    object_store_from_uri_or_path_with_provider(uri_or_path, storage_options, None).await
 }
 
 pub async fn object_store_from_uri_or_path_with_provider(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
     storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-    s3_credentials_refresh_offset_seconds: Option<u64>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
     let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-    let mut object_store_params = ObjectStoreParams {
-        storage_options: storage_options.clone(),
-        storage_options_provider,
+
+    let accessor = match (storage_options, storage_options_provider) {
+        (Some(opts), Some(provider)) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(opts, provider),
+        )),
+        (None, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
+            provider,
+        ))),
+        (Some(opts), None) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(opts),
+        )),
+        (None, None) => None,
+    };
+
+    let object_store_params = ObjectStoreParams {
+        storage_options_accessor: accessor,
         ..Default::default()
     };
-    if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
-        object_store_params.s3_credentials_refresh_offset =
-            std::time::Duration::from_secs(offset_seconds);
-    }
 
     let (object_store, path) = ObjectStore::from_uri_and_params(
         object_store_registry,
@@ -425,13 +429,11 @@ impl LanceFileSession {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let (object_store, base_path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
             storage_options,
             storage_options_provider,
-            s3_credentials_refresh_offset_seconds,
         )
         .await?;
         Ok(Self {
@@ -444,25 +446,16 @@ impl LanceFileSession {
 #[pymethods]
 impl LanceFileSession {
     #[new]
-    #[pyo3(signature=(uri_or_path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
+    #[pyo3(signature=(uri_or_path, storage_options=None, storage_options_provider=None))]
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let provider = storage_options_provider
             .map(crate::storage_options::py_object_to_storage_options_provider)
             .transpose()?;
-        rt().block_on(
-            None,
-            Self::try_new(
-                uri_or_path,
-                storage_options,
-                provider,
-                s3_credentials_refresh_offset_seconds,
-            ),
-        )?
+        rt().block_on(None, Self::try_new(uri_or_path, storage_options, provider))?
     }
 
     #[pyo3(signature=(path, columns=None))]
@@ -644,14 +637,12 @@ impl LanceFileReader {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
             storage_options,
             storage_options_provider,
-            s3_credentials_refresh_offset_seconds,
         )
         .await?;
         Self::open_with_store(object_store, path, columns).await
@@ -749,27 +740,17 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, storage_options_provider=None, columns=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let provider = storage_options_provider
             .map(crate::storage_options::py_object_to_storage_options_provider)
             .transpose()?;
-        rt().block_on(
-            None,
-            Self::open(
-                path,
-                storage_options,
-                provider,
-                s3_credentials_refresh_offset_seconds,
-                columns,
-            ),
-        )?
+        rt().block_on(None, Self::open(path, storage_options, provider, columns))?
     }
 
     pub fn read_all(

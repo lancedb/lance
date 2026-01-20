@@ -14,6 +14,7 @@
 package org.lance.util;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.Map;
@@ -25,9 +26,19 @@ public final class JsonUtils {
 
   public static String toJson(Map<String, Object> params) {
     try {
-      return OBJECT_MAPPER.writeValueAsString(params);
+      return params == null ? null : OBJECT_MAPPER.writeValueAsString(params);
     } catch (JsonProcessingException e) {
       throw new IllegalStateException("Failed to serialize to JSON", e);
+    }
+  }
+
+  public static Map<String, Object> fromJson(String json) {
+    try {
+      return json == null
+          ? null
+          : OBJECT_MAPPER.readValue(json, new TypeReference<Map<String, Object>>() {});
+    } catch (JsonProcessingException e) {
+      throw new IllegalStateException("Failed to deserialize from JSON", e);
     }
   }
 }

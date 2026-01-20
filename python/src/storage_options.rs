@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_io::object_store::StorageOptionsProvider;
+use lance_io::object_store::{StorageOptionsAccessor, StorageOptionsProvider};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -166,4 +166,128 @@ pub fn py_object_to_storage_options_provider(
 ) -> PyResult<Arc<dyn StorageOptionsProvider>> {
     let py_provider = PyStorageOptionsProvider::new(py_obj)?;
     Ok(Arc::new(PyStorageOptionsProviderWrapper::new(py_provider)))
+}
+
+/// Python wrapper for StorageOptionsAccessor
+///
+/// This wraps a Rust StorageOptionsAccessor and exposes it to Python.
+#[pyclass(name = "StorageOptionsAccessor")]
+#[derive(Clone)]
+pub struct PyStorageOptionsAccessor {
+    inner: Arc<StorageOptionsAccessor>,
+}
+
+impl PyStorageOptionsAccessor {
+    pub fn new(accessor: Arc<StorageOptionsAccessor>) -> Self {
+        Self { inner: accessor }
+    }
+
+    pub fn inner(&self) -> Arc<StorageOptionsAccessor> {
+        self.inner.clone()
+    }
+}
+
+#[pymethods]
+impl PyStorageOptionsAccessor {
+    /// Create an accessor with only static options (no refresh capability)
+    #[staticmethod]
+    fn with_static_options(options: HashMap<String, String>) -> Self {
+        Self {
+            inner: Arc::new(StorageOptionsAccessor::with_static_options(options)),
+        }
+    }
+
+    /// Create an accessor with a dynamic provider (no initial options)
+    ///
+    /// The refresh offset is extracted from storage options using the `refresh_offset_millis` key.
+    #[staticmethod]
+    fn with_provider(provider: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rust_provider = py_object_to_storage_options_provider(provider)?;
+        Ok(Self {
+            inner: Arc::new(StorageOptionsAccessor::with_provider(rust_provider)),
+        })
+    }
+
+    /// Create an accessor with initial options and a dynamic provider
+    ///
+    /// The refresh offset is extracted from initial_options using the `refresh_offset_millis` key.
+    #[staticmethod]
+    fn with_initial_and_provider(
+        initial_options: HashMap<String, String>,
+        provider: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let rust_provider = py_object_to_storage_options_provider(provider)?;
+        Ok(Self {
+            inner: Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                initial_options,
+                rust_provider,
+            )),
+        })
+    }
+
+    /// Get current valid storage options
+    fn get_storage_options(&self, py: Python<'_>) -> PyResult<HashMap<String, String>> {
+        let accessor = self.inner.clone();
+        let options = rt()
+            .block_on(Some(py), accessor.get_storage_options())?
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(options.0)
+    }
+
+    /// Get the initial storage options without refresh
+    fn initial_storage_options(&self) -> Option<HashMap<String, String>> {
+        self.inner.initial_storage_options().cloned()
+    }
+
+    /// Get the accessor ID for equality/hashing
+    fn accessor_id(&self) -> String {
+        self.inner.accessor_id()
+    }
+
+    /// Check if this accessor has a dynamic provider
+    fn has_provider(&self) -> bool {
+        self.inner.has_provider()
+    }
+
+    /// Get the refresh offset in seconds
+    fn refresh_offset_secs(&self) -> u64 {
+        self.inner.refresh_offset().as_secs()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "StorageOptionsAccessor(id={}, has_provider={})",
+            self.inner.accessor_id(),
+            self.inner.has_provider()
+        )
+    }
+}
+
+/// Create a StorageOptionsAccessor from Python parameters
+///
+/// This handles the conversion from Python types to Rust StorageOptionsAccessor.
+/// The refresh offset is extracted from storage_options using the `refresh_offset_millis` key.
+#[allow(dead_code)]
+pub fn create_accessor_from_python(
+    storage_options: Option<HashMap<String, String>>,
+    storage_options_provider: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<Arc<StorageOptionsAccessor>>> {
+    match (storage_options, storage_options_provider) {
+        (Some(opts), Some(provider)) => {
+            let rust_provider = py_object_to_storage_options_provider(provider)?;
+            Ok(Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(opts, rust_provider),
+            )))
+        }
+        (None, Some(provider)) => {
+            let rust_provider = py_object_to_storage_options_provider(provider)?;
+            Ok(Some(Arc::new(StorageOptionsAccessor::with_provider(
+                rust_provider,
+            ))))
+        }
+        (Some(opts), None) => Ok(Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            opts,
+        )))),
+        (None, None) => Ok(None),
+    }
 }

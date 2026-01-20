@@ -36,6 +36,7 @@ pub use serde::{read_row_ids, write_row_ids};
 use snafu::location;
 
 use crate::utils::LanceIteratorExtension;
+use lance_core::utils::mask::RowSetOps;
 use segment::U64Segment;
 use tracing::instrument;
 

@@ -433,7 +433,6 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -463,7 +462,6 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
-            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -2225,6 +2223,49 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
+    @property
+    def initial_storage_options(self) -> Optional[Dict[str, str]]:
+        """
+        Get the initial storage options used to open this dataset.
+
+        This returns the options that were provided when the dataset was opened,
+        without any refresh from the provider. Returns None if no storage options
+        were provided.
+        """
+        return self._ds.initial_storage_options()
+
+    def latest_storage_options(self) -> Optional[Dict[str, str]]:
+        """
+        Get the latest storage options, potentially refreshed from the provider.
+
+        If a storage options provider was configured and credentials are expiring,
+        this will refresh them.
+
+        Returns
+        -------
+        Optional[Dict[str, str]]
+            - Storage options dict if configured (static or refreshed from provider)
+            - None if no storage options were configured for this dataset
+
+        Raises
+        ------
+        IOError
+            If an error occurs while fetching/refreshing options from the provider
+        """
+        return self._ds.latest_storage_options()
+
+    @property
+    def storage_options_accessor(self):
+        """
+        Get the storage options accessor for this dataset.
+
+        The accessor bundles static storage options and optional dynamic provider,
+        handling caching and refresh logic internally.
+
+        Returns None if neither storage options nor a provider were configured.
+        """
+        return self._ds.storage_options_accessor()
+
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> "LanceDataset":
@@ -2411,8 +2452,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``LABEL_LIST``. A special index that is used to index list
           columns whose values have small cardinality.  For example, a column that
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
-          with a ``LABEL_LIST`` index.  This index can only speedup queries with
-          ``array_has_any`` or ``array_has_all`` filters.
+          with a ``LABEL_LIST`` index. This index can speed up list membership
+          filters such as ``array_has_any``, ``array_has_all``, and
+          ``array_has`` / ``array_contains``.
         * ``NGRAM``. A special index that is used to index string columns. This index
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
@@ -5508,8 +5550,6 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
-    ignore_namespace_table_storage_options: bool = False,
-    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5611,29 +5651,16 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
-    ignore_namespace_table_storage_options : bool, default False
-        If True, ignore the storage options returned by the namespace and only use
-        the provided `storage_options` parameter. The storage options provider will
-        not be created, so credentials will not be automatically refreshed.
-        This is useful when you want to use your own credentials instead of the
-        namespace-provided credentials.
-    s3_credentials_refresh_offset_seconds : optional, int
-        The number of seconds before credential expiration to trigger a refresh.
-        Default is 60 seconds. Only applicable when using AWS S3 with temporary
-        credentials. For example, if set to 60, credentials will be refreshed
-        when they have less than 60 seconds remaining before expiration. This
-        should be set shorter than the credential lifetime to avoid using
-        expired credentials.
 
     Notes
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
+    - Storage options from describe_table() will be used automatically
     - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
-      storage options refresh (unless `ignore_namespace_table_storage_options=True`)
+      storage options refresh
     - Initial storage options from describe_table() will be merged with
-      any provided `storage_options` (unless
-      `ignore_namespace_table_storage_options=True`)
+      any provided `storage_options`
     """
     # Validate that user provides either uri OR (namespace + table_id), not both
     has_uri = uri is not None
@@ -5715,11 +5742,8 @@ def write_dataset(
                 f"Namespace did not return a table location in {mode} response"
             )
 
-        # Check if we should ignore namespace storage options
-        if ignore_namespace_table_storage_options:
-            namespace_storage_options = None
-        else:
-            namespace_storage_options = response.storage_options
+        # Use namespace storage options
+        namespace_storage_options = response.storage_options
 
         # Set up storage options and provider
         if namespace_storage_options:
@@ -5781,12 +5805,6 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
-
-    # Add s3_credentials_refresh_offset_seconds if specified
-    if s3_credentials_refresh_offset_seconds is not None:
-        params["s3_credentials_refresh_offset_seconds"] = (
-            s3_credentials_refresh_offset_seconds
-        )
 
     if commit_lock:
         if not callable(commit_lock):

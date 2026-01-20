@@ -99,8 +99,6 @@ def dataset(
     session: Optional[Session] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
-    ignore_namespace_table_storage_options: bool = False,
-    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -168,26 +166,13 @@ def dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
-    ignore_namespace_table_storage_options : bool, default False
-        Only applicable when using `namespace` and `table_id`. If True, storage
-        options returned from the namespace's describe_table() will be ignored
-        (treated as None). If False (default), storage options from describe_table()
-        will be used and a dynamic storage options provider will be created to
-        automatically refresh credentials before they expire.
-    s3_credentials_refresh_offset_seconds : optional, int
-        The number of seconds before credential expiration to trigger a refresh.
-        Default is 60 seconds. Only applicable when using AWS S3 with temporary
-        credentials. For example, if set to 60, credentials will be refreshed
-        when they have less than 60 seconds remaining before expiration. This
-        should be set shorter than the credential lifetime to avoid using
-        expired credentials.
 
     Notes
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
-    - Storage options from describe_table() will be used unless
-      `ignore_namespace_table_storage_options=True`
+    - Storage options from describe_table() will be used automatically
+    - A dynamic storage options provider will be created to refresh credentials
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
@@ -220,10 +205,7 @@ def dataset(
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
 
-        if ignore_namespace_table_storage_options:
-            namespace_storage_options = None
-        else:
-            namespace_storage_options = response.storage_options
+        namespace_storage_options = response.storage_options
 
         if namespace_storage_options:
             storage_options_provider = LanceNamespaceStorageOptionsProvider(
@@ -251,7 +233,6 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
-        s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -276,7 +257,6 @@ def dataset(
                 read_params=read_params,
                 session=session,
                 storage_options_provider=storage_options_provider,
-                s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
             )
     else:
         return ds

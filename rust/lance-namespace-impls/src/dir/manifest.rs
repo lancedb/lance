@@ -982,7 +982,11 @@ impl ManifestNamespace {
             let write_params = WriteParams {
                 session,
                 store_params: storage_options.as_ref().map(|opts| ObjectStoreParams {
-                    storage_options: Some(opts.clone()),
+                    storage_options_accessor: Some(Arc::new(
+                        lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                            opts.clone(),
+                        ),
+                    )),
                     ..Default::default()
                 }),
                 ..Default::default()
