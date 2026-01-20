@@ -191,7 +191,7 @@ impl BlobPreprocessor {
                 .metadata()
                 .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
                 .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value > 0)
+                .filter(|&value| value > DEDICATED_THRESHOLD)
                 .unwrap_or(DEDICATED_THRESHOLD);
 
             let struct_arr = array
@@ -1196,7 +1196,7 @@ mod tests {
         let kinds = write_then_get_blob_kinds(vec![blob_len], Some(overridden_threshold)).await;
 
         assert_eq!(kinds.len(), 1);
-        assert_eq!(kinds[0], BlobKind::Dedicated);
+        assert_eq!(kinds[0], BlobKind::Packed);
     }
 
     #[tokio::test]

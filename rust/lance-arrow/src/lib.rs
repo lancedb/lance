@@ -49,7 +49,7 @@ pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 /// Metadata key for overriding the dedicated blob size threshold (in bytes)
 pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
-    "lance.blob.v2:blob_dedicated_size_threshold";
+    "lance-encoding:blob-dedicated-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
