@@ -55,9 +55,17 @@ impl ColumnStatsReader {
 
     /// Get the list of column names that have statistics available.
     pub fn column_names(&self) -> Result<Vec<String>> {
+        use lance_file::writer::COLUMN_STATS_COLUMN_NAME_FIELD;
         let column_names = self
             .stats_batch
-            .column(0)
+            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected column '{}' in stats batch",
+                    COLUMN_STATS_COLUMN_NAME_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| Error::Internal {
@@ -74,10 +82,18 @@ impl ColumnStatsReader {
     ///
     /// Returns `None` if the column has no statistics available.
     pub fn read_column_stats(&self, column_name: &str) -> Result<Option<ColumnStats>> {
+        use lance_file::writer::COLUMN_STATS_COLUMN_NAME_FIELD;
         // Find the row index for this column
         let column_names = self
             .stats_batch
-            .column(0)
+            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected column '{}' in stats batch",
+                    COLUMN_STATS_COLUMN_NAME_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| Error::Internal {
@@ -103,10 +119,20 @@ impl ColumnStatsReader {
         }
         let field = field.unwrap();
 
-        // Extract arrays for this column
+        // Extract arrays for this column using column names for better readability
+        use lance_file::writer::{
+            COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
+            COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD,
+            COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
+        };
+
         let fragment_ids_ref = self
             .stats_batch
-            .column(1)
+            .column_by_name("fragment_ids")
+            .ok_or_else(|| Error::Internal {
+                message: "Expected 'fragment_ids' column in stats batch".to_string(),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -124,7 +150,14 @@ impl ColumnStatsReader {
 
         let zone_starts_ref = self
             .stats_batch
-            .column(2)
+            .column_by_name("zone_starts")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'zone_starts' column ({}) in stats batch",
+                    COLUMN_STATS_ZONE_START_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -142,7 +175,14 @@ impl ColumnStatsReader {
 
         let zone_lengths_ref = self
             .stats_batch
-            .column(3)
+            .column_by_name("zone_lengths")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'zone_lengths' column ({}) in stats batch",
+                    COLUMN_STATS_ZONE_LENGTH_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -160,7 +200,14 @@ impl ColumnStatsReader {
 
         let null_counts_ref = self
             .stats_batch
-            .column(4)
+            .column_by_name("null_counts")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'null_counts' column ({}) in stats batch",
+                    COLUMN_STATS_NULL_COUNT_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -178,7 +225,14 @@ impl ColumnStatsReader {
 
         let nan_counts_ref = self
             .stats_batch
-            .column(5)
+            .column_by_name("nan_counts")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'nan_counts' column ({}) in stats batch",
+                    COLUMN_STATS_NAN_COUNT_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -196,7 +250,14 @@ impl ColumnStatsReader {
 
         let min_values_ref = self
             .stats_batch
-            .column(6)
+            .column_by_name("min_values")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'min_values' column ({}) in stats batch",
+                    COLUMN_STATS_MIN_VALUE_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -214,7 +275,14 @@ impl ColumnStatsReader {
 
         let max_values_ref = self
             .stats_batch
-            .column(7)
+            .column_by_name("max_values")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected 'max_values' column ({}) in stats batch",
+                    COLUMN_STATS_MAX_VALUE_FIELD
+                ),
+                location: location!(),
+            })?
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
@@ -338,10 +406,16 @@ fn parse_scalar_value(s: &str, data_type: &arrow_schema::DataType) -> Result<Sca
 mod tests {
     use super::*;
     // Re-import types that are used by the parent module but not re-exported
+    use crate::dataset::column_stats::create_consolidated_stats_schema;
     use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
     use arrow_array::{RecordBatch, StringArray as ArrowStringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
+    use lance_file::writer::{
+        COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
+        COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD,
+        COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
+    };
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(
@@ -356,99 +430,47 @@ mod tests {
 
     fn create_test_stats_batch() -> RecordBatch {
         // Create a consolidated stats batch with 2 columns: "id" and "name"
-        // Match the exact schema created by column_stats.rs (with proper inner field names)
-        let schema = ArrowSchema::new(vec![
-            ArrowField::new("column_name", DataType::Utf8, false),
-            ArrowField::new(
-                "fragment_ids",
-                DataType::List(Arc::new(ArrowField::new(
-                    "fragment_id",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "zone_starts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "zone_start",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "zone_lengths",
-                DataType::List(Arc::new(ArrowField::new(
-                    "zone_length",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "null_counts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "null_count",
-                    DataType::UInt32,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "nan_counts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "nan_count",
-                    DataType::UInt32,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "mins",
-                DataType::List(Arc::new(ArrowField::new("min", DataType::Utf8, false))),
-                false,
-            ),
-            ArrowField::new(
-                "maxs",
-                DataType::List(Arc::new(ArrowField::new("max", DataType::Utf8, false))),
-                false,
-            ),
-        ]);
+        // Use the shared schema creation function from column_stats.rs
+        let schema = create_consolidated_stats_schema();
 
-        // Build lists for "id" column (Int32) - use with_field to match the schema
+        // Build lists for "id" column (Int32) - use constants to match the schema
+        // Note: "fragment_id" is used in consolidated layout (not in flat layout constants)
         let mut fragment_ids_builder = ListBuilder::new(UInt64Builder::new())
             .with_field(ArrowField::new("fragment_id", DataType::UInt64, false));
         fragment_ids_builder.values().append_value(0);
         fragment_ids_builder.values().append_value(1);
         fragment_ids_builder.append(true);
 
-        let mut zone_starts_builder = ListBuilder::new(UInt64Builder::new())
-            .with_field(ArrowField::new("zone_start", DataType::UInt64, false));
+        let mut zone_starts_builder = ListBuilder::new(UInt64Builder::new()).with_field(
+            ArrowField::new(COLUMN_STATS_ZONE_START_FIELD, DataType::UInt64, false),
+        );
         zone_starts_builder.values().append_value(0);
         zone_starts_builder.values().append_value(100);
         zone_starts_builder.append(true);
 
-        let mut zone_lengths_builder = ListBuilder::new(UInt64Builder::new())
-            .with_field(ArrowField::new("zone_length", DataType::UInt64, false));
+        let mut zone_lengths_builder = ListBuilder::new(UInt64Builder::new()).with_field(
+            ArrowField::new(COLUMN_STATS_ZONE_LENGTH_FIELD, DataType::UInt64, false),
+        );
         zone_lengths_builder.values().append_value(100);
         zone_lengths_builder.values().append_value(100);
         zone_lengths_builder.append(true);
 
-        let mut null_counts_builder = ListBuilder::new(UInt32Builder::new())
-            .with_field(ArrowField::new("null_count", DataType::UInt32, false));
+        let mut null_counts_builder = ListBuilder::new(UInt32Builder::new()).with_field(
+            ArrowField::new(COLUMN_STATS_NULL_COUNT_FIELD, DataType::UInt32, false),
+        );
         null_counts_builder.values().append_value(0);
         null_counts_builder.values().append_value(0);
         null_counts_builder.append(true);
 
-        let mut nan_counts_builder = ListBuilder::new(UInt32Builder::new())
-            .with_field(ArrowField::new("nan_count", DataType::UInt32, false));
+        let mut nan_counts_builder = ListBuilder::new(UInt32Builder::new()).with_field(
+            ArrowField::new(COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32, false),
+        );
         nan_counts_builder.values().append_value(0);
         nan_counts_builder.values().append_value(0);
         nan_counts_builder.append(true);
 
         let mut mins_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-            "min",
+            COLUMN_STATS_MIN_VALUE_FIELD,
             DataType::Utf8,
             false,
         ));
@@ -457,7 +479,7 @@ mod tests {
         mins_builder.append(true);
 
         let mut maxs_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-            "max",
+            COLUMN_STATS_MAX_VALUE_FIELD,
             DataType::Utf8,
             false,
         ));
@@ -495,7 +517,7 @@ mod tests {
         maxs_builder.append(true);
 
         RecordBatch::try_new(
-            Arc::new(schema),
+            schema,
             vec![
                 Arc::new(ArrowStringArray::from(vec!["id", "name"])),
                 Arc::new(fragment_ids_builder.finish()),
@@ -673,67 +695,10 @@ mod tests {
     fn test_empty_stats_batch() {
         let schema = create_test_schema();
 
-        // Create empty stats batch
-        let stats_schema = ArrowSchema::new(vec![
-            ArrowField::new("column_name", DataType::Utf8, false),
-            ArrowField::new(
-                "fragment_ids",
-                DataType::List(Arc::new(ArrowField::new(
-                    "fragment_id",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "zone_starts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "zone_start",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "zone_lengths",
-                DataType::List(Arc::new(ArrowField::new(
-                    "zone_length",
-                    DataType::UInt64,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "null_counts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "null_count",
-                    DataType::UInt32,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "nan_counts",
-                DataType::List(Arc::new(ArrowField::new(
-                    "nan_count",
-                    DataType::UInt32,
-                    false,
-                ))),
-                false,
-            ),
-            ArrowField::new(
-                "mins",
-                DataType::List(Arc::new(ArrowField::new("min", DataType::Utf8, false))),
-                false,
-            ),
-            ArrowField::new(
-                "maxs",
-                DataType::List(Arc::new(ArrowField::new("max", DataType::Utf8, false))),
-                false,
-            ),
-        ]);
+        // Create empty stats batch using the shared schema function
+        let stats_schema = create_consolidated_stats_schema();
 
-        let empty_batch = RecordBatch::new_empty(Arc::new(stats_schema));
+        let empty_batch = RecordBatch::new_empty(stats_schema);
         let reader = ColumnStatsReader::new(schema, empty_batch);
 
         // Reading from empty batch should return None (no stats available)

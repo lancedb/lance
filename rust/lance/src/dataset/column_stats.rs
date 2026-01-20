@@ -25,6 +25,11 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::zone::ZoneBound;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::FileReader;
+use lance_file::writer::{
+    COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
+    COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_LENGTH_FIELD,
+    COLUMN_STATS_ZONE_START_FIELD,
+};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -33,6 +38,20 @@ use snafu::location;
 
 use crate::dataset::fragment::FileFragment;
 use crate::{Dataset, Error};
+
+// Schema field definitions for consolidated statistics
+// Re-export from lance-file for consistency (these are used in the consolidated list-based layout)
+// Note: The flat layout uses these same field names but with different structure
+const FRAGMENT_ID_FIELD: &str = "fragment_id"; // Used in consolidated layout only
+
+/// Helper function to create a list field for consolidated statistics
+fn create_list_field(name: &str, item_name: &str, item_type: DataType) -> ArrowField {
+    ArrowField::new(
+        name,
+        DataType::List(Arc::new(ArrowField::new(item_name, item_type, false))),
+        false,
+    )
+}
 
 /// Consolidated statistics for a single zone of a single column.
 #[derive(Debug, Clone)]
@@ -372,7 +391,8 @@ async fn read_fragment_column_stats(
         })?;
 
     // Process each row (one row per zone per column) and convert from flat layout
-    // to nested structure. Zones may arrive out of order, so we need to resize vectors.
+    // to nested structure. Zones must arrive in order (zone_id 0, 1, 2, ...) as they
+    // are written in order and Arrow IPC preserves row order.
     for row_idx in 0..stats_batch.num_rows() {
         let col_name = column_names.value(row_idx).to_string();
         let zone_id = zone_ids.value(row_idx) as usize;
@@ -390,29 +410,23 @@ async fn read_fragment_column_stats(
         };
 
         // Get or create the zones vector for this column
-        let zones_for_column = result.entry(col_name).or_insert_with(Vec::new);
+        let zones_for_column = result.entry(col_name.clone()).or_insert_with(Vec::new);
 
-        // Ensure the zones vector has enough capacity for this zone_id
-        // (zones may be read out of order, so we need to pre-allocate)
-        let required_capacity = zone_id + 1;
-        if zones_for_column.len() < required_capacity {
-            zones_for_column.resize(
-                required_capacity,
-                ZoneStats {
-                    bound: ZoneBound {
-                        fragment_id: 0,
-                        start: 0,
-                        length: 0,
-                    },
-                    null_count: 0,
-                    nan_count: 0,
-                    min: String::new(),
-                    max: String::new(),
-                },
-            );
+        // Zones must arrive in order. If they don't, it indicates a bug in the writer
+        // or data corruption. Assert to fail fast rather than silently handling it.
+        if zone_id != zones_for_column.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "Column stats zones arrived out of order: expected zone_id {}, got {} for column '{}'",
+                    zones_for_column.len(),
+                    zone_id,
+                    col_name
+                ),
+                location: location!(),
+            });
         }
 
-        zones_for_column[zone_id] = zone_stat;
+        zones_for_column.push(zone_stat);
     }
 
     Ok(Some(result))
@@ -433,37 +447,37 @@ impl ZoneListBuilders {
     fn new() -> Self {
         Self {
             fragment_ids: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                "fragment_id",
+                FRAGMENT_ID_FIELD,
                 DataType::UInt64,
                 false,
             )),
             zone_starts: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                "zone_start",
+                COLUMN_STATS_ZONE_START_FIELD,
                 DataType::UInt64,
                 false,
             )),
             zone_lengths: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                "zone_length",
+                COLUMN_STATS_ZONE_LENGTH_FIELD,
                 DataType::UInt64,
                 false,
             )),
             null_counts: ListBuilder::new(UInt32Builder::new()).with_field(ArrowField::new(
-                "null_count",
+                COLUMN_STATS_NULL_COUNT_FIELD,
                 DataType::UInt32,
                 false,
             )),
             nan_counts: ListBuilder::new(UInt32Builder::new()).with_field(ArrowField::new(
-                "nan_count",
+                COLUMN_STATS_NAN_COUNT_FIELD,
                 DataType::UInt32,
                 false,
             )),
             mins: ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-                "min",
+                COLUMN_STATS_MIN_VALUE_FIELD,
                 DataType::Utf8,
                 false,
             )),
             maxs: ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-                "max",
+                COLUMN_STATS_MAX_VALUE_FIELD,
                 DataType::Utf8,
                 false,
             )),
@@ -513,64 +527,28 @@ impl ZoneListBuilders {
 }
 
 /// Create the Arrow schema for consolidated statistics
-fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
+pub(crate) fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("column_name", DataType::Utf8, false),
-        ArrowField::new(
-            "fragment_ids",
-            DataType::List(Arc::new(ArrowField::new(
-                "fragment_id",
-                DataType::UInt64,
-                false,
-            ))),
-            false,
-        ),
-        ArrowField::new(
+        ArrowField::new(COLUMN_STATS_COLUMN_NAME_FIELD, DataType::Utf8, false),
+        create_list_field("fragment_ids", FRAGMENT_ID_FIELD, DataType::UInt64),
+        create_list_field(
             "zone_starts",
-            DataType::List(Arc::new(ArrowField::new(
-                "zone_start",
-                DataType::UInt64,
-                false,
-            ))),
-            false,
+            COLUMN_STATS_ZONE_START_FIELD,
+            DataType::UInt64,
         ),
-        ArrowField::new(
+        create_list_field(
             "zone_lengths",
-            DataType::List(Arc::new(ArrowField::new(
-                "zone_length",
-                DataType::UInt64,
-                false,
-            ))),
-            false,
+            COLUMN_STATS_ZONE_LENGTH_FIELD,
+            DataType::UInt64,
         ),
-        ArrowField::new(
+        create_list_field(
             "null_counts",
-            DataType::List(Arc::new(ArrowField::new(
-                "null_count",
-                DataType::UInt32,
-                false,
-            ))),
-            false,
+            COLUMN_STATS_NULL_COUNT_FIELD,
+            DataType::UInt32,
         ),
-        ArrowField::new(
-            "nan_counts",
-            DataType::List(Arc::new(ArrowField::new(
-                "nan_count",
-                DataType::UInt32,
-                false,
-            ))),
-            false,
-        ),
-        ArrowField::new(
-            "min_values",
-            DataType::List(Arc::new(ArrowField::new("min", DataType::Utf8, false))),
-            false,
-        ),
-        ArrowField::new(
-            "max_values",
-            DataType::List(Arc::new(ArrowField::new("max", DataType::Utf8, false))),
-            false,
-        ),
+        create_list_field("nan_counts", COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32),
+        create_list_field("min_values", COLUMN_STATS_MIN_VALUE_FIELD, DataType::Utf8),
+        create_list_field("max_values", COLUMN_STATS_MAX_VALUE_FIELD, DataType::Utf8),
     ]))
 }
 
@@ -660,6 +638,44 @@ mod tests {
     use crate::dataset::WriteParams;
     use futures::stream::TryStreamExt;
 
+    // Helper functions for common test schemas
+    fn create_id_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    fn create_id_name_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]))
+    }
+
+    fn create_id_value_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Float32, false),
+        ]))
+    }
+
+    fn create_multi_type_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("int_col", DataType::Int32, false),
+            ArrowField::new("float_col", DataType::Float32, false),
+            ArrowField::new("string_col", DataType::Utf8, false),
+        ]))
+    }
+
+    fn create_nullable_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nullable_value", DataType::Int32, true),
+        ]))
+    }
+
     /// Helper function to read consolidated stats file using FileReader
     async fn read_stats_file(dataset: &Dataset, stats_path: &str) -> Vec<RecordBatch> {
         let full_path = dataset.base.child(stats_path);
@@ -711,15 +727,12 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("name", DataType::Utf8, false),
-        ]));
+        let schema = create_id_name_schema();
 
         // Create 3 fragments, each with stats
         let write_params = WriteParams {
             max_rows_per_file: 100,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -746,7 +759,7 @@ mod tests {
             } else {
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -921,11 +934,11 @@ mod tests {
             "value",
             DataType::Int32,
             false,
-        )]));
+        )])); // Note: Different from id_schema, using "value" field name
 
         let write_params = WriteParams {
             max_rows_per_file: 100,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -948,7 +961,7 @@ mod tests {
                 let _dataset = Dataset::open(test_uri).await.unwrap();
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -999,17 +1012,13 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = create_id_schema();
 
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -1037,11 +1046,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("int_col", DataType::Int32, false),
-            ArrowField::new("float_col", DataType::Float32, false),
-            ArrowField::new("string_col", DataType::Utf8, false),
-        ]));
+        let schema = create_multi_type_schema();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1057,7 +1062,7 @@ mod tests {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -1187,11 +1192,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = create_id_schema();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1200,7 +1201,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -1310,14 +1311,11 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int64, false),
-            ArrowField::new("value", DataType::Float32, false),
-        ]));
+        let schema = create_id_value_schema();
 
         let write_params = WriteParams {
             max_rows_per_file: 50_000,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -1347,7 +1345,7 @@ mod tests {
                 let _dataset = Dataset::open(test_uri).await.unwrap();
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -1497,10 +1495,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("nullable_value", DataType::Int32, true),
-        ]));
+        let schema = create_nullable_schema();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1516,7 +1511,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -1562,11 +1557,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = create_id_schema();
 
         // Create dataset with stats and small max_rows_per_file to force multiple files
         let batch = RecordBatch::try_new(
@@ -1576,8 +1567,8 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
-            max_rows_per_file: 100, // Force multiple data files per fragment
+            disable_column_stats: false, // Stats enabled
+            max_rows_per_file: 100,      // Force multiple data files per fragment
             ..Default::default()
         };
 

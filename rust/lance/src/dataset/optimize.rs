@@ -7942,7 +7942,7 @@ mod tests {
 
         let write_params = WriteParams {
             max_rows_per_file: 100,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -7966,7 +7966,7 @@ mod tests {
                 let _dataset = Dataset::open(test_uri).await.unwrap();
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -8101,7 +8101,7 @@ mod tests {
 
         let write_params = WriteParams {
             max_rows_per_file: 50,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 
@@ -8124,7 +8124,7 @@ mod tests {
                 let _dataset = Dataset::open(test_uri).await.unwrap();
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -8257,7 +8257,7 @@ mod tests {
             let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
             let append_params = WriteParams {
                 mode: crate::dataset::WriteMode::Append,
-                enable_column_stats: true,
+                disable_column_stats: false, // Stats enabled
                 ..Default::default()
             };
             Dataset::write(reader, test_uri, Some(append_params))
@@ -8394,7 +8394,7 @@ mod tests {
         // Write with stable row IDs
         let write_params = WriteParams {
             max_rows_per_file: 100,
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             enable_stable_row_ids: true,
             ..Default::default()
         };
@@ -8417,7 +8417,7 @@ mod tests {
                 let _dataset = Dataset::open(test_uri).await.unwrap();
                 let append_params = WriteParams {
                     mode: crate::dataset::WriteMode::Append,
-                    enable_column_stats: true,
+                    disable_column_stats: false, // Stats enabled
                     ..Default::default()
                 };
                 Dataset::write(reader, test_uri, Some(append_params))
@@ -8546,7 +8546,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
         let write_params = WriteParams {
-            enable_column_stats: true,
+            disable_column_stats: false, // Stats enabled
             ..Default::default()
         };
 

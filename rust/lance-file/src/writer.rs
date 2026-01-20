@@ -67,6 +67,31 @@ pub const COLUMN_STATS_VERSION_KEY: &str = "lance:column_stats:version";
 /// Current version of column statistics format
 pub const COLUMN_STATS_VERSION: u32 = 1;
 
+// Schema field names for column statistics (flat layout)
+// These constants ensure consistency across schema creation
+pub const COLUMN_STATS_COLUMN_NAME_FIELD: &str = "column_name";
+pub const COLUMN_STATS_ZONE_ID_FIELD: &str = "zone_id";
+pub const COLUMN_STATS_ZONE_START_FIELD: &str = "zone_start";
+pub const COLUMN_STATS_ZONE_LENGTH_FIELD: &str = "zone_length";
+pub const COLUMN_STATS_NULL_COUNT_FIELD: &str = "null_count";
+pub const COLUMN_STATS_NAN_COUNT_FIELD: &str = "nan_count";
+pub const COLUMN_STATS_MIN_VALUE_FIELD: &str = "min_value";
+pub const COLUMN_STATS_MAX_VALUE_FIELD: &str = "max_value";
+
+/// Create the Arrow schema for column statistics (flat layout: one row per zone per column)
+pub fn create_column_stats_flat_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(COLUMN_STATS_COLUMN_NAME_FIELD, DataType::Utf8, false),
+        ArrowField::new(COLUMN_STATS_ZONE_ID_FIELD, DataType::UInt32, false),
+        ArrowField::new(COLUMN_STATS_ZONE_START_FIELD, DataType::UInt64, false),
+        ArrowField::new(COLUMN_STATS_ZONE_LENGTH_FIELD, DataType::UInt64, false),
+        ArrowField::new(COLUMN_STATS_NULL_COUNT_FIELD, DataType::UInt32, false),
+        ArrowField::new(COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32, false),
+        ArrowField::new(COLUMN_STATS_MIN_VALUE_FIELD, DataType::Utf8, false),
+        ArrowField::new(COLUMN_STATS_MAX_VALUE_FIELD, DataType::Utf8, false),
+    ]))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
     /// How many bytes to use for buffering column data
@@ -116,9 +141,10 @@ pub struct FileWriterOptions {
     /// require more up-to-date readers to read the data.
     pub format_version: Option<LanceFileVersion>,
 
-    /// If true, enable column statistics generation when writing data files.
+    /// If true, disable column statistics generation when writing data files.
     /// Column statistics can be used for planning optimization and filtering.
-    pub enable_column_stats: bool,
+    /// Default is false (column stats are enabled by default).
+    pub disable_column_stats: bool,
 }
 
 // Total in-memory budget for buffering serialized page metadata before flushing
@@ -247,7 +273,7 @@ pub struct FileWriter {
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
     page_spill: Option<PageSpillState>,
-    /// Column statistics processors (one per column), only initialized if enable_column_stats is true
+    /// Column statistics processors (one per column), only initialized if disable_column_stats is false
     column_stats_processors: Option<Vec<FileZoneBuilder<ColumnStatisticsProcessor>>>,
 }
 
@@ -505,7 +531,7 @@ impl FileWriter {
         self.schema = Some(schema);
 
         // Initialize column statistics processors if enabled
-        if self.options.enable_column_stats {
+        if !self.options.disable_column_stats {
             let mut processors = Vec::new();
             for field in &self.schema.as_ref().unwrap().fields {
                 let data_type = field.data_type().clone();
@@ -963,7 +989,7 @@ impl FileWriter {
 
         // 3. write global buffers (we write the schema here)
         // Build the column statistics if enabled
-        if self.options.enable_column_stats {
+        if !self.options.disable_column_stats {
             self.build_column_statistics().await?;
         }
         let global_buffer_offsets = self.write_global_buffers().await?;
@@ -1093,16 +1119,7 @@ impl FileWriter {
         let max_value_array = Arc::new(StringArray::from(max_values)) as ArrayRef;
 
         // Create schema for the statistics RecordBatch (flat schema, no lists)
-        let stats_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("column_name", DataType::Utf8, false),
-            ArrowField::new("zone_id", DataType::UInt32, false),
-            ArrowField::new("zone_start", DataType::UInt64, false),
-            ArrowField::new("zone_length", DataType::UInt64, false),
-            ArrowField::new("null_count", DataType::UInt32, false),
-            ArrowField::new("nan_count", DataType::UInt32, false),
-            ArrowField::new("min_value", DataType::Utf8, false),
-            ArrowField::new("max_value", DataType::Utf8, false),
-        ]));
+        let stats_schema = create_column_stats_flat_schema();
 
         // Create RecordBatch (flat structure)
         let stats_batch = RecordBatch::try_new(
@@ -2694,7 +2711,7 @@ mod tests {
         let object_store = ObjectStore::local();
 
         let options = FileWriterOptions {
-            enable_column_stats: true,
+            disable_column_stats: false,
             ..Default::default()
         };
 
@@ -2842,7 +2859,7 @@ mod tests {
         let object_store = ObjectStore::local();
 
         let options = FileWriterOptions {
-            enable_column_stats: true,
+            disable_column_stats: false,
             ..Default::default()
         };
 
@@ -2942,7 +2959,7 @@ mod tests {
         let object_store = ObjectStore::local();
 
         let options = FileWriterOptions {
-            enable_column_stats: true,
+            disable_column_stats: false,
             ..Default::default()
         };
 
@@ -3037,7 +3054,7 @@ mod tests {
         let object_store = ObjectStore::local();
 
         let options = FileWriterOptions {
-            enable_column_stats: false, // Disabled
+            disable_column_stats: true, // Disabled
             ..Default::default()
         };
 

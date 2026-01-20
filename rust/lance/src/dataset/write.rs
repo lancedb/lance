@@ -422,12 +422,12 @@ pub struct WriteParams {
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
 
-    /// If true, enable column statistics generation when writing data files.
+    /// If true, disable column statistics generation when writing data files.
     ///
     /// Note: Once set for a dataset, this setting should remain consistent across
     /// all write operations. This value must match the dataset's policy.
-    /// Default is `false`.
-    pub enable_column_stats: bool,
+    /// Default is `false` (column stats are enabled by default).
+    pub disable_column_stats: bool,
 }
 
 impl Default for WriteParams {
@@ -458,7 +458,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
-            enable_column_stats: false,
+            disable_column_stats: false,
         }
     }
 }
@@ -466,9 +466,9 @@ impl Default for WriteParams {
 impl WriteParams {
     /// Validate the dataset's column stats policy.
     ///
-    /// If the dataset has a policy set in the manifest, this will check that `enable_column_stats`
-    /// matches it. Returns an error if the values don't match. If the dataset doesn't have a policy,
-    /// the value from WriteParams (defaults to `false`) will be used.
+    /// If the dataset has a policy set in the manifest, this will check that `disable_column_stats`
+    /// matches it (inverted). Returns an error if the values don't match. If the dataset doesn't have a policy,
+    /// the value from WriteParams (defaults to `false`, meaning stats enabled) will be used.
     ///
     /// # Arguments
     ///
@@ -477,11 +477,11 @@ impl WriteParams {
     /// # Errors
     ///
     /// Returns an error if the manifest contains an invalid policy value or if
-    /// `enable_column_stats` doesn't match the dataset's policy.
+    /// `disable_column_stats` doesn't match the dataset's policy (inverted).
     pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
         if let Some(dataset) = dataset {
             if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY) {
-                let dataset_policy: bool = policy_str.parse().map_err(|_| {
+                let dataset_policy_enabled: bool = policy_str.parse().map_err(|_| {
                     Error::invalid_input(
                         format!(
                             "[ColumnStats] Invalid value for {} in dataset config: {}",
@@ -490,14 +490,16 @@ impl WriteParams {
                         location!(),
                     )
                 })?;
+                // Convert enabled policy to disable flag (invert)
+                let dataset_policy_disable = !dataset_policy_enabled;
 
-                if self.enable_column_stats != dataset_policy {
+                if self.disable_column_stats != dataset_policy_disable {
                     return Err(Error::invalid_input(
                         format!(
-                            "[ColumnStats] Policy mismatch: dataset requires enable_column_stats={}, \
-                             but WriteParams has enable_column_stats={}. \
+                            "[ColumnStats] Policy mismatch: dataset requires disable_column_stats={}, \
+                             but WriteParams has disable_column_stats={}. \
                              All fragments in a dataset must have consistent column statistics.",
-                            dataset_policy, self.enable_column_stats
+                            dataset_policy_disable, self.disable_column_stats
                         ),
                         location!(),
                     ));
@@ -710,7 +712,7 @@ pub async fn do_write_fragments(
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
-        params.enable_column_stats,
+        params.disable_column_stats,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1546,7 +1548,7 @@ pub async fn open_writer(
         storage_version,
         WriterOptions {
             add_data_dir: true,
-            enable_column_stats: false,
+            disable_column_stats: false,
             ..Default::default()
         },
     )
@@ -1596,7 +1598,7 @@ struct WriterOptions {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
-    enable_column_stats: bool,
+    disable_column_stats: bool,
 }
 
 async fn open_writer_with_options(
@@ -1615,7 +1617,7 @@ async fn open_writer_with_options(
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
-        enable_column_stats,
+        disable_column_stats,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1649,7 +1651,7 @@ async fn open_writer_with_options(
             schema.clone(),
             FileWriterOptions {
                 format_version: Some(storage_version),
-                enable_column_stats,
+                disable_column_stats,
                 ..Default::default()
             },
         )?;
@@ -1720,7 +1722,7 @@ struct WriterGenerator {
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
     /// Whether to enable column statistics generation
-    enable_column_stats: bool,
+    disable_column_stats: bool,
 }
 
 impl WriterGenerator {
@@ -1737,7 +1739,7 @@ impl WriterGenerator {
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
-        enable_column_stats: bool,
+        disable_column_stats: bool,
     ) -> Self {
         Self {
             object_store,
@@ -1752,7 +1754,7 @@ impl WriterGenerator {
             source_store_params,
             blob_pack_file_size_threshold,
             next_base_index: AtomicUsize::new(0),
-            enable_column_stats,
+            disable_column_stats,
         }
     }
 
@@ -1788,7 +1790,7 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    enable_column_stats: self.enable_column_stats,
+                    disable_column_stats: self.disable_column_stats,
                 },
             )
             .await?
@@ -1807,7 +1809,7 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    enable_column_stats: self.enable_column_stats,
+                    disable_column_stats: self.disable_column_stats,
                 },
             )
             .await?
@@ -2601,7 +2603,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
-            false, // enable_column_stats
+            false, // disable_column_stats (stats enabled)
         );
 
         // Create a writer
@@ -2647,7 +2649,7 @@ mod tests {
             LanceFileVersion::Stable,
             WriterOptions {
                 add_data_dir: false, // Don't add /data
-                enable_column_stats: false,
+                disable_column_stats: false,
                 ..Default::default()
             },
         )
@@ -2721,7 +2723,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
-            false, // enable_column_stats
+            false, // disable_column_stats (stats enabled)
         );
 
         // Create test batch

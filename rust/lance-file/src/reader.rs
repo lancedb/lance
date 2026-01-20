@@ -2688,6 +2688,11 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
+    use crate::writer::{
+        COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
+        COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_ID_FIELD,
+        COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
+    };
     use std::{
         collections::{BTreeMap, HashMap},
         pin::Pin,
@@ -3941,7 +3946,7 @@ mod tests {
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             FileWriterOptions {
-                enable_column_stats: true,
+                disable_column_stats: false, // Stats enabled
                 ..Default::default()
             },
         )
@@ -3990,26 +3995,36 @@ mod tests {
             .unwrap()
             .expect("Expected column stats to be present");
 
-        // Verify the schema of the stats batch (flat layout)
+        // There are 8 columns in the stats batch, which correspond to the flat zone statistics format:
+        //  0: column_name   (String)   - Name of the column the stats belong to
+        //  1: zone_id       (UInt32)   - ID of the zone within the column
+        //  2: zone_start    (UInt64)   - Starting row offset of the zone
+        //  3: zone_length   (UInt64)   - Number of rows in this zone
+        //  4: null_count    (UInt32)   - Number of nulls in the zone
+        //  5: nan_count     (UInt32)   - Number of NaNs (if applicable) in the zone
+        //  6: min           (String)   - Minimum value (as string) in the zone (using scalar_value_to_string)
+        //  7: max           (String)   - Maximum value (as string) in the zone
+        //
+        // This matches the output from writing column stats with disable_column_stats: false (stats enabled)
         assert_eq!(stats_batch.num_columns(), 8);
         assert_eq!(
             stats_batch.schema().field(0).name(),
-            "column_name",
+            COLUMN_STATS_COLUMN_NAME_FIELD,
             "First field should be column_name"
         );
         assert_eq!(
             stats_batch.schema().field(1).name(),
-            "zone_id",
+            COLUMN_STATS_ZONE_ID_FIELD,
             "Second field should be zone_id"
         );
         assert_eq!(
             stats_batch.schema().field(2).name(),
-            "zone_start",
+            COLUMN_STATS_ZONE_START_FIELD,
             "Third field should be zone_start"
         );
         assert_eq!(
             stats_batch.schema().field(3).name(),
-            "zone_length",
+            COLUMN_STATS_ZONE_LENGTH_FIELD,
             "Fourth field should be zone_length"
         );
 
@@ -4021,7 +4036,8 @@ mod tests {
 
         // Verify column_name contains "data"
         let column_names = stats_batch
-            .column(0)
+            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -4030,7 +4046,8 @@ mod tests {
         // Verify zone_id is a UInt32 array
         use arrow_array::UInt32Array;
         let zone_ids = stats_batch
-            .column(1)
+            .column_by_name(COLUMN_STATS_ZONE_ID_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
@@ -4039,12 +4056,14 @@ mod tests {
         // Verify zone_start and zone_length
         use arrow_array::UInt64Array;
         let zone_starts = stats_batch
-            .column(2)
+            .column_by_name(COLUMN_STATS_ZONE_START_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
         let zone_lengths = stats_batch
-            .column(3)
+            .column_by_name(COLUMN_STATS_ZONE_LENGTH_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
@@ -4053,12 +4072,14 @@ mod tests {
 
         // Verify null_count and nan_count
         let null_counts = stats_batch
-            .column(4)
+            .column_by_name(COLUMN_STATS_NULL_COUNT_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
         let nan_counts = stats_batch
-            .column(5)
+            .column_by_name(COLUMN_STATS_NAN_COUNT_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
@@ -4067,12 +4088,14 @@ mod tests {
 
         // Verify min_value and max_value (stored as strings in ScalarValue debug format)
         let min_values = stats_batch
-            .column(6)
+            .column_by_name(COLUMN_STATS_MIN_VALUE_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let max_values = stats_batch
-            .column(7)
+            .column_by_name(COLUMN_STATS_MAX_VALUE_FIELD)
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -4103,7 +4126,7 @@ mod tests {
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             FileWriterOptions {
-                enable_column_stats: false, // Explicitly disable
+                disable_column_stats: true, // Explicitly disable
                 ..Default::default()
             },
         )
