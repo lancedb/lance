@@ -37,14 +37,7 @@ impl PartitionSource {
         cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<InvertedPartition> {
-        InvertedPartition::load(
-            self.store.clone(),
-            self.id,
-            None,
-            cache,
-            token_set_format,
-        )
-        .await
+        InvertedPartition::load(self.store.clone(), self.id, None, cache, token_set_format).await
     }
 }
 
@@ -188,11 +181,9 @@ impl<'a> SizeBasedMerger<'a> {
         for (row_id, num_tokens) in part.docs.iter() {
             builder.docs.append(*row_id, *num_tokens);
         }
-        builder
-            .posting_lists
-            .resize_with(builder.tokens.len(), || {
-                PostingListBuilder::new(part.inverted_list.has_positions())
-            });
+        builder.posting_lists.resize_with(builder.tokens.len(), || {
+            PostingListBuilder::new(part.inverted_list.has_positions())
+        });
 
         let postings = part
             .inverted_list
@@ -251,7 +242,10 @@ impl Merger for SizeBasedMerger<'_> {
         let start = std::time::Instant::now();
         let parts = std::mem::take(&mut self.input);
         let num_parts = parts.len();
-        let buffer_size = std::cmp::max(1, std::cmp::min(get_num_compute_intensive_cpus(), num_parts));
+        let buffer_size = std::cmp::max(
+            1,
+            std::cmp::min(get_num_compute_intensive_cpus(), num_parts),
+        );
         let cache = LanceCache::no_cache();
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
@@ -393,12 +387,8 @@ mod tests {
             sources.push(PartitionSource::new(src_store.clone(), id));
         }
 
-        let mut merger = SizeBasedMerger::new(
-            dest_store.as_ref(),
-            sources,
-            u64::MAX,
-            token_set_format,
-        );
+        let mut merger =
+            SizeBasedMerger::new(dest_store.as_ref(), sources, u64::MAX, token_set_format);
         let merged_partitions = merger.merge().await?;
         assert_eq!(merged_partitions, vec![num_parts as u64]);
 
