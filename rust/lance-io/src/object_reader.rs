@@ -113,7 +113,7 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
 // However, this failure is pretty common (e.g. timeout) and we want to retry in these
 // situations.  In addition, we provide additional logging information in these
 // failures cases.
-async fn do_get_with_outer_retry<'a>(
+async fn do_get_with_outer_retry(
     download_retry_count: usize,
     get_request: Arc<GetRequest>,
     desc: impl Fn() -> String,
