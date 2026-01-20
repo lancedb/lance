@@ -95,15 +95,15 @@ impl<'a> SizeBasedMerger<'a> {
                 builder.id(),
                 start.elapsed()
             );
-            let next_id = builder.id() + 1;
             self.partitions.push(builder.id());
             let with_position = self.with_position.expect("with_position must be set");
+            let next_id = self.next_id;
             self.builder = Some(InnerBuilder::new(
                 next_id,
                 with_position,
                 self.token_set_format,
             ));
-            self.next_id = next_id + 1;
+            self.next_id += 1;
         }
         Ok(())
     }
