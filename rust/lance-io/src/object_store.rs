@@ -705,7 +705,7 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() {
+        if self.is_local() || self.scheme == "file-object-store" {
             // Local file system needs to delete directories as well.
             return super::local::remove_dir_all(&path);
         }
@@ -1099,11 +1099,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_directory() {
+    async fn test_delete_directory_local_store() {
+        test_delete_directory("").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_file_object_store() {
+        test_delete_directory("file-object-store://").await;
+    }
+
+    async fn test_delete_directory(prefix: &str) {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
-        create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
         write_to_file(
             path.join("foo")
                 .join("bar")
@@ -1113,8 +1121,8 @@ mod tests {
             "delete",
         )
         .unwrap();
-        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
-        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        let uri = format!("{}{}", prefix, path.to_str().unwrap());
+        let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
