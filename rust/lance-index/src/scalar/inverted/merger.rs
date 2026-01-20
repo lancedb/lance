@@ -3,7 +3,7 @@
 
 use fst::Streamer;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{cache::LanceCache, Error, Result};
+use lance_core::{cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus, Error, Result};
 use snafu::location;
 
 use crate::scalar::IndexStore;
@@ -21,16 +21,14 @@ pub trait Merger {
     async fn merge(&mut self) -> Result<Vec<u64>>;
 }
 
-const MERGE_PARTITION_BUFFER: usize = 4;
-
 #[derive(Debug, Clone)]
-pub(crate) struct PartitionSource {
+pub(super) struct PartitionSource {
     store: std::sync::Arc<dyn IndexStore>,
     id: u64,
 }
 
 impl PartitionSource {
-    pub(crate) fn new(store: std::sync::Arc<dyn IndexStore>, id: u64) -> Self {
+    pub(super) fn new(store: std::sync::Arc<dyn IndexStore>, id: u64) -> Self {
         Self { store, id }
     }
 
@@ -253,7 +251,7 @@ impl Merger for SizeBasedMerger<'_> {
         let start = std::time::Instant::now();
         let parts = std::mem::take(&mut self.input);
         let num_parts = parts.len();
-        let buffer_size = std::cmp::max(1, std::cmp::min(MERGE_PARTITION_BUFFER, num_parts));
+        let buffer_size = std::cmp::max(1, std::cmp::min(get_num_compute_intensive_cpus(), num_parts));
         let cache = LanceCache::no_cache();
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
@@ -381,7 +379,7 @@ mod tests {
         ));
 
         let token_set_format = TokenSetFormat::default();
-        let num_parts = MERGE_PARTITION_BUFFER + 2;
+        let num_parts = get_num_compute_intensive_cpus().saturating_add(2);
         let mut sources = Vec::with_capacity(num_parts);
         for id in 0..num_parts as u64 {
             let mut builder = InnerBuilder::new(id, false, token_set_format);
