@@ -91,7 +91,10 @@ jobs:
           EOF
       - name: Copy lance-huggingface docs
         run: |
-          cp lance-huggingface/docs/src/index.md docs/src/integrations/huggingface.md
+          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Huggingface: huggingface
+          EOF
       - name: Copy contributing docs
         run: |
           mkdir -p docs/src/community/project-specific/lance
