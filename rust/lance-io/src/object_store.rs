@@ -1134,7 +1134,7 @@ mod tests {
             url.set_path(path.to_str().unwrap());
             url
         };
-        let (store, base) = ObjectStore::from_uri(&url.to_string()).await.unwrap();
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
