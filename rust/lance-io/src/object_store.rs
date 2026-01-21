@@ -706,7 +706,7 @@ impl ObjectStore {
         let path = Path::parse(&path)?;
 
         if self.is_local() {
-            // The local file system needs to delete both files and directories.
+            // The local file system provider needs to delete both files and directories.
             return super::local::remove_dir_all(&path);
         }
         let sub_entries = self
