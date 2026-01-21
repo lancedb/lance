@@ -1551,7 +1551,7 @@ fn inner_get_data_statistics<'local>(
         )?;
         env.call_method(
             &data_stats,
-            "addFiledStatistics",
+            "addFieldStatistics",
             "(Lorg/lance/ipc/FieldStatistics;)V",
             &[JValue::Object(&filed_jobj)],
         )?;
