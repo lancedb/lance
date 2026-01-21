@@ -1128,6 +1128,9 @@ mod tests {
         )
         .unwrap();
         let uri = format!("{}{}", prefix, path.to_str().unwrap());
+        if let Err(err) = ObjectStore::from_uri(&uri).await {
+            panic!("Failed to parse uri {}: {:?}", uri, err);
+        }
         let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
