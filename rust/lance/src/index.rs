@@ -594,7 +594,7 @@ impl DatasetIndexExt for Dataset {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<IndexMetadata> {
+    ) -> Result<()> {
         // Use the builder pattern with default train=true for backward compatibility
         let mut builder = self.create_index_builder(columns, index_type, params);
 
