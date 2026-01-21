@@ -2027,6 +2027,7 @@ pub async fn finalize_distributed_merge(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
+    Ok(())
 }
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(
