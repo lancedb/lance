@@ -705,8 +705,8 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() || self.scheme == "file-object-store" {
-            // Local file system needs to delete directories as well.
+        if self.is_local() {
+            // The local file system needs to delete both files and directories.
             return super::local::remove_dir_all(&path);
         }
         let sub_entries = self
@@ -718,6 +718,11 @@ impl ObjectStore {
             .delete_stream(sub_entries)
             .try_collect::<Vec<_>>()
             .await?;
+        if self.scheme == "file-object-store" {
+            // file-object-store tries to do everything as similarly as possible to the remote
+            // object stores. But we still have to delete the directory entries afterwards.
+            return super::local::remove_dir_all(&path);
+        }
         Ok(())
     }
 
