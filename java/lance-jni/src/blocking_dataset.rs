@@ -26,7 +26,6 @@ use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
-use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -41,7 +40,6 @@ use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::{IndexParams, IndexType};
@@ -976,44 +974,12 @@ fn inner_merge_index_metadata(
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
     RT.block_on(async {
-        let index_store = LanceIndexStore::from_dataset_for_new(&dataset_guard.inner, &index_uuid)?;
-        let object_store = dataset_guard.inner.object_store();
-        let index_dir = dataset_guard.inner.indices_dir().child(index_uuid);
-
-        match index_type {
-            IndexType::Inverted => lance_index::scalar::inverted::builder::merge_index_files(
-                object_store,
-                &index_dir,
-                Arc::new(index_store),
-            )
+        dataset_guard
+            .inner
+            .merge_index_metadata(&index_uuid, index_type, batch_readhead)
             .await
-            .map_err(|e| {
-                Error::runtime_error(format!(
-                    "Cannot create index of type: {:?}. Caused by: {:?}",
-                    index_type,
-                    e.to_string()
-                ))
-            }),
-            IndexType::BTree => lance_index::scalar::btree::merge_index_files(
-                object_store,
-                &index_dir,
-                Arc::new(index_store),
-                batch_readhead,
-            )
-            .await
-            .map_err(|e| {
-                Error::runtime_error(format!(
-                    "Cannot create index of type: {:?}. Caused by: {:?}",
-                    index_type,
-                    e.to_string()
-                ))
-            }),
-            _ => Err(Error::input_error(format!(
-                "Cannot merge index type: {:?}. Only supports BTREE and INVERTED now.",
-                index_type
-            ))),
-        }
-    })
+    })?;
+    Ok(())
 }
 
 #[no_mangle]

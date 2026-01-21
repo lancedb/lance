@@ -34,7 +34,6 @@ use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
 use lance::dataset::cleanup::CleanupPolicyBuilder;
-use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -66,7 +65,6 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
@@ -2080,53 +2078,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
     ) -> PyResult<()> {
         rt().block_on(None, async {
-            let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
-            let index_dir = self.ds.indices_dir().child(index_uuid);
-            let index_type_up = index_type.to_uppercase();
-            log::info!(
-                "merge_index_metadata called with index_type={} (upper={})",
-                index_type,
-                index_type_up
-            );
-            match index_type_up.as_str() {
-                "INVERTED" | "FTS" => {
-                    // Call merge_index_files function for inverted index
-                    lance_index::scalar::inverted::builder::merge_index_files(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Arc::new(store),
-                    )
-                    .await
-                }
-                "BTREE" => {
-                    // Call merge_index_files function for btree index
-                    lance_index::scalar::btree::merge_index_files(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Arc::new(store),
-                        batch_readhead,
-                    )
-                    .await
-                }
-                // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
-                "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "VECTOR" => {
-                    // Merge distributed vector index partials and finalize root index via Lance IVF helper
-                    lance::index::vector::ivf::finalize_distributed_merge(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Some(&index_type_up),
-                    )
-                    .await?;
-                    Ok(())
-                }
-                _ => Err(lance::Error::InvalidInput {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Unsupported index type (patched): {}", index_type_up),
-                    )),
-                    location: location!(),
-                }),
-            }
+            self.ds
+                .merge_index_metadata(index_uuid, IndexType::try_from(index_type)?, batch_readhead)
+                .await
         })?
         .map_err(|err| PyValueError::new_err(err.to_string()))
     }

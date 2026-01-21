@@ -191,15 +191,13 @@ impl TryFrom<&str> for IndexType {
 
     fn try_from(value: &str) -> Result<Self> {
         match value {
-            "BTree" => Ok(Self::BTree),
-            "Bitmap" => Ok(Self::Bitmap),
-            "LabelList" => Ok(Self::LabelList),
-            "Inverted" => Ok(Self::Inverted),
-            "NGram" => Ok(Self::NGram),
-            "FragmentReuse" => Ok(Self::FragmentReuse),
-            "MemWal" => Ok(Self::MemWal),
-            "ZoneMap" => Ok(Self::ZoneMap),
-            "Vector" => Ok(Self::Vector),
+            "BTree" | "BTREE" => Ok(Self::BTree),
+            "Bitmap" | "BITMAP" => Ok(Self::Bitmap),
+            "LabelList" | "LABELLIST" => Ok(Self::LabelList),
+            "Inverted" | "INVERTED" => Ok(Self::Inverted),
+            "NGram" | "NGRAM" => Ok(Self::NGram),
+            "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
+            "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
             "IVF_PQ" => Ok(Self::IvfPq),
@@ -207,6 +205,8 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(
                 format!("invalid index type: {}", value),
                 location!(),

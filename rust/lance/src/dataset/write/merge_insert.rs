@@ -2217,6 +2217,9 @@ impl Merger {
 mod tests {
     use super::*;
     use crate::dataset::scanner::ColumnOrdering;
+    use crate::dataset::write::merge_insert::inserted_rows::{
+        extract_key_value_from_batch, KeyExistenceFilter, KeyExistenceFilterBuilder,
+    };
     use crate::index::vector::VectorIndexParams;
     use crate::io::commit::read_transaction_file;
     use crate::{
@@ -2227,13 +2230,15 @@ mod tests {
             FragmentRowCount, ThrottledStoreWrapper,
         },
     };
+    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
     use arrow_array::RecordBatch;
     use arrow_array::{
         types::{Int32Type, UInt32Type},
-        FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-        RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
+        Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, ListArray,
+        RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
     };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
@@ -4667,6 +4672,443 @@ mod tests {
             "Expected TooMuchWriteContention (retryable conflict exhausted), got: {:?}",
             result2
         );
+    }
+
+    #[test]
+    fn test_concurrent_insert_different_new_list_key() {
+        // Schema for list(string) key column "tags".
+        let tags_field = Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![tags_field]));
+
+        // Build two batches inserting list key ["a", "b"] and ["c", "d"].
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.append_value(["a", "b"].iter().copied().map(Some));
+        let tags_array1 = builder.finish();
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(tags_array1)]).unwrap();
+
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.append_value(["c", "d"].iter().copied().map(Some));
+        let tags_array2 = builder.finish();
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(tags_array2)]).unwrap();
+
+        // Build bloom filters for the list keys.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("tags")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("tags")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            !has_intersection,
+            "Expected bloom filters not intersect for different list(string) keys",
+        );
+        assert!(
+            !might_be_fp,
+            "Bloom filter intersection should be definitively not conflict",
+        );
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_new_list_key() {
+        // Schema for list(string) key column "tags".
+        let tags_field = Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![tags_field]));
+
+        // Build two batches both inserting the same list key ["a", "b"].
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.append_value(["a", "b"].iter().copied().map(Some));
+        let tags_array1 = builder.finish();
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(tags_array1)]).unwrap();
+
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.append_value(["a", "b"].iter().copied().map(Some));
+        let tags_array2 = builder.finish();
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(tags_array2)]).unwrap();
+
+        // Build bloom filters for the list key.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("tags")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("tags")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            has_intersection,
+            "Expected bloom filters to intersect for identical list(string) keys",
+        );
+        assert!(
+            might_be_fp,
+            "Bloom filter intersection should be treated as potential conflict",
+        );
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_new_nested_list_key() {
+        // Build nested list(list(string)) value [["a", "b"], ["c"]] for the "tags" column.
+        let nested_tags = make_nested_array(&[["a", "b"].as_slice(), ["c"].as_slice()]);
+        let tags_field = Field::new("tags", nested_tags.data_type().clone(), false);
+        let nested_tags2 = make_nested_array(&[["a", "b"].as_slice(), ["c"].as_slice()]);
+
+        let schema = Arc::new(Schema::new(vec![tags_field]));
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_tags)]).unwrap();
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(nested_tags2)]).unwrap();
+
+        // Build bloom filters for the nested list key.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("tags")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("tags")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            has_intersection,
+            "Expected bloom filters to intersect for identical nested list(list(string)) keys",
+        );
+        assert!(
+            might_be_fp,
+            "Bloom filter intersection should be treated as potential conflict",
+        );
+    }
+
+    #[test]
+    fn test_concurrent_insert_different_new_struct_key() {
+        let user_field = Field::new(
+            "user",
+            DataType::Struct(
+                vec![
+                    Field::new("first", DataType::Utf8, false),
+                    Field::new("last", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![user_field]));
+
+        // Build two batches inserting different struct keys.
+        let struct_array1 = make_struct_array_first_last_name(vec!["alice"], vec!["smith"]);
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array1)]).unwrap();
+
+        let struct_array2 = make_struct_array_first_last_name(vec!["bob"], vec!["jones"]);
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(struct_array2)]).unwrap();
+
+        // Build bloom filters for the struct key.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("user")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("user")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            !has_intersection,
+            "Expected bloom filters not intersect for different struct keys",
+        );
+        assert!(
+            !might_be_fp,
+            "Bloom filter intersection should be definitively not conflict",
+        );
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_new_struct_key() {
+        let user_field = Field::new(
+            "user",
+            DataType::Struct(
+                vec![
+                    Field::new("first", DataType::Utf8, false),
+                    Field::new("last", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![user_field]));
+
+        // Build two batches both inserting the same struct key {first: "alice", last: "smith"}.
+        let struct_array1 = make_struct_array_first_last_name(vec!["alice"], vec!["smith"]);
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array1)]).unwrap();
+
+        let struct_array2 = make_struct_array_first_last_name(vec!["alice"], vec!["smith"]);
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(struct_array2)]).unwrap();
+
+        // Build bloom filters for the struct key.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("user")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("user")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            has_intersection,
+            "Expected bloom filters to intersect for identical struct keys",
+        );
+        assert!(
+            might_be_fp,
+            "Bloom filter intersection should be treated as potential conflict",
+        );
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_new_nested_struct_key() {
+        // Build nested struct value {address: {city: "seattle", zip: 98101}} for the "user" column.
+        let outer_struct = make_nested_struct_array_city_zip("seattle", 98101);
+        let user_field = Field::new("user", outer_struct.data_type().clone(), false);
+        let schema = Arc::new(Schema::new(vec![user_field]));
+
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(outer_struct)]).unwrap();
+
+        let outer_struct2 = make_nested_struct_array_city_zip("seattle", 98101);
+        let batch2 = RecordBatch::try_new(schema, vec![Arc::new(outer_struct2)]).unwrap();
+
+        // Build bloom filters for the nested struct key.
+        let field_ids = vec![0_i32];
+        let mut builder1 = KeyExistenceFilterBuilder::new(field_ids.clone());
+        let mut builder2 = KeyExistenceFilterBuilder::new(field_ids);
+
+        let key1 = extract_key_value_from_batch(&batch1, 0, &[String::from("user")])
+            .expect("first batch should produce key");
+        let key2 = extract_key_value_from_batch(&batch2, 0, &[String::from("user")])
+            .expect("second batch should produce key");
+
+        builder1.insert(key1).unwrap();
+        builder2.insert(key2).unwrap();
+        let filter1 = KeyExistenceFilter::from_bloom_filter(&builder1);
+        let filter2 = KeyExistenceFilter::from_bloom_filter(&builder2);
+
+        let (has_intersection, might_be_fp) = filter1.intersects(&filter2).unwrap();
+        assert!(
+            has_intersection,
+            "Expected bloom filters to intersect for identical nested struct keys",
+        );
+        assert!(
+            might_be_fp,
+            "Bloom filter intersection should be treated as potential conflict",
+        );
+    }
+
+    /// End-to-end test for merge_insert using a struct-typed key column.
+    #[tokio::test]
+    async fn test_merge_insert_struct_key_upsert() {
+        let user_field = Field::new(
+            "user",
+            DataType::Struct(
+                vec![
+                    Field::new("first", DataType::Utf8, false),
+                    Field::new("last", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            user_field,
+            Field::new("value", DataType::UInt32, false),
+        ]));
+
+        // Initial dataset:
+        // (alice, smith) -> 1
+        // (bob, jones)  -> 1
+        // (carla, doe)  -> 1
+        let user_array = make_struct_array_first_last_name(
+            vec!["alice", "bob", "carla"],
+            vec!["smith", "jones", "doe"],
+        );
+        let values = UInt32Array::from(vec![1, 1, 1]);
+        let initial_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(user_array), Arc::new(values)])
+                .unwrap();
+
+        let test_uri = "memory://test_merge_insert_struct_key.lance";
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // New data: update alice, insert david
+        let new_user_array =
+            make_struct_array_first_last_name(vec!["alice", "david"], vec!["smith", "brown"]);
+        let new_values = UInt32Array::from(vec![10, 2]);
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(new_user_array), Arc::new(new_values)],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new([Ok(new_batch)], schema.clone());
+        let (merged_ds, stats) = MergeInsertBuilder::try_new(dataset, vec!["user".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(reader_to_stream(Box::new(reader)))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(stats.num_deleted_rows, 0);
+
+        let result = merged_ds.scan().try_into_batch().await.unwrap();
+        let user_col = result
+            .column_by_name("user")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let first = user_col
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let last = user_col
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = result
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+
+        let mut rows = Vec::new();
+        for i in 0..result.num_rows() {
+            rows.push((
+                first.value(i).to_string(),
+                last.value(i).to_string(),
+                values.value(i),
+            ));
+        }
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("alice".to_string(), "smith".to_string(), 10),
+                ("bob".to_string(), "jones".to_string(), 1),
+                ("carla".to_string(), "doe".to_string(), 1),
+                ("david".to_string(), "brown".to_string(), 2),
+            ],
+        );
+    }
+
+    fn make_struct_array_first_last_name(first: Vec<&str>, last: Vec<&str>) -> StructArray {
+        let first = StringArray::from(first);
+        let last = StringArray::from(last);
+
+        StructArray::from(vec![
+            (
+                Arc::new(Field::new("first", DataType::Utf8, false)),
+                Arc::new(first) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new("last", DataType::Utf8, false)),
+                Arc::new(last) as Arc<dyn Array>,
+            ),
+        ])
+    }
+
+    fn make_nested_struct_array_city_zip(city: &str, zip: i32) -> StructArray {
+        let city = StringArray::from(vec![city]);
+        let zip = Int32Array::from(vec![zip]);
+
+        let inner_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("city", DataType::Utf8, false)),
+                Arc::new(city) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new("zip", DataType::Int32, false)),
+                Arc::new(zip) as Arc<dyn Array>,
+            ),
+        ]);
+
+        StructArray::from(vec![(
+            Arc::new(Field::new(
+                "address",
+                inner_struct.data_type().clone(),
+                false,
+            )),
+            Arc::new(inner_struct) as Arc<dyn Array>,
+        )])
+    }
+
+    fn make_nested_array(inner_lists: &[&[&str]]) -> ListArray {
+        let mut inner_builder = ListBuilder::new(StringBuilder::new());
+        for inner in inner_lists {
+            inner_builder.append_value(inner.iter().map(|s| Some(*s)));
+        }
+        let inner_list_array = inner_builder.finish();
+
+        let offsets = ScalarBuffer::<i32>::from(vec![0, inner_list_array.len() as i32]);
+        let offsets = OffsetBuffer::new(offsets);
+        ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                inner_list_array.data_type().clone(),
+                inner_list_array.nulls().is_some(),
+            )),
+            offsets,
+            Arc::new(inner_list_array),
+            None,
+        )
     }
 
     /// Test that merge_insert with bloom filter fails when committing against

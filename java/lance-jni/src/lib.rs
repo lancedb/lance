@@ -58,6 +58,7 @@ mod storage_options;
 pub mod traits;
 mod transaction;
 pub mod utils;
+mod vector_trainer;
 
 pub use error::Error;
 pub use error::Result;

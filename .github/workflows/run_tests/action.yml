@@ -16,6 +16,9 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Setup MSVC for torch.compile
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
     - name: Install dependencies
       working-directory: python
       shell: bash

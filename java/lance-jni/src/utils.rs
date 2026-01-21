@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString, JValue, JValueGen};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_schema::{DataType, Field};
+use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
 use jni::JNIEnv;
 use lance::dataset::optimize::CompactionOptions;
@@ -256,7 +257,7 @@ pub fn get_vector_index_params(
             let shuffle_partition_concurrency = env
                 .get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
 
-            let ivf_params = IvfBuildParams {
+            let mut ivf_params = IvfBuildParams {
                 num_partitions: Some(num_partitions),
                 max_iters,
                 sample_rate,
@@ -264,6 +265,44 @@ pub fn get_vector_index_params(
                 shuffle_partition_concurrency,
                 ..Default::default()
             };
+
+            // Optional pre-trained IVF centroids from Java IvfBuildParams
+            // Method signature: float[] getCentroids()
+            let centroids_obj = env
+                .call_method(&ivf_params_obj, "getCentroids", "()[F", &[])?
+                .l()?;
+
+            if !centroids_obj.is_null() {
+                let jarray: JFloatArray = centroids_obj.into();
+                let length = env.get_array_length(&jarray)?;
+                if length > 0 {
+                    if (length as usize) % num_partitions != 0 {
+                        return Err(Error::input_error(format!(
+                            "Invalid IVF centroids: length {} is not divisible by num_partitions {}",
+                            length, num_partitions
+                        )));
+                    }
+                    let mut buffer = vec![0.0f32; length as usize];
+                    env.get_float_array_region(&jarray, 0, &mut buffer)?;
+                    let dimension = buffer.len() / num_partitions;
+
+                    let values = Float32Array::from(buffer);
+                    let fsl = FixedSizeListArray::try_new(
+                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        dimension as i32,
+                        Arc::new(values) as ArrayRef,
+                        None,
+                    )
+                    .map_err(|e| {
+                        Error::input_error(format!(
+                            "Failed to construct FixedSizeListArray for IVF centroids: {e}"
+                        ))
+                    })?;
+
+                    ivf_params.centroids = Some(Arc::new(fsl));
+                }
+            }
+
             stages.push(StageParams::Ivf(ivf_params));
 
             // Parse HnswBuildParams
@@ -305,13 +344,34 @@ pub fn get_vector_index_params(
                         env.get_int_as_usize_from_method(&pq_obj, "getKmeansRedos")?;
                     let sample_rate = env.get_int_as_usize_from_method(&pq_obj, "getSampleRate")?;
 
+                    // Optional pre-trained PQ codebook from Java PQBuildParams
+                    // Method signature: float[] getCodebook()
+                    let codebook_obj = env
+                        .call_method(&pq_obj, "getCodebook", "()[F", &[])?
+                        .l()?;
+
+                    let codebook = if !codebook_obj.is_null() {
+                        let jarray: JFloatArray = codebook_obj.into();
+                        let length = env.get_array_length(&jarray)?;
+                        if length > 0 {
+                            let mut buffer = vec![0.0f32; length as usize];
+                            env.get_float_array_region(&jarray, 0, &mut buffer)?;
+                            let values = Float32Array::from(buffer);
+                            Some(Arc::new(values) as _)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     Ok(PQBuildParams {
                         num_sub_vectors,
                         num_bits,
                         max_iters,
                         kmeans_redos,
+                        codebook,
                         sample_rate,
-                        ..Default::default()
                     })
                 },
             )?;

@@ -43,9 +43,6 @@ public class VectorIndexParams {
     if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
       throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
     }
-    if (sqParams.isPresent() && !hnswParams.isPresent()) {
-      throw new IllegalArgumentException("IVF + SQ is not supported");
-    }
   }
 
   /**

@@ -33,7 +33,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -111,6 +111,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
 };
@@ -125,6 +126,7 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
+use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -2747,6 +2749,55 @@ impl Dataset {
     ) -> Result<()> {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
+    }
+
+    pub async fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: IndexType,
+        batch_readhead: Option<usize>,
+    ) -> Result<()> {
+        let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
+        let index_dir = self.indices_dir().child(index_uuid);
+        match index_type {
+            IndexType::Inverted => {
+                // Call merge_index_files function for inverted index
+                lance_index::scalar::inverted::builder::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                )
+                .await
+            }
+            IndexType::BTree => {
+                // Call merge_index_files function for btree index
+                lance_index::scalar::btree::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    batch_readhead,
+                )
+                .await
+            }
+            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
+            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
+                // Merge distributed vector index partials and finalize root index via Lance IVF helper
+                crate::index::vector::ivf::finalize_distributed_merge(
+                    self.object_store(),
+                    &index_dir,
+                    Some(index_type),
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidInput {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported index type (patched): {}", index_type),
+                )),
+                location: location!(),
+            }),
+        }
     }
 }
 
