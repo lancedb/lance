@@ -3,8 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
-
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -57,7 +55,7 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::ivf::storage::{IvfModel, IVF_METADATA_KEY};
 use lance_index::vector::kmeans::KMeansParams;
-use lance_index::vector::pq::storage::{transpose, ProductQuantizationMetadata, PQ_METADATA_KEY};
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -97,6 +95,8 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::location;
+use std::collections::HashSet;
+use std::{any::Any, collections::HashMap, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -1867,20 +1867,8 @@ async fn write_ivf_hnsw_file(
 pub async fn finalize_distributed_merge(
     object_store: &ObjectStore,
     index_dir: &object_store::path::Path,
-    requested_index_type: Option<&str>,
+    requested_index_type: Option<IndexType>,
 ) -> Result<()> {
-    let index_uuid = index_dir
-        .parts()
-        .last()
-        .map(|p| p.as_ref().to_string())
-        .unwrap_or_default();
-    log::info!(
-        "finalize_distributed_merge: start index_uuid={} index_dir={:?} requested_index_type={:?}",
-        index_uuid,
-        index_dir,
-        requested_index_type
-    );
-
     // Merge per-shard auxiliary files into a unified auxiliary.idx.
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
@@ -1890,11 +1878,6 @@ pub async fn finalize_distributed_merge(
 
     // Open the unified auxiliary file.
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-    log::info!(
-        "finalize_distributed_merge: opening unified auxiliary file index_uuid={} aux_path={:?}",
-        index_uuid,
-        aux_path
-    );
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
@@ -1906,7 +1889,7 @@ pub async fn finalize_distributed_merge(
         fh,
         None,
         Arc::default(),
-        &lance_core::cache::LanceCache::no_cache(),
+        &LanceCache::no_cache(),
         V2ReaderOptions::default(),
     )
     .await?;
@@ -1925,11 +1908,6 @@ pub async fn finalize_distributed_merge(
             message: "IVF index parse error".to_string(),
             location: location!(),
         })?;
-    log::info!(
-        "finalize_distributed_merge: IVF_METADATA_KEY buffer index {} for index_uuid={}",
-        ivf_buf_idx,
-        index_uuid
-    );
 
     let raw_ivf_bytes = aux_reader.read_global_buffer(ivf_buf_idx).await?;
     let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
@@ -1937,10 +1915,6 @@ pub async fn finalize_distributed_merge(
     // If the unified IVF metadata does not contain centroids, try to source them
     // from any partial_* index.idx under this index directory.
     if pb_ivf.centroids_tensor.is_none() {
-        log::info!(
-            "finalize_distributed_merge: centroids missing in unified IVF metadata, scanning partial index files for index_uuid={}",
-            index_uuid
-        );
         let mut stream = object_store.list(Some(index_dir.clone()));
         let mut partial_index_path = None;
 
@@ -1961,11 +1935,6 @@ pub async fn finalize_distributed_merge(
         }
 
         if let Some(partial_index_path) = partial_index_path {
-            log::info!(
-                "finalize_distributed_merge: found partial index with potential centroids at {:?} for index_uuid={}",
-                partial_index_path,
-                index_uuid
-            );
             let fh = scheduler
                 .open_file(&partial_index_path, &CachedFileSize::unknown())
                 .await?;
@@ -1984,46 +1953,14 @@ pub async fn finalize_distributed_merge(
                     let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
                     if partial_pb_ivf.centroids_tensor.is_some() {
                         pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
-                        log::info!(
-                            "finalize_distributed_merge: restored IVF centroids from partial index {:?} for index_uuid={}",
-                            partial_index_path,
-                            index_uuid
-                        );
                     }
                 }
             }
         }
     }
 
-    if pb_ivf.centroids_tensor.is_none() {
-        log::warn!(
-            "finalize_distributed_merge: IVF centroids still missing after scanning partial index files for index_uuid={}",
-            index_uuid
-        );
-    }
-
     let ivf_model: IvfModel = IvfModel::try_from(pb_ivf.clone())?;
     let nlist = ivf_model.num_partitions();
-    let lengths_preview: Vec<u32> = pb_ivf.lengths.iter().copied().take(16).collect();
-    let total_length: u64 = pb_ivf.lengths.iter().map(|v| *v as u64).sum();
-
-    // Try to extract PQ metadata for logging (if present).
-    let pq_meta_summary = meta
-        .file_schema
-        .metadata
-        .get(PQ_METADATA_KEY)
-        .and_then(|json| serde_json::from_str::<ProductQuantizationMetadata>(json).ok())
-        .map(|pm| (pm.dimension, pm.num_sub_vectors, pm.nbits));
-
-    log::info!(
-        "finalize_distributed_merge: unified IVF summary index_uuid={} nlist={} total_length={} lengths_preview={:?} pq_meta={:?}",
-        index_uuid,
-        nlist,
-        total_length,
-        lengths_preview,
-        pq_meta_summary
-    );
-
     let ivf_bytes = pb_ivf.encode_to_vec().into();
 
     // Determine index metadata JSON from auxiliary or requested index type.
@@ -2068,14 +2005,6 @@ pub async fn finalize_distributed_merge(
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.
     let idx_meta: IndexMetadata = serde_json::from_str(&index_meta_json)?;
-    log::info!(
-        "finalize_distributed_merge: index metadata index_uuid={} index_type={} distance_type={} nlist={} total_length={}",
-        index_uuid,
-        idx_meta.index_type,
-        idx_meta.distance_type,
-        nlist,
-        total_length
-    );
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
@@ -2098,6 +2027,69 @@ pub async fn finalize_distributed_merge(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
+
+    if let Err(err) = cleanup_partial_vector_dirs(object_store, index_dir).await {
+        warn!(
+            "Failed to cleanup partial_* vector index directories under '{}': {}",
+            index_dir.as_ref(),
+            err
+        );
+    }
+
+    Ok(())
+}
+
+/// Cleanup for distributed partial vector index directories after
+/// a distributed merge.
+///
+/// This helper scans `index_dir` for direct child directories whose names
+/// start with `partial_` (e.g. `<index_dir>/partial_0`, `<index_dir>/partial_1`)
+/// and attempts to recursively delete them via [`ObjectStore::remove_dir_all`].
+///
+/// Listing and deletion failures are logged with [`warn!`] and ignored so that
+/// index finalization is never blocked by cleanup. The function always returns
+/// `Ok(())`.
+async fn cleanup_partial_vector_dirs(
+    object_store: &ObjectStore,
+    index_dir: &object_store::path::Path,
+) -> Result<()> {
+    let mut partial_dirs: HashSet<Path> = HashSet::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                if let Some(relative_parts) = meta.location.prefix_match(index_dir) {
+                    let rel_parts: Vec<_> = relative_parts.collect();
+                    // Expect paths like: <index_dir>/partial_*/<file>
+                    if rel_parts.len() >= 2 {
+                        let parent_name = rel_parts[0].as_ref();
+                        if parent_name.starts_with("partial_") {
+                            partial_dirs.insert(index_dir.child(parent_name));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to list index directory '{}' while collecting partial_* dirs: {}",
+                    index_dir.as_ref(),
+                    e
+                );
+            }
+        }
+    }
+
+    for dir in partial_dirs {
+        if let Err(e) = object_store.remove_dir_all(dir.clone()).await {
+            warn!(
+                "Failed to remove partial_* directory '{}' after distributed merge: {}",
+                dir.as_ref(),
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -3608,5 +3600,70 @@ mod tests {
         }
 
         assert!(correct_times >= 9, "correct: {}", correct_times);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_only_partial_dirs() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup");
+
+        // partial_* directories that should be removed
+        let partial0_file = index_dir.child("partial_0").child("file.bin");
+        let partial_abc_file = index_dir.child("partial_abc").child("file.bin");
+
+        // Non-partial paths that must be preserved
+        let partialx_file = index_dir.child("partialX").child("file.bin");
+        let shard_file = index_dir.child("shard_0").child("file.bin");
+        let keep_root_file = index_dir.child("keep_root.txt");
+
+        object_store.put(&partial0_file, b"partial0").await.unwrap();
+        object_store
+            .put(&partial_abc_file, b"partial_abc")
+            .await
+            .unwrap();
+        object_store.put(&partialx_file, b"partialx").await.unwrap();
+        object_store.put(&shard_file, b"shard").await.unwrap();
+        object_store.put(&keep_root_file, b"root").await.unwrap();
+
+        // Sanity: all files exist before cleanup
+        assert!(object_store.exists(&partial0_file).await.unwrap());
+        assert!(object_store.exists(&partial_abc_file).await.unwrap());
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+
+        // partial_* directories should be removed
+        assert!(!object_store.exists(&partial0_file).await.unwrap());
+        assert!(!object_store.exists(&partial_abc_file).await.unwrap());
+
+        // Non-partial directories and root files must be preserved
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_idempotent() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup_idempotent");
+
+        let partial_file = index_dir.child("partial_0").child("file.bin");
+        object_store.put(&partial_file, b"partial").await.unwrap();
+
+        assert!(object_store.exists(&partial_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+        assert!(!object_store.exists(&partial_file).await.unwrap());
+
+        // Second call should succeed even when there are no partial_* directories left.
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
     }
 }
