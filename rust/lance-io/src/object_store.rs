@@ -1110,10 +1110,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_directory_file_object_store() {
-        test_delete_directory("file-object-store://").await;
+        test_delete_directory("file-object-store").await;
     }
 
-    async fn test_delete_directory(prefix: &str) {
+    async fn test_delete_directory(scheme: &str) {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
@@ -1127,11 +1127,14 @@ mod tests {
             "delete",
         )
         .unwrap();
-        let uri = format!("{}{}", prefix, path.to_str().unwrap());
-        if let Err(err) = ObjectStore::from_uri(&uri).await {
-            panic!("Failed to parse uri {}: {:?}", uri, err);
-        }
-        let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
+        let url = if scheme.is_empty() {
+            Url::from_directory_path(&path).unwrap()
+        } else {
+            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+            url.set_path(path.to_str().unwrap());
+            url
+        };
+        let (store, base) = ObjectStore::from_uri(&url.to_string()).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
