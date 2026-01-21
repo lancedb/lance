@@ -1112,6 +1112,7 @@ mod tests {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
+        create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
         write_to_file(
             path.join("foo")
                 .join("bar")
