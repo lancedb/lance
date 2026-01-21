@@ -594,7 +594,7 @@ impl DatasetIndexExt for Dataset {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()> {
+    ) -> Result<IndexMetadata> {
         // Use the builder pattern with default train=true for backward compatibility
         let mut builder = self.create_index_builder(columns, index_type, params);
 
@@ -1303,11 +1303,6 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        log::info!(
-            "open_vector_index: enter uuid={} column={}",
-            uuid,
-            column
-        );
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
@@ -1336,11 +1331,6 @@ impl DatasetIndexInternalExt for Dataset {
         let index = match (major_version, minor_version) {
             (0, 1) | (0, 0) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
-                log::info!(
-                    "open_vector_index: uuid={} column={} version=0.1 (legacy IVF_PQ)",
-                    uuid,
-                    column
-                );
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1363,11 +1353,6 @@ impl DatasetIndexInternalExt for Dataset {
 
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                log::info!(
-                    "open_vector_index: uuid={} column={} version=0.2 (legacy IVF_PQ)",
-                    uuid,
-                    column
-                );
                 let reader = PreviousFileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
@@ -1416,23 +1401,6 @@ impl DatasetIndexInternalExt for Dataset {
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
-                log::info!(
-                    "open_vector_index: uuid={} column={} version=0.3 index_type={} distance_type={}",
-                    uuid,
-                    column,
-                    index_metadata.index_type,
-                    index_metadata.distance_type
-                );
-                let resolved_as_index_name = column == index_meta.name;
-                log::info!(
-                    "open_vector_index: uuid={} column_arg={} resolved_as_index_name={} field_path={} field_type={:?} element_type={:?}",
-                    uuid,
-                    column,
-                    resolved_as_index_name,
-                    field_path,
-                    field.data_type(),
-                    element_type,
-                );
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -1446,12 +1414,6 @@ impl DatasetIndexInternalExt for Dataset {
                                 index_cache,
                             )
                             .await?;
-                            log::info!(
-                                "open_vector_index: uuid={} column={} selected_impl=IVF_FLAT quantizer=FlatQuantizer element_type={:?}",
-                                uuid,
-                                field_path,
-                                element_type
-                            );
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                         }
                         DataType::UInt8 => {
@@ -1464,12 +1426,6 @@ impl DatasetIndexInternalExt for Dataset {
                                 index_cache,
                             )
                             .await?;
-                            log::info!(
-                                "open_vector_index: uuid={} column={} selected_impl=IVF_FLAT quantizer=FlatBinQuantizer element_type={:?}",
-                                uuid,
-                                field_path,
-                                element_type
-                            );
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                         }
                         _ => Err(Error::Index {
@@ -1491,11 +1447,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_PQ",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
@@ -1509,11 +1460,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_SQ",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
@@ -1527,11 +1473,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_RQ",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
@@ -1548,11 +1489,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_HNSW_FLAT",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
@@ -1566,11 +1502,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_HNSW_SQ",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
@@ -1584,11 +1515,6 @@ impl DatasetIndexInternalExt for Dataset {
                             index_cache,
                         )
                         .await?;
-                        log::info!(
-                            "open_vector_index: uuid={} column={} selected_impl=IVF_HNSW_PQ",
-                            uuid,
-                            field_path
-                        );
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
