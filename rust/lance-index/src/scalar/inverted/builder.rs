@@ -505,6 +505,8 @@ impl InnerBuilder {
             }
         }
 
+        // Errors from batch generation are sent through the channel and surfaced via `batch?`.
+        // Awaiting the producer here is just to propagate panics/cancellation.
         producer.await?;
         writer.finish().await?;
         Ok(())
