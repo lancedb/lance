@@ -8,6 +8,7 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod transaction;
 
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
@@ -19,6 +20,7 @@ pub use manifest::{
     is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, DETACHED_VERSION_MASK,
 };
+pub use transaction::Transaction;
 
 use lance_core::{Error, Result};
 
@@ -50,7 +52,7 @@ impl TryFrom<&pb::Uuid> for Uuid {
 
     fn try_from(p: &pb::Uuid) -> Result<Self> {
         if p.uuid.len() != 16 {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 "Protobuf UUID is malformed".to_string(),
                 location!(),
             ));

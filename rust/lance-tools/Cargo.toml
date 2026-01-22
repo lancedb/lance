@@ -17,14 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-futures.workspace = true
 lance-core.workspace = true
-lance-encoding.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
 object_store.workspace = true
 snafu.workspace = true
-tokio-stream.workspace = true
-tokio-util.workspace = true
 tokio.workspace = true
 url.workspace = true

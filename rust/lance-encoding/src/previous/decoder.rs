@@ -94,7 +94,7 @@ pub struct DecoderReady {
 
 /// A decoder for a field's worth of data
 ///
-/// The decoder is initially "unloaded" (doesn't have all its data).  The [`Self::wait`]
+/// The decoder is initially "unloaded" (doesn't have all its data).  The [`Self::wait_for_loaded`]
 /// method should be called to wait for the needed I/O data before attempting to decode
 /// any further.
 ///

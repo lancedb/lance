@@ -9,7 +9,7 @@ use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use jni::JNIEnv;
-use lance::dataset::scanner::LanceFilter;
+use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeMergeInsert<'a>(
+pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,    // Dataset object
     jparam: JObject,      // MergeInsertParams object
@@ -114,6 +114,7 @@ fn extract_when_matched<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> R
             None => Err(Error::input_error("No matched updated expr".to_string())),
         },
         "Fail" => Ok(WhenMatched::Fail),
+        "Delete" => Ok(WhenMatched::Delete),
         _ => Err(Error::input_error(format!(
             "Illegal when_matched: {when_matched}",
         ))),
@@ -158,7 +159,7 @@ fn extract_when_not_matched_by_source_str<'local>(
 fn extract_when_not_matched_by_source_delete_expr<'local>(
     env: &mut JNIEnv<'local>,
     jparam: &JObject,
-) -> Result<Option<LanceFilter>> {
+) -> Result<Option<ExprFilter>> {
     let when_not_matched_by_source_delete_expr = env
         .call_method(
             jparam,
@@ -169,7 +170,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
         .l()?;
 
     if let Some(expr) = env.get_string_opt(&when_not_matched_by_source_delete_expr)? {
-        return Ok(Some(LanceFilter::Sql(expr)));
+        return Ok(Some(ExprFilter::Sql(expr)));
     }
 
     let when_not_matched_by_source_delete_substrait_expr = env
@@ -182,7 +183,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
         .l()?;
 
     match env.get_bytes_opt(&when_not_matched_by_source_delete_substrait_expr)? {
-        Some(expr) => Ok(Some(LanceFilter::Substrait(expr.to_vec()))),
+        Some(expr) => Ok(Some(ExprFilter::Substrait(expr.to_vec()))),
         None => Ok(None),
     }
 }
@@ -190,7 +191,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
 fn extract_when_not_matched_by_source(
     schema: &Schema,
     when_not_matched_by_source: &str,
-    when_not_matched_by_source_delete_expr: Option<LanceFilter>,
+    when_not_matched_by_source_delete_expr: Option<ExprFilter>,
 ) -> Result<WhenNotMatchedBySource> {
     match when_not_matched_by_source {
         "Keep" => Ok(WhenNotMatchedBySource::Keep),
@@ -228,11 +229,11 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
     Ok(skip_auto_cleanup)
 }
 
-const MERGE_STATS_CLASS: &str = "com/lancedb/lance/merge/MergeInsertStats";
+const MERGE_STATS_CLASS: &str = "org/lance/merge/MergeInsertStats";
 const MERGE_STATS_CONSTRUCTOR_SIG: &str = "(JJJIJJ)V";
-const MERGE_RESULT_CLASS: &str = "com/lancedb/lance/merge/MergeInsertResult";
+const MERGE_RESULT_CLASS: &str = "org/lance/merge/MergeInsertResult";
 const MERGE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lcom/lancedb/lance/Dataset;Lcom/lancedb/lance/merge/MergeInsertStats;)V";
+    "(Lorg/lance/Dataset;Lorg/lance/merge/MergeInsertStats;)V";
 
 impl IntoJava for MergeStats {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {

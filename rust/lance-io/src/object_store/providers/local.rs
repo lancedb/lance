@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
@@ -20,7 +20,7 @@ pub struct FileStoreProvider;
 impl ObjectStoreProvider for FileStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(LocalFileSystem::new()),
@@ -31,6 +31,9 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 
@@ -47,6 +50,14 @@ impl ObjectStoreProvider for FileStoreProvider {
                 location!(),
             )
         })
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &Url,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok(url.scheme().to_string())
     }
 }
 
@@ -72,6 +83,31 @@ mod tests {
             let path = provider.extract_path(&url).unwrap();
             assert_eq!(path.as_ref(), expected_path, "uri: '{}'", uri);
         }
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file",
+            provider
+                .calculate_object_store_prefix(&Url::parse("file:///etc").unwrap(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_for_file_object_store() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file-object-store",
+            provider
+                .calculate_object_store_prefix(
+                    &Url::parse("file-object-store:///etc").unwrap(),
+                    None
+                )
+                .unwrap()
+        );
     }
 
     #[test]

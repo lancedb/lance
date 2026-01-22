@@ -4,21 +4,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_array::RecordBatchIterator;
+use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::NullabilityComparison;
-use lance_core::datatypes::Schema;
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::ROW_ADDR;
-use lance_core::ROW_ID;
-use lance_core::ROW_OFFSET;
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
+use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::location;
@@ -36,8 +32,6 @@ use super::resolve_commit_handler;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
-use super::WrittenFragments;
-
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -146,7 +140,7 @@ impl<'a> InsertBuilder<'a> {
         data: Vec<RecordBatch>,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
-        // and write in parallel. https://github.com/lancedb/lance/issues/1980
+        // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
             return Err(Error::InvalidInput {
                 source: "No data to write".into(),
@@ -199,7 +193,7 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
-        let written_frags = write_fragments_internal(
+        let (written_fragments, _) = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -210,79 +204,56 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(schema, written_frags, &context)?;
+        let transaction = Self::build_transaction(schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
 
     fn build_transaction(
         schema: Schema,
-        written_frags: WrittenFragments,
+        fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                // Fetch auto_cleanup params from context
-                let config_upsert_values = match context.params.auto_cleanup.as_ref() {
-                    Some(auto_cleanup_params) => {
+                let config_upsert_values =
+                    if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
                         let mut upsert_values = HashMap::new();
-
                         upsert_values.insert(
                             String::from("lance.auto_cleanup.interval"),
                             auto_cleanup_params.interval.to_string(),
                         );
 
-                        match auto_cleanup_params.older_than.to_std() {
-                            Ok(d) => {
-                                upsert_values.insert(
-                                    String::from("lance.auto_cleanup.older_than"),
-                                    format_duration(d).to_string(),
-                                );
+                        let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
+                            Error::InvalidInput {
+                                source: e.into(),
+                                location: location!(),
                             }
-                            Err(e) => {
-                                return Err(Error::InvalidInput {
-                                    source: e.into(),
-                                    location: location!(),
-                                })
-                            }
-                        };
-
+                        })?;
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.older_than"),
+                            format_duration(duration).to_string(),
+                        );
                         Some(upsert_values)
-                    }
-                    None => None,
-                };
-
+                    } else {
+                        None
+                    };
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
-                    fragments: written_frags.default.0,
+                    fragments,
                     config_upsert_values,
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
-            WriteMode::Overwrite => {
-                Operation::Overwrite {
-                    // Use the full schema, not the written schema
-                    schema,
-                    fragments: written_frags.default.0,
-                    config_upsert_values: None,
-                    initial_bases: context.params.initial_bases.clone(),
-                }
-            }
-            WriteMode::Append => Operation::Append {
-                fragments: written_frags.default.0,
-            },
-        };
-
-        let blobs_op = written_frags.blob.map(|blob| match context.params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
-                schema: blob.1,
-                fragments: blob.0,
+            WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
                 config_upsert_values: None,
                 initial_bases: context.params.initial_bases.clone(),
             },
-            WriteMode::Append => Operation::Append { fragments: blob.0 },
-        });
+            WriteMode::Append => Operation::Append { fragments },
+        };
 
         let transaction = TransactionBuilder::new(
             context
@@ -292,7 +263,6 @@ impl<'a> InsertBuilder<'a> {
                 .unwrap_or(0),
             operation,
         )
-        .blobs_op(blobs_op)
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
 
@@ -328,26 +298,16 @@ impl<'a> InsertBuilder<'a> {
                     );
                     context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
                 }
-                let m = dataset.manifest.as_ref();
-                let mut schema_cmp_opts = SchemaCompareOptions {
-                    // In the legacy format we stored the dictionary in the manifest and
-                    // all files must have identical dictionaries.
-                    //
-                    // In 2.0+ the dictionary is stored in the files and dictionaries may
-                    // fluctuate between files.
-                    compare_dictionary: m.should_use_legacy_format(),
-                    // array nullability is checked later, using actual data instead
-                    // of the schema
+
+                let schema_cmp_opts = SchemaCompareOptions {
+                    compare_dictionary: dataset.manifest.should_use_legacy_format(),
                     compare_nullability: NullabilityComparison::Ignore,
+                    allow_missing_if_nullable: true,
+                    ignore_field_order: true,
                     ..Default::default()
                 };
-                if m.blob_dataset_version.is_none() {
-                    // Balanced datasets don't yet support schema evolution
-                    schema_cmp_opts.ignore_field_order = true;
-                    schema_cmp_opts.allow_missing_if_nullable = true;
-                }
 
-                data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+                data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
             }
         }
 
@@ -363,15 +323,6 @@ impl<'a> InsertBuilder<'a> {
                     location: location!(),
                 });
             }
-        }
-
-        // If we are writing a dataset with non-default storage, we need to enable stable row ids
-        if context.dest.dataset().is_none()
-            && !context.params.enable_stable_row_ids
-            && data_schema.fields.iter().any(|f| !f.is_default_storage())
-        {
-            log::info!("Enabling stable row ids because non-default storage is used");
-            context.params.enable_stable_row_ids = true;
         }
 
         // Feature flags
@@ -483,8 +434,8 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::StructArray;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, RecordBatchReader, StructArray};
+    use arrow_schema::{ArrowError, DataType, Field, Schema};
 
     use crate::session::Session;
 
@@ -534,5 +485,130 @@ mod test {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn prevent_blob_version_upgrade_on_overwrite() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://blob-version-guard")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+
+        let result = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    mod external_error {
+        use super::*;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct MyTestError {
+            code: i32,
+            details: String,
+        }
+
+        impl fmt::Display for MyTestError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "MyTestError({}): {}", self.code, self.details)
+            }
+        }
+
+        impl std::error::Error for MyTestError {}
+
+        fn create_failing_iterator(
+            schema: Arc<Schema>,
+            fail_at_batch: usize,
+            error_code: i32,
+        ) -> impl Iterator<Item = std::result::Result<RecordBatch, ArrowError>> {
+            let mut batch_count = 0;
+            std::iter::from_fn(move || {
+                if batch_count >= 5 {
+                    return None;
+                }
+                batch_count += 1;
+                if batch_count == fail_at_batch {
+                    Some(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                        code: error_code,
+                        details: format!("Failed at batch {}", batch_count),
+                    }))))
+                } else {
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![batch_count as i32; 10]))],
+                    )
+                    .unwrap();
+                    Some(Ok(batch))
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_preserves_external_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 42;
+            let iter = create_failing_iterator(schema.clone(), 3, error_code);
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_external_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source
+                        .downcast_ref::<MyTestError>()
+                        .expect("Should be able to downcast to MyTestError");
+                    assert_eq!(original.code, error_code);
+                    assert!(original.details.contains("batch 3"));
+                }
+                Err(other) => panic!("Expected Error::External variant, got: {:?}", other),
+                Ok(_) => panic!("Expected error, got success"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_first_batch_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 999;
+            let iter = std::iter::once(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                code: error_code,
+                details: "immediate failure".to_string(),
+            }))));
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_first_batch_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source.downcast_ref::<MyTestError>().unwrap();
+                    assert_eq!(original.code, error_code);
+                }
+                Err(other) => panic!("Expected External, got: {:?}", other),
+                Ok(_) => panic!("Expected error"),
+            }
+        }
     }
 }

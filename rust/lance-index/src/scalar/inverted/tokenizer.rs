@@ -30,7 +30,7 @@ pub struct InvertedIndexParams {
     /// lance tokenizer takes care of different data types, such as text, json, etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
-    /// - default: text
+    /// - none: auto type inference
     pub(crate) lance_tokenizer: Option<String>,
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
@@ -90,6 +90,11 @@ pub struct InvertedIndexParams {
     /// whether prefix only
     #[serde(default)]
     pub(crate) prefix_only: bool,
+
+    /// If true, skip the partition merge stage after indexing.
+    /// This can be useful for distributed indexing where merge is handled separately.
+    #[serde(default)]
+    pub(crate) skip_merge: bool,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -108,6 +113,34 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
+        })
+    }
+}
+
+impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
+    type Error = Error;
+
+    fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            lance_tokenizer: defaults.lance_tokenizer,
+            base_tokenizer: details
+                .base_tokenizer
+                .as_ref()
+                .cloned()
+                .unwrap_or(defaults.base_tokenizer),
+            language: serde_json::from_str(details.language.as_str())?,
+            with_position: details.with_position,
+            max_token_length: details.max_token_length.map(|l| l as usize),
+            lower_case: details.lower_case,
+            stem: details.stem,
+            remove_stop_words: details.remove_stop_words,
+            custom_stop_words: defaults.custom_stop_words,
+            ascii_folding: details.ascii_folding,
+            min_ngram_length: details.min_ngram_length,
+            max_ngram_length: details.max_ngram_length,
+            prefix_only: details.prefix_only,
+            skip_merge: defaults.skip_merge,
         })
     }
 }
@@ -146,7 +179,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
-            lance_tokenizer: Some("text".to_owned()),
+            lance_tokenizer: None,
             base_tokenizer,
             language,
             with_position: false,
@@ -159,6 +192,7 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
+            skip_merge: false,
         }
     }
 
@@ -239,6 +273,12 @@ impl InvertedIndexParams {
     /// Default to `false`.
     pub fn ngram_prefix_only(mut self, prefix_only: bool) -> Self {
         self.prefix_only = prefix_only;
+        self
+    }
+
+    /// Skip merging partitions after indexing.
+    pub fn skip_merge(mut self, skip_merge: bool) -> Self {
+        self.skip_merge = skip_merge;
         self
     }
 

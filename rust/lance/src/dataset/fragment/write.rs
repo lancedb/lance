@@ -8,9 +8,9 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
@@ -18,6 +18,7 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
@@ -134,11 +135,13 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", generate_random_filename());
+        let data_file_key = generate_random_filename();
+        let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let has_blob_v2 = schema_has_blob_v2(&schema);
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::v2::writer::FileWriter::try_new(
+        let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
             schema,
             FileWriterOptions {
@@ -146,6 +149,16 @@ impl<'a> FragmentCreateBuilder<'a> {
                 ..Default::default()
             },
         )?;
+
+        let mut preprocessor = if has_blob_v2 {
+            Some(BlobPreprocessor::new(
+                object_store.as_ref().clone(),
+                base_path.child(DATA_DIR),
+                data_file_key.clone(),
+            ))
+        } else {
+            None
+        };
 
         let (major, minor) = writer.version().to_numbers();
 
@@ -160,7 +173,10 @@ impl<'a> FragmentCreateBuilder<'a> {
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
+            let mut batch_chunk = batched_chunk?;
+            if let Some(pre) = preprocessor.as_mut() {
+                batch_chunk = preprocess_blob_batches(&batch_chunk, pre).await?;
+            }
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
@@ -244,7 +260,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema,
@@ -287,12 +303,12 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
         let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        let storage_options = self
+        let accessor = self
             .write_params
             .and_then(|p| p.store_params.as_ref())
-            .and_then(|p| p.storage_options.clone());
-        if let Some(storage_options) = storage_options {
-            builder = builder.with_storage_options(storage_options);
+            .and_then(|p| p.storage_options_accessor.clone());
+        if let Some(accessor) = accessor {
+            builder = builder.with_storage_options_accessor(accessor);
         }
         match builder.load().await {
             Ok(dataset) => {

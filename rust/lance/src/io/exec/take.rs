@@ -30,6 +30,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use tracing::error;
 
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
@@ -101,11 +102,32 @@ impl TakeStream {
 
     async fn do_open_reader(&self, fragment_id: u32) -> DataFusionResult<Arc<FragmentReader>> {
         let fragment = self
-        .dataset
-        .get_fragment(fragment_id as usize)
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!("The input to a take operation specified fragment id {} but this fragment does not exist in the dataset", fragment_id))
-        })?;
+            .dataset
+            .get_fragment(fragment_id as usize)
+            .ok_or_else(|| {
+                let branch = self
+                    .dataset
+                    .manifest()
+                    .branch
+                    .as_deref()
+                    .unwrap_or("main");
+                error!(
+                    fragment_id,
+                    dataset_uri = %self.dataset.uri(),
+                    manifest_version = self.dataset.manifest().version,
+                    manifest_path = %self.dataset.manifest_location().path,
+                    branch = ?self.dataset.manifest().branch,
+                    "Missing fragment id during take operation",
+                );
+                DataFusionError::Execution(format!(
+                    "The input to a take operation specified fragment id {} but this fragment does not exist in the dataset (uri={}, version={}, manifest={}, branch={})",
+                    fragment_id,
+                    self.dataset.uri(),
+                    self.dataset.manifest().version,
+                    self.dataset.manifest_location().path,
+                    branch
+                ))
+            })?;
 
         let reader = Arc::new(
             fragment

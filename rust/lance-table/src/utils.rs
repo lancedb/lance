@@ -22,7 +22,7 @@ impl<I: Iterator> LanceIteratorExtension for I {
 /// able to pre-compute the size of the iterator but the iterator implementation
 /// isn't able to itself. A common example is when using `flatten()`.
 ///
-/// This is inspired by discussion in https://github.com/rust-lang/rust/issues/68995
+/// This is inspired by discussion in <https://github.com/rust-lang/rust/issues/68995>
 pub struct ExactSize<I> {
     inner: I,
     size: usize,

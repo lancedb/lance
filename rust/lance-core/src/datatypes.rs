@@ -19,12 +19,11 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
-    LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
+    BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
-    Projectable, Projection, Schema,
+    escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,
+    OnMissing, Projectable, Projection, Schema,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -47,6 +46,31 @@ pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
+pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("kind", DataType::UInt8, false),
+        ArrowField::new("position", DataType::UInt64, false),
+        ArrowField::new("size", DataType::UInt64, false),
+        ArrowField::new("blob_id", DataType::UInt32, false),
+        ArrowField::new("blob_uri", DataType::Utf8, false),
+    ])
+});
+
+pub static BLOB_V2_DESC_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_DESC_FIELDS.clone()));
+
+pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
+    ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), false).with_metadata(HashMap::from([
+        (lance_arrow::BLOB_META_KEY.to_string(), "true".to_string()),
+        ("lance-encoding:packed".to_string(), "true".to_string()),
+    ]))
+});
+
+pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
+
+pub const BLOB_LOGICAL_TYPE: &str = "blob";
+
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -67,8 +91,20 @@ impl LogicalType {
         self.0 == "large_list" || self.0 == "large_list.struct"
     }
 
+    fn is_fixed_size_list_struct(&self) -> bool {
+        self.0.starts_with("fixed_size_list:struct:")
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
+    }
+
+    fn is_blob(&self) -> bool {
+        self.0 == BLOB_LOGICAL_TYPE
+    }
+
+    fn is_map(&self) -> bool {
+        self.0 == "map"
     }
 }
 
@@ -168,6 +204,21 @@ impl TryFrom<&DataType> for LogicalType {
                 }
             }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
+            DataType::Map(_, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Unsupported map data type with keys_sorted=true: {:?}",
+                            dt
+                        ),
+                        location: location!(),
+                    });
+                }
+                "map".to_string()
+            }
             _ => {
                 return Err(Error::Schema {
                     message: format!("Unsupported data type: {:?}", dt),
@@ -203,6 +254,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            BLOB_LOGICAL_TYPE => Some(LargeBinary),
             "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
@@ -386,4 +438,35 @@ pub fn lance_supports_nulls(datatype: &DataType) -> bool {
             | DataType::FixedSizeBinary(_)
             | DataType::FixedSizeList(_, _)
     )
+}
+
+/// Physical storage mode for blob v2 descriptors (one byte, stored in the packed struct column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlobKind {
+    /// Stored in the main data file’s out-of-line buffer; `position`/`size` point into that file.
+    Inline = 0,
+    /// Stored in a shared packed blob file; `position`/`size` locate the slice, `blob_id` selects the file.
+    Packed = 1,
+    /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
+    Dedicated = 2,
+    /// Not stored by Lance; `blob_uri` holds an absolute external URI, offsets are zero.
+    External = 3,
+}
+
+impl TryFrom<u8> for BlobKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Inline),
+            1 => Ok(Self::Packed),
+            2 => Ok(Self::Dedicated),
+            3 => Ok(Self::External),
+            other => Err(Error::InvalidInput {
+                source: format!("Unknown blob kind {other:?}").into(),
+                location: location!(),
+            }),
+        }
+    }
 }

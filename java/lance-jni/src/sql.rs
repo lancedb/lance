@@ -14,7 +14,7 @@ use lance::dataset::sql::SqlQueryBuilder;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_SqlQuery_intoBatchRecords(
+pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
     mut env: JNIEnv,
     _class: JClass,
     java_dataset: JObject,
@@ -35,7 +35,7 @@ pub extern "system" fn Java_com_lancedb_lance_SqlQuery_intoBatchRecords(
             with_row_addr,
             stream_addr,
         )
-        .map_err(|e| Error::io_error(e.to_string()))
+        .map_err(|e| Error::input_error(e.to_string()))
     )
 }
 
@@ -80,7 +80,7 @@ fn sql_builder(
     let sql_str = sql.extract(env)?;
     let table_str = env.get_string_opt(&table_name)?;
 
-    let mut dataset_guard =
+    let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
     let mut builder = dataset_guard

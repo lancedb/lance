@@ -11,12 +11,12 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
-use lance_file::{
-    reader::FileReader,
-    writer::{FileWriter, ManifestProvider},
+use lance_file::previous::{
+    reader::FileReader as PreviousFileReader,
+    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
+use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
@@ -68,7 +68,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
+impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
@@ -87,7 +87,7 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
 }
 
 #[async_trait]
-impl IndexWriter for v2::writer::FileWriter {
+impl IndexWriter for current_writer::FileWriter {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write_batch(&batch).await?;
@@ -107,7 +107,7 @@ impl IndexWriter for v2::writer::FileWriter {
 }
 
 #[async_trait]
-impl IndexReader for FileReader {
+impl IndexReader for PreviousFileReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
@@ -139,7 +139,7 @@ impl IndexReader for FileReader {
 }
 
 #[async_trait]
-impl IndexReader for v2::reader::FileReader {
+impl IndexReader for current_reader::FileReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;
@@ -158,16 +158,13 @@ impl IndexReader for v2::reader::FileReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            v2::reader::ReaderProjection::from_column_names(
+            ReaderProjection::from_column_names(
                 self.metadata().version(),
                 self.schema(),
                 projection,
             )?
         } else {
-            v2::reader::ReaderProjection::from_whole_schema(
-                self.schema(),
-                self.metadata().version(),
-            )
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
         };
         let batches = self
             .read_stream_projected(
@@ -216,10 +213,10 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
-        let writer = v2::writer::FileWriter::try_new(
+        let writer = current_writer::FileWriter::try_new(
             writer,
             schema,
-            v2::writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions::default(),
         )?;
         Ok(Box::new(writer))
     }
@@ -230,7 +227,7 @@ impl IndexStore for LanceIndexStore {
             .scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await?;
-        match v2::reader::FileReader::try_open(
+        match current_reader::FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -244,7 +241,7 @@ impl IndexStore for LanceIndexStore {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
                     let path = self.index_dir.child(name);
-                    let file_reader = FileReader::try_new_self_described(
+                    let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
                         &path,
                         Some(&self.metadata_cache),
@@ -315,8 +312,7 @@ pub mod tests {
     use crate::scalar::{
         bitmap::BitmapIndex,
         btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
-        flat::FlatIndexMetadata,
-        LabelListQuery, SargableQuery, ScalarIndex,
+        LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
     };
 
     use super::*;
@@ -324,14 +320,14 @@ pub mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, UInt64Type},
-        RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
+        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
@@ -356,6 +352,7 @@ pub mod tests {
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         let params = BTreeParameters {
             zone_size: Some(batch_size),
+            range_id: None,
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
@@ -405,7 +402,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_ids = result.row_addrs().true_rows();
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(10000));
 
@@ -421,9 +418,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs().true_rows();
 
-        assert_eq!(Some(0), row_ids.len());
+        assert_eq!(Some(0), row_addrs.len());
 
         let result = index
             .search(
@@ -437,9 +434,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs().true_rows();
 
-        assert_eq!(Some(100), row_ids.len());
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     #[tokio::test]
@@ -497,10 +494,10 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs().true_rows();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = updated_index
             .search(
@@ -511,17 +508,17 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs().true_rows();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(500_000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(500_000));
     }
 
     async fn check(index: &Arc<dyn ScalarIndex>, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(&results.row_addrs().true_rows(), &expected_arr);
     }
 
     #[tokio::test]
@@ -826,13 +823,13 @@ pub mod tests {
                 .unwrap();
 
             assert!(result.is_exact());
-            let row_ids = result.row_ids();
+            let row_addrs = result.row_addrs().true_rows();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
-            assert!(!row_ids.is_empty());
-            assert!(row_ids.len().unwrap() < data.num_rows() as u64);
-            assert!(row_ids.contains(sample_row_id));
+            assert!(!row_addrs.is_empty());
+            assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
+            assert!(row_addrs.contains(sample_row_id));
         }
     }
 
@@ -858,13 +855,12 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
         train_btree_index(
             data,
-            &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
             None,
         )
         .await
@@ -889,17 +885,17 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs().true_rows();
 
-        assert!(row_ids.is_empty());
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
             .await
             .unwrap();
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(4096));
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(row_addrs.len(), Some(4096));
     }
 
     async fn train_bitmap(
@@ -965,9 +961,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(2));
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(2));
 
         let result = index
             .search(
@@ -978,11 +974,11 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(3), row_ids.len());
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(3));
-        assert!(row_ids.contains(6));
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(Some(3), row_addrs.len());
+        assert!(row_addrs.contains(1));
+        assert!(row_addrs.contains(3));
+        assert!(row_addrs.contains(6));
     }
 
     #[tokio::test]
@@ -1007,9 +1003,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = index
             .search(
@@ -1023,8 +1019,8 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert!(row_ids.is_empty());
+        let row_addrs = result.row_addrs().true_rows();
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(
@@ -1038,15 +1034,15 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(100), row_ids.len());
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(&results.row_addrs().true_rows(), &expected_arr);
     }
 
     #[tokio::test]
@@ -1310,9 +1306,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(5000));
+        let row_addrs = result.row_addrs().true_rows();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(5000));
     }
 
     #[tokio::test]
@@ -1359,8 +1355,8 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
-            .contains(65));
+            .row_addrs()
+            .selected(65));
         // Deleted
         assert!(remapped_index
             .search(
@@ -1369,7 +1365,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .is_empty());
         // Not remapped
         assert!(remapped_index
@@ -1379,8 +1375,8 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
-            .contains(3));
+            .row_addrs()
+            .selected(3));
     }
 
     async fn train_tag(
@@ -1445,10 +1441,10 @@ pub mod tests {
                     .unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
-                let row_ids = result.row_ids();
+                let row_addrs = result.row_addrs().true_rows();
 
-                let row_ids_set = row_ids
-                    .row_ids()
+                let row_addrs_set = row_addrs
+                    .row_addrs()
                     .unwrap()
                     .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
@@ -1462,7 +1458,7 @@ pub mod tests {
                     let list = list.unwrap();
                     let row_id = row_id.unwrap();
                     let vals = list.as_primitive::<UInt8Type>().values();
-                    if row_ids_set.contains(&row_id) {
+                    if row_addrs_set.contains(&row_id) {
                         assert!(match_fn(vals));
                     } else {
                         assert!(no_match_fn(vals));
@@ -1508,5 +1504,86 @@ pub mod tests {
             Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_label_list_null_handling() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        // Create test data with null items within lists:
+        // Row 0: [1, 2] - no nulls
+        // Row 1: [3, null] - has a null item
+        // Row 2: [4] - no nulls
+        let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3), None]),
+            Some(vec![Some(4)]),
+        ]);
+        let row_ids = UInt64Array::from_iter_values(0..3);
+        // Create schema with nullable list items to match the ListArray
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                VALUE_COLUMN_NAME,
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                true,
+            ),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_array), Arc::new(row_ids)],
+        )
+        .unwrap();
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        train_tag(&index_store, batch_reader).await;
+
+        let index = LabelListIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::LabelListIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        // Test: Search for lists containing value 1
+        // Row 0: [1, 2] - contains 1 → TRUE
+        // Row 1: [3, null] - has null item, unknown if it matches → NULL
+        // Row 2: [4] - doesn't contain 1 → FALSE
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    actual_rows,
+                    vec![0],
+                    "Should find row 0 where list contains 1"
+                );
+
+                let null_row_ids = row_ids.null_rows();
+                assert!(
+                    !null_row_ids.is_empty(),
+                    "null_row_ids should not be empty - row 1 has null item"
+                );
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(
+                    null_rows,
+                    vec![1],
+                    "Should report row 1 as null because it contains a null item"
+                );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
     }
 }

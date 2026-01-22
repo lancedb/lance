@@ -97,6 +97,7 @@ use crate::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::Error;
@@ -205,9 +206,161 @@ impl AddAssign for CompactionMetrics {
     }
 }
 
+/// Trait for implementing custom compaction planning strategies.
+///
+/// This trait allows users to define their own compaction strategies by implementing
+/// the `plan` method. The default implementation is provided by [`DefaultCompactionPlanner`].
+#[async_trait::async_trait]
+pub trait CompactionPlanner: Send + Sync {
+    /// Build compaction plan.
+    ///
+    /// This method analyzes the dataset's fragments and generates a [`CompactionPlan`]
+    /// containing a list of compaction tasks to execute.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset` - Reference to the dataset to be compacted
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
+}
+
+/// Formulate a plan to compact the files in a dataset
+///
+/// The compaction plan will contain a list of tasks to execute. Each task
+/// will contain approximately `target_rows_per_fragment` rows and will be
+/// rewriting fragments that are adjacent in the dataset's fragment list. Some
+/// tasks may contain a single fragment when that fragment has deletions that
+/// are being materialized and doesn't have any neighbors that need to be
+/// compacted.
+#[derive(Debug, Clone, Default)]
+pub struct DefaultCompactionPlanner {
+    options: CompactionOptions,
+}
+
+impl DefaultCompactionPlanner {
+    pub fn new(mut options: CompactionOptions) -> Self {
+        options.validate();
+        Self { options }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for DefaultCompactionPlanner {
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        // get_fragments should be returning fragments in sorted order (by id)
+        // and fragment ids should be unique
+        let fragments = dataset.get_fragments();
+
+        debug_assert!(
+            fragments.windows(2).all(|w| w[0].id() < w[1].id()),
+            "fragments in manifest are not sorted"
+        );
+        let mut fragment_metrics = futures::stream::iter(fragments)
+            .map(|fragment| async move {
+                match collect_metrics(&fragment).await {
+                    Ok(metrics) => Ok((fragment.metadata, metrics)),
+                    Err(e) => Err(e),
+                }
+            })
+            .buffered(dataset.object_store().io_parallelism());
+
+        let index_fragmaps = load_index_fragmaps(dataset).await?;
+        let indices_containing_frag = |frag_id: u32| {
+            index_fragmaps
+                .iter()
+                .enumerate()
+                .filter(|(_, bitmap)| bitmap.contains(frag_id))
+                .map(|(pos, _)| pos)
+                .collect::<Vec<_>>()
+        };
+
+        let mut candidate_bins: Vec<CandidateBin> = Vec::new();
+        let mut current_bin: Option<CandidateBin> = None;
+        let mut i = 0;
+
+        while let Some(res) = fragment_metrics.next().await {
+            let (fragment, metrics) = res?;
+
+            let candidacy = if self.options.materialize_deletions
+                && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
+            {
+                Some(CompactionCandidacy::CompactItself)
+            } else if metrics.physical_rows < self.options.target_rows_per_fragment {
+                // Only want to compact if their are neighbors to compact such that
+                // we can get a larger fragment.
+                Some(CompactionCandidacy::CompactWithNeighbors)
+            } else {
+                // Not a candidate
+                None
+            };
+
+            let indices = indices_containing_frag(fragment.id as u32);
+
+            match (candidacy, &mut current_bin) {
+                (None, None) => {} // keep searching
+                (Some(candidacy), None) => {
+                    // Start a new bin
+                    current_bin = Some(CandidateBin {
+                        fragments: vec![fragment],
+                        pos_range: i..(i + 1),
+                        candidacy: vec![candidacy],
+                        row_counts: vec![metrics.num_rows()],
+                        indices,
+                    });
+                }
+                (Some(candidacy), Some(bin)) => {
+                    // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
+                    // the existing bin if it contains the same indices
+                    if bin.indices == indices {
+                        // Add to current bin
+                        bin.fragments.push(fragment);
+                        bin.pos_range.end += 1;
+                        bin.candidacy.push(candidacy);
+                        bin.row_counts.push(metrics.num_rows());
+                    } else {
+                        // Index set is different.  Complete previous bin and start new one
+                        candidate_bins.push(current_bin.take().unwrap());
+                        current_bin = Some(CandidateBin {
+                            fragments: vec![fragment],
+                            pos_range: i..(i + 1),
+                            candidacy: vec![candidacy],
+                            row_counts: vec![metrics.num_rows()],
+                            indices,
+                        });
+                    }
+                }
+                (None, Some(_)) => {
+                    // Bin is complete
+                    candidate_bins.push(current_bin.take().unwrap());
+                }
+            }
+
+            i += 1;
+        }
+
+        // Flush the last bin
+        if let Some(bin) = current_bin {
+            candidate_bins.push(bin);
+        }
+
+        let final_bins = candidate_bins
+            .into_iter()
+            .filter(|bin| !bin.is_noop())
+            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
+            .map(|bin| TaskData {
+                fragments: bin.fragments,
+            });
+
+        let mut compaction_plan =
+            CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        compaction_plan.extend_tasks(final_bins);
+
+        Ok(compaction_plan)
+    }
+}
+
 /// Compacts the files in the dataset without reordering them.
 ///
-/// This does a few things:
+/// By default, this does a few things:
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
@@ -217,13 +370,20 @@ impl AddAssign for CompactionMetrics {
 /// If no compaction is needed, this method will not make a new version of the table.
 pub async fn compact_files(
     dataset: &mut Dataset,
-    mut options: CompactionOptions,
+    options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    options.validate();
+    let planner = DefaultCompactionPlanner::new(options);
+    compact_files_with_planner(dataset, remap_options, &planner).await
+}
 
-    let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
+pub async fn compact_files_with_planner(
+    dataset: &mut Dataset,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
+    planner: &dyn CompactionPlanner,
+) -> Result<CompactionMetrics> {
+    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -233,16 +393,23 @@ pub async fn compact_files(
     let dataset_ref = &dataset.clone();
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
+        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
         .buffer_unordered(
-            options
+            compaction_plan
+                .options
                 .num_threads
                 .unwrap_or_else(get_num_compute_intensive_cpus),
         );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(dataset, completed_tasks, remap_options, &options).await?;
+    let metrics = commit_compaction(
+        dataset,
+        completed_tasks,
+        remap_options,
+        &compaction_plan.options,
+    )
+    .await?;
 
     Ok(metrics)
 }
@@ -457,127 +624,12 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     Ok(index_fragmaps)
 }
 
-/// Formulate a plan to compact the files in a dataset
-///
-/// The compaction plan will contain a list of tasks to execute. Each task
-/// will contain approximately `target_rows_per_fragment` rows and will be
-/// rewriting fragments that are adjacent in the dataset's fragment list. Some
-/// tasks may contain a single fragment when that fragment has deletions that
-/// are being materialized and doesn't have any neighbors that need to be
-/// compacted.
 pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    // get_fragments should be returning fragments in sorted order (by id)
-    // and fragment ids should be unique
-    debug_assert!(
-        dataset
-            .get_fragments()
-            .windows(2)
-            .all(|w| w[0].id() < w[1].id()),
-        "fragments in manifest are not sorted"
-    );
-    let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
-        .map(|fragment| async move {
-            match collect_metrics(&fragment).await {
-                Ok(metrics) => Ok((fragment.metadata, metrics)),
-                Err(e) => Err(e),
-            }
-        })
-        .buffered(dataset.object_store().io_parallelism());
-
-    let index_fragmaps = load_index_fragmaps(dataset).await?;
-    let indices_containing_frag = |frag_id: u32| {
-        index_fragmaps
-            .iter()
-            .enumerate()
-            .filter(|(_, bitmap)| bitmap.contains(frag_id))
-            .map(|(pos, _)| pos)
-            .collect::<Vec<_>>()
-    };
-
-    let mut candidate_bins: Vec<CandidateBin> = Vec::new();
-    let mut current_bin: Option<CandidateBin> = None;
-    let mut i = 0;
-
-    while let Some(res) = fragment_metrics.next().await {
-        let (fragment, metrics) = res?;
-
-        let candidacy = if options.materialize_deletions
-            && metrics.deletion_percentage() > options.materialize_deletions_threshold
-        {
-            Some(CompactionCandidacy::CompactItself)
-        } else if metrics.physical_rows < options.target_rows_per_fragment {
-            // Only want to compact if their are neighbors to compact such that
-            // we can get a larger fragment.
-            Some(CompactionCandidacy::CompactWithNeighbors)
-        } else {
-            // Not a candidate
-            None
-        };
-
-        let indices = indices_containing_frag(fragment.id as u32);
-
-        match (candidacy, &mut current_bin) {
-            (None, None) => {} // keep searching
-            (Some(candidacy), None) => {
-                // Start a new bin
-                current_bin = Some(CandidateBin {
-                    fragments: vec![fragment],
-                    pos_range: i..(i + 1),
-                    candidacy: vec![candidacy],
-                    row_counts: vec![metrics.num_rows()],
-                    indices,
-                });
-            }
-            (Some(candidacy), Some(bin)) => {
-                // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
-                // the existing bin if it contains the same indices
-                if bin.indices == indices {
-                    // Add to current bin
-                    bin.fragments.push(fragment);
-                    bin.pos_range.end += 1;
-                    bin.candidacy.push(candidacy);
-                    bin.row_counts.push(metrics.num_rows());
-                } else {
-                    // Index set is different.  Complete previous bin and start new one
-                    candidate_bins.push(current_bin.take().unwrap());
-                    current_bin = Some(CandidateBin {
-                        fragments: vec![fragment],
-                        pos_range: i..(i + 1),
-                        candidacy: vec![candidacy],
-                        row_counts: vec![metrics.num_rows()],
-                        indices,
-                    });
-                }
-            }
-            (None, Some(_)) => {
-                // Bin is complete
-                candidate_bins.push(current_bin.take().unwrap());
-            }
-        }
-
-        i += 1;
-    }
-
-    // Flush the last bin
-    if let Some(bin) = current_bin {
-        candidate_bins.push(bin);
-    }
-
-    let final_bins = candidate_bins
-        .into_iter()
-        .filter(|bin| !bin.is_noop())
-        .flat_map(|bin| bin.split_for_size(options.target_rows_per_fragment))
-        .map(|bin| TaskData {
-            fragments: bin.fragments,
-        });
-
-    let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options.clone());
-    compaction_plan.extend_tasks(final_bins);
-
-    Ok(compaction_plan)
+    let planner = DefaultCompactionPlanner::new(options.clone());
+    planner.plan(dataset).await
 }
 
 /// The result of a single compaction task.
@@ -609,7 +661,6 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
-        /*blob_op=*/ None,
         None,
     );
 
@@ -661,7 +712,7 @@ async fn rewrite_files(
     // The versions of Lance prior to when we started writing the writer version
     // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
     // make sure to recompute them.
-    // See: https://github.com/lancedb/lance/issues/1531
+    // See: https://github.com/lance-format/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
 
     // It's possible the fragments are old and don't have physical rows or
@@ -675,6 +726,13 @@ async fn rewrite_files(
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut scanner = dataset.scan();
+    let has_blob_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob());
+    if has_blob_columns {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
     }
@@ -727,7 +785,7 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    let new_fragments = write_fragments_internal(
+    let (mut new_fragments, _) = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
@@ -737,10 +795,6 @@ async fn rewrite_files(
         None, // Compaction doesn't use target_bases
     )
     .await?;
-
-    // We should not be rewriting any blob data
-    assert!(new_fragments.blob.is_none());
-    let mut new_fragments = new_fragments.default.0;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -1065,8 +1119,6 @@ pub async fn commit_compaction(
             rewritten_indices,
             frag_reuse_index,
         },
-        // TODO: Add a blob compaction pass
-        /*blob_op= */ None,
         None,
     );
 
@@ -1090,12 +1142,13 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type, Int64Type};
     use arrow_array::{
-        Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
-        RecordBatchIterator,
+        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
+    use lance_arrow::BLOB_META_KEY;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::Error;
@@ -1112,6 +1165,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -1339,6 +1393,57 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_columns() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, false)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let expected_payload: Vec<Vec<u8>> =
+            vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9, 10], vec![11]];
+        let id_column: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            0..expected_payload.len() as i32,
+        ));
+        let blob_array: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+            expected_payload.iter().map(|value| Some(value.as_slice())),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_column, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+        assert!(dataset.get_fragments().len() > 1);
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let dataset = Arc::new(dataset);
+        let row_indices: Vec<u64> = (0..expected_payload.len() as u64).collect();
+        let blobs = dataset
+            .take_blobs_by_indices(&row_indices, "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected_payload.len());
+        for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
+            let bytes = blob.read().await.unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
     }
 
     fn row_addrs(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
@@ -2958,7 +3063,7 @@ mod tests {
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
+            target_rows_per_fragment: 50_000,
             defer_index_remap: true,
             ..Default::default()
         };
@@ -3527,5 +3632,42 @@ mod tests {
             "Expected no fragment scan in plan: {}",
             plan
         );
+    }
+
+    #[tokio::test]
+    async fn test_default_compaction_planner() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create dataset with multiple small fragments
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 2000,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        // Test default planner
+        let options = CompactionOptions {
+            target_rows_per_fragment: 5000,
+            materialize_deletions_threshold: 2.0,
+            ..Default::default()
+        };
+
+        let planner = DefaultCompactionPlanner::new(options);
+        let plan = planner.plan(&dataset).await.unwrap();
+
+        // Should create tasks to compact small fragments
+        assert!(!plan.tasks.is_empty());
+        assert_eq!(plan.read_version, dataset.manifest.version);
+        // make sure options.validate() worked
+        assert!(!plan.options.materialize_deletions);
     }
 }

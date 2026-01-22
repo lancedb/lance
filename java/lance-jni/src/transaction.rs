@@ -11,19 +11,19 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jbyte;
+use jni::sys::jboolean;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
+use lance::io::ObjectStoreParams;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,7 +33,7 @@ impl IntoJava for &RewriteGroup {
         let new_fragments = export_vec(env, &self.new_fragments)?;
 
         Ok(env.new_object(
-            "com/lancedb/lance/operation/RewriteGroup",
+            "org/lance/operation/RewriteGroup",
             "(Ljava/util/List;Ljava/util/List;)V",
             &[
                 JValue::Object(&old_fragments),
@@ -52,7 +52,7 @@ impl IntoJava for &RewrittenIndex {
         let new_index_details_value = env.byte_array_from_slice(&self.new_index_details.value)?;
 
         Ok(env.new_object(
-            "com/lancedb/lance/operation/RewrittenIndex",
+            "org/lance/operation/RewrittenIndex",
             "(Ljava/util/UUID;Ljava/util/UUID;Ljava/lang/String;[BII)V",
             &[
                 JValue::Object(&old_id),
@@ -71,99 +71,9 @@ impl IntoJava for &DataReplacementGroup {
         let new_file = self.1.into_java(env)?;
 
         Ok(env.new_object(
-            "com/lancedb/lance/operation/DataReplacement$DataReplacementGroup",
-            "(JLcom/lancedb/lance/fragment/DataFile;)V",
+            "org/lance/operation/DataReplacement$DataReplacementGroup",
+            "(JLorg/lance/fragment/DataFile;)V",
             &[JValue::Long(fragment_id as i64), JValue::Object(&new_file)],
-        )?)
-    }
-}
-
-impl IntoJava for &IndexMetadata {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let uuid = self.uuid.into_java(env)?;
-
-        let fields = {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for field in &self.fields {
-                let field_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*field)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&field_obj)],
-                )?;
-            }
-            array_list
-        };
-        let name = env.new_string(&self.name)?;
-
-        let fragment_bitmap = if let Some(bitmap) = &self.fragment_bitmap {
-            let mut bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bytes)
-                .map_err(|e| Error::input_error(e.to_string()))?;
-
-            let jbytes =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) };
-
-            let byte_array = env.new_byte_array(bytes.len() as i32)?;
-            env.set_byte_array_region(&byte_array, 0, jbytes)?;
-            byte_array.into()
-        } else {
-            JObject::null()
-        };
-
-        // Convert index_details to byte array
-        let index_details = if let Some(details) = &self.index_details {
-            let bytes = details.encode_to_vec();
-            let jbytes: &[jbyte] =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) };
-
-            let byte_array = env.new_byte_array(bytes.len() as i32)?;
-            env.set_byte_array_region(&byte_array, 0, jbytes)?;
-            byte_array.into()
-        } else {
-            JObject::null()
-        };
-
-        // Convert created_at to Instant
-        let created_at = if let Some(dt) = &self.created_at {
-            let seconds = dt.timestamp();
-            let nanos = dt.timestamp_subsec_nanos() as i64;
-            env.call_static_method(
-                "java/time/Instant",
-                "ofEpochSecond",
-                "(JJ)Ljava/time/Instant;",
-                &[JValue::Long(seconds), JValue::Long(nanos)],
-            )?
-            .l()?
-        } else {
-            JObject::null()
-        };
-
-        // Convert base_id from Option<u32> to Integer for Java
-        let base_id = if let Some(id) = self.base_id {
-            env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(id as i32)])?
-        } else {
-            JObject::null()
-        };
-
-        // Create IndexMetadata object
-        Ok(env.new_object(
-            "com/lancedb/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;Ljava/lang/Integer;)V",
-            &[
-                JValue::Object(&uuid),
-                JValue::Object(&fields),
-                JValue::Object(&name),
-                JValue::Long(self.dataset_version as i64),
-                JValue::Object(&fragment_bitmap),
-                JValue::Object(&index_details),
-                JValue::Int(self.index_version),
-                JValue::Object(&created_at),
-                JValue::Object(&base_id),
-            ],
         )?)
     }
 }
@@ -174,7 +84,7 @@ impl IntoJava for &UpdateMode {
             UpdateMode::RewriteRows => "RewriteRows",
             UpdateMode::RewriteColumns => "RewriteColumns",
         };
-        let update_mode_type_class = "com/lancedb/lance/operation/Update$UpdateMode";
+        let update_mode_type_class = "org/lance/operation/Update$UpdateMode";
         env.get_static_field(
             update_mode_type_class,
             name,
@@ -251,12 +161,12 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
 
         let fragment_bitmap: Option<RoaringBitmap> =
-            env.get_optional_from_method(self, "fragmentBitmap", |env, bitmap_obj| {
-                let byte_array: JByteArray = bitmap_obj.into();
-                let bytes = env.convert_byte_array(&byte_array)?;
-                let bitmap = RoaringBitmap::deserialize_from(Cursor::new(bytes)).map_err(|e| {
-                    Error::input_error(format!("Invalid RoaringBitmap data: {}", e))
-                })?;
+            env.get_optional_from_method(self, "fragments", |env, fragments_obj| {
+                let frag_ids = env.get_integers(&fragments_obj)?;
+                let bitmap = frag_ids
+                    .iter()
+                    .map(|val| *val as u32)
+                    .collect::<RoaringBitmap>();
                 Ok(bitmap)
             })?;
 
@@ -301,12 +211,7 @@ impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataReplacementGroup> {
         let fragment_id = env.call_method(self, "fragmentId", "()J", &[])?.j()? as u64;
         let new_file = env
-            .call_method(
-                self,
-                "replacedFile",
-                "()Lcom/lancedb/lance/fragment/DataFile;",
-                &[],
-            )?
+            .call_method(self, "replacedFile", "()Lorg/lance/fragment/DataFile;", &[])?
             .l()?
             .extract_object(env)?;
 
@@ -363,7 +268,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReadTransaction<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeReadTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -387,7 +292,7 @@ fn inner_read_transaction<'local>(
     Ok(transaction)
 }
 
-fn convert_to_java_transaction<'local>(
+pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
     java_dataset: &JObject,
@@ -397,18 +302,16 @@ fn convert_to_java_transaction<'local>(
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
     };
-    let operation = convert_to_java_operation_inner(env, transaction.operation)?;
-    let blobs_op = convert_to_java_operation(env, transaction.blobs_op)?;
+    let operation = convert_to_java_operation(env, Some(transaction.operation))?;
 
     let java_transaction = env.new_object(
-        "com/lancedb/lance/Transaction",
-        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "org/lance/Transaction",
+        "(Lorg/lance/Dataset;JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
         &[
             JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&blobs_op),
             JValue::Object(&JObject::null()),
             JValue::Object(&transaction_properties),
         ],
@@ -416,7 +319,7 @@ fn convert_to_java_transaction<'local>(
     Ok(java_transaction)
 }
 
-fn convert_to_java_operation<'local>(
+pub(crate) fn convert_to_java_operation<'local>(
     env: &mut JNIEnv<'local>,
     operation: Option<Operation>,
 ) -> Result<JObject<'local>> {
@@ -438,7 +341,7 @@ fn convert_to_java_operation_inner<'local>(
             let java_fragments = export_vec(env, &rust_fragments)?;
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Append",
+                "org/lance/operation/Append",
                 "(Ljava/util/List;)V",
                 &[JValue::Object(&java_fragments)],
             )?)
@@ -459,7 +362,7 @@ fn convert_to_java_operation_inner<'local>(
             let predicate_obj = env.new_string(&predicate)?;
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Delete",
+                "org/lance/operation/Delete",
                 "(Ljava/util/List;Ljava/util/List;Ljava/lang/String;)V",
                 &[
                     JValue::Object(&updated_fragments_obj),
@@ -482,7 +385,7 @@ fn convert_to_java_operation_inner<'local>(
             };
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Overwrite",
+                "org/lance/operation/Overwrite",
                 "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Ljava/util/Map;)V",
                 &[
                     JValue::Object(&java_fragments),
@@ -496,9 +399,10 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            mem_wal_to_merge: _,
+            merged_generations: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
+            inserted_rows_filter: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -523,7 +427,7 @@ fn convert_to_java_operation_inner<'local>(
                 )?
                 .l()?;
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Update",
+                "org/lance/operation/Update",
                 "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
@@ -539,7 +443,7 @@ fn convert_to_java_operation_inner<'local>(
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Project",
+                "org/lance/operation/Project",
                 "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
                 &[JValue::Object(&java_schema)],
             )?)
@@ -557,8 +461,8 @@ fn convert_to_java_operation_inner<'local>(
             };
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Rewrite",
-                "(Ljava/util/List;Ljava/util/List;Lcom/lancedb/lance/index/Index;)V",
+                "org/lance/operation/Rewrite",
+                "(Ljava/util/List;Ljava/util/List;Lorg/lance/index/Index;)V",
                 &[
                     JValue::Object(&java_groups),
                     JValue::Object(&java_indices),
@@ -594,8 +498,8 @@ fn convert_to_java_operation_inner<'local>(
             };
 
             let java_operation = env.new_object(
-                "com/lancedb/lance/operation/UpdateConfig",
-                "(Lcom/lancedb/lance/operation/UpdateMap;Lcom/lancedb/lance/operation/UpdateMap;Lcom/lancedb/lance/operation/UpdateMap;Ljava/util/Map;)V",
+                "org/lance/operation/UpdateConfig",
+                "(Lorg/lance/operation/UpdateMap;Lorg/lance/operation/UpdateMap;Lorg/lance/operation/UpdateMap;Ljava/util/Map;)V",
                 &[
                     JValue::Object(&config_updates_obj),
                     JValue::Object(&table_metadata_updates_obj),
@@ -609,7 +513,7 @@ fn convert_to_java_operation_inner<'local>(
             let java_replacements = export_vec(env, &replacements)?;
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/DataReplacement",
+                "org/lance/operation/DataReplacement",
                 "(Ljava/util/List;)V",
                 &[JValue::Object(&java_replacements)],
             )?)
@@ -622,7 +526,7 @@ fn convert_to_java_operation_inner<'local>(
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
-                "com/lancedb/lance/operation/Merge",
+                "org/lance/operation/Merge",
                 "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;)V",
                 &[
                     JValue::Object(&java_fragments),
@@ -631,12 +535,12 @@ fn convert_to_java_operation_inner<'local>(
             )?)
         }
         Operation::Restore { version } => Ok(env.new_object(
-            "com/lancedb/lance/operation/Restore",
+            "org/lance/operation/Restore",
             "(J)V",
             &[JValue::Long(version as i64)],
         )?),
         Operation::ReserveFragments { num_fragments } => Ok(env.new_object(
-            "com/lancedb/lance/operation/ReserveFragments",
+            "org/lance/operation/ReserveFragments",
             "(I)V",
             &[JValue::Int(num_fragments as i32)],
         )?),
@@ -644,7 +548,7 @@ fn convert_to_java_operation_inner<'local>(
     }
 }
 
-fn convert_to_java_schema<'local>(
+pub(crate) fn convert_to_java_schema<'local>(
     env: &mut JNIEnv<'local>,
     schema: LanceSchema,
 ) -> Result<JObject<'local>> {
@@ -660,14 +564,22 @@ fn convert_to_java_schema<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCommitTransaction<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(&mut env, java_dataset, java_transaction)
+        inner_commit_transaction(
+            &mut env,
+            java_dataset,
+            java_transaction,
+            detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
+        )
     )
 }
 
@@ -675,17 +587,69 @@ fn inner_commit_transaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached: bool,
+    enable_v2_manifest_paths: bool,
 ) -> Result<JObject<'local>> {
     let write_param_jobj = env
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
         .l()?;
     let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
     let write_param = to_rust_map(env, &write_param_jmap)?;
+
+    // Get the Dataset's storage_options_accessor and merge with write_param
+    let storage_options_accessor = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        let existing_accessor = dataset_guard.inner.storage_options_accessor();
+
+        // Merge write_param with existing accessor's initial options
+        match existing_accessor {
+            Some(accessor) => {
+                let mut merged = accessor
+                    .initial_storage_options()
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(write_param);
+                if let Some(provider) = accessor.provider().cloned() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_initial_and_provider(
+                            merged, provider,
+                        ),
+                    ))
+                } else {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(merged),
+                    ))
+                }
+            }
+            None => {
+                if !write_param.is_empty() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(write_param),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
+    // Build ObjectStoreParams using the merged accessor
+    let store_params = ObjectStoreParams {
+        storage_options_accessor,
+        ..Default::default()
+    };
+
     let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_dataset))?;
     let new_blocking_ds = {
         let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, write_param)?
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.commit_transaction(
+            transaction,
+            store_params,
+            detached,
+            enable_v2_manifest_paths,
+        )?
     };
     new_blocking_ds.into_java(env)
 }
@@ -701,16 +665,11 @@ fn convert_to_rust_transaction(
         .call_method(
             &java_transaction,
             "operation",
-            "()Lcom/lancedb/lance/operation/Operation;",
+            "()Lorg/lance/operation/Operation;",
             &[],
         )?
         .l()?;
     let op = convert_to_rust_operation(env, &op, java_dataset)?;
-
-    let blobs_op =
-        env.get_optional_from_method(&java_transaction, "blobsOperation", |env, blobs_op| {
-            convert_to_rust_operation(env, &blobs_op, java_dataset)
-        })?;
 
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
@@ -722,7 +681,6 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
-        .blobs_op(blobs_op)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }
@@ -772,7 +730,7 @@ fn convert_to_rust_operation(
                 .call_method(
                     java_operation,
                     "configUpdates",
-                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    "()Lorg/lance/operation/UpdateMap;",
                     &[],
                 )?
                 .l()?;
@@ -786,7 +744,7 @@ fn convert_to_rust_operation(
                 .call_method(
                     java_operation,
                     "tableMetadataUpdates",
-                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    "()Lorg/lance/operation/UpdateMap;",
                     &[],
                 )?
                 .l()?;
@@ -800,7 +758,7 @@ fn convert_to_rust_operation(
                 .call_method(
                     java_operation,
                     "schemaMetadataUpdates",
-                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    "()Lorg/lance/operation/UpdateMap;",
                     &[],
                 )?
                 .l()?;
@@ -960,9 +918,10 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: None,
+                merged_generations: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter: None,
             }
         }
         "DataReplacement" => {
@@ -993,6 +952,20 @@ fn convert_to_rust_operation(
                 .call_method(java_operation, "numFragments", "()I", &[])?
                 .i()? as u32;
             return Ok(Operation::ReserveFragments { num_fragments });
+        }
+        "CreateIndex" => {
+            let new_indices =
+                import_vec_from_method(env, java_operation, "getNewIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            let removed_indices =
+                import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            return Ok(Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            });
         }
         _ => unimplemented!(),
     };
@@ -1068,7 +1041,7 @@ fn export_update_map<'a>(
 
             // Create UpdateMap object
             let update_map_obj = env.new_object(
-                "com/lancedb/lance/operation/UpdateMap",
+                "org/lance/operation/UpdateMap",
                 "(Ljava/util/Map;Z)V",
                 &[
                     JValue::Object(&updates_map),

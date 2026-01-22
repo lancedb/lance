@@ -10,7 +10,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
@@ -150,7 +150,7 @@ struct DeleteJob {
 struct DeleteData {
     updated_fragments: Vec<Fragment>,
     deleted_fragment_ids: Vec<u64>,
-    affected_rows: Option<RowIdTreeMap>,
+    affected_rows: Option<RowAddrTreeMap>,
 }
 
 impl RetryExecutor for DeleteJob {
@@ -167,14 +167,14 @@ impl RetryExecutor for DeleteJob {
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows) = if let Some(filter_expr) =
-            scanner.get_filter()?
+            scanner.get_expr_filter()?
         {
             if matches!(
                 filter_expr,
                 Expr::Literal(ScalarValue::Boolean(Some(false)), _)
             ) {
                 // Predicate evaluated to false - no deletions
-                (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
+                (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()))
             } else if matches!(
                 filter_expr,
                 Expr::Literal(ScalarValue::Boolean(Some(true)), _)
@@ -213,12 +213,12 @@ impl RetryExecutor for DeleteJob {
 
                 let (fragments, deleted_ids) =
                     apply_deletions(&self.dataset, &removed_row_addrs).await?;
-                let affected_rows = RowIdTreeMap::from(removed_row_addrs.as_ref().clone());
+                let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
                 (fragments, deleted_ids, Some(affected_rows))
             }
         } else {
             // No filter was applied - this shouldn't happen but treat as delete nothing
-            (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
+            (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()))
         };
 
         Ok(DeleteData {
@@ -234,12 +234,7 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids: data.deleted_fragment_ids,
             predicate: self.predicate.clone(),
         };
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let mut builder = CommitBuilder::new(dataset);
 

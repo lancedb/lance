@@ -19,6 +19,7 @@ futures = { workspace = true }
 half = { workspace = true }
 hex = "0.4.3"
 rand = { workspace = true }
+rand_distr = { workspace = true }
 rand_xoshiro = { workspace = true }
 random_word = { version = "0.5", features = ["en"] }
 

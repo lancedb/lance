@@ -13,8 +13,8 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_file::v2::writer::FileWriterOptions;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::writer::FileWriterOptions;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::PART_ID_COLUMN;
@@ -221,8 +221,7 @@ pub async fn write_vector_storage(
         data.boxed()
     };
 
-    let mut writer =
-        lance_file::v2::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
+    let mut writer = lance_file::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
     let mut transformed_stream = data
         .map_ok(move |batch| {
             let ivf_transformer = ivf_transformer.clone();
@@ -247,8 +246,8 @@ pub async fn write_vector_storage(
 #[instrument(level = "debug", skip(writer, auxiliary_writer, data, ivf, quantizer))]
 pub(super) async fn build_hnsw_partitions(
     dataset: Arc<dyn DatasetTakeRows>,
-    writer: &mut FileWriter<ManifestDescribing>,
-    auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
+    writer: &mut PreviousFileWriter<ManifestDescribing>,
+    auxiliary_writer: Option<&mut PreviousFileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,

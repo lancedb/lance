@@ -3,8 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
-
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -43,19 +41,26 @@ use lance_core::{
 };
 use lance_file::{
     format::MAGIC,
-    writer::{FileWriter, FileWriterOptions},
+    previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    },
+    reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
-use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
+use lance_index::vector::hnsw::HnswMetadata;
+use lance_index::vector::ivf::storage::{IvfModel, IVF_METADATA_KEY};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
+use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -71,6 +76,8 @@ use lance_index::{
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
@@ -83,10 +90,13 @@ use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
 use log::{info, warn};
 use object_store::path::Path;
+use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::location;
+use std::collections::HashSet;
+use std::{any::Any, collections::HashMap, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -379,20 +389,12 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = options.num_indices_to_merge;
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - num_indices_to_merge
-    };
-    let indices_to_merge = existing_indices[start_pos..].to_vec();
-    let merged_num = indices_to_merge.len();
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
-    match index_type {
+    let merged_num = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -404,14 +406,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                     dataset.clone(),
@@ -421,14 +424,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             }
         }
         // IVF_PQ
@@ -441,14 +445,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
@@ -460,14 +465,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
@@ -478,80 +484,75 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (sub_index_type, quantization_type) => {
             unimplemented!(
@@ -560,7 +561,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 quantization_type
             )
         }
-    }
+    };
 
     Ok((new_uuid, merged_num))
 }
@@ -609,7 +610,7 @@ async fn optimize_ivf_pq_indices(
 
     let start_pos = existing_indices
         .len()
-        .saturating_sub(options.num_indices_to_merge);
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
 
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
@@ -683,10 +684,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    let start_pos = if num_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_to_merge
     };
 
     let indices_to_merge = existing_indices[start_pos..]
@@ -701,7 +703,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the HNSW writer
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -725,8 +731,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1041,6 +1050,10 @@ impl VectorIndex for IVFIndex {
         unimplemented!("only for v2 IVFIndex")
     }
 
+    fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         unimplemented!("only for v2 IVFIndex")
@@ -1218,8 +1231,7 @@ pub async fn build_ivf_model(
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
-    if centroids.is_some() && !params.retrain {
-        let centroids = centroids.unwrap();
+    if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != num_partitions * dim {
             return Err(Error::Index {
@@ -1231,7 +1243,7 @@ pub async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(IvfModel::new(centroids.as_ref().clone(), None));
+        return Ok(IvfModel::new(centroids.clone(), None));
     }
     let sample_size_hint = num_partitions * params.sample_rate;
 
@@ -1474,10 +1486,82 @@ pub(crate) async fn remap_index_file_v3(
     mapping: &HashMap<u64, Option<u64>>,
     column: String,
 ) -> Result<()> {
+    let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().child(new_uuid);
-    index
-        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
-        .await
+    let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
+    match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "the field type {} is not supported for FLAT index",
+                    element_type
+                ),
+                location: location!(),
+            }),
+        },
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
+                .remap(mapping)
+                .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1662,7 +1746,11 @@ async fn write_ivf_hnsw_file(
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1690,8 +1778,11 @@ async fn write_ivf_hnsw_file(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1760,6 +1851,245 @@ async fn write_ivf_hnsw_file(
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
     aux_writer.finish().await?;
+    Ok(())
+}
+
+/// Finalize distributed merge for IVF-based vector indices.
+///
+/// This helper merges partial auxiliary index files produced by distributed
+/// jobs into a unified `auxiliary.idx` and then creates a root `index.idx`
+/// using the v2 index format so that `open_vector_index_v2` can load it.
+///
+/// The caller must pass `index_dir` pointing at the index UUID directory
+/// (e.g. `<table>/indices/<uuid>`). `requested_index_type` is only used as
+/// a fallback when the unified auxiliary file does not contain index
+/// metadata.
+pub async fn finalize_distributed_merge(
+    object_store: &ObjectStore,
+    index_dir: &object_store::path::Path,
+    requested_index_type: Option<IndexType>,
+) -> Result<()> {
+    // Merge per-shard auxiliary files into a unified auxiliary.idx.
+    lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+        object_store,
+        index_dir,
+    )
+    .await?;
+
+    // Open the unified auxiliary file.
+    let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let scheduler = ScanScheduler::new(
+        Arc::new(object_store.clone()),
+        SchedulerConfig::max_bandwidth(object_store),
+    );
+    let fh = scheduler
+        .open_file(&aux_path, &CachedFileSize::unknown())
+        .await?;
+    let aux_reader = V2Reader::try_open(
+        fh,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await?;
+
+    let meta = aux_reader.metadata();
+    let ivf_buf_idx: u32 = meta
+        .file_schema
+        .metadata
+        .get(IVF_METADATA_KEY)
+        .ok_or_else(|| Error::Index {
+            message: "IVF meta missing in unified auxiliary".to_string(),
+            location: location!(),
+        })?
+        .parse()
+        .map_err(|_| Error::Index {
+            message: "IVF index parse error".to_string(),
+            location: location!(),
+        })?;
+
+    let raw_ivf_bytes = aux_reader.read_global_buffer(ivf_buf_idx).await?;
+    let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
+
+    // If the unified IVF metadata does not contain centroids, try to source them
+    // from any partial_* index.idx under this index directory.
+    if pb_ivf.centroids_tensor.is_none() {
+        let mut stream = object_store.list(Some(index_dir.clone()));
+        let mut partial_index_path = None;
+
+        while let Some(item) = stream.next().await {
+            let meta = item?;
+            if let Some(fname) = meta.location.filename() {
+                if fname == INDEX_FILE_NAME {
+                    let parts: Vec<_> = meta.location.parts().collect();
+                    if parts.len() >= 2 {
+                        let parent = parts[parts.len() - 2].as_ref();
+                        if parent.starts_with("partial_") {
+                            partial_index_path = Some(meta.location.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(partial_index_path) = partial_index_path {
+            let fh = scheduler
+                .open_file(&partial_index_path, &CachedFileSize::unknown())
+                .await?;
+            let partial_reader = V2Reader::try_open(
+                fh,
+                None,
+                Arc::default(),
+                &lance_core::cache::LanceCache::no_cache(),
+                V2ReaderOptions::default(),
+            )
+            .await?;
+            let partial_meta = partial_reader.metadata();
+            if let Some(ivf_idx_str) = partial_meta.file_schema.metadata.get(IVF_METADATA_KEY) {
+                if let Ok(ivf_idx) = ivf_idx_str.parse::<u32>() {
+                    let partial_ivf_bytes = partial_reader.read_global_buffer(ivf_idx).await?;
+                    let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
+                    if partial_pb_ivf.centroids_tensor.is_some() {
+                        pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
+                    }
+                }
+            }
+        }
+    }
+
+    let ivf_model: IvfModel = IvfModel::try_from(pb_ivf.clone())?;
+    let nlist = ivf_model.num_partitions();
+    let ivf_bytes = pb_ivf.encode_to_vec().into();
+
+    // Determine index metadata JSON from auxiliary or requested index type.
+    let index_meta_json =
+        if let Some(idx_json) = meta.file_schema.metadata.get(INDEX_METADATA_SCHEMA_KEY) {
+            idx_json.clone()
+        } else {
+            let dt = meta
+                .file_schema
+                .metadata
+                .get(DISTANCE_TYPE_KEY)
+                .cloned()
+                .unwrap_or_else(|| "l2".to_string());
+            let index_type = requested_index_type.ok_or_else(|| Error::Index {
+                message:
+                    "Index type must be provided when auxiliary metadata is missing index metadata"
+                        .to_string(),
+                location: location!(),
+            })?;
+            serde_json::to_string(&IndexMetadata {
+                index_type: index_type.to_string(),
+                distance_type: dt,
+            })?
+        };
+
+    // Write root index.idx via V2 writer so downstream opens through v2 path.
+    let index_path = index_dir.child(INDEX_FILE_NAME);
+    let obj_writer = object_store.create(&index_path).await?;
+
+    // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
+    let arrow_schema = HNSW::schema();
+    let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
+    let mut v2_writer = V2Writer::try_new(obj_writer, schema, V2WriterOptions::default())?;
+
+    // Attach precise index metadata (type + distance).
+    v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
+
+    // Add IVF protobuf as a global buffer and reference via IVF_METADATA_KEY.
+    let pos = v2_writer.add_global_buffer(ivf_bytes).await?;
+    v2_writer.add_schema_metadata(IVF_METADATA_KEY, pos.to_string());
+
+    // For HNSW variants, attach per-partition metadata list; for FLAT-based
+    // variants, attach minimal placeholder metadata.
+    let idx_meta: IndexMetadata = serde_json::from_str(&index_meta_json)?;
+    let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
+    let is_flat_based = matches!(
+        idx_meta.index_type.as_str(),
+        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ"
+    );
+
+    if is_hnsw {
+        let default_meta = HnswMetadata::default();
+        let meta_vec: Vec<String> = (0..nlist)
+            .map(|_| serde_json::to_string(&default_meta).unwrap())
+            .collect();
+        let meta_vec_json = serde_json::to_string(&meta_vec)?;
+        v2_writer.add_schema_metadata(HNSW_METADATA_KEY, meta_vec_json);
+    } else if is_flat_based {
+        let meta_vec: Vec<String> = (0..nlist).map(|_| "{}".to_string()).collect();
+        let meta_vec_json = serde_json::to_string(&meta_vec)?;
+        v2_writer.add_schema_metadata("lance:flat", meta_vec_json);
+    }
+
+    let empty_batch = RecordBatch::new_empty(arrow_schema);
+    v2_writer.write_batch(&empty_batch).await?;
+    v2_writer.finish().await?;
+
+    if let Err(err) = cleanup_partial_vector_dirs(object_store, index_dir).await {
+        warn!(
+            "Failed to cleanup partial_* vector index directories under '{}': {}",
+            index_dir.as_ref(),
+            err
+        );
+    }
+
+    Ok(())
+}
+
+/// Cleanup for distributed partial vector index directories after
+/// a distributed merge.
+///
+/// This helper scans `index_dir` for direct child directories whose names
+/// start with `partial_` (e.g. `<index_dir>/partial_0`, `<index_dir>/partial_1`)
+/// and attempts to recursively delete them via [`ObjectStore::remove_dir_all`].
+///
+/// Listing and deletion failures are logged with [`warn!`] and ignored so that
+/// index finalization is never blocked by cleanup. The function always returns
+/// `Ok(())`.
+async fn cleanup_partial_vector_dirs(
+    object_store: &ObjectStore,
+    index_dir: &object_store::path::Path,
+) -> Result<()> {
+    let mut partial_dirs: HashSet<Path> = HashSet::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                if let Some(relative_parts) = meta.location.prefix_match(index_dir) {
+                    let rel_parts: Vec<_> = relative_parts.collect();
+                    // Expect paths like: <index_dir>/partial_*/<file>
+                    if rel_parts.len() >= 2 {
+                        let parent_name = rel_parts[0].as_ref();
+                        if parent_name.starts_with("partial_") {
+                            partial_dirs.insert(index_dir.child(parent_name));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to list index directory '{}' while collecting partial_* dirs: {}",
+                    index_dir.as_ref(),
+                    e
+                );
+            }
+        }
+    }
+
+    for dir in partial_dirs {
+        if let Err(e) = object_store.remove_dir_all(dir.clone()).await {
+            warn!(
+                "Failed to remove partial_* directory '{}' after distributed merge: {}",
+                dir.as_ref(),
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -2093,7 +2423,7 @@ mod tests {
                     maximum_nprobes: None,
                     ef: None,
                     refine_factor: None,
-                    metric_type: MetricType::L2,
+                    metric_type: Some(MetricType::L2),
                     use_index: true,
                     dist_q_c: 0.0,
                 };
@@ -2313,7 +2643,6 @@ mod tests {
                 removed_indices: vec![],
             },
             None,
-            None,
         );
 
         // Apply the transaction to register the index
@@ -2415,7 +2744,6 @@ mod tests {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
             },
-            None,
             None,
         );
 
@@ -3272,5 +3600,70 @@ mod tests {
         }
 
         assert!(correct_times >= 9, "correct: {}", correct_times);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_only_partial_dirs() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup");
+
+        // partial_* directories that should be removed
+        let partial0_file = index_dir.child("partial_0").child("file.bin");
+        let partial_abc_file = index_dir.child("partial_abc").child("file.bin");
+
+        // Non-partial paths that must be preserved
+        let partialx_file = index_dir.child("partialX").child("file.bin");
+        let shard_file = index_dir.child("shard_0").child("file.bin");
+        let keep_root_file = index_dir.child("keep_root.txt");
+
+        object_store.put(&partial0_file, b"partial0").await.unwrap();
+        object_store
+            .put(&partial_abc_file, b"partial_abc")
+            .await
+            .unwrap();
+        object_store.put(&partialx_file, b"partialx").await.unwrap();
+        object_store.put(&shard_file, b"shard").await.unwrap();
+        object_store.put(&keep_root_file, b"root").await.unwrap();
+
+        // Sanity: all files exist before cleanup
+        assert!(object_store.exists(&partial0_file).await.unwrap());
+        assert!(object_store.exists(&partial_abc_file).await.unwrap());
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+
+        // partial_* directories should be removed
+        assert!(!object_store.exists(&partial0_file).await.unwrap());
+        assert!(!object_store.exists(&partial_abc_file).await.unwrap());
+
+        // Non-partial directories and root files must be preserved
+        assert!(object_store.exists(&partialx_file).await.unwrap());
+        assert!(object_store.exists(&shard_file).await.unwrap());
+        assert!(object_store.exists(&keep_root_file).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_idempotent() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_test_cleanup_idempotent");
+
+        let partial_file = index_dir.child("partial_0").child("file.bin");
+        object_store.put(&partial_file, b"partial").await.unwrap();
+
+        assert!(object_store.exists(&partial_file).await.unwrap());
+
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
+        assert!(!object_store.exists(&partial_file).await.unwrap());
+
+        // Second call should succeed even when there are no partial_* directories left.
+        cleanup_partial_vector_dirs(&object_store, &index_dir)
+            .await
+            .unwrap();
     }
 }

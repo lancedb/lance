@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -15,17 +16,19 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
-use datafusion_physical_plan::metrics::BaselineMetrics;
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
+use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
 use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
+use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
@@ -34,11 +37,12 @@ use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_index::{DatasetIndexExt, IndexCriteria};
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
+    partitions_searched: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -46,8 +50,13 @@ impl FtsIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
+            partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
+    }
+
+    pub fn record_parts_searched(&self, num_parts: usize) {
+        self.partitions_searched.add(num_parts);
     }
 }
 
@@ -80,10 +89,20 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -211,11 +230,7 @@ impl ExecutionPlan for MatchQueryExec {
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",
@@ -243,6 +258,7 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     ))
                 })?;
+            metrics.record_parts_searched(inverted_idx.partition_count());
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let params = params
@@ -255,7 +271,14 @@ impl ExecutionPlan for MatchQueryExec {
                     let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
                         tantivy::tokenizer::SimpleTokenizer::default(),
                     );
-                    Box::new(TextTokenizer::new(tokenizer))
+                    match inverted_idx.tokenizer().doc_type() {
+                        DocType::Text => {
+                            Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                        DocType::Json => {
+                            Box::new(JsonTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                    }
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
@@ -263,7 +286,7 @@ impl ExecutionPlan for MatchQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     query.operator,
                     pre_filter,
@@ -325,10 +348,20 @@ impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlatMatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlatMatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -340,9 +373,10 @@ impl FlatMatchQueryExec {
         query: MatchQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
     ) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            EquivalenceProperties::new(schema),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -409,13 +443,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let unindexed_input =
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
+        let schema = self.schema();
         let stream = stream::once(async move {
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?;
             let inverted_idx = match index_meta {
                 Some(index_meta) => {
@@ -427,12 +458,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 }
                 None => None,
             };
+            if let Some(index) = inverted_idx.as_ref() {
+                metrics.record_parts_searched(index.partition_count());
+            }
 
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
                 &inverted_idx,
+                schema,
             ))
         })
         .try_flatten_unordered(None)
@@ -483,10 +518,20 @@ impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "PhraseQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "PhraseQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -607,11 +652,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 query.terms
             )))?;
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",
@@ -639,6 +680,7 @@ impl ExecutionPlan for PhraseQueryExec {
                         column,
                     ))
                 })?;
+            metrics.record_parts_searched(index.partition_count());
 
             let mut tokenizer = index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
@@ -646,7 +688,7 @@ impl ExecutionPlan for PhraseQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
                     pre_filter,
@@ -1009,6 +1051,9 @@ impl ExecutionPlan for BooleanQueryExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let params = self.params.clone();
+        let should_plan = self.should.clone();
+        let must_plan = self.must.clone();
+        let must_not_plan = self.must_not.clone();
         let must = self
             .must
             .as_ref()
@@ -1058,6 +1103,22 @@ impl ExecutionPlan for BooleanQueryExec {
                 }
             }
 
+            let mut partitions_searched = 0;
+            for plan in [Some(&should_plan), must_plan.as_ref(), Some(&must_not_plan)] {
+                let Some(plan) = plan else {
+                    continue;
+                };
+                let Some(metrics) = plan.metrics() else {
+                    continue;
+                };
+                for (metric_name, count) in metrics.iter_counts() {
+                    if metric_name.as_ref() == PARTITIONS_SEARCHED_METRIC {
+                        partitions_searched += count.value();
+                    }
+                }
+            }
+            metrics.record_parts_searched(partitions_searched);
+
             // sort the results and take the top k
             let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
@@ -1096,18 +1157,47 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::inverted::query::{
-        BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+        BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
+        PhraseQuery,
+    };
+    use lance_index::scalar::inverted::{InvertedIndex, FTS_SCHEMA};
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
+    use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
+
+    use crate::{
+        index::DatasetIndexInternalExt,
+        io::exec::PreFilterSource,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use crate::{io::exec::PreFilterSource, utils::test::NoContextTestFixture};
-
     use super::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+
+    #[derive(Default)]
+    struct StatsHolder {
+        collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
+    }
+
+    impl StatsHolder {
+        fn get_setter(&self) -> ExecutionStatsCallback {
+            let collected_stats = self.collected_stats.clone();
+            Arc::new(move |stats| {
+                *collected_stats.lock().unwrap() = Some(stats.clone());
+            })
+        }
+
+        fn consume(self) -> ExecutionSummaryCounts {
+            self.collected_stats.lock().unwrap().take().unwrap()
+        }
+    }
 
     #[test]
     fn execute_without_context() {
@@ -1139,6 +1229,7 @@ pub mod tests {
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             flat_input,
+            FTS_SCHEMA.clone(),
         );
         flat_match_query
             .execute(0, Arc::new(TaskContext::default()))
@@ -1191,5 +1282,136 @@ pub mod tests {
             .unwrap();
         let metrics = boost_query.metrics().unwrap();
         assert!(metrics.elapsed_compute().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_parts_searched_metrics() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["hello", "lance", "search"]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("text").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = dataset
+            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let expected_parts = inverted_index.partition_count();
+
+        let stats_holder = StatsHolder::default();
+        let mut scanner = dataset.scan();
+        scanner
+            .scan_stats_callback(stats_holder.get_setter())
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap();
+        let _ = scanner.try_into_batch().await.unwrap();
+        let stats = stats_holder.consume();
+        let parts_searched = stats
+            .all_counts
+            .get(PARTITIONS_SEARCHED_METRIC)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(parts_searched, expected_parts);
+
+        let mut analyze_scanner = dataset.scan();
+        analyze_scanner
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap();
+        let analysis = analyze_scanner.analyze_plan().await.unwrap();
+        assert!(analysis.contains(PARTITIONS_SEARCHED_METRIC));
+    }
+
+    #[tokio::test]
+    async fn test_boolean_query_parts_searched_metrics() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["hello", "lance", "search"]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("text").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = dataset
+            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let expected_parts = inverted_index.partition_count();
+
+        let query = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("hello".to_string())
+                    .with_operator(Operator::And)
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("lance".to_string())
+                    .with_operator(Operator::And)
+                    .into(),
+            ),
+        ]);
+        let expected_total = expected_parts * 2;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let boolean_line = analysis
+            .lines()
+            .find(|line| line.contains("BooleanQuery"))
+            .unwrap();
+        assert!(
+            boolean_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
+            "BooleanQuery metrics missing partitions_searched: {boolean_line}"
+        );
     }
 }

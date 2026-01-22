@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import os
 import random
 import re
@@ -132,7 +133,7 @@ def btree_comparison_datasets(tmp_path):
             index_type="BTREE",
             name=fragment_index_name,
             replace=False,
-            fragment_uuid=fragment_index_id,
+            index_uuid=fragment_index_id,
             fragment_ids=[fragment_id],
         )
 
@@ -660,6 +661,11 @@ def test_filter_with_fts_index(dataset):
     results = results["doc"]
     for row in results:
         assert query == row.as_py()
+
+
+def test_create_scalar_index_fts_alias(dataset):
+    dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
+    assert any(idx["type"] == "Inverted" for idx in dataset.list_indices())
 
 
 def test_multi_index_create(tmp_path):
@@ -1688,37 +1694,33 @@ def test_zonemap_zone_size(tmp_path: Path):
     assert small_bytes_read < large_bytes_read
 
 
-def test_bloomfilter_index(tmp_path: Path):
-    """Test create bloomfilter index"""
-    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
-    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
-    indices = dataset.list_indices()
-    assert len(indices) == 1
+def test_zonemap_deletion_handling(tmp_path: Path):
+    """Test zonemap deletion handling"""
+    data = pa.table(
+        {
+            "id": range(10),
+            "value": [True, False] * 5,
+        }
+    )
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.delete("NOT value")
+    assert ds.to_table(filter="value = True").num_rows == 5
+    assert ds.to_table(filter="value = False").num_rows == 0
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
-    # Get detailed index statistics
-    index_stats = dataset.stats.index_stats("values_idx")
-    assert index_stats["index_type"] == "BloomFilter"
-    assert "indices" in index_stats
-    assert len(index_stats["indices"]) == 1
+    ds.create_scalar_index("value", index_type="zonemap")
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
-    # Verify bloomfilter statistics
-    bloom_stats = index_stats["indices"][0]
-    assert "num_blocks" in bloom_stats
-    assert bloom_stats["num_blocks"] == 2
-    assert bloom_stats["number_of_items"] == 8192
-    assert "probability" in bloom_stats
-    assert bloom_stats["probability"] == 0.00057  # Default probability
-
-    # Test that the bloomfilter index is being used in the query plan
-    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
-    plan = scanner.explain_plan()
-    assert "ScalarIndexQuery" in plan
-
-    # Verify the query returns correct results
-    result = scanner.to_table()
-    assert result.num_rows == 1
-    assert result["values"][0].as_py() == 1234
+    # now create the index before deletion
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.create_scalar_index("value", index_type="zonemap")
+    ds.delete("NOT value")
+    assert ds.to_table(filter="value = True").num_rows == 5
+    assert ds.to_table(filter="value = False").num_rows == 0
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
 
 def test_zonemap_index_remapping(tmp_path: Path):
@@ -1771,11 +1773,72 @@ def test_zonemap_index_remapping(tmp_path: Path):
     # Test with a different query to ensure index works properly
     scanner = dataset.scanner(filter="values BETWEEN 1000 AND 1500", prefilter=True)
     plan = scanner.explain_plan()
-    print(f"Query plan after optimization: {plan}")
     assert "ScalarIndexQuery" in plan
 
     result = scanner.to_table()
     assert result.num_rows == 501  # 1000..1500 inclusive
+
+
+def test_bloomfilter_index(tmp_path: Path):
+    """Test create bloomfilter index"""
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+
+    # Get detailed index statistics
+    index_stats = dataset.stats.index_stats("values_idx")
+    assert index_stats["index_type"] == "BloomFilter"
+    assert "indices" in index_stats
+    assert len(index_stats["indices"]) == 1
+
+    # Verify bloomfilter statistics
+    bloom_stats = index_stats["indices"][0]
+    assert "num_blocks" in bloom_stats
+    assert bloom_stats["num_blocks"] == 2
+    assert bloom_stats["number_of_items"] == 8192
+    assert "probability" in bloom_stats
+    assert bloom_stats["probability"] == 0.00057  # Default probability
+
+    # Test that the bloomfilter index is being used in the query plan
+    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 1
+    assert result["values"][0].as_py() == 1234
+
+
+def test_bloomfilter_deletion_handling(tmp_path: Path):
+    """Test bloomfilter deletion handling"""
+    data = pa.table(
+        {
+            "id": range(10),
+            "value": [1, 0] * 5,
+        }
+    )
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    # now create the index before deletion
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
 
 def test_json_index():
@@ -1798,13 +1861,14 @@ def test_json_index():
     )
 
 
-def test_null_handling(tmp_path: Path):
+def test_null_handling():
     tbl = pa.table(
         {
             "x": [1, 2, None, 3],
+            "y": ["a", "b", "c", None],
         }
     )
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset = lance.write_dataset(tbl, "memory://test")
 
     def check():
         assert dataset.to_table(filter="x IS NULL").num_rows == 1
@@ -1813,11 +1877,19 @@ def test_null_handling(tmp_path: Path):
         assert dataset.to_table(filter="x < 5").num_rows == 3
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
         assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x > 0 OR (y != 'a')").num_rows == 4
+        assert dataset.to_table(filter="x > 0 AND (y != 'a')").num_rows == 1
+        assert dataset.to_table(filter="y != 'a'").num_rows == 2
+        # NOT should exclude nulls (issue #4756)
+        assert dataset.to_table(filter="NOT (x < 2)").num_rows == 2
+        assert dataset.to_table(filter="NOT (x IN (1, 2))").num_rows == 1
+        # Double NOT
+        assert dataset.to_table(filter="NOT (NOT (x < 2))").num_rows == 1
 
     check()
     dataset.create_scalar_index("x", index_type="BITMAP")
     check()
-    dataset.create_scalar_index("x", index_type="BTREE")
+    dataset.create_scalar_index("y", index_type="BTREE")
     check()
 
 
@@ -1903,6 +1975,39 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "LabelList"
+
+
+def test_label_list_index_array_contains(tmp_path: Path):
+    # Include lists with NULL items to ensure NULL needle behavior matches
+    # non-index execution.
+    tbl = pa.table(
+        {"labels": [["foo", "bar"], ["bar"], ["baz"], ["qux", None], [None], [], None]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    expected_null_rows = dataset.to_table(
+        filter="array_contains(labels, NULL)"
+    ).num_rows
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    result = dataset.to_table(filter="array_contains(labels, 'foo')")
+    assert result.num_rows == 1
+
+    result = dataset.to_table(filter="array_contains(labels, 'bar')")
+    assert result.num_rows == 2
+
+    result = dataset.to_table(filter="array_contains(labels, 'oof')")
+    assert result.num_rows == 0
+
+    explain = dataset.scanner(filter="array_contains(labels, 'foo')").explain_plan()
+    assert "ScalarIndexQuery" in explain
+
+    # NULL needle: preserve semantics (must match pre-index execution) and avoid
+    # using the LABEL_LIST index.
+    actual_null_rows = dataset.to_table(filter="array_contains(labels, NULL)").num_rows
+    assert actual_null_rows == expected_null_rows
+    explain = dataset.scanner(filter="array_contains(labels, NULL)").explain_plan()
+    assert "ScalarIndexQuery" not in explain
 
 
 def test_create_index_empty_dataset(tmp_path: Path):
@@ -2222,7 +2327,7 @@ def build_distributed_fts_index(
             index_type="INVERTED",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
             **index_params,
         )
@@ -3075,24 +3180,21 @@ def test_distribute_fts_index_build(tmp_path):
     import uuid
 
     index_id = str(uuid.uuid4())
-    print(f"Using index ID: {index_id}")
     index_name = "multiple_fragment_idx"
 
     fragments = ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
 
     for fragment in ds.get_fragments():
         fragment_id = fragment.fragment_id
-        print(f"Creating index for fragment {fragment_id}")
 
-        # Use the new fragment_ids and fragment_uuid parameters
+        # Use the new fragment_ids and index_uuid parameters
         ds.create_scalar_index(
             column="text",
             index_type="INVERTED",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
             remove_stop_words=False,
         )
@@ -3133,8 +3235,6 @@ def test_distribute_fts_index_build(tmp_path):
         read_version=ds.version,
     )
 
-    print("Successfully committed multiple fragment index")
-
     # Verify the index was created and is functional
     indices = ds_committed.list_indices()
     assert len(indices) > 0, "No indices found after commit"
@@ -3162,7 +3262,6 @@ def test_distribute_fts_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    print(f"Search for '{search_word}' returned {results.num_rows} results")
     # We should get at least one result since we searched for a word from the dataset
     assert results.num_rows > 0, f"No results found for search term '{search_word}'"
 
@@ -3280,7 +3379,7 @@ def test_distribute_btree_index_build(tmp_path):
             index_type="BTREE",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
         )
 
@@ -3945,3 +4044,191 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify query still works after optimization
     results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)
     assert results.num_rows == 51  # 34 + 17 from new data
+
+
+def test_json_inverted_match_query(tmp_path):
+    # Prepare dataset with JSON data
+    json_data = [
+        {
+            "Title": "HarryPotter Chapter One",
+            "Content": "Once upon a time, there was a boy named Harry.",
+            "Author": "J.K. Rowling",
+            "Price": 99,
+            "Language": ["english", "french"],
+        },
+        {
+            "Title": "HarryPotter Chapter Two",
+            "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+            "Author": "J.K. Rowling",
+            "Price": 128,
+            "Language": ["english", "chinese"],
+        },
+        {
+            "Title": "The Hobbit",
+            "Content": "In a hole in the ground there lived a hobbit.",
+            "Author": "J.R.R. Tolkien",
+            "Price": 89,
+            "Language": ["english"],
+        },
+    ]
+
+    # Convert to JSON strings
+    json_strings = pa.array([json.dumps(doc) for doc in json_data], type=pa.json_())
+    table = pa.table({"json_col": json_strings, "id": range(len(json_data))})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Create inverted index with JSON tokenizer
+    dataset.create_scalar_index(
+        "json_col",
+        index_type="INVERTED",
+        base_tokenizer="simple",
+        max_token_length=10,
+        stem=True,
+        lower_case=True,
+        remove_stop_words=True,
+    )
+
+    # Test match query with token exceeding max_token_length
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Title,str,harrypotter", "json_col")
+    )
+    assert results.num_rows == 0
+
+    # Test stemming
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Content,str,onc", "json_col")
+    )
+    assert results.num_rows == 1
+
+    # Test language match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Language,str,english", "json_col")
+    )
+    assert results.num_rows == 3
+
+    # Test author match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Author,str,tolkien", "json_col")
+    )
+    assert results.num_rows == 1
+
+
+def test_describe_indices(tmp_path):
+    data = pa.table(
+        {
+            "id": range(100),
+            "text": [f"document {i} about lance database" for i in range(100)],
+            "bitmap": range(100),
+            "bloomfilter": range(100),
+            "btree": range(100),
+            "json": pa.array(
+                [json.dumps({"key": f"value_{i}"}) for i in range(100)], pa.json_()
+            ),
+            "ngram": [f"document {i}" for i in range(100)],
+            "zonemap": range(100),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED")
+    indices = ds.describe_indices()
+    assert len(indices) == 1
+
+    assert indices[0].name == "text_idx"
+    assert indices[0].type_url == "/lance.table.InvertedIndexDetails"
+    assert indices[0].index_type == "Inverted"
+    assert indices[0].num_rows_indexed == 100
+    assert indices[0].fields == [1]
+    assert indices[0].field_names == ["text"]
+    assert len(indices[0].segments) == 1
+    assert indices[0].segments[0].uuid is not None
+    assert indices[0].segments[0].fragment_ids == {0}
+    assert indices[0].segments[0].dataset_version_at_last_update == 1
+    assert indices[0].segments[0].index_version == 1
+    assert indices[0].segments[0].created_at is not None
+    assert isinstance(indices[0].segments[0].created_at, datetime)
+
+    details = indices[0].details
+    assert details is not None and len(details) > 0
+    assert details["lance_tokenizer"] is None
+    assert details["base_tokenizer"] == "simple"
+    assert details["language"] == "English"
+    assert not details["with_position"]
+    assert details["max_token_length"] == 40
+    assert details["lower_case"]
+    assert details["stem"]
+    assert details["remove_stop_words"]
+    assert details["custom_stop_words"] is None
+    assert details["ascii_folding"]
+    assert details["min_ngram_length"] == 3
+    assert details["max_ngram_length"] == 3
+    assert not details["prefix_only"]
+
+    ds.create_scalar_index("bitmap", index_type="BITMAP")
+    ds.create_scalar_index("bloomfilter", index_type="BLOOMFILTER")
+    ds.create_scalar_index("btree", index_type="BTREE")
+    ds.create_scalar_index(
+        "json",
+        IndexConfig(
+            index_type="json", parameters={"target_index_type": "btree", "path": "x"}
+        ),
+    )
+    ds.create_scalar_index("ngram", index_type="NGRAM")
+    ds.create_scalar_index("zonemap", index_type="ZONEMAP")
+
+    indices = ds.describe_indices()
+    # Skip text index since it is already asserted above
+    indices = [index for index in indices if index.name != "text_idx"]
+    indices.sort(key=lambda x: x.name)
+
+    names = [
+        "bitmap_idx",
+        "bloomfilter_idx",
+        "btree_idx",
+        "json_idx",
+        "ngram_idx",
+        "zonemap_idx",
+    ]
+    types_urls = [
+        "/lance.table.BitmapIndexDetails",
+        "/lance.index.pb.BloomFilterIndexDetails",
+        "/lance.table.BTreeIndexDetails",
+        "/lance.index.pb.JsonIndexDetails",
+        "/lance.table.NGramIndexDetails",
+        "/lance.table.ZoneMapIndexDetails",
+    ]
+    index_types = [
+        "Bitmap",
+        "BloomFilter",
+        "BTree",
+        "Json",
+        "NGram",
+        "ZoneMap",
+    ]
+    details = [
+        "{}",
+        "{}",
+        "{}",
+        '{"path":"x","target_details":{}}',
+        "{}",
+        "{}",
+    ]
+
+    for i in range(len(indices)):
+        assert indices[i].name == names[i]
+        assert indices[i].type_url == types_urls[i]
+        assert indices[i].index_type == index_types[i]
+        assert indices[i].num_rows_indexed == 100
+        assert indices[i].fields == [i + 2]
+        assert indices[i].field_names == [data.column_names[i + 2]]
+        assert len(indices[i].segments) == 1
+        assert indices[i].segments[0].fragment_ids == {0}
+        assert indices[i].segments[0].dataset_version_at_last_update == i + 2
+        assert indices[i].segments[0].index_version == 0
+        assert indices[i].segments[0].created_at is not None
+        assert isinstance(indices[i].segments[0].created_at, datetime)
+        assert indices[i].details == json.loads(details[i])
+
+    ds.delete("id < 50")
+    indices = ds.describe_indices()
+    for index in indices:
+        assert index.num_rows_indexed == 50

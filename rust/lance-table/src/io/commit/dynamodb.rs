@@ -21,6 +21,7 @@ use object_store::path::Path;
 use snafu::location;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use lance_core::error::box_error;
@@ -82,7 +83,14 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn wrap_err(self) -> Result<T> {
-        self.map_err(|err| Error::from(WrappedSdkError(err)))
+        self.map_err(|err| {
+            warn!(
+                target: "lance::dynamodb",
+                request_id = err.request_id().unwrap_or("unknown"),
+                "DynamoDB SDK error: {err:?}",
+            );
+            Error::from(WrappedSdkError(err))
+        })
     }
 }
 
@@ -267,11 +275,11 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
         let path = item
             .get(path!())
-            .ok_or_else(|| Error::io(format!("key {} is not present", path!()), location!()))?;
+            .ok_or_else(|| Error::not_found(format!("key {} is not present", path!())))?;
 
         match path {
             AttributeValue::S(path) => Ok(path.clone()),
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!("key {} is not a string", path!()),
                 location!(),
             )),
@@ -301,9 +309,11 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
         let path = item
             .get(path!())
-            .ok_or_else(|| Error::io(format!("key {} is not present", path!()), location!()))?
+            .ok_or_else(|| Error::not_found(format!("key {} is not present", path!())))?
             .as_s()
-            .map_err(|_| Error::io(format!("key {} is not a string", path!()), location!()))?
+            .map_err(|_| {
+                Error::invalid_input(format!("key {} is not a string", path!()), location!())
+            })?
             .as_str();
         let path = Path::from(path);
 
@@ -354,9 +364,9 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                     return Ok(None);
                 }
                 if items.len() > 1 {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!(
-                            "dynamodb table: {} return unexpected number of items",
+                            "dynamodb table: {} returned unexpected number of items",
                             self.table_name
                         ),
                         location!(),
@@ -365,22 +375,16 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
                 let item = items.pop().expect("length checked");
                 let version_attribute = item
-                .get(version!())
-                .ok_or_else(||
-                    Error::io(
-                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, version!()),
-                        location!(),
-                    )
-                )?;
+                    .get(version!())
+                    .ok_or_else(|| Error::not_found(
+                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, version!())
+                    ))?;
 
                 let path_attribute = item
-                .get(path!())
-                .ok_or_else(||
-                    Error::io(
-                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, path!()),
-                        location!(),
-                    )
-                )?;
+                    .get(path!())
+                    .ok_or_else(|| Error::not_found(
+                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, path!())
+                    ))?;
 
                 let size = item.get("size").and_then(|attr| match attr {
                     AttributeValue::N(size) => size.parse().ok(),
@@ -391,7 +395,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
                 match (version_attribute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => {
-                        let version = version.parse().map_err(|e| Error::io(
+                        let version = version.parse().map_err(|e| Error::invalid_input(
                             format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
                             location!(),
                         ))?;
@@ -406,7 +410,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                         };
                         Ok(Some(location))
                     },
-                    _ => Err(Error::io(
+                    _ => Err(Error::invalid_input(
                         format!("dynamodb error: found entries for {base_uri} but the returned data is not number type"),
                         location!(),
                     ))

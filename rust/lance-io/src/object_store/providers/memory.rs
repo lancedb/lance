@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -17,9 +17,9 @@ pub struct MemoryStoreProvider;
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for MemoryStoreProvider {
-    async fn new_store(&self, _base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
@@ -30,6 +30,9 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 
@@ -40,6 +43,14 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         }
         output.push_str(url.path());
         Ok(Path::from(output))
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        _url: &Url,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok("memory".to_string())
     }
 }
 
@@ -55,5 +66,16 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = MemoryStoreProvider;
+        assert_eq!(
+            "memory",
+            provider
+                .calculate_object_store_prefix(&Url::parse("memory://etc").unwrap(), None)
+                .unwrap()
+        );
     }
 }

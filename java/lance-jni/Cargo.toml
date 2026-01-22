@@ -1,16 +1,19 @@
 [package]
 name = "lance-jni"
-version = "0.38.3-beta.10"
+version = "2.1.0-beta.0"
 edition = "2021"
-authors = ["Lance Devs <dev@lancedb.com>"]
+authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/lancedb/lance"
+repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
 description = "JNI bindings for Lance Columnar format"
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = []
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }
@@ -19,10 +22,12 @@ lance-encoding = { path = "../../rust/lance-encoding" }
 lance-linalg = { path = "../../rust/lance-linalg" }
 lance-index = { path = "../../rust/lance-index" }
 lance-io = { path = "../../rust/lance-io" }
+lance-namespace = { path = "../../rust/lance-namespace" }
+lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
-arrow = { version = "56.1", features = ["ffi"] }
-arrow-schema = "56.1"
+arrow = { version = "57.1", features = ["ffi"] }
+arrow-schema = "57.1"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
@@ -30,12 +35,29 @@ tokio = { version = "1.23", features = [
     "fs",
     "sync",
 ] }
+async-trait = "0.1"
+snafu = "0.8"
 jni = "0.21.1"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1" }
+bytes = "1.11"
 log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
-prost = "0.13.5"
+prost = "0.14.1"
 roaring = "0.10.1"
-prost-types = "0.13.5"
+prost-types = "0.14.1"
 chrono = "0.4.41"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# This rule applies to every package except workspace members (dependencies
+# such as `arrow` and `tokio`). It disables debug info and related features on
+# dependencies so their binaries stay smaller, improving cache reuse.
+[profile.dev.package."*"]
+debug = false
+debug-assertions = false
+strip = "debuginfo"
+incremental = false

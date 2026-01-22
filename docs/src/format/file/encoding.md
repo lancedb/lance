@@ -22,7 +22,7 @@ layouts which represent the same data.
 
 ### Data Types
 
-Lance uses a subset of Arrow's type system for data types. An Arrow data type is is both a data type and an encoding.
+Lance uses a subset of Arrow's type system for data types. An Arrow data type is both a data type and an encoding.
 When writing data Lance will often normalize Arrow data types. For example, a string array and a large string array
 might end up traveling down the same path (variable width data). In fact, most types fall into two general paths. One
 for fixed-width data and one for variable-width data (where we recognize both 32-bit and 64-bit offsets).
@@ -253,7 +253,7 @@ blocks as opaque chunks. This means we can use any compression algorithm that we
 %%% proto.message.MiniBlockLayout %%%
 ```
 
-The protobuf for the mini block layout describes the cmopression of the various buffers. It also tells us
+The protobuf for the mini block layout describes the compression of the various buffers. It also tells us
 some information about the dictionary (if present) and the repetition index (if present).
 
 ### Full Zip Page Layout
@@ -478,7 +478,7 @@ This will likely change in future versions.
 Bitpacking is a compression technique that removes the unused bits from a set of values. For example, if we have
 a u32 array and the maximum value is 5000 then we only need 13 bits to store each value.
 
-When used in a mini-block context we always use 1024 values per block. In addition, we store the compresesed bit
+When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
 
 Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving

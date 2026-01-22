@@ -5,7 +5,7 @@
 
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
 
-use crate::BLOB_META_KEY;
+use crate::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
 
 pub enum Indentation {
     OneLine,
@@ -40,6 +40,9 @@ pub trait FieldExt {
 
     /// Check if the field is marked as a blob
     fn is_blob(&self) -> bool;
+
+    /// Check if the field is marked as a blob
+    fn is_blob_v2(&self) -> bool;
 }
 
 impl FieldExt for Field {
@@ -103,6 +106,18 @@ impl FieldExt for Field {
     fn is_blob(&self) -> bool {
         let field_metadata = self.metadata();
         field_metadata.get(BLOB_META_KEY).is_some()
+            || field_metadata
+                .get(ARROW_EXT_NAME_KEY)
+                .map(|value| value == BLOB_V2_EXT_NAME)
+                .unwrap_or(false)
+    }
+
+    fn is_blob_v2(&self) -> bool {
+        let field_metadata = self.metadata();
+        field_metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|value| value == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
     }
 }
 

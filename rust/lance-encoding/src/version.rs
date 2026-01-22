@@ -3,6 +3,8 @@
 
 use std::str::FromStr;
 
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -80,6 +82,18 @@ impl LanceFileVersion {
         use strum::IntoEnumIterator;
 
         Self::iter().filter(|&v| v != Self::Stable && v != Self::Next && v != Self::Legacy)
+    }
+
+    pub fn support_add_sub_column(&self) -> bool {
+        self > &Self::V2_1
+    }
+
+    pub fn support_remove_sub_column(&self, field: &Field) -> bool {
+        if self <= &Self::V2_1 {
+            field.data_type().is_struct()
+        } else {
+            field.data_type().is_nested()
+        }
     }
 }
 

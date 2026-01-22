@@ -9,15 +9,15 @@
 //! different abilities to handle concurrent writes, so a trait is provided
 //! to allow for different implementations.
 //!
-//! The trait [CommitHandler] can be implemented to provide different commit
+//! The trait [`CommitHandler`] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
+//! `ConditionalPutCommitHandler`, which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
 //! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
-//! terms of a lock. The trait [CommitLock] can be implemented as a simpler
-//! alternative to [CommitHandler].
+//! terms of a lock. The trait `CommitLock` can be implemented as a simpler
+//! alternative to [`CommitHandler`].
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -45,7 +45,8 @@ use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult, BLOB_DIR,
+    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult,
+    TRANSACTIONS_DIR,
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -62,7 +63,7 @@ use log;
 use object_store::path::Path;
 use prost::Message;
 
-mod conflict_resolver;
+pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
@@ -71,12 +72,13 @@ mod external_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
+#[allow(dead_code)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child("_transactions").child(transaction_file);
+    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -84,13 +86,13 @@ pub(crate) async fn read_transaction_file(
 }
 
 /// Write a transaction to a file and return the relative path.
-async fn write_transaction_file(
+pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child("_transactions").child(file_name.as_str());
+    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
@@ -107,13 +109,17 @@ async fn do_commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    blob_version: Option<u64>,
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, base_path, transaction).await?
+    } else {
+        String::new()
+    };
 
     let (mut manifest, indices) = if let Operation::Clone {
+        is_shallow,
         ref_name,
         ref_version,
         ref_path,
@@ -134,49 +140,79 @@ async fn do_commit_new_dataset(
         )
         .await?;
 
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
-        let new_manifest = source_manifest.shallow_clone(
-            ref_name.clone(),
-            ref_path.clone(),
-            new_base_id,
-            branch_name.clone(),
-            transaction_file,
-        );
+        if *is_shallow {
+            let new_base_id = source_manifest
+                .base_paths
+                .keys()
+                .max()
+                .map(|id| *id + 1)
+                .unwrap_or(0);
+            let new_manifest = source_manifest.shallow_clone(
+                ref_name.clone(),
+                ref_path.clone(),
+                new_base_id,
+                branch_name.clone(),
+                transaction_file,
+            );
 
-        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-            let reader = object_store.open(&source_manifest_location.path).await?;
-            let section: pb::IndexSection =
-                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-            section
-                .indices
-                .into_iter()
-                .map(|index_pb| {
-                    let mut index = IndexMetadata::try_from(index_pb)?;
-                    index.base_id = Some(new_base_id);
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = Some(new_base_id);
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            (new_manifest, updated_indices)
         } else {
-            vec![]
-        };
-        (new_manifest, updated_indices)
+            // Deep clone: build a manifest that references local files (no external bases)
+            let mut new_manifest = source_manifest.clone();
+            new_manifest.base_paths.clear();
+            new_manifest.branch = None;
+            new_manifest.tag = None;
+            new_manifest.index_section = None; // will be rewritten below
+            let mut new_frags = new_manifest.fragments.as_ref().clone();
+            for f in &mut new_frags {
+                for df in &mut f.files {
+                    df.base_id = None;
+                }
+                if let Some(d) = f.deletion_file.as_mut() {
+                    d.base_id = None;
+                }
+            }
+            new_manifest.fragments = Arc::new(new_frags);
+
+            // Indices: keep metadata but normalize base to local
+            let mut updated_indices = Vec::new();
+            if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                updated_indices = section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = None;
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (new_manifest, updated_indices)
+        }
     } else {
-        let (manifest, indices) = transaction.build_manifest(
-            None,
-            vec![],
-            &transaction_file,
-            write_config,
-            blob_version,
-        )?;
+        let (manifest, indices) =
+            transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
         (manifest, indices)
     };
-
-    manifest.blob_dataset_version = blob_version;
 
     let result = write_manifest_file(
         object_store,
@@ -190,6 +226,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
+        Some(transaction),
     )
     .await;
 
@@ -232,26 +269,6 @@ pub(crate) async fn commit_new_dataset(
     metadata_cache: &crate::session::caches::DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
-        let blob_path = base_path.child(BLOB_DIR);
-        let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
-        let (blob_manifest, _) = do_commit_new_dataset(
-            object_store,
-            commit_handler,
-            &blob_path,
-            &blob_tx,
-            write_config,
-            manifest_naming_scheme,
-            None,
-            metadata_cache,
-            store_registry.clone(),
-        )
-        .await?;
-        Some(blob_manifest.version)
-    } else {
-        None
-    };
-
     do_commit_new_dataset(
         object_store,
         commit_handler,
@@ -259,7 +276,6 @@ pub(crate) async fn commit_new_dataset(
         transaction,
         write_config,
         manifest_naming_scheme,
-        blob_version,
         metadata_cache,
         store_registry,
     )
@@ -415,10 +431,6 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for (old_field_id, new_field_id) in &old_field_id_mapping {
         let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
         field.id = *new_field_id;
-
-        if let Some(local_field) = manifest.local_schema.mut_field_by_id(*old_field_id) {
-            local_field.id = *new_field_id;
-        }
     }
 
     // Drop data files that are no longer in use.
@@ -537,9 +549,26 @@ fn must_recalculate_fragment_bitmap(
     index: &IndexMetadata,
     version: Option<&WriterVersion>,
 ) -> bool {
+    if index.fragment_bitmap.is_none() {
+        return true;
+    }
     // If the fragment bitmap was written by an old version of lance then we need to recalculate
     // it because it could be corrupt due to a bug in versions < 0.8.15
-    index.fragment_bitmap.is_none() || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true)
+    if let Some(version) = version {
+        if version.library != "lance" {
+            // We assume a different library is not affected by the bug.
+            return false;
+        }
+
+        let cutoff = semver::Version::new(0, 8, 15);
+        version
+            .lance_lib_version()
+            .map(|lance_lib_version| lance_lib_version < cutoff)
+            .unwrap_or(true)
+    } else {
+        // Older versions of Lance library didn't record writer version at all.
+        true
+    }
 }
 
 /// Update indices with new fields.
@@ -620,11 +649,14 @@ pub(crate) async fn do_commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-    new_blob_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, &dataset.base, transaction).await?
+    } else {
+        String::new()
+    };
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
@@ -641,6 +673,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -649,7 +682,6 @@ pub(crate) async fn do_commit_detached_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
-                new_blob_version,
             )?,
         };
 
@@ -676,6 +708,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
+            Some(transaction),
         )
         .await;
 
@@ -716,25 +749,6 @@ pub(crate) async fn commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
-        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
-        let blobs_tx =
-            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
-            blobs_dataset.as_ref(),
-            object_store,
-            commit_handler,
-            &blobs_tx,
-            write_config,
-            commit_config,
-            None,
-        )
-        .await?;
-        Some(blobs_manifest.version)
-    } else {
-        None
-    };
-
     do_commit_detached_transaction(
         dataset,
         object_store,
@@ -742,7 +756,6 @@ pub(crate) async fn commit_detached_transaction(
         transaction,
         write_config,
         commit_config,
-        new_blob_version,
     )
     .await
 }
@@ -771,27 +784,8 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowIdTreeMap>,
+    affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
-        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
-        let blobs_tx =
-            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
-            blobs_dataset.as_ref(),
-            object_store,
-            commit_handler,
-            &blobs_tx,
-            write_config,
-            commit_config,
-            None,
-        )
-        .await?;
-        Some(blobs_manifest.version)
-    } else {
-        None
-    };
-
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -849,8 +843,11 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
-        let transaction_file =
-            write_transaction_file(object_store, &dataset.base, &transaction).await?;
+        let transaction_file = if !write_config.disable_transaction_file() {
+            write_transaction_file(object_store, &dataset.base, &transaction).await?
+        } else {
+            String::new()
+        };
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
@@ -866,6 +863,7 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -874,7 +872,6 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
-                new_blob_version,
             )?,
         };
 
@@ -884,7 +881,7 @@ pub(crate) async fn commit_transaction(
         // The versions of Lance prior to when we started writing the writer version
         // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
         // make sure to recompute them.
-        // See: https://github.com/lancedb/lance/issues/1531
+        // See: https://github.com/lance-format/lance/issues/1531
         let recompute_stats = previous_writer_version.is_none();
 
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
@@ -908,6 +905,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
+            Some(&transaction),
         )
         .await;
 
@@ -999,6 +997,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1148,7 +1147,6 @@ mod tests {
         let transaction = Transaction::new(
             42,
             Operation::Append { fragments: vec![] },
-            /*blobs_op= */ None,
             Some("hello world".to_string()),
         );
 
@@ -1371,6 +1369,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_restore_does_not_decrease_max_fragment_id() {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Append a few times to advance max_fragment_id and create newer versions.
+        for _ in 0..2 {
+            let reader = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+            dataset.append(reader, None).await.unwrap();
+        }
+
+        let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Restore an earlier version (version 1) as the latest.
+        let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        dataset_v1.restore().await.unwrap();
+
+        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
+        let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
+        assert!(
+            restored_max >= latest_max,
+            "max_fragment_id should not decrease on restore: before={}, after={}",
+            latest_max,
+            restored_max
+        );
+    }
+
     async fn get_empty_dataset() -> (TempStrDir, Dataset) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
@@ -1550,7 +1579,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version=*/ None,
             HashMap::new(),
         );
 

@@ -6,8 +6,7 @@
 use std::{
     cmp::{max, Ordering},
     collections::{HashMap, VecDeque},
-    fmt::{self, Display},
-    str::FromStr,
+    fmt,
     sync::Arc,
 };
 
@@ -22,7 +21,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
     json::{is_arrow_json_field, is_json_field},
-    ARROW_EXT_NAME_KEY, *,
+    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
@@ -30,9 +29,10 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
-
-pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    Error, Result,
+};
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
 /// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
@@ -41,6 +41,21 @@ pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-clas
 /// (2) The field must be a leaf without child (i.e. it is a primitive data type).
 /// (3) The field must not be within a list type.
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
+
+/// Use this config key in Arrow field metadata to specify the position of a primary key column.
+/// The value is a 1-based integer indicating the order within the composite primary key.
+/// When specified, primary key fields are ordered by this position value.
+/// When not specified, primary key fields are ordered by their schema field id.
+pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
+    "lance-schema:unenforced-primary-key:position";
+
+fn has_blob_v2_extension(field: &ArrowField) -> bool {
+    field
+        .metadata()
+        .get(ARROW_EXT_NAME_KEY)
+        .map(|name| name == BLOB_V2_EXT_NAME)
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
@@ -71,6 +86,37 @@ pub struct SchemaCompareOptions {
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
+    /// Allow the source schema to be a subset of the target schema (default false)
+    pub allow_subschema: bool,
+}
+
+/// Blob column format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobVersion {
+    /// Legacy blob format (position / size only).
+    #[default]
+    V1,
+    /// Blob v2 struct format.
+    V2,
+}
+
+impl BlobVersion {
+    /// Convert a persisted string value (e.g. table config) into a blob version
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value {
+            "1" => Some(Self::V1),
+            "2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Persistable string representation for table config.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }
+    }
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -83,40 +129,6 @@ pub enum Encoding {
     Dictionary,
     /// RLE encoding.
     RLE,
-}
-
-/// Describes the rate at which a column should be compacted
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
-pub enum StorageClass {
-    /// Default storage class (stored in primary dataset)
-    #[default]
-    Default,
-    /// Blob storage class (stored in blob dataset)
-    Blob,
-}
-
-impl Display for StorageClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => write!(f, "default"),
-            Self::Blob => write!(f, "blob"),
-        }
-    }
-}
-
-impl FromStr for StorageClass {
-    type Err = Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "default" | "" => Ok(Self::Default),
-            "blob" => Ok(Self::Blob),
-            _ => Err(Error::Schema {
-                message: format!("Unknown storage class: {}", s),
-                location: location!(),
-            }),
-        }
-    }
 }
 
 /// What to do on a merge operation if the types of the fields don't match
@@ -139,12 +151,15 @@ pub struct Field {
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
-    pub children: Vec<Field>,
+    pub children: Vec<Self>,
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
-    pub storage_class: StorageClass,
-    pub unenforced_primary_key: bool,
+
+    /// Position of this field in the primary key (1-based).
+    /// None means the field is not part of the primary key.
+    /// Some(n) means this field is the nth column in the primary key.
+    pub unenforced_primary_key_position: Option<u32>,
 }
 
 impl Field {
@@ -161,8 +176,21 @@ impl Field {
             lt if lt.is_large_list() => {
                 DataType::LargeList(Arc::new(ArrowField::from(&self.children[0])))
             }
+            lt if lt.is_fixed_size_list_struct() => {
+                // Parse size from "fixed_size_list:struct:N"
+                let size: i32 =
+                    lt.0.split(':')
+                        .next_back()
+                        .expect("fixed_size_list:struct logical type missing size suffix")
+                        .parse()
+                        .expect("fixed_size_list:struct logical type has invalid size");
+                DataType::FixedSizeList(Arc::new(ArrowField::from(&self.children[0])), size)
+            }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
+            }
+            lt if lt.is_map() => {
+                DataType::Map(Arc::new(ArrowField::from(&self.children[0])), false)
             }
             lt => DataType::try_from(lt).unwrap(),
         }
@@ -171,14 +199,6 @@ impl Field {
     pub fn has_dictionary_types(&self) -> bool {
         matches!(self.data_type(), DataType::Dictionary(_, _))
             || self.children.iter().any(Self::has_dictionary_types)
-    }
-
-    pub fn is_default_storage(&self) -> bool {
-        self.storage_class == StorageClass::Default
-    }
-
-    pub fn storage_class(&self) -> StorageClass {
-        self.storage_class
     }
 
     /// Merge a field with another field using a reference field to ensure
@@ -254,11 +274,17 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        let children = self
-            .children
-            .iter()
-            .filter_map(|c| c.apply_projection(projection))
-            .collect::<Vec<_>>();
+        // For Map types, we must preserve ALL children (entries struct with key/value)
+        // Map internal structure should not be subject to projection filtering
+        let children = if self.logical_type.is_map() {
+            // Map field: keep all children intact (entries struct and its key/value fields)
+            self.children.clone()
+        } else {
+            self.children
+                .iter()
+                .filter_map(|c| c.apply_projection(projection))
+                .collect::<Vec<_>>()
+        };
 
         // The following case is invalid:
         // - This is a nested field (has children)
@@ -276,7 +302,11 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(projection.blob_handling.unload_if_needed(new_field))
+            Some(
+                projection
+                    .blob_handling
+                    .unload_if_needed(new_field, projection.blob_version),
+            )
         }
     }
 
@@ -501,16 +531,55 @@ impl Field {
     /// Blob fields will load descriptions by default
     pub fn is_blob(&self) -> bool {
         self.metadata.contains_key(BLOB_META_KEY)
+            || self
+                .metadata
+                .get(ARROW_EXT_NAME_KEY)
+                .map(|name| name == BLOB_V2_EXT_NAME)
+                .unwrap_or(false)
+    }
+
+    /// Returns true if the field is explicitly marked as blob v2 extension.
+    pub fn is_blob_v2(&self) -> bool {
+        self.metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
+    }
+
+    /// If the field is a blob, update this field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
+    pub fn unloaded_mut(&mut self) {
+        if self.is_blob_v2() {
+            self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
+        } else if self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+        }
     }
 
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded(mut self) -> Self {
-        if self.data_type().is_binary_like() && self.is_blob() {
-            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
+        if self.is_blob() {
+            match version {
+                BlobVersion::V2 => {
+                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+                    self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
+                }
+                BlobVersion::V1 => {
+                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+                    self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+                }
+            }
         }
         self
     }
@@ -526,8 +595,7 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
-            storage_class: self.storage_class,
-            unenforced_primary_key: self.unenforced_primary_key,
+            unenforced_primary_key_position: self.unenforced_primary_key_position,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -635,6 +703,12 @@ impl Field {
                 Ok(self.clone())
             }
             (DataType::Struct(_), DataType::Struct(_)) => {
+                // Blob v2 columns are special: they can have different struct layouts
+                // (logical input vs. descriptor struct). We treat blob v2 structs like primitive
+                // fields (e.g. a binary column) during schema set operations (union/subtract).
+                if self.is_blob() {
+                    return Ok(self.clone());
+                }
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
@@ -653,7 +727,8 @@ impl Field {
                 Ok(cloned)
             }
             (DataType::List(_), DataType::List(_))
-            | (DataType::LargeList(_), DataType::LargeList(_)) => {
+            | (DataType::LargeList(_), DataType::LargeList(_))
+            | (DataType::Map(_, _), DataType::Map(_, _)) => {
                 let projected =
                     self.children[0].project_by_field(&other.children[0], on_type_mismatch)?;
                 let mut cloned = self.clone();
@@ -705,6 +780,33 @@ impl Field {
         }
     }
 
+    /// Case-insensitive version of resolve.
+    /// First tries exact match for each child, then falls back to case-insensitive.
+    pub(crate) fn resolve_case_insensitive<'a>(
+        &'a self,
+        split: &mut VecDeque<&str>,
+        fields: &mut Vec<&'a Self>,
+    ) -> bool {
+        fields.push(self);
+        if split.is_empty() {
+            return true;
+        }
+        let first = split.pop_front().unwrap();
+        // Try exact match first
+        if let Some(child) = self.children.iter().find(|c| c.name == first) {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        // Fall back to case-insensitive match
+        if let Some(child) = self
+            .children
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(first))
+        {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        false
+    }
+
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Arrow {
@@ -715,13 +817,33 @@ impl Field {
                 location: location!(),
             });
         }
+
+        if self.is_blob() != other.is_blob() {
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to intersect blob and non-blob field: {}",
+                    self.name
+                ),
+                location: location!(),
+            });
+        }
+
         let self_type = self.data_type();
         let other_type = other.data_type();
 
         if matches!(
             (&self_type, &other_type),
-            (DataType::Struct(_), DataType::Struct(_)) | (DataType::List(_), DataType::List(_))
+            (DataType::Struct(_), DataType::Struct(_))
+                | (DataType::List(_), DataType::List(_))
+                | (DataType::Map(_, _), DataType::Map(_, _))
         ) {
+            // Blob v2 uses a struct logical type for descriptors, which differs from the logical
+            // input struct (data/uri). When intersecting schemas for projection we want to keep
+            // the projected blob layout instead of intersecting by child names.
+            if self.is_blob() {
+                return Ok(self.clone());
+            }
+
             let children = self
                 .children
                 .iter()
@@ -744,8 +866,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
-                unenforced_primary_key: self.unenforced_primary_key,
+                unenforced_primary_key_position: self.unenforced_primary_key_position,
             };
             return Ok(f);
         }
@@ -808,8 +929,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
-                unenforced_primary_key: self.unenforced_primary_key,
+                unenforced_primary_key_position: self.unenforced_primary_key_position,
             })
         }
     }
@@ -939,6 +1059,11 @@ impl Field {
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
+
+    /// Return true if the field is part of the (unenforced) primary key.
+    pub fn is_unenforced_primary_key(&self) -> bool {
+        self.unenforced_primary_key_position.is_some()
+    }
 }
 
 impl fmt::Display for Field {
@@ -969,6 +1094,7 @@ impl TryFrom<&ArrowField> for Field {
     type Error = Error;
 
     fn try_from(field: &ArrowField) -> Result<Self> {
+        let mut metadata = field.metadata().clone();
         let children = match field.data_type() {
             DataType::Struct(children) => children
                 .iter()
@@ -976,23 +1102,70 @@ impl TryFrom<&ArrowField> for Field {
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::FixedSizeList(item, _) if matches!(item.data_type(), DataType::Struct(_)) => {
+                vec![Self::try_from(item.as_ref())?]
+            }
+            DataType::Map(entries, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::Schema {
+                        message: "Unsupported map field with keys_sorted=true".to_string(),
+                        location: location!(),
+                    });
+                }
+                // Validate Map entries follow Arrow specification
+                let DataType::Struct(struct_fields) = entries.data_type() else {
+                    return Err(Error::Schema {
+                        message: "Map entries field must be a Struct<key, value>".to_string(),
+                        location: location!(),
+                    });
+                };
+                if struct_fields.len() < 2 {
+                    return Err(Error::Schema {
+                        message: "Map entries struct must contain both key and value fields"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+                let key_field = &struct_fields[0];
+                if key_field.is_nullable() {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                            key_field.name()
+                        ),
+                        location: location!(),
+                    });
+                }
+                vec![Self::try_from(entries.as_ref())?]
+            }
             _ => vec![],
         };
-        let storage_class = field
-            .metadata()
-            .get(LANCE_STORAGE_CLASS_SCHEMA_META_KEY)
-            .map(|s| StorageClass::from_str(s))
-            .unwrap_or(Ok(StorageClass::Default))?;
+        let unenforced_primary_key_position = metadata
+            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                // Backward compatibility: use 0 for legacy boolean flag
+                metadata
+                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .map(|_| 0)
+            });
+        let is_blob_v2 = has_blob_v2_extension(field);
 
-        let unenforced_primary_key = field
-            .metadata()
-            .get(LANCE_UNENFORCED_PRIMARY_KEY)
-            .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
+        if is_blob_v2 {
+            metadata
+                .entry(ARROW_EXT_NAME_KEY.to_string())
+                .or_insert_with(|| BLOB_V2_EXT_NAME.to_string());
+        }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
+        } else if is_blob_v2 {
+            LogicalType::from("struct")
         } else {
             LogicalType::try_from(field.data_type())?
         };
@@ -1006,16 +1179,17 @@ impl TryFrom<&ArrowField> for Field {
                 dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
-                // Use plain encoder to store the offsets of list.
-                DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
+                // Use plain encoder to store the offsets of list and map.
+                DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => {
+                    Some(Encoding::Plain)
+                }
                 _ => None,
             },
-            metadata: field.metadata().clone(),
+            metadata,
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            storage_class,
-            unenforced_primary_key,
+            unenforced_primary_key_position,
         })
     }
 }
@@ -1033,6 +1207,12 @@ impl From<&Field> for ArrowField {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
 
+        if field.logical_type.is_blob() {
+            metadata
+                .entry(BLOB_META_KEY.to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
             metadata.insert(
@@ -1041,15 +1221,6 @@ impl From<&Field> for ArrowField {
             );
         }
 
-        match field.storage_class {
-            StorageClass::Default => {}
-            StorageClass::Blob => {
-                metadata.insert(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                );
-            }
-        }
         out.with_metadata(metadata)
     }
 }
@@ -1060,7 +1231,8 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
-
+    use lance_arrow::BLOB_META_KEY;
+    use std::collections::HashMap;
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
@@ -1152,6 +1324,23 @@ mod tests {
             .0,
             "struct"
         );
+
+        assert_eq!(
+            LogicalType::try_from(&DataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        ArrowField::new("key", DataType::Utf8, false),
+                        ArrowField::new("value", DataType::Int32, true),
+                    ])),
+                    true
+                )),
+                false
+            ))
+            .unwrap()
+            .0,
+            "map"
+        );
     }
 
     #[test]
@@ -1169,6 +1358,89 @@ mod tests {
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::from(&field), arrow_field);
+    }
+
+    #[test]
+    fn map_key_must_be_non_nullable() {
+        let entries_field = Arc::new(ArrowField::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Utf8, true), // invalid: nullable key
+                ArrowField::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ));
+        let arrow_field = ArrowField::new("props", DataType::Map(entries_field, false), true);
+
+        let result = Field::try_from(&arrow_field);
+        assert!(result.is_err(), "Nullable map key should be rejected");
+    }
+
+    #[test]
+    fn map_keys_sorted_unsupported() {
+        let entries_field = Arc::new(ArrowField::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Utf8, false),
+                ArrowField::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ));
+
+        // Test that keys_sorted=true is rejected
+        let arrow_field_sorted = ArrowField::new(
+            "map_field",
+            DataType::Map(entries_field.clone(), true),
+            true,
+        );
+        let result = Field::try_from(&arrow_field_sorted);
+        assert!(result.is_err(), "keys_sorted=true should be rejected");
+        assert!(result.unwrap_err().to_string().contains("keys_sorted=true"));
+
+        // Test that keys_sorted=false is supported
+        let arrow_field_unsorted =
+            ArrowField::new("map_field", DataType::Map(entries_field, false), true);
+        let lance_field_unsorted = Field::try_from(&arrow_field_unsorted).unwrap();
+
+        // Verify conversion back to ArrowField preserves keys_sorted=false
+        let converted_field_unsorted = ArrowField::from(&lance_field_unsorted);
+        match converted_field_unsorted.data_type() {
+            DataType::Map(_, keys_sorted) => assert!(!keys_sorted, "keys_sorted should be false"),
+            _ => panic!("Expected Map type"),
+        }
+    }
+
+    #[test]
+    fn map_entries_must_be_struct() {
+        let entries_field = Arc::new(ArrowField::new("entries", DataType::Utf8, false));
+        let arrow_field = ArrowField::new("map_field", DataType::Map(entries_field, false), true);
+
+        let err = Field::try_from(&arrow_field).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Map entries field must be a Struct"),
+            "Expected struct requirement error, got {err}"
+        );
+    }
+
+    #[test]
+    fn map_entries_struct_needs_key_and_value() {
+        let entries_field = Arc::new(ArrowField::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "key",
+                DataType::Utf8,
+                false,
+            )])),
+            false,
+        ));
+        let arrow_field = ArrowField::new("map_field", DataType::Map(entries_field, false), true);
+
+        let err = Field::try_from(&arrow_field).unwrap_err();
+        assert!(
+            err.to_string().contains("must contain both key and value"),
+            "Expected both fields requirement error, got {err}"
+        );
     }
 
     #[test]
@@ -1531,5 +1803,17 @@ mod tests {
         // Finally, ignore will ignore
         assert!(f1.compare_with_options(&f2, &ignore_nullability));
         assert!(f2.compare_with_options(&f1, &ignore_nullability));
+    }
+
+    #[test]
+    fn blob_into_unloaded_selects_v2_layout() {
+        let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
+        assert_eq!(unloaded.children.len(), 5);
+        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }
 }

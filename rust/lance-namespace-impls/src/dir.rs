@@ -6,205 +6,617 @@
 //! This module provides a directory-based implementation of the Lance namespace
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Arc;
+pub mod manifest;
 
+use arrow::record_batch::RecordBatchIterator;
+use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
-use opendal::Operator;
+use lance::session::Session;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 
+use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
-    ListNamespacesResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
-    TableExistsRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
+    DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableRequest, DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
 };
 
 use lance_core::{box_error, Error, Result};
+use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
 
-/// Connect to a directory-based namespace implementation.
+use crate::credentials::{
+    create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
+};
+
+/// Result of checking table status atomically.
 ///
-/// This is a convenience wrapper around DirectoryNamespace::new that returns
-/// the same type as connect for API consistency.
-pub async fn connect_dir(properties: HashMap<String, String>) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties).map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+/// This struct captures the state of a table directory in a single snapshot,
+/// avoiding race conditions between checking existence and other status flags.
+pub(crate) struct TableStatus {
+    /// Whether the table directory exists (has any files)
+    pub(crate) exists: bool,
+    /// Whether the table has a `.lance-deregistered` marker file
+    pub(crate) is_deregistered: bool,
+    /// Whether the table has a `.lance-reserved` marker file (declared but not written)
+    pub(crate) has_reserved_file: bool,
 }
 
-/// Configuration for DirectoryNamespace.
-#[derive(Debug, Clone)]
-pub struct DirectoryNamespaceConfig {
-    /// Root directory for the namespace
+/// Builder for creating a DirectoryNamespace.
+///
+/// This builder provides a fluent API for configuring and establishing
+/// connections to directory-based Lance namespaces.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create a local directory namespace
+/// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ```no_run
+/// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+/// # use lance::session::Session;
+/// # use std::sync::Arc;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create with custom storage options and session
+/// let session = Arc::new(Session::default());
+/// let namespace = DirectoryNamespaceBuilder::new("s3://bucket/path")
+///     .storage_option("region", "us-west-2")
+///     .storage_option("access_key_id", "key")
+///     .session(session)
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct DirectoryNamespaceBuilder {
     root: String,
-    /// Storage options for the backend
-    storage_options: HashMap<String, String>,
+    storage_options: Option<HashMap<String, String>>,
+    session: Option<Arc<Session>>,
+    manifest_enabled: bool,
+    dir_listing_enabled: bool,
+    inline_optimization_enabled: bool,
+    credential_vendor_properties: HashMap<String, String>,
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
 }
 
-impl DirectoryNamespaceConfig {
-    /// Property key for the root directory
-    pub const ROOT: &'static str = "root";
-    /// Prefix for storage options
-    pub const STORAGE_OPTIONS_PREFIX: &'static str = "storage.";
+impl std::fmt::Debug for DirectoryNamespaceBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryNamespaceBuilder")
+            .field("root", &self.root)
+            .field("storage_options", &self.storage_options)
+            .field("manifest_enabled", &self.manifest_enabled)
+            .field("dir_listing_enabled", &self.dir_listing_enabled)
+            .field(
+                "inline_optimization_enabled",
+                &self.inline_optimization_enabled,
+            )
+            .field(
+                "context_provider",
+                &self.context_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
+}
 
-    /// Create a new configuration from properties
-    pub fn new(properties: HashMap<String, String>) -> Self {
+impl DirectoryNamespaceBuilder {
+    /// Create a new DirectoryNamespaceBuilder with the specified root path.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Root directory path (local path or cloud URI like s3://bucket/path)
+    pub fn new(root: impl Into<String>) -> Self {
+        Self {
+            root: root.into().trim_end_matches('/').to_string(),
+            storage_options: None,
+            session: None,
+            manifest_enabled: true,
+            dir_listing_enabled: true, // Default to enabled for backwards compatibility
+            inline_optimization_enabled: true,
+            credential_vendor_properties: HashMap::new(),
+            context_provider: None,
+        }
+    }
+
+    /// Enable or disable manifest-based listing.
+    ///
+    /// When enabled (default), the namespace uses a `__manifest` table to track tables.
+    /// When disabled, relies solely on directory scanning.
+    pub fn manifest_enabled(mut self, enabled: bool) -> Self {
+        self.manifest_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable directory-based listing fallback.
+    ///
+    /// When enabled (default), falls back to directory scanning for tables not in the manifest.
+    /// When disabled, only consults the manifest table.
+    pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
+        self.dir_listing_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable inline optimization of the __manifest table.
+    ///
+    /// When enabled (default), performs compaction and indexing on the __manifest table
+    /// after every write operation to maintain optimal performance.
+    /// When disabled, manual optimization must be performed separately.
+    pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
+        self.inline_optimization_enabled = enabled;
+        self
+    }
+
+    /// Create a DirectoryNamespaceBuilder from properties HashMap.
+    ///
+    /// This method parses a properties map into builder configuration.
+    /// It expects:
+    /// - `root`: The root directory path (required)
+    /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
+    /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable inline optimization of __manifest table (optional, default: true)
+    /// - `storage.*`: Storage options (optional, prefix will be stripped)
+    ///
+    /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
+    /// - `credential_vendor.enabled`: Set to "true" to enable credential vending (required)
+    /// - `credential_vendor.permission`: Permission level: read, write, or admin (default: read)
+    ///
+    /// AWS-specific properties (for s3:// locations):
+    /// - `credential_vendor.aws_role_arn`: AWS IAM role ARN (required for AWS)
+    /// - `credential_vendor.aws_external_id`: AWS external ID (optional)
+    /// - `credential_vendor.aws_region`: AWS region (optional)
+    /// - `credential_vendor.aws_role_session_name`: AWS role session name (optional)
+    /// - `credential_vendor.aws_duration_millis`: Credential duration in ms (default: 3600000, range: 15min-12hrs)
+    ///
+    /// GCP-specific properties (for gs:// locations):
+    /// - `credential_vendor.gcp_service_account`: Service account to impersonate (optional)
+    ///
+    /// Note: GCP uses Application Default Credentials (ADC). To use a service account key file,
+    /// set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable before starting.
+    /// GCP token duration cannot be configured; it's determined by the STS endpoint (typically 1 hour).
+    ///
+    /// Azure-specific properties (for az:// locations):
+    /// - `credential_vendor.azure_account_name`: Azure storage account name (required for Azure)
+    /// - `credential_vendor.azure_tenant_id`: Azure tenant ID (optional)
+    /// - `credential_vendor.azure_duration_millis`: Credential duration in ms (default: 3600000, up to 7 days)
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - Configuration properties
+    /// * `session` - Optional Lance session to reuse object store registry
+    ///
+    /// # Returns
+    ///
+    /// Returns a `DirectoryNamespaceBuilder` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `root` property is missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # use std::collections::HashMap;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut properties = HashMap::new();
+    /// properties.insert("root".to_string(), "/path/to/data".to_string());
+    /// properties.insert("manifest_enabled".to_string(), "true".to_string());
+    /// properties.insert("dir_listing_enabled".to_string(), "false".to_string());
+    /// properties.insert("storage.region".to_string(), "us-west-2".to_string());
+    ///
+    /// let namespace = DirectoryNamespaceBuilder::from_properties(properties, None)?
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_properties(
+        properties: HashMap<String, String>,
+        session: Option<Arc<Session>>,
+    ) -> Result<Self> {
+        // Extract root from properties (required)
         let root = properties
-            .get(Self::ROOT)
+            .get("root")
             .cloned()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .trim_end_matches('/')
-            .to_string();
+            .ok_or_else(|| Error::Namespace {
+                source: "Missing required property 'root' for directory namespace".into(),
+                location: snafu::location!(),
+            })?;
 
+        // Extract storage options (properties prefixed with "storage.")
         let storage_options: HashMap<String, String> = properties
             .iter()
             .filter_map(|(k, v)| {
-                k.strip_prefix(Self::STORAGE_OPTIONS_PREFIX)
+                k.strip_prefix("storage.")
                     .map(|key| (key.to_string(), v.clone()))
             })
             .collect();
 
-        Self {
-            root,
+        let storage_options = if storage_options.is_empty() {
+            None
+        } else {
+            Some(storage_options)
+        };
+
+        // Extract manifest_enabled (default: true)
+        let manifest_enabled = properties
+            .get("manifest_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
+        // Extract dir_listing_enabled (default: true)
+        let dir_listing_enabled = properties
+            .get("dir_listing_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
+        // Extract inline_optimization_enabled (default: true)
+        let inline_optimization_enabled = properties
+            .get("inline_optimization_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
+        // Extract credential vendor properties (properties prefixed with "credential_vendor.")
+        // The prefix is stripped to get short property names
+        // The build() method will check if enabled=true before creating the vendor
+        let credential_vendor_properties: HashMap<String, String> = properties
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("credential_vendor.")
+                    .map(|key| (key.to_string(), v.clone()))
+            })
+            .collect();
+
+        Ok(Self {
+            root: root.trim_end_matches('/').to_string(),
             storage_options,
-        }
+            session,
+            manifest_enabled,
+            dir_listing_enabled,
+            inline_optimization_enabled,
+            credential_vendor_properties,
+            context_provider: None,
+        })
     }
 
-    /// Get the root directory
-    pub fn root(&self) -> &str {
-        &self.root
+    /// Add a storage option.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Storage option key (e.g., "region", "access_key_id")
+    /// * `value` - Storage option value
+    pub fn storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.storage_options
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
     }
 
-    /// Get the storage options
-    pub fn storage_options(&self) -> &HashMap<String, String> {
-        &self.storage_options
+    /// Add multiple storage options.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - HashMap of storage options to add
+    pub fn storage_options(mut self, options: HashMap<String, String>) -> Self {
+        self.storage_options
+            .get_or_insert_with(HashMap::new)
+            .extend(options);
+        self
+    }
+
+    /// Set the Lance session to use for this namespace.
+    ///
+    /// When a session is provided, the namespace will reuse the session's
+    /// object store registry, allowing multiple namespaces and datasets
+    /// to share the same underlying storage connections.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Arc-wrapped Lance session
+    pub fn session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Add a credential vendor property.
+    ///
+    /// Use short property names without the `credential_vendor.` prefix.
+    /// Common properties: `enabled`, `permission`.
+    /// AWS properties: `aws_role_arn`, `aws_external_id`, `aws_region`, `aws_role_session_name`, `aws_duration_millis`.
+    /// GCP properties: `gcp_service_account`.
+    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_duration_millis`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key (e.g., "enabled", "aws_role_arn")
+    /// * `value` - Property value
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let namespace = DirectoryNamespaceBuilder::new("s3://my-bucket/data")
+    ///     .credential_vendor_property("enabled", "true")
+    ///     .credential_vendor_property("aws_role_arn", "arn:aws:iam::123456789012:role/MyRole")
+    ///     .credential_vendor_property("permission", "read")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn credential_vendor_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.credential_vendor_properties
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Add multiple credential vendor properties.
+    ///
+    /// Use short property names without the `credential_vendor.` prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - HashMap of credential vendor properties to add
+    pub fn credential_vendor_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.credential_vendor_properties.extend(properties);
+        self
+    }
+
+    /// Set a dynamic context provider for per-request context.
+    ///
+    /// The provider can be used to generate additional context for operations.
+    /// For DirectoryNamespace, the context is stored but not directly used
+    /// in operations (unlike RestNamespace where it's converted to HTTP headers).
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The context provider implementation
+    pub fn context_provider(mut self, provider: Arc<dyn DynamicContextProvider>) -> Self {
+        self.context_provider = Some(provider);
+        self
+    }
+
+    /// Build the DirectoryNamespace.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `DirectoryNamespace` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The root path is invalid
+    /// - Connection to the storage backend fails
+    /// - Storage options are invalid
+    pub async fn build(self) -> Result<DirectoryNamespace> {
+        let (object_store, base_path) =
+            Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
+
+        let manifest_ns = if self.manifest_enabled {
+            match manifest::ManifestNamespace::from_directory(
+                self.root.clone(),
+                self.storage_options.clone(),
+                self.session.clone(),
+                object_store.clone(),
+                base_path.clone(),
+                self.dir_listing_enabled,
+                self.inline_optimization_enabled,
+            )
+            .await
+            {
+                Ok(ns) => Some(Arc::new(ns)),
+                Err(e) => {
+                    // Failed to initialize manifest namespace, fall back to directory listing only
+                    log::warn!(
+                        "Failed to initialize manifest namespace, falling back to directory listing only: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Create credential vendor once during initialization if enabled
+        let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
+        {
+            create_credential_vendor_for_location(&self.root, &self.credential_vendor_properties)
+                .await?
+                .map(Arc::from)
+        } else {
+            None
+        };
+
+        Ok(DirectoryNamespace {
+            root: self.root,
+            storage_options: self.storage_options,
+            session: self.session,
+            object_store,
+            base_path,
+            manifest_ns,
+            dir_listing_enabled: self.dir_listing_enabled,
+            credential_vendor,
+            context_provider: self.context_provider,
+        })
+    }
+
+    /// Initialize the Lance ObjectStore based on the configuration
+    async fn initialize_object_store(
+        root: &str,
+        storage_options: &Option<HashMap<String, String>>,
+        session: &Option<Arc<Session>>,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        // Build ObjectStoreParams from storage options
+        let accessor = storage_options.clone().map(|opts| {
+            Arc::new(lance_io::object_store::StorageOptionsAccessor::with_static_options(opts))
+        });
+        let params = ObjectStoreParams {
+            storage_options_accessor: accessor,
+            ..Default::default()
+        };
+
+        // Use object store registry from session if provided, otherwise create a new one
+        let registry = if let Some(session) = session {
+            session.store_registry()
+        } else {
+            Arc::new(ObjectStoreRegistry::default())
+        };
+
+        // Use Lance's object store factory to create from URI
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to create object store: {}", e).into(),
+                location: snafu::location!(),
+            })?;
+
+        Ok((object_store, base_path))
     }
 }
 
 /// Directory-based implementation of Lance Namespace.
 ///
 /// This implementation stores tables as Lance datasets in a directory structure.
-/// It supports local filesystems and cloud storage backends through OpenDAL.
+/// It supports local filesystems and cloud storage backends through Lance's object store.
+///
+/// ## Manifest-based Listing
+///
+/// When `manifest_enabled=true`, the namespace uses a special `__manifest` Lance table to track tables
+/// instead of scanning the filesystem. This provides:
+/// - Better performance for listing operations
+/// - Ability to track table metadata
+/// - Foundation for future features like namespaces and table renaming
+///
+/// When `dir_listing_enabled=true`, the namespace falls back to directory scanning for tables not
+/// found in the manifest, enabling gradual migration.
+///
+/// ## Credential Vending
+///
+/// When credential vendor properties are configured, `describe_table` will vend temporary
+/// credentials based on the table location URI. The vendor type is auto-selected:
+/// - `s3://` locations use AWS STS AssumeRole
+/// - `gs://` locations use GCP OAuth2 tokens
+/// - `az://` locations use Azure SAS tokens
 pub struct DirectoryNamespace {
-    config: DirectoryNamespaceConfig,
-    operator: Operator,
+    root: String,
+    storage_options: Option<HashMap<String, String>>,
+    #[allow(dead_code)]
+    session: Option<Arc<Session>>,
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+    manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
+    dir_listing_enabled: bool,
+    /// Credential vendor created once during initialization.
+    /// Used to vend temporary credentials for table access.
+    credential_vendor: Option<Arc<dyn CredentialVendor>>,
+    /// Dynamic context provider for per-request context.
+    /// Stored but not directly used in operations (available for future extensions).
+    #[allow(dead_code)]
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+}
+
+impl std::fmt::Debug for DirectoryNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
+impl std::fmt::Display for DirectoryNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
 }
 
 impl DirectoryNamespace {
-    /// Create a new DirectoryNamespace instance
-    pub fn new(properties: HashMap<String, String>) -> Result<Self> {
-        let config = DirectoryNamespaceConfig::new(properties);
-        let operator = Self::initialize_operator(&config)?;
+    /// Apply pagination to a list of table names
+    ///
+    /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.
+    ///
+    /// # Arguments
+    /// * `names` - The vector of table names to paginate
+    /// * `page_token` - Skip items until finding one greater than this value (start_after semantics)
+    /// * `limit` - Maximum number of items to keep
+    fn apply_pagination(names: &mut Vec<String>, page_token: Option<String>, limit: Option<i32>) {
+        // Sort alphabetically for consistent ordering
+        names.sort();
 
-        Ok(Self { config, operator })
+        // Apply page_token filtering (start_after semantics)
+        if let Some(start_after) = page_token {
+            if let Some(index) = names
+                .iter()
+                .position(|name| name.as_str() > start_after.as_str())
+            {
+                names.drain(0..index);
+            } else {
+                names.clear();
+            }
+        }
+
+        // Apply limit
+        if let Some(limit) = limit {
+            if limit >= 0 {
+                names.truncate(limit as usize);
+            }
+        }
     }
 
-    /// Initialize the OpenDAL operator based on the configuration
-    fn initialize_operator(config: &DirectoryNamespaceConfig) -> Result<Operator> {
-        let root = config.root();
-        let storage_options = &config.storage_options;
-
-        // Parse the root path to determine scheme and configuration
-        let (scheme, opendal_config) = Self::parse_storage_path(root, storage_options)?;
-
-        // Create the operator with the determined scheme and configuration
-        let operator =
-            Operator::via_iter(scheme, opendal_config).map_err(|e| Error::Namespace {
-                source: format!("Failed to create operator: {}", e).into(),
+    /// List tables using directory scanning (fallback method)
+    async fn list_directory_tables(&self) -> Result<Vec<String>> {
+        let mut tables = Vec::new();
+        let entries = self
+            .object_store
+            .read_dir(self.base_path.clone())
+            .await
+            .map_err(|e| Error::IO {
+                source: box_error(std::io::Error::other(format!(
+                    "Failed to list directory: {}",
+                    e
+                ))),
                 location: snafu::location!(),
             })?;
 
-        Ok(operator)
-    }
-
-    /// Parse storage path and return scheme and configuration
-    fn parse_storage_path(
-        root: &str,
-        storage_options: &HashMap<String, String>,
-    ) -> Result<(opendal::Scheme, HashMap<String, String>)> {
-        use url::Url;
-
-        let mut config = HashMap::new();
-
-        // Try to parse as URL, if it fails, treat as local filesystem path
-        let (scheme, authority, path) = if let Ok(url) = Url::parse(root) {
-            let scheme = Self::normalize_scheme(url.scheme());
-            let authority = url.host_str().unwrap_or("");
-            // For file:// and fs:// URLs, preserve the full path including leading slash
-            // For cloud storage URLs, remove the leading slash
-            let path = if scheme == "fs" || scheme == "file" {
-                url.path().to_string()
-            } else {
-                url.path().trim_start_matches('/').to_string()
-            };
-            (scheme, authority.to_string(), path)
-        } else {
-            // Not a URL, treat as local filesystem - prepend fs://
-            ("fs".to_string(), String::new(), root.to_string())
-        };
-
-        // Configure based on scheme
-        let opendal_scheme = match scheme.as_str() {
-            "fs" | "file" => {
-                // For filesystem, use the full path (authority is empty for local paths)
-                if authority.is_empty() {
-                    config.insert("root".to_string(), path);
-                } else {
-                    // Handle file:///absolute/path or fs://hostname/path
-                    config.insert("root".to_string(), format!("{}/{}", authority, path));
-                }
-                opendal::Scheme::Fs
+        for entry in entries {
+            let path = entry.trim_end_matches('/');
+            if !path.ends_with(".lance") {
+                continue;
             }
-            "s3" => {
-                config.insert("root".to_string(), path);
-                config.insert("bucket".to_string(), authority);
-                opendal::Scheme::S3
-            }
-            "gcs" => {
-                config.insert("root".to_string(), path);
-                config.insert("bucket".to_string(), authority);
-                opendal::Scheme::Gcs
-            }
-            "azblob" => {
-                config.insert("root".to_string(), path);
-                config.insert("container".to_string(), authority);
-                opendal::Scheme::Azblob
-            }
-            _ => {
-                // For unknown schemes, try to parse as OpenDAL scheme
-                config.insert("root".to_string(), path);
-                if !authority.is_empty() {
-                    config.insert("bucket".to_string(), authority);
-                }
-                opendal::Scheme::from_str(&scheme).map_err(|_| Error::Namespace {
-                    source: format!("Unsupported storage scheme: {}", scheme).into(),
-                    location: snafu::location!(),
-                })?
-            }
-        };
 
-        // Add storage options for all schemes
-        config.extend(storage_options.clone());
+            let table_name = &path[..path.len() - 6];
 
-        Ok((opendal_scheme, config))
-    }
+            // Use atomic check to skip deregistered tables and declared-but-not-written tables
+            let status = self.check_table_status(table_name).await;
+            if status.is_deregistered || status.has_reserved_file {
+                continue;
+            }
 
-    /// Normalize scheme names with common aliases
-    fn normalize_scheme(scheme: &str) -> String {
-        match scheme.to_lowercase().as_str() {
-            "s3a" | "s3n" => "s3".to_string(),
-            "abfs" => "azblob".to_string(),
-            "file" => "fs".to_string(),
-            s => s.to_string(),
+            tables.push(table_name.to_string());
         }
+
+        Ok(tables)
     }
 
     /// Validate that the namespace ID represents the root namespace
@@ -233,7 +645,7 @@ impl DirectoryNamespace {
         if id.len() != 1 {
             return Err(Error::Namespace {
                 source: format!(
-                    "Directory namespace only supports single-level table IDs, but got: {:?}",
+                    "Multi-level table IDs are only supported when manifest mode is enabled, but got: {:?}",
                     id
                 )
                 .into(),
@@ -244,14 +656,199 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
-    /// Get the full path for a table
-    fn table_full_path(&self, table_name: &str) -> String {
-        format!("{}/{}.lance", self.config.root(), table_name)
+    /// Get the full URI path for a table (for returning in responses)
+    fn table_full_uri(&self, table_name: &str) -> String {
+        format!("{}/{}.lance", &self.root, table_name)
     }
 
-    /// Get the versions path for a table
-    fn table_versions_path(&self, table_name: &str) -> String {
-        format!("{}.lance/_versions/", table_name)
+    /// Get the object store path for a table (relative to base_path)
+    fn table_path(&self, table_name: &str) -> Path {
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
+    }
+
+    /// Get the reserved file path for a table
+    fn table_reserved_file_path(&self, table_name: &str) -> Path {
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
+            .child(".lance-reserved")
+    }
+
+    /// Get the deregistered marker file path for a table
+    fn table_deregistered_file_path(&self, table_name: &str) -> Path {
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
+            .child(".lance-deregistered")
+    }
+
+    /// Atomically check table existence and deregistration status.
+    ///
+    /// This performs a single directory listing to get a consistent snapshot of the
+    /// table's state, avoiding race conditions between checking existence and
+    /// checking deregistration status.
+    pub(crate) async fn check_table_status(&self, table_name: &str) -> TableStatus {
+        let table_path = self.table_path(table_name);
+        match self.object_store.read_dir(table_path).await {
+            Ok(entries) => {
+                let exists = !entries.is_empty();
+                let is_deregistered = entries.iter().any(|e| e.ends_with(".lance-deregistered"));
+                let has_reserved_file = entries.iter().any(|e| e.ends_with(".lance-reserved"));
+                TableStatus {
+                    exists,
+                    is_deregistered,
+                    has_reserved_file,
+                }
+            }
+            Err(_) => TableStatus {
+                exists: false,
+                is_deregistered: false,
+                has_reserved_file: false,
+            },
+        }
+    }
+
+    /// Atomically create a marker file using put_if_not_exists semantics.
+    ///
+    /// This uses `PutMode::Create` which will fail if the file already exists,
+    /// providing atomic creation semantics to avoid race conditions.
+    ///
+    /// Returns Ok(()) if the file was created successfully.
+    /// Returns Err with appropriate message if the file already exists or other error.
+    async fn put_marker_file_atomic(
+        &self,
+        path: &Path,
+        file_description: &str,
+    ) -> std::result::Result<(), String> {
+        let put_opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+
+        match self
+            .object_store
+            .inner
+            .put_opts(path, bytes::Bytes::new().into(), put_opts)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => {
+                Err(format!("{} already exists", file_description))
+            }
+            Err(e) => Err(format!("Failed to create {}: {}", file_description, e)),
+        }
+    }
+
+    /// Get storage options for a table, using credential vending if configured.
+    ///
+    /// If credential vendor properties are configured and the table location matches
+    /// a supported cloud provider, this will create an appropriate vendor and vend
+    /// temporary credentials scoped to the table location. Otherwise, returns the
+    /// static storage options.
+    ///
+    /// The vendor type is auto-selected based on the table URI:
+    /// - `s3://` locations use AWS STS AssumeRole
+    /// - `gs://` locations use GCP OAuth2 tokens
+    /// - `az://` locations use Azure SAS tokens
+    ///
+    /// The permission level (Read, Write, Admin) is configured at namespace
+    /// initialization time via the `credential_vendor_permission` property.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_uri` - The full URI of the table
+    /// * `identity` - Optional identity from the request for identity-based credential vending
+    async fn get_storage_options_for_table(
+        &self,
+        table_uri: &str,
+        identity: Option<&Identity>,
+    ) -> Result<Option<HashMap<String, String>>> {
+        if let Some(ref vendor) = self.credential_vendor {
+            let vended = vendor.vend_credentials(table_uri, identity).await?;
+            return Ok(Some(vended.storage_options));
+        }
+        Ok(self.storage_options.clone())
+    }
+
+    /// Migrate directory-based tables to the manifest.
+    ///
+    /// This is a one-time migration operation that:
+    /// 1. Scans the directory for existing `.lance` tables
+    /// 2. Registers any unmigrated tables in the manifest
+    /// 3. Returns the count of tables that were migrated
+    ///
+    /// This method is safe to run multiple times - it will skip tables that are already
+    /// registered in the manifest.
+    ///
+    /// # Usage
+    ///
+    /// After creating tables in directory-only mode or dual mode, you can migrate them
+    /// to the manifest to enable manifest-only mode:
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Create namespace with dual mode (manifest + directory listing)
+    /// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+    ///     .manifest_enabled(true)
+    ///     .dir_listing_enabled(true)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// // ... tables are created and used ...
+    ///
+    /// // Migrate existing directory tables to manifest
+    /// let migrated_count = namespace.migrate().await?;
+    /// println!("Migrated {} tables", migrated_count);
+    ///
+    /// // Now you can disable directory listing for better performance:
+    /// // (requires rebuilding the namespace)
+    /// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+    ///     .manifest_enabled(true)
+    ///     .dir_listing_enabled(false)  // All tables now in manifest
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of tables that were migrated to the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Manifest is not enabled
+    /// - Directory listing fails
+    /// - Manifest registration fails
+    pub async fn migrate(&self) -> Result<usize> {
+        // We only care about tables in the root namespace
+        let Some(ref manifest_ns) = self.manifest_ns else {
+            return Ok(0); // No manifest, nothing to migrate
+        };
+
+        // Get all table locations already in the manifest
+        let manifest_locations = manifest_ns.list_manifest_table_locations().await?;
+
+        // Get all tables from directory
+        let dir_tables = self.list_directory_tables().await?;
+
+        // Register each directory table that doesn't have an overlapping location
+        // If a directory name already exists in the manifest,
+        // that means the table must have already been migrated or created
+        // in the manifest, so we can skip it.
+        let mut migrated_count = 0;
+        for table_name in dir_tables {
+            // For root namespace tables, the directory name is "table_name.lance"
+            let dir_name = format!("{}.lance", table_name);
+            if !manifest_locations.contains(&dir_name) {
+                manifest_ns.register_table(&table_name, dir_name).await?;
+                migrated_count += 1;
+            }
+        }
+
+        Ok(migrated_count)
     }
 }
 
@@ -261,10 +858,11 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        // Validate this is a request for the root namespace
-        Self::validate_root_namespace_id(&request.id)?;
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.list_namespaces(request).await;
+        }
 
-        // Directory namespace only contains the root namespace (empty list)
+        Self::validate_root_namespace_id(&request.id)?;
         Ok(ListNamespacesResponse::new(vec![]))
     }
 
@@ -272,12 +870,15 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        // Validate this is a request for the root namespace
-        Self::validate_root_namespace_id(&request.id)?;
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.describe_namespace(request).await;
+        }
 
-        // Return description of the root namespace
+        Self::validate_root_namespace_id(&request.id)?;
+        #[allow(clippy::needless_update)]
         Ok(DescribeNamespaceResponse {
             properties: Some(HashMap::new()),
+            ..Default::default()
         })
     }
 
@@ -285,7 +886,10 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        // Root namespace always exists and cannot be created
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.create_namespace(request).await;
+        }
+
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Err(Error::Namespace {
                 source: "Root namespace already exists and cannot be created".into(),
@@ -293,15 +897,17 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
-        // Non-root namespaces are not supported
         Err(Error::NotSupported {
-            source: "Directory namespace only supports the root namespace".into(),
+            source: "Child namespaces are only supported when manifest mode is enabled".into(),
             location: snafu::location!(),
         })
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
-        // Root namespace always exists and cannot be dropped
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.drop_namespace(request).await;
+        }
+
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Err(Error::Namespace {
                 source: "Root namespace cannot be dropped".into(),
@@ -309,159 +915,279 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
-        // Non-root namespaces are not supported
         Err(Error::NotSupported {
-            source: "Directory namespace only supports the root namespace".into(),
+            source: "Child namespaces are only supported when manifest mode is enabled".into(),
             location: snafu::location!(),
         })
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
-        // Root namespace always exists
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.namespace_exists(request).await;
+        }
+
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Ok(());
         }
 
-        // Non-root namespaces don't exist
         Err(Error::Namespace {
-            source: "Only root namespace exists in directory namespace".into(),
+            source: "Child namespaces are only supported when manifest mode is enabled".into(),
             location: snafu::location!(),
         })
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
-        Self::validate_root_namespace_id(&request.id)?;
-
-        let mut tables = Vec::new();
-
-        // Use non-recursive listing to avoid issues with object stores that don't have directory concept
-        let entries = self.operator.list("").await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to list directory: {}",
-                e
-            ))),
+        // Validate that namespace ID is provided
+        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Namespace ID is required".into(),
             location: snafu::location!(),
         })?;
 
-        for entry in entries {
-            let path = entry.path().trim_end_matches('/');
-
-            // Only process directory-like paths that end with .lance
-            if !path.ends_with(".lance") {
-                continue;
+        // For child namespaces, always delegate to manifest (if enabled)
+        if !namespace_id.is_empty() {
+            if let Some(ref manifest_ns) = self.manifest_ns {
+                return manifest_ns.list_tables(request).await;
             }
+            return Err(Error::NotSupported {
+                source: "Child namespaces are only supported when manifest mode is enabled".into(),
+                location: snafu::location!(),
+            });
+        }
 
-            // Extract table name (remove .lance suffix)
-            let table_name = &path[..path.len() - 6];
-
-            // Check if it's a valid Lance dataset or has .lance-reserved file
-            let mut is_table = false;
-
-            // First check for .lance-reserved file
-            let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
-            if self
-                .operator
-                .exists(&reserved_file_path)
-                .await
-                .unwrap_or(false)
-            {
-                is_table = true;
-            }
-
-            // If not found, check for _versions directory
-            if !is_table {
-                let versions_path = self.table_versions_path(table_name);
-                if let Ok(version_entries) = self.operator.list(&versions_path).await {
-                    // If there's at least one version file, it's a valid Lance dataset
-                    if !version_entries.is_empty() {
-                        is_table = true;
-                    }
-                }
-            }
-
-            if is_table {
-                tables.push(table_name.to_string());
+        // When only manifest is enabled (no directory listing), delegate directly to manifest
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            if !self.dir_listing_enabled {
+                return manifest_ns.list_tables(request).await;
             }
         }
 
+        // When both manifest and directory listing are enabled, we need to merge and deduplicate
+        let mut tables = if self.manifest_ns.is_some() && self.dir_listing_enabled {
+            // Get all manifest table locations (for deduplication)
+            let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
+                manifest_ns.list_manifest_table_locations().await?
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // Get all manifest tables (without pagination for merging)
+            let mut manifest_request = request.clone();
+            manifest_request.limit = None;
+            manifest_request.page_token = None;
+            let manifest_tables = if let Some(ref manifest_ns) = self.manifest_ns {
+                let manifest_response = manifest_ns.list_tables(manifest_request).await?;
+                manifest_response.tables
+            } else {
+                vec![]
+            };
+
+            // Start with all manifest table names
+            // Add directory tables that aren't already in the manifest (by location)
+            let mut all_tables: Vec<String> = manifest_tables;
+            let dir_tables = self.list_directory_tables().await?;
+            for table_name in dir_tables {
+                // Check if this table's location is already in the manifest
+                // Manifest stores full URIs, so we need to check both formats
+                let full_location = format!("{}/{}.lance", self.root, table_name);
+                let relative_location = format!("{}.lance", table_name);
+                if !manifest_locations.contains(&full_location)
+                    && !manifest_locations.contains(&relative_location)
+                {
+                    all_tables.push(table_name);
+                }
+            }
+
+            all_tables
+        } else {
+            self.list_directory_tables().await?
+        };
+
+        // Apply sorting and pagination
+        Self::apply_pagination(&mut tables, request.page_token, request.limit);
         let response = ListTablesResponse::new(tables);
         Ok(response)
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
-
-        // Check if table exists - either as Lance dataset or with .lance-reserved file
-        let mut table_exists = false;
-
-        // First check for .lance-reserved file
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
-        if self
-            .operator
-            .exists(&reserved_file_path)
-            .await
-            .unwrap_or(false)
-        {
-            table_exists = true;
-        }
-
-        // If not found, check if it's a Lance dataset by looking for _versions directory
-        if !table_exists {
-            let versions_path = self.table_versions_path(&table_name);
-            if let Ok(entries) = self.operator.list(&versions_path).await {
-                if !entries.is_empty() {
-                    table_exists = true;
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            match manifest_ns.describe_table(request.clone()).await {
+                Ok(mut response) => {
+                    // Only apply identity-based credential vending when explicitly requested
+                    if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                        if let Some(ref table_uri) = response.table_uri {
+                            let identity = request.identity.as_deref();
+                            response.storage_options = self
+                                .get_storage_options_for_table(table_uri, identity)
+                                .await?;
+                        }
+                    } else if request.vend_credentials == Some(false) {
+                        response.storage_options = None;
+                    }
+                    return Ok(response);
                 }
+                Err(_)
+                    if self.dir_listing_enabled
+                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
+                {
+                    // Fall through to directory check only for single-level IDs
+                }
+                Err(e) => return Err(e),
             }
         }
 
-        if !table_exists {
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+
+        // Atomically check table existence and deregistration status
+        let status = self.check_table_status(&table_name).await;
+
+        if !status.exists {
             return Err(Error::Namespace {
                 source: format!("Table does not exist: {}", table_name).into(),
                 location: snafu::location!(),
             });
         }
 
-        Ok(DescribeTableResponse {
-            version: None,
-            location: Some(table_path),
-            schema: None,
-            properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
-        })
-    }
-
-    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
-        let table_name = Self::table_name_from_id(&request.id)?;
-
-        // Check if table exists - either as Lance dataset or with .lance-reserved file
-        let mut table_exists = false;
-
-        // First check for .lance-reserved file
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
-        if self
-            .operator
-            .exists(&reserved_file_path)
-            .await
-            .unwrap_or(false)
-        {
-            table_exists = true;
+        if status.is_deregistered {
+            return Err(Error::Namespace {
+                source: format!("Table is deregistered: {}", table_name).into(),
+                location: snafu::location!(),
+            });
         }
 
-        // If not found, check if it's a Lance dataset by looking for _versions directory
-        if !table_exists {
-            let versions_path = self.table_versions_path(&table_name);
-            if let Ok(entries) = self.operator.list(&versions_path).await {
-                if !entries.is_empty() {
-                    table_exists = true;
+        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+
+        // If not loading detailed metadata, return minimal response with just location
+        if !load_detailed_metadata {
+            let storage_options = if vend_credentials {
+                self.get_storage_options_for_table(&table_uri, identity)
+                    .await?
+            } else {
+                None
+            };
+            return Ok(DescribeTableResponse {
+                table: Some(table_name),
+                namespace: request.id.as_ref().map(|id| {
+                    if id.len() > 1 {
+                        id[..id.len() - 1].to_vec()
+                    } else {
+                        vec![]
+                    }
+                }),
+                location: Some(table_uri.clone()),
+                table_uri: Some(table_uri),
+                storage_options,
+                ..Default::default()
+            });
+        }
+
+        // Try to load the dataset to get real information
+        match Dataset::open(&table_uri).await {
+            Ok(mut dataset) => {
+                // If a specific version is requested, checkout that version
+                if let Some(requested_version) = request.version {
+                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                }
+
+                let version_info = dataset.version();
+                let lance_schema = dataset.schema();
+                let arrow_schema: arrow_schema::Schema = lance_schema.into();
+                let json_schema = arrow_schema_to_json(&arrow_schema)?;
+                let storage_options = if vend_credentials {
+                    self.get_storage_options_for_table(&table_uri, identity)
+                        .await?
+                } else {
+                    None
+                };
+
+                // Convert BTreeMap to HashMap for the response
+                let metadata: std::collections::HashMap<String, String> =
+                    version_info.metadata.into_iter().collect();
+
+                Ok(DescribeTableResponse {
+                    table: Some(table_name),
+                    namespace: request.id.as_ref().map(|id| {
+                        if id.len() > 1 {
+                            id[..id.len() - 1].to_vec()
+                        } else {
+                            vec![]
+                        }
+                    }),
+                    version: Some(version_info.version as i64),
+                    location: Some(table_uri.clone()),
+                    table_uri: Some(table_uri),
+                    schema: Some(Box::new(json_schema)),
+                    storage_options,
+                    metadata: Some(metadata),
+                    ..Default::default()
+                })
+            }
+            Err(err) => {
+                // Use the reserved file status from the atomic check
+                if status.has_reserved_file {
+                    let storage_options = if vend_credentials {
+                        self.get_storage_options_for_table(&table_uri, identity)
+                            .await?
+                    } else {
+                        None
+                    };
+                    Ok(DescribeTableResponse {
+                        table: Some(table_name),
+                        namespace: request.id.as_ref().map(|id| {
+                            if id.len() > 1 {
+                                id[..id.len() - 1].to_vec()
+                            } else {
+                                vec![]
+                            }
+                        }),
+                        location: Some(table_uri.clone()),
+                        table_uri: Some(table_uri),
+                        storage_options,
+                        ..Default::default()
+                    })
+                } else {
+                    Err(Error::Namespace {
+                        source: format!(
+                            "Table directory exists but cannot load dataset {}: {:?}",
+                            table_name, err
+                        )
+                        .into(),
+                        location: snafu::location!(),
+                    })
                 }
             }
         }
+    }
 
-        if !table_exists {
+    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            match manifest_ns.table_exists(request.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(_) if self.dir_listing_enabled => {
+                    // Fall through to directory check
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let table_name = Self::table_name_from_id(&request.id)?;
+
+        // Atomically check table existence and deregistration status
+        let status = self.check_table_status(&table_name).await;
+
+        if !status.exists {
             return Err(Error::Namespace {
                 source: format!("Table does not exist: {}", table_name).into(),
+                location: snafu::location!(),
+            });
+        }
+
+        if status.is_deregistered {
+            return Err(Error::Namespace {
+                source: format!("Table is deregistered: {}", table_name).into(),
                 location: snafu::location!(),
             });
         }
@@ -469,15 +1195,41 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(())
     }
 
+    async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.drop_table(request).await;
+        }
+
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+        let table_path = self.table_path(&table_name);
+
+        self.object_store
+            .remove_dir_all(table_path)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to drop table {}: {}", table_name, e).into(),
+                location: snafu::location!(),
+            })?;
+
+        Ok(DropTableResponse {
+            id: request.id,
+            location: Some(table_uri),
+            ..Default::default()
+        })
+    }
+
     async fn create_table(
         &self,
         request: CreateTableRequest,
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.create_table(request, request_data).await;
+        }
 
-        // Validate that request_data is provided and is a valid Arrow IPC stream
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
         if request_data.is_empty() {
             return Err(Error::Namespace {
                 source: "Request data (Arrow IPC stream) is required for create_table".into(),
@@ -485,32 +1237,12 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_path {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_path
-                    )
-                    .into(),
-                    location: snafu::location!(),
-                });
-            }
-        }
-
         // Parse the Arrow IPC stream from request_data
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-
         let cursor = Cursor::new(request_data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| Error::Namespace {
             source: format!("Invalid Arrow IPC stream: {}", e).into(),
             location: snafu::location!(),
         })?;
-
-        // Extract schema from the IPC stream
         let arrow_schema = stream_reader.schema();
 
         // Collect all batches from the stream
@@ -524,24 +1256,29 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Create RecordBatchReader from the batches
         let reader = if batches.is_empty() {
-            // If no batches in the stream, create an empty batch with the schema
             let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
             let batches = vec![Ok(batch)];
-            arrow::record_batch::RecordBatchIterator::new(batches, arrow_schema.clone())
+            RecordBatchIterator::new(batches, arrow_schema.clone())
         } else {
-            // Convert to RecordBatchIterator
             let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            arrow::record_batch::RecordBatchIterator::new(batch_results, arrow_schema)
+            RecordBatchIterator::new(batch_results, arrow_schema)
         };
 
-        // Set up write parameters for creating a new dataset
+        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
         let write_params = WriteParams {
             mode: lance::dataset::WriteMode::Create,
+            store_params,
             ..Default::default()
         };
 
         // Create the Lance dataset using the actual Lance API
-        Dataset::write(reader, &table_path, Some(write_params))
+        Dataset::write(reader, &table_uri, Some(write_params))
             .await
             .map_err(|e| Error::Namespace {
                 source: format!("Failed to create Lance dataset: {}", e).into(),
@@ -550,9 +1287,9 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(CreateTableResponse {
             version: Some(1),
-            location: Some(table_path),
-            properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
+            location: Some(table_uri),
+            storage_options: self.storage_options.clone(),
+            ..Default::default()
         })
     }
 
@@ -560,17 +1297,34 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            #[allow(deprecated)]
+            let mut response = manifest_ns.create_empty_table(request.clone()).await?;
+            // Only apply identity-based credential vending when explicitly requested
+            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                if let Some(ref location) = response.location {
+                    let identity = request.identity.as_deref();
+                    response.storage_options = self
+                        .get_storage_options_for_table(location, identity)
+                        .await?;
+                }
+            } else if request.vend_credentials == Some(false) {
+                response.storage_options = None;
+            }
+            return Ok(response);
+        }
+
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        let table_uri = self.table_full_uri(&table_name);
 
         // Validate location if provided
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
-            if location != table_path {
+            if location != table_uri {
                 return Err(Error::Namespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_path
+                        table_name, location, table_uri
                     )
                     .into(),
                     location: snafu::location!(),
@@ -578,69 +1332,214 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
-        self.operator
-            .write(&reserved_file_path, Vec::<u8>::new())
+        // Atomically create the .lance-reserved file to mark the table as existing.
+        // This uses put_if_not_exists semantics to avoid race conditions.
+        let reserved_file_path = self.table_reserved_file_path(&table_name);
+
+        self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
             .await
             .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to create .lance-reserved file for table {}: {}",
-                    table_name, e
-                )
-                .into(),
+                source: e.into(),
                 location: snafu::location!(),
             })?;
 
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+        let storage_options = if vend_credentials {
+            self.get_storage_options_for_table(&table_uri, identity)
+                .await?
+        } else {
+            None
+        };
+
         Ok(CreateEmptyTableResponse {
-            location: Some(table_path),
-            properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
+            location: Some(table_uri),
+            storage_options,
+            ..Default::default()
         })
     }
 
-    async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            let mut response = manifest_ns.declare_table(request.clone()).await?;
+            // Only apply identity-based credential vending when explicitly requested
+            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                if let Some(ref location) = response.location {
+                    let identity = request.identity.as_deref();
+                    response.storage_options = self
+                        .get_storage_options_for_table(location, identity)
+                        .await?;
+                }
+            } else if request.vend_credentials == Some(false) {
+                response.storage_options = None;
+            }
+            return Ok(response);
+        }
 
-        // Remove the entire table directory
-        let table_dir = format!("{}.lance/", table_name);
-        self.operator
-            .remove_all(&table_dir)
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+
+        // Validate location if provided
+        if let Some(location) = &request.location {
+            let location = location.trim_end_matches('/');
+            if location != table_uri {
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Cannot declare table {} at location {}, must be at location {}",
+                        table_name, location, table_uri
+                    )
+                    .into(),
+                    location: snafu::location!(),
+                });
+            }
+        }
+
+        // Check if table already has data (created via create_table).
+        // The atomic put only prevents races between concurrent declare_table calls,
+        // not between declare_table and existing data.
+        let status = self.check_table_status(&table_name).await;
+        if status.exists && !status.has_reserved_file {
+            // Table has data but no reserved file - it was created with data
+            return Err(Error::Namespace {
+                source: format!("Table already exists: {}", table_name).into(),
+                location: snafu::location!(),
+            });
+        }
+
+        // Atomically create the .lance-reserved file to mark the table as declared.
+        // This uses put_if_not_exists semantics to avoid race conditions between
+        // concurrent declare_table calls.
+        let reserved_file_path = self.table_reserved_file_path(&table_name);
+
+        self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
             .await
             .map_err(|e| Error::Namespace {
-                source: format!("Failed to drop table {}: {}", table_name, e).into(),
+                source: e.into(),
                 location: snafu::location!(),
             })?;
 
-        Ok(DropTableResponse {
-            id: request.id,
-            location: Some(table_path),
-            properties: None,
-            transaction_id: None,
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+        let storage_options = if vend_credentials {
+            self.get_storage_options_for_table(&table_uri, identity)
+                .await?
+        } else {
+            None
+        };
+
+        Ok(DeclareTableResponse {
+            location: Some(table_uri),
+            storage_options,
+            ..Default::default()
         })
+    }
+
+    async fn register_table(
+        &self,
+        request: lance_namespace::models::RegisterTableRequest,
+    ) -> Result<lance_namespace::models::RegisterTableResponse> {
+        // If manifest is enabled, delegate to manifest namespace
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return LanceNamespace::register_table(manifest_ns.as_ref(), request).await;
+        }
+
+        // Without manifest, register_table is not supported
+        Err(Error::NotSupported {
+            source: "register_table is only supported when manifest mode is enabled".into(),
+            location: snafu::location!(),
+        })
+    }
+
+    async fn deregister_table(
+        &self,
+        request: lance_namespace::models::DeregisterTableRequest,
+    ) -> Result<lance_namespace::models::DeregisterTableResponse> {
+        // If manifest is enabled, delegate to manifest namespace
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
+        }
+
+        // V1 mode: create a .lance-deregistered marker file in the table directory
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+
+        // Check table existence and deregistration status.
+        // This provides better error messages for common cases.
+        let status = self.check_table_status(&table_name).await;
+
+        if !status.exists {
+            return Err(Error::Namespace {
+                source: format!("Table does not exist: {}", table_name).into(),
+                location: snafu::location!(),
+            });
+        }
+
+        if status.is_deregistered {
+            return Err(Error::Namespace {
+                source: format!("Table is already deregistered: {}", table_name).into(),
+                location: snafu::location!(),
+            });
+        }
+
+        // Atomically create the .lance-deregistered marker file.
+        // This uses put_if_not_exists semantics to prevent race conditions
+        // when multiple processes try to deregister the same table concurrently.
+        // If a race occurs and another process already created the file,
+        // we'll get an AlreadyExists error which we convert to a proper message.
+        let deregistered_path = self.table_deregistered_file_path(&table_name);
+        self.put_marker_file_atomic(
+            &deregistered_path,
+            &format!("deregistration marker for table {}", table_name),
+        )
+        .await
+        .map_err(|e| {
+            // Convert "already exists" to "already deregistered" for better UX
+            let message = if e.contains("already exists") {
+                format!("Table is already deregistered: {}", table_name)
+            } else {
+                e
+            };
+            Error::Namespace {
+                source: message.into(),
+                location: snafu::location!(),
+            }
+        })?;
+
+        Ok(lance_namespace::models::DeregisterTableResponse {
+            id: request.id,
+            location: Some(table_uri),
+            ..Default::default()
+        })
+    }
+
+    fn namespace_id(&self) -> String {
+        format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_namespace::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
+    use arrow_ipc::reader::StreamReader;
+    use lance::dataset::Dataset;
+    use lance_core::utils::tempfile::TempStdDir;
+    use lance_namespace::models::{
+        CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
+    };
     use lance_namespace::schema::convert_json_arrow_schema;
-    use std::collections::HashMap;
+    use std::io::Cursor;
     use std::sync::Arc;
-    use tempfile::TempDir;
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
-    async fn create_test_namespace() -> (DirectoryNamespace, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
+    async fn create_test_namespace() -> (DirectoryNamespace, TempStdDir) {
+        let temp_dir = TempStdDir::default();
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
         (namespace, temp_dir)
     }
 
@@ -738,40 +1637,24 @@ mod tests {
             .await;
         assert!(result.is_err());
 
-        // Test with multi-level ID
+        // Test with multi-level ID - should now work with manifest enabled
+        // First create the parent namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_namespace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Now create table in the namespace
         let mut request = CreateTableRequest::new();
-        request.id = Some(vec!["namespace".to_string(), "table".to_string()]);
+        request.id = Some(vec!["test_namespace".to_string(), "table".to_string()]);
 
         let result = namespace
             .create_table(request, bytes::Bytes::from(ipc_data))
             .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("single-level table IDs"));
-    }
-
-    #[tokio::test]
-    async fn test_create_table_with_wrong_location() {
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        // Create test IPC data
-        let schema = create_test_schema();
-        let ipc_data = create_test_ipc_data(&schema);
-
-        let mut request = CreateTableRequest::new();
-        request.id = Some(vec!["test_table".to_string()]);
-        request.location = Some("/wrong/path/table.lance".to_string());
-
-        let result = namespace
-            .create_table(request, bytes::Bytes::from(ipc_data))
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be at location"));
+        // Should succeed with manifest enabled
+        assert!(
+            result.is_ok(),
+            "Multi-level table IDs should work with manifest enabled"
+        );
     }
 
     #[tokio::test]
@@ -779,7 +1662,8 @@ mod tests {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
         // Initially, no tables
-        let request = ListTablesRequest::new();
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
 
@@ -804,7 +1688,8 @@ mod tests {
             .unwrap();
 
         // List tables should return both
-        let request = ListTablesRequest::new();
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         let tables = response.tables;
         assert_eq!(tables.len(), 2);
@@ -816,15 +1701,27 @@ mod tests {
     async fn test_list_tables_with_namespace_id() {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
+        // First create a child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_namespace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Now list tables in the child namespace
         let mut request = ListTablesRequest::new();
-        request.id = Some(vec!["namespace".to_string()]);
+        request.id = Some(vec!["test_namespace".to_string()]);
 
         let result = namespace.list_tables(request).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("root namespace operations"));
+        // Should succeed (with manifest enabled) and return empty list (no tables yet)
+        assert!(
+            result.is_ok(),
+            "list_tables should work with child namespace when manifest is enabled"
+        );
+        let response = result.unwrap();
+        assert_eq!(
+            response.tables.len(),
+            0,
+            "Namespace should have no tables yet"
+        );
     }
 
     #[tokio::test]
@@ -947,29 +1844,34 @@ mod tests {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
         // Test list_namespaces - should return empty list for root
-        let request = ListNamespacesRequest::new();
+        let mut request = ListNamespacesRequest::new();
+        request.id = Some(vec![]);
         let result = namespace.list_namespaces(request).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().namespaces.len(), 0);
 
         // Test describe_namespace - should succeed for root
-        let request = DescribeNamespaceRequest::new();
+        let mut request = DescribeNamespaceRequest::new();
+        request.id = Some(vec![]);
         let result = namespace.describe_namespace(request).await;
         assert!(result.is_ok());
 
         // Test namespace_exists - root always exists
-        let request = NamespaceExistsRequest::new();
+        let mut request = NamespaceExistsRequest::new();
+        request.id = Some(vec![]);
         let result = namespace.namespace_exists(request).await;
         assert!(result.is_ok());
 
         // Test create_namespace - root cannot be created
-        let request = CreateNamespaceRequest::new();
+        let mut request = CreateNamespaceRequest::new();
+        request.id = Some(vec![]);
         let result = namespace.create_namespace(request).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
 
         // Test drop_namespace - root cannot be dropped
-        let request = DropNamespaceRequest::new();
+        let mut request = DropNamespaceRequest::new();
+        request.id = Some(vec![]);
         let result = namespace.drop_namespace(request).await;
         assert!(result.is_err());
         assert!(result
@@ -982,42 +1884,54 @@ mod tests {
     async fn test_non_root_namespace_operations() {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
-        // Test create_namespace for non-root - not supported
+        // With manifest enabled (default), child namespaces are now supported
+        // Test create_namespace for non-root - should succeed with manifest
         let mut request = CreateNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.create_namespace(request).await;
-        assert!(matches!(result, Err(Error::NotSupported { .. })));
+        assert!(
+            result.is_ok(),
+            "Child namespace creation should succeed with manifest enabled"
+        );
 
-        // Test namespace_exists for non-root - should not exist
+        // Test namespace_exists for non-root - should exist after creation
         let mut request = NamespaceExistsRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.namespace_exists(request).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Only root namespace exists"));
+        assert!(
+            result.is_ok(),
+            "Child namespace should exist after creation"
+        );
 
-        // Test drop_namespace for non-root - not supported
+        // Test drop_namespace for non-root - should succeed
         let mut request = DropNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.drop_namespace(request).await;
-        assert!(matches!(result, Err(Error::NotSupported { .. })));
+        assert!(
+            result.is_ok(),
+            "Child namespace drop should succeed with manifest enabled"
+        );
+
+        // Verify namespace no longer exists
+        let mut request = NamespaceExistsRequest::new();
+        request.id = Some(vec!["child".to_string()]);
+        let result = namespace.namespace_exists(request).await;
+        assert!(
+            result.is_err(),
+            "Child namespace should not exist after drop"
+        );
     }
 
     #[tokio::test]
     async fn test_config_custom_root() {
-        let temp_dir = TempDir::new().unwrap();
-        let custom_path = temp_dir.path().join("custom");
+        let temp_dir = TempStdDir::default();
+        let custom_path = temp_dir.join("custom");
         std::fs::create_dir(&custom_path).unwrap();
 
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            custom_path.to_string_lossy().to_string(),
-        );
-
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(custom_path.to_string_lossy().to_string())
+            .build()
+            .await
+            .unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1037,16 +1951,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_storage_options() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
-        properties.insert("storage.option1".to_string(), "value1".to_string());
-        properties.insert("storage.option2".to_string(), "value2".to_string());
+        let temp_dir = TempStdDir::default();
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .storage_option("option1", "value1")
+            .storage_option("option2", "value2")
+            .build()
+            .await
+            .unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1064,6 +1976,106 @@ mod tests {
         let storage_options = response.storage_options.unwrap();
         assert_eq!(storage_options.get("option1"), Some(&"value1".to_string()));
         assert_eq!(storage_options.get("option2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_manifest_enabled() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_enabled".to_string(), "true".to_string());
+        properties.insert("dir_listing_enabled".to_string(), "false".to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        assert!(builder.manifest_enabled);
+        assert!(!builder.dir_listing_enabled);
+
+        let namespace = builder.build().await.unwrap();
+
+        // Create test IPC data
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // Create a table
+        let mut request = CreateTableRequest::new();
+        request.id = Some(vec!["test_table".to_string()]);
+
+        let response = namespace
+            .create_table(request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        assert!(response.location.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_dir_listing_enabled() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_enabled".to_string(), "false".to_string());
+        properties.insert("dir_listing_enabled".to_string(), "true".to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        assert!(!builder.manifest_enabled);
+        assert!(builder.dir_listing_enabled);
+
+        let namespace = builder.build().await.unwrap();
+
+        // Create test IPC data
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // Create a table
+        let mut request = CreateTableRequest::new();
+        request.id = Some(vec!["test_table".to_string()]);
+
+        let response = namespace
+            .create_table(request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        assert!(response.location.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_defaults() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        // Both should default to true
+        assert!(builder.manifest_enabled);
+        assert!(builder.dir_listing_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_with_storage_options() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_enabled".to_string(), "true".to_string());
+        properties.insert("storage.region".to_string(), "us-west-2".to_string());
+        properties.insert("storage.bucket".to_string(), "my-bucket".to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        assert!(builder.manifest_enabled);
+        assert!(builder.storage_options.is_some());
+
+        let storage_options = builder.storage_options.unwrap();
+        assert_eq!(
+            storage_options.get("region"),
+            Some(&"us-west-2".to_string())
+        );
+        assert_eq!(
+            storage_options.get("bucket"),
+            Some(&"my-bucket".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1119,158 +2131,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_dir() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
+        let temp_dir = TempStdDir::default();
 
-        let namespace = connect_dir(properties).await.unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
 
-        // Test basic operation through the trait object
-        let request = ListTablesRequest::new();
+        // Test basic operation through the concrete type
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_storage_path_local() {
-        let storage_options = HashMap::new();
-
-        // Test local filesystem paths
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("/path/to/data", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/path/to/data");
-
-        // Test relative path
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("./data", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "./data");
-    }
-
-    #[test]
-    fn test_parse_storage_path_s3() {
-        let storage_options = HashMap::new();
-
-        // Test S3 URL
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket/path/to/data", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-
-        // Test S3 with just bucket
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "");
-    }
-
-    #[test]
-    fn test_parse_storage_path_gcs() {
-        let storage_options = HashMap::new();
-
-        // Test GCS URL
-        let (scheme, config) = DirectoryNamespace::parse_storage_path(
-            "gcs://my-bucket/path/to/data",
-            &storage_options,
-        )
-        .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Gcs));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-    }
-
-    #[test]
-    fn test_parse_storage_path_azblob() {
-        let storage_options = HashMap::new();
-
-        // Test Azure Blob URL
-        let (scheme, config) = DirectoryNamespace::parse_storage_path(
-            "azblob://my-container/path/to/data",
-            &storage_options,
-        )
-        .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Azblob));
-        assert_eq!(config.get("container").unwrap(), "my-container");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-
-        // Test with abfs alias
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("abfs://my-container/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Azblob));
-        assert_eq!(config.get("container").unwrap(), "my-container");
-        assert_eq!(config.get("root").unwrap(), "path");
-    }
-
-    #[test]
-    fn test_normalize_scheme() {
-        // Test scheme normalization
-        assert_eq!(DirectoryNamespace::normalize_scheme("s3a"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("s3n"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("S3A"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("abfs"), "azblob");
-        assert_eq!(DirectoryNamespace::normalize_scheme("ABFS"), "azblob");
-        assert_eq!(DirectoryNamespace::normalize_scheme("file"), "fs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("FILE"), "fs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("gcs"), "gcs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("random"), "random");
-    }
-
-    #[test]
-    fn test_fs_scheme_url() {
-        let storage_options = HashMap::new();
-
-        // Test file:// URLs
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("file:///absolute/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/absolute/path");
-
-        // Test fs:// URLs
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("fs:///absolute/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/absolute/path");
-    }
-
-    #[test]
-    fn test_storage_options_passed_through() {
-        // Test that storage options are properly passed through parse_storage_path
-        let mut storage_options = HashMap::new();
-        storage_options.insert("aws_access_key_id".to_string(), "test_key".to_string());
-        storage_options.insert(
-            "aws_secret_access_key".to_string(),
-            "test_secret".to_string(),
-        );
-        storage_options.insert("region".to_string(), "us-west-2".to_string());
-
-        // Test with S3 - storage options should be included
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path");
-        assert_eq!(config.get("aws_access_key_id").unwrap(), "test_key");
-        assert_eq!(config.get("aws_secret_access_key").unwrap(), "test_secret");
-        assert_eq!(config.get("region").unwrap(), "us-west-2");
-
-        // Test with local filesystem - storage options should still be included
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("/local/path", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/local/path");
-        // Even for local fs, storage options should be passed through
-        assert_eq!(config.get("aws_access_key_id").unwrap(), "test_key");
     }
 
     #[tokio::test]
@@ -1326,6 +2198,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_create_empty_table() {
         let (namespace, temp_dir) = create_test_namespace().await;
 
@@ -1338,7 +2211,7 @@ mod tests {
         assert!(response.location.unwrap().ends_with("empty_table.lance"));
 
         // Verify the .lance-reserved file was created in the correct location
-        let table_dir = temp_dir.path().join("empty_table.lance");
+        let table_dir = temp_dir.join("empty_table.lance");
         assert!(table_dir.exists());
         assert!(table_dir.is_dir());
 
@@ -1356,7 +2229,8 @@ mod tests {
         namespace.table_exists(exists_request).await.unwrap();
 
         // List tables should include the empty table
-        let list_request = ListTablesRequest::new();
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
         let list_response = namespace.list_tables(list_request).await.unwrap();
         assert!(list_response.tables.contains(&"empty_table".to_string()));
 
@@ -1369,6 +2243,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_create_empty_table_with_wrong_location() {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
@@ -1385,6 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_create_empty_table_then_drop() {
         let (namespace, temp_dir) = create_test_namespace().await;
 
@@ -1396,7 +2272,7 @@ mod tests {
         assert!(create_response.location.is_some());
 
         // Verify it exists
-        let table_dir = temp_dir.path().join("empty_table_to_drop.lance");
+        let table_dir = temp_dir.join("empty_table_to_drop.lance");
         assert!(table_dir.exists());
         let reserved_file = table_dir.join(".lance-reserved");
         assert!(reserved_file.exists());
@@ -1416,5 +2292,1265 @@ mod tests {
         exists_request.id = Some(vec!["empty_table_to_drop".to_string()]);
         let exists_result = namespace.table_exists(exists_request).await;
         assert!(exists_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_child_namespace_create_and_list() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create multiple child namespaces
+        for i in 1..=3 {
+            let mut create_req = CreateNamespaceRequest::new();
+            create_req.id = Some(vec![format!("ns{}", i)]);
+            let result = namespace.create_namespace(create_req).await;
+            assert!(result.is_ok(), "Failed to create child namespace ns{}", i);
+        }
+
+        // List child namespaces
+        let list_req = ListNamespacesRequest {
+            id: Some(vec![]),
+            ..Default::default()
+        };
+        let result = namespace.list_namespaces(list_req).await;
+        assert!(result.is_ok());
+        let namespaces = result.unwrap().namespaces;
+        assert_eq!(namespaces.len(), 3);
+        assert!(namespaces.contains(&"ns1".to_string()));
+        assert!(namespaces.contains(&"ns2".to_string()));
+        assert!(namespaces.contains(&"ns3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_nested_namespace_hierarchy() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create parent namespace
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["parent".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        // Create nested children
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["parent".to_string(), "child1".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["parent".to_string(), "child2".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        // List children of parent
+        let list_req = ListNamespacesRequest {
+            id: Some(vec!["parent".to_string()]),
+            ..Default::default()
+        };
+        let result = namespace.list_namespaces(list_req).await;
+        assert!(result.is_ok());
+        let children = result.unwrap().namespaces;
+        assert_eq!(children.len(), 2);
+        assert!(children.contains(&"child1".to_string()));
+        assert!(children.contains(&"child2".to_string()));
+
+        // List root should only show parent
+        let list_req = ListNamespacesRequest {
+            id: Some(vec![]),
+            ..Default::default()
+        };
+        let result = namespace.list_namespaces(list_req).await;
+        assert!(result.is_ok());
+        let root_namespaces = result.unwrap().namespaces;
+        assert_eq!(root_namespaces.len(), 1);
+        assert_eq!(root_namespaces[0], "parent");
+    }
+
+    #[tokio::test]
+    async fn test_table_in_child_namespace() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create table in child namespace
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let result = namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await;
+        assert!(result.is_ok(), "Failed to create table in child namespace");
+
+        // List tables in child namespace
+        let list_req = ListTablesRequest {
+            id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
+        };
+        let result = namespace.list_tables(list_req).await;
+        assert!(result.is_ok());
+        let tables = result.unwrap().tables;
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0], "table1");
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_ok());
+
+        // Describe table in child namespace
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let result = namespace.describe_table(describe_req).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.location.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_tables_in_child_namespace() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create multiple tables
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        for i in 1..=3 {
+            let mut create_table_req = CreateTableRequest::new();
+            create_table_req.id = Some(vec!["test_ns".to_string(), format!("table{}", i)]);
+            namespace
+                .create_table(create_table_req, bytes::Bytes::from(ipc_data.clone()))
+                .await
+                .unwrap();
+        }
+
+        // List tables
+        let list_req = ListTablesRequest {
+            id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
+        };
+        let result = namespace.list_tables(list_req).await;
+        assert!(result.is_ok());
+        let tables = result.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+        assert!(tables.contains(&"table1".to_string()));
+        assert!(tables.contains(&"table2".to_string()));
+        assert!(tables.contains(&"table3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_in_child_namespace() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Drop table
+        let mut drop_req = DropTableRequest::new();
+        drop_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let result = namespace.drop_table(drop_req).await;
+        assert!(result.is_ok(), "Failed to drop table in child namespace");
+
+        // Verify table no longer exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_empty_table_in_child_namespace() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create empty table
+        let mut create_empty_req = CreateEmptyTableRequest::new();
+        create_empty_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
+        let result = namespace.create_empty_table(create_empty_req).await;
+        assert!(
+            result.is_ok(),
+            "Failed to create empty table in child namespace"
+        );
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_deeply_nested_namespace() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create deeply nested namespace hierarchy
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["level1".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["level1".to_string(), "level2".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec![
+            "level1".to_string(),
+            "level2".to_string(),
+            "level3".to_string(),
+        ]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        // Create table in deeply nested namespace
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec![
+            "level1".to_string(),
+            "level2".to_string(),
+            "level3".to_string(),
+            "table1".to_string(),
+        ]);
+        let result = namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await;
+        assert!(
+            result.is_ok(),
+            "Failed to create table in deeply nested namespace"
+        );
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec![
+            "level1".to_string(),
+            "level2".to_string(),
+            "level3".to_string(),
+            "table1".to_string(),
+        ]);
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_namespace_with_properties() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create namespace with properties
+        let mut properties = HashMap::new();
+        properties.insert("owner".to_string(), "test_user".to_string());
+        properties.insert("description".to_string(), "Test namespace".to_string());
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["test_ns".to_string()]);
+        create_req.properties = Some(properties.clone());
+        namespace.create_namespace(create_req).await.unwrap();
+
+        // Describe namespace and verify properties
+        let describe_req = DescribeNamespaceRequest {
+            id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
+        };
+        let result = namespace.describe_namespace(describe_req).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.properties.is_some());
+        let props = response.properties.unwrap();
+        assert_eq!(props.get("owner"), Some(&"test_user".to_string()));
+        assert_eq!(
+            props.get("description"),
+            Some(&"Test namespace".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cannot_drop_namespace_with_tables() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create table in namespace
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Try to drop namespace - should fail
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(vec!["test_ns".to_string()]);
+        let result = namespace.drop_namespace(drop_req).await;
+        assert!(
+            result.is_err(),
+            "Should not be able to drop namespace with tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_isolation_between_namespaces() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Create two namespaces
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns2".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+
+        // Create table with same name in both namespaces
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["ns1".to_string(), "table1".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data.clone()))
+            .await
+            .unwrap();
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["ns2".to_string(), "table1".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // List tables in each namespace
+        let list_req = ListTablesRequest {
+            id: Some(vec!["ns1".to_string()]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let result = namespace.list_tables(list_req).await.unwrap();
+        assert_eq!(result.tables.len(), 1);
+        assert_eq!(result.tables[0], "table1");
+
+        let list_req = ListTablesRequest {
+            id: Some(vec!["ns2".to_string()]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let result = namespace.list_tables(list_req).await.unwrap();
+        assert_eq!(result.tables.len(), 1);
+        assert_eq!(result.tables[0], "table1");
+
+        // Drop table in ns1 shouldn't affect ns2
+        let mut drop_req = DropTableRequest::new();
+        drop_req.id = Some(vec!["ns1".to_string(), "table1".to_string()]);
+        namespace.drop_table(drop_req).await.unwrap();
+
+        // Verify ns1 table is gone but ns2 table still exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["ns1".to_string(), "table1".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_err());
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["ns2".to_string(), "table1".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_directory_tables() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Step 1: Create tables in directory-only mode
+        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create some tables
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        for i in 1..=3 {
+            let mut create_req = CreateTableRequest::new();
+            create_req.id = Some(vec![format!("table{}", i)]);
+            dir_only_ns
+                .create_table(create_req, bytes::Bytes::from(ipc_data.clone()))
+                .await
+                .unwrap();
+        }
+
+        drop(dir_only_ns);
+
+        // Step 2: Create namespace with dual mode (manifest + directory listing)
+        let dual_mode_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Before migration, tables should be visible (via directory listing fallback)
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = dual_mode_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+
+        // Run migration
+        let migrated_count = dual_mode_ns.migrate().await.unwrap();
+        assert_eq!(migrated_count, 3, "Should migrate all 3 tables");
+
+        // Verify tables are now in manifest
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = dual_mode_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+
+        // Run migration again - should be idempotent
+        let migrated_count = dual_mode_ns.migrate().await.unwrap();
+        assert_eq!(
+            migrated_count, 0,
+            "Should not migrate already-migrated tables"
+        );
+
+        drop(dual_mode_ns);
+
+        // Step 3: Create namespace with manifest-only mode
+        let manifest_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Tables should still be accessible (now from manifest only)
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = manifest_only_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+        assert!(tables.contains(&"table1".to_string()));
+        assert!(tables.contains(&"table2".to_string()));
+        assert!(tables.contains(&"table3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_without_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace without manifest
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // migrate() should return 0 when manifest is not enabled
+        let migrated_count = namespace.migrate().await.unwrap();
+        assert_eq!(migrated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_table() {
+        use lance_namespace::models::{RegisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a physical table first using lance directly
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let table_uri = format!("{}/external_table.lance", temp_path);
+        let cursor = Cursor::new(ipc_data);
+        let stream_reader = StreamReader::try_new(cursor, None).unwrap();
+        let batches: Vec<_> = stream_reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let schema = batches[0].schema();
+        let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+        let reader = RecordBatchIterator::new(batch_results, schema);
+        Dataset::write(Box::new(reader), &table_uri, None)
+            .await
+            .unwrap();
+
+        // Register the table
+        let mut register_req = RegisterTableRequest::new("external_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+
+        let response = namespace.register_table(register_req).await.unwrap();
+        assert_eq!(response.location, Some("external_table.lance".to_string()));
+
+        // Verify table exists in namespace
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["registered_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_ok());
+
+        // Verify we can list the table
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = namespace.list_tables(list_req).await.unwrap();
+        assert!(tables.tables.contains(&"registered_table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_duplicate_fails() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Register a table
+        let mut register_req = RegisterTableRequest::new("test_table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+
+        namespace
+            .register_table(register_req.clone())
+            .await
+            .unwrap();
+
+        // Try to register again - should fail
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table() {
+        use lance_namespace::models::{DeregisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace with manifest-only mode (no directory listing fallback)
+        // This ensures deregistered tables are truly invisible
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req.clone()).await.is_ok());
+
+        // Deregister the table
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Should return location and id
+        assert!(
+            response.location.is_some(),
+            "Deregister should return location"
+        );
+        let location = response.location.as_ref().unwrap();
+        // Location should be a proper file:// URI with the temp path
+        // Use uri_to_url to normalize the temp path to a URL for comparison
+        let expected_url = lance_io::object_store::uri_to_url(temp_path)
+            .expect("Failed to convert temp path to URL");
+        let expected_prefix = expected_url.to_string();
+        assert!(
+            location.starts_with(&expected_prefix),
+            "Location should start with '{}', got: {}",
+            expected_prefix,
+            location
+        );
+        assert!(
+            location.contains("test_table"),
+            "Location should contain table name: {}",
+            location
+        );
+        assert_eq!(response.id, Some(vec!["test_table".to_string()]));
+
+        // Verify table no longer exists in namespace (removed from manifest)
+        assert!(namespace.table_exists(exists_req).await.is_err());
+
+        // Verify physical data still exists at the returned location
+        let dataset = Dataset::open(location).await;
+        assert!(
+            dataset.is_ok(),
+            "Physical table data should still exist at {}",
+            location
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_in_child_namespace() {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DeregisterTableRequest, TableExistsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table in the child namespace
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Deregister the table
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        let response = namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Should return location and id in child namespace
+        assert!(
+            response.location.is_some(),
+            "Deregister should return location"
+        );
+        let location = response.location.as_ref().unwrap();
+        // Location should be a proper file:// URI with the temp path
+        // Use uri_to_url to normalize the temp path to a URL for comparison
+        let expected_url = lance_io::object_store::uri_to_url(temp_path)
+            .expect("Failed to convert temp path to URL");
+        let expected_prefix = expected_url.to_string();
+        assert!(
+            location.starts_with(&expected_prefix),
+            "Location should start with '{}', got: {}",
+            expected_prefix,
+            location
+        );
+        assert!(
+            location.contains("test_ns") && location.contains("test_table"),
+            "Location should contain namespace and table name: {}",
+            location
+        );
+        assert_eq!(
+            response.id,
+            Some(vec!["test_ns".to_string(), "test_table".to_string()])
+        );
+
+        // Verify table no longer exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_without_manifest_fails() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace without manifest
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register - should fail (register requires manifest)
+        let mut register_req = RegisterTableRequest::new("test_table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("manifest mode is enabled"));
+
+        // Note: deregister_table now works in V1 mode via .lance-deregistered marker files
+        // See test_deregister_table_v1_mode for that test case
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_absolute_uri() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with absolute URI - should fail
+        let mut register_req = RegisterTableRequest::new("s3://bucket/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Absolute URIs are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_absolute_path() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with absolute path - should fail
+        let mut register_req = RegisterTableRequest::new("/tmp/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_path_traversal() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with path traversal - should fail
+        let mut register_req = RegisterTableRequest::new("../outside/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Path traversal is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_namespace_write() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::LanceNamespace;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let namespace = Arc::new(namespace) as Arc<dyn LanceNamespace>;
+
+        // Use child namespace instead of root
+        let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        // Test 1: CREATE mode
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
+        let dataset =
+            Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+                .await
+                .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(dataset.version().version, 1);
+
+        // Test 2: APPEND mode
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let params_append = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let reader2 = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader2,
+            namespace.clone(),
+            table_id.clone(),
+            Some(params_append),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+        assert_eq!(dataset.version().version, 2);
+
+        // Test 3: OVERWRITE mode
+        let data3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(Int32Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+
+        let params_overwrite = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+
+        let reader3 = RecordBatchIterator::new(vec![data3].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader3,
+            namespace.clone(),
+            table_id.clone(),
+            Some(params_overwrite),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(dataset.version().version, 3);
+
+        // Verify old data was replaced
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let a_col = result
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_col.values(), &[100, 200]);
+    }
+
+    // ============================================================
+    // Tests for declare_table
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_declare_table_v1_mode() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, TableExistsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace in V1 mode (no manifest)
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Declare a table
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace.declare_table(declare_req).await.unwrap();
+
+        // Should return location
+        assert!(response.location.is_some());
+        let location = response.location.as_ref().unwrap();
+        assert!(location.ends_with("test_table.lance"));
+
+        // Table should exist (via reserved file)
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_ok());
+
+        // Describe should work but return no version/schema (not written yet)
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert!(describe_response.location.is_some());
+        assert!(describe_response.version.is_none()); // Not written yet
+        assert!(describe_response.schema.is_none()); // Not written yet
+    }
+
+    #[tokio::test]
+    async fn test_declare_table_with_manifest() {
+        use lance_namespace::models::{DeclareTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace with manifest
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Declare a table
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace.declare_table(declare_req).await.unwrap();
+
+        // Should return location
+        assert!(response.location.is_some());
+
+        // Table should exist in manifest
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_declare_table_when_table_exists() {
+        use lance_namespace::models::DeclareTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // First create a table with actual data
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Try to declare the same table - should fail because it already has data
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.declare_table(declare_req).await;
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // Tests for deregister_table in V1 mode
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_deregister_table_v1_mode() {
+        use lance_namespace::models::{DeregisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace in V1 mode (no manifest, with dir listing)
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table with data
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req.clone()).await.is_ok());
+
+        // Deregister the table
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Should return location
+        assert!(response.location.is_some());
+        let location = response.location.as_ref().unwrap();
+        assert!(location.contains("test_table"));
+
+        // Table should no longer exist (deregistered)
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("deregistered"));
+
+        // Physical data should still exist
+        let dataset = Dataset::open(location).await;
+        assert!(dataset.is_ok(), "Physical table data should still exist");
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_v1_already_deregistered() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Deregister once
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .deregister_table(deregister_req.clone())
+            .await
+            .unwrap();
+
+        // Try to deregister again - should fail
+        let result = namespace.deregister_table(deregister_req).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already deregistered"));
+    }
+
+    // ============================================================
+    // Tests for list_tables skipping deregistered tables
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_list_tables_skips_deregistered_v1() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create two tables
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req1 = CreateTableRequest::new();
+        create_req1.id = Some(vec!["table1".to_string()]);
+        namespace
+            .create_table(create_req1, bytes::Bytes::from(ipc_data.clone()))
+            .await
+            .unwrap();
+
+        let mut create_req2 = CreateTableRequest::new();
+        create_req2.id = Some(vec!["table2".to_string()]);
+        namespace
+            .create_table(create_req2, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // List tables - should see both (root namespace = empty vec)
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let list_response = namespace.list_tables(list_req.clone()).await.unwrap();
+        assert_eq!(list_response.tables.len(), 2);
+
+        // Deregister table1
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["table1".to_string()]);
+        namespace.deregister_table(deregister_req).await.unwrap();
+
+        // List tables - should only see table2
+        let list_response = namespace.list_tables(list_req).await.unwrap();
+        assert_eq!(list_response.tables.len(), 1);
+        assert!(list_response.tables.contains(&"table2".to_string()));
+        assert!(!list_response.tables.contains(&"table1".to_string()));
+    }
+
+    // ============================================================
+    // Tests for describe_table and table_exists with deregistered tables
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_describe_table_fails_for_deregistered_v1() {
+        use lance_namespace::models::{DeregisterTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Describe should work before deregistration
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.describe_table(describe_req.clone()).await.is_ok());
+
+        // Deregister
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Describe should fail after deregistration
+        let result = namespace.describe_table(describe_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("deregistered"));
+    }
+
+    #[tokio::test]
+    async fn test_table_exists_fails_for_deregistered_v1() {
+        use lance_namespace::models::{DeregisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Table exists should work before deregistration
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req.clone()).await.is_ok());
+
+        // Deregister
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Table exists should fail after deregistration
+        let result = namespace.table_exists(exists_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("deregistered"));
+    }
+
+    #[tokio::test]
+    async fn test_atomic_table_status_check() {
+        // This test verifies that the TableStatus check is atomic
+        // by ensuring a single directory listing is used
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Table status should show exists=true, is_deregistered=false
+        let status = namespace.check_table_status("test_table").await;
+        assert!(status.exists);
+        assert!(!status.is_deregistered);
+        assert!(!status.has_reserved_file);
     }
 }

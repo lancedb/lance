@@ -13,7 +13,8 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::cache::LanceCache;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::utils::mask::NullableRowAddrSet;
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
@@ -41,7 +42,7 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         &self,
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<NullableRowAddrSet> {
         let result = self.search(query, metrics).await?;
         match result {
             SearchResult::Exact(row_ids) => Ok(row_ids),
@@ -55,9 +56,9 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
 
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
-/// A scalar index that can be used on List<T> columns to
-/// support queries with array_contains_all and array_contains_any
-/// using an underlying bitmap index.
+/// A scalar index that can be used on `List<T>` columns to
+/// accelerate list membership filters such as `array_has_all`, `array_has_any`,
+/// and `array_has` / `array_contains`, using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct LabelListIndex {
     values_index: Arc<dyn LabelListSubIndex>,
@@ -118,7 +119,7 @@ impl LabelListIndex {
         &'a self,
         values: &'a Vec<ScalarValue>,
         metrics: &'a dyn MetricsCollector,
-    ) -> BoxStream<'a, Result<RowIdTreeMap>> {
+    ) -> BoxStream<'a, Result<NullableRowAddrSet>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
@@ -129,24 +130,24 @@ impl LabelListIndex {
 
     async fn set_union<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        mut sets: impl TryStream<Ok = NullableRowAddrSet, Error = Error> + 'a + Unpin,
         single_set: bool,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<NullableRowAddrSet> {
         let mut union_bitmap = sets.try_next().await?.unwrap();
         if single_set {
             return Ok(union_bitmap);
         }
         while let Some(next) = sets.try_next().await? {
-            union_bitmap |= next;
+            union_bitmap |= &next;
         }
         Ok(union_bitmap)
     }
 
     async fn set_intersection<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        mut sets: impl TryStream<Ok = NullableRowAddrSet, Error = Error> + 'a + Unpin,
         single_set: bool,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<NullableRowAddrSet> {
         let mut intersect_bitmap = sets.try_next().await?.unwrap();
         if single_set {
             return Ok(intersect_bitmap);
@@ -354,6 +355,10 @@ pub struct LabelListIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn name(&self) -> &str {
+        "LabelList"
+    }
+
     fn new_training_request(
         &self,
         _params: &str,

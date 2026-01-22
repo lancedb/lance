@@ -8,6 +8,7 @@ use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 use snafu::location;
+use std::borrow::Cow;
 
 /// A copy-on-write byte buffer.
 ///
@@ -108,40 +109,28 @@ impl LanceBuffer {
         }
     }
 
-    /// Convert a buffer into a bytes::Bytes object
-    ///
-    /// This convert is zero cost.
-    pub fn into_bytes(self) -> bytes::Bytes {
-        self.0.into_vec::<u8>().unwrap().into()
-    }
-
-    /// Creates an owned copy of the buffer, will always involve a full copy of the bytes
-    pub fn to_owned(&self) -> Self {
-        Self(Buffer::from_vec(self.0.to_vec()))
-    }
-
     /// Make an owned copy of the buffer (always does a copy of the data)
     pub fn deep_copy(&self) -> Self {
         Self(Buffer::from_vec(self.0.to_vec()))
     }
 
-    /// Reinterprets a Vec<T> as a LanceBuffer
+    /// Reinterprets a `Vec<T>` as a LanceBuffer
     ///
-    /// This is a zero-copy operation. We can safely reinterpret Vec<T> into &[u8] which is what happens here.
-    /// However, we cannot safely reinterpret a Vec<T> into a Vec<u8> in rust due to alignment constraints
+    /// This is a zero-copy operation. We can safely reinterpret `Vec<T>` into `&[u8]` which is what happens here.
+    /// However, we cannot safely reinterpret a `Vec<T>` into a `Vec<u8>` in rust due to alignment constraints
     /// from [`Vec::from_raw_parts`]:
     ///
     /// > `T` needs to have the same alignment as what `ptr` was allocated with.
     /// > (`T` having a less strict alignment is not sufficient, the alignment really
-    /// > needs to be equal to satisfy the [`dealloc`] requirement that memory must be
+    /// > needs to be equal to satisfy the `dealloc` requirement that memory must be
     /// > allocated and deallocated with the same layout.)
     pub fn reinterpret_vec<T: ArrowNativeType>(vec: Vec<T>) -> Self {
         Self(Buffer::from_vec(vec))
     }
 
-    /// Reinterprets Arc<[T]> as a LanceBuffer
+    /// Reinterprets `Arc<[T]>` as a LanceBuffer
     ///
-    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    /// This is similar to [`Self::reinterpret_vec`] but for `Arc<[T]>` instead of `Vec<T>`
     ///
     /// The same alignment constraints apply
     pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
@@ -153,7 +142,7 @@ impl LanceBuffer {
         Self(buffer)
     }
 
-    /// Reinterprets a LanceBuffer into a Vec<T>
+    /// Reinterprets a LanceBuffer into a `Vec<T>`
     ///
     /// If the underlying buffer is not properly aligned, this will involve a copy of the data
     ///
@@ -176,6 +165,33 @@ impl LanceBuffer {
             let mut bytes = MutableBuffer::from(vec);
             bytes.extend_from_slice(self);
             ScalarBuffer::<T>::from(Buffer::from(bytes))
+        }
+    }
+
+    /// Reinterprets a LanceBuffer into a `&[T]`
+    ///
+    /// Unlike [`Self::borrow_to_typed_slice`], this function returns a `Cow<'_, [T]>` instead of an owned
+    /// buffer. It saves the cost of Arc creation and destruction, which can be really helpful when
+    /// we borrow data and just drop it without reusing it.
+    ///
+    /// Caller should decide which way to use based on their own needs.
+    ///
+    /// If the underlying buffer is not properly aligned, this will involve a copy of the data
+    ///
+    /// Note: doing this sort of re-interpretation generally makes assumptions about the endianness
+    /// of the data.  Lance does not support big-endian machines so this is safe.  However, if we end
+    /// up supporting big-endian machines in the future, then any use of this method will need to be
+    /// carefully reviewed.
+    pub fn borrow_to_typed_view<T: ArrowNativeType + bytemuck::Pod>(&self) -> Cow<'_, [T]> {
+        let align = std::mem::align_of::<T>();
+        if self.len() % std::mem::size_of::<T>() != 0 {
+            panic!("attempt to view data type of size {} but we have {} bytes which isn't evenly divisible", std::mem::size_of::<T>(), self.len());
+        }
+
+        if self.as_ptr().align_offset(align) == 0 {
+            Cow::Borrowed(bytemuck::cast_slice(&self.0))
+        } else {
+            Cow::Owned(bytemuck::pod_collect_to_vec(self.0.as_slice()))
         }
     }
 

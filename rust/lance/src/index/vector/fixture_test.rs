@@ -163,7 +163,12 @@ mod test {
         fn ivf_model(&self) -> &IvfModel {
             unimplemented!("only for IVF")
         }
+
         fn quantizer(&self) -> Quantizer {
+            unimplemented!("only for IVF")
+        }
+
+        fn partition_size(&self, _: usize) -> usize {
             unimplemented!("only for IVF")
         }
 
@@ -259,7 +264,7 @@ mod test {
                 maximum_nprobes: None,
                 ef: None,
                 refine_factor: None,
-                metric_type: metric,
+                metric_type: Some(metric),
                 use_index: true,
                 dist_q_c: 0.0,
             };

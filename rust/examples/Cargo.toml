@@ -38,7 +38,7 @@ arrow-select = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 itertools = { workspace = true }
 futures = { workspace = true }
-lance = { workspace = true }
+lance = { workspace = true, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
 lance-index = { workspace = true }
 lance-core = { workspace = true }
 lance-linalg = { workspace = true }
@@ -49,6 +49,6 @@ tokio = { workspace = true }
 all_asserts = "2.3.1"
 env_logger = "0.11.7"
 hf-hub = "0.4.2"
-parquet = "56.1"
+parquet = "57.1"
 tokenizers = "0.15.2"
 rand.workspace = true

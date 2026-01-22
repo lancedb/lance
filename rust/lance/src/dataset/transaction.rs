@@ -45,14 +45,15 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use super::ManifestWriteConfig;
+use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
+use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
+use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{datatypes::BlobVersion, datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::mem_wal::MemWal;
+use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
@@ -88,21 +89,8 @@ pub struct Transaction {
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
-    /// If the transaction modified the blobs dataset, this is the operation
-    /// to apply to the blobs dataset.
-    ///
-    /// If this is `None`, then the blobs dataset was not modified
-    pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum BlobsOperation {
-    /// The operation did not modify the blobs dataset
-    Unchanged,
-    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
-    Updated(u64),
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -212,7 +200,7 @@ pub enum Operation {
     ///
     /// e.g. if fragments being replaced contain files with different schema layouts on
     /// the column being replaced, the operation is not allowed.
-    /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
+    /// say `frag_1: [A] [B, C]` and `frag_2: [A, B] [C]` and we are trying to replace column A
     /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
@@ -257,13 +245,16 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
-        /// The MemWAL (pre-image) that should be marked as merged after this transaction
-        mem_wal_to_merge: Option<MemWal>,
+        /// List of MemWAL region generations to mark as merged after this transaction
+        merged_generations: Vec<MergedGeneration>,
         /// The fields that used to judge whether to preserve the new frag's id into
         /// the frag bitmap of the specified indices.
         fields_for_preserving_frag_bitmap: Vec<u32>,
         /// The mode of update
         update_mode: Option<UpdateMode>,
+        /// Optional filter for detecting conflicts on inserted row keys.
+        /// Only tracks keys from INSERT operations during merge insert, not updates.
+        inserted_rows_filter: Option<KeyExistenceFilter>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -276,11 +267,11 @@ pub enum Operation {
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
     },
-    /// Update the state of MemWALs.
+    /// Update merged generations in MemWAL index.
+    /// This is used during merge-insert to atomically record which
+    /// generations have been merged to the base table.
     UpdateMemWalState {
-        added: Vec<MemWal>,
-        updated: Vec<MemWal>,
-        removed: Vec<MemWal>,
+        merged_generations: Vec<MergedGeneration>,
     },
 
     /// Clone a dataset.
@@ -330,6 +321,15 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+        }
+    }
+}
+
+impl From<&Transaction> for lance_table::format::Transaction {
+    fn from(value: &Transaction) -> Self {
+        let pb_transaction: pb::Transaction = value.into();
+        Self {
+            inner: pb_transaction,
         }
     }
 }
@@ -450,30 +450,33 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
-                    mem_wal_to_merge: a_mem_wal_to_merge,
+                    merged_generations: a_merged_generations,
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
+                    inserted_rows_filter: a_inserted_rows_filter,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
-                    mem_wal_to_merge: b_mem_wal_to_merge,
+                    merged_generations: b_merged_generations,
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
+                    inserted_rows_filter: b_inserted_rows_filter,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
-                    && a_mem_wal_to_merge == b_mem_wal_to_merge
+                    && compare_vec(a_merged_generations, b_merged_generations)
                     && compare_vec(
                         a_fields_for_preserving_frag_bitmap,
                         b_fields_for_preserving_frag_bitmap,
                     )
                     && a_update_mode == b_update_mode
+                    && a_inserted_rows_filter == b_inserted_rows_filter
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1023,20 +1026,12 @@ impl PartialEq for Operation {
             }
             (
                 Self::UpdateMemWalState {
-                    added: a_added,
-                    updated: a_updated,
-                    removed: a_removed,
+                    merged_generations: a_merged,
                 },
                 Self::UpdateMemWalState {
-                    added: b_added,
-                    updated: b_updated,
-                    removed: b_removed,
+                    merged_generations: b_merged,
                 },
-            ) => {
-                compare_vec(a_added, b_added)
-                    && compare_vec(a_updated, b_updated)
-                    && compare_vec(a_removed, b_removed)
-            }
+            ) => compare_vec(a_merged, b_merged),
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
@@ -1430,7 +1425,6 @@ pub struct TransactionBuilder {
     // uuid is optional for builder since it can autogenerate
     uuid: Option<String>,
     operation: Operation,
-    blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
@@ -1441,7 +1435,6 @@ impl TransactionBuilder {
             read_version,
             uuid: None,
             operation,
-            blobs_op: None,
             tag: None,
             transaction_properties: None,
         }
@@ -1449,11 +1442,6 @@ impl TransactionBuilder {
 
     pub fn uuid(mut self, uuid: String) -> Self {
         self.uuid = Some(uuid);
-        self
-    }
-
-    pub fn blobs_op(mut self, blobs_op: Option<Operation>) -> Self {
-        self.blobs_op = blobs_op;
         self
     }
 
@@ -1478,7 +1466,6 @@ impl TransactionBuilder {
             read_version: self.read_version,
             uuid,
             operation: self.operation,
-            blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
         }
@@ -1490,18 +1477,8 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation).build()
     }
 
-    pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
-        Self { blobs_op, ..self }
-    }
-
-    pub fn new(
-        read_version: u64,
-        operation: Operation,
-        blobs_op: Option<Operation>,
-        tag: Option<String>,
-    ) -> Self {
+    pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
         TransactionBuilder::new(read_version, operation)
-            .blobs_op(blobs_op)
             .tag(tag)
             .build()
     }
@@ -1552,6 +1529,7 @@ impl Transaction {
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
+        current_manifest: &Manifest,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
@@ -1560,6 +1538,9 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        manifest.max_fragment_id = manifest
+            .max_fragment_id
+            .max(current_manifest.max_fragment_id);
         Ok((manifest, indices))
     }
 
@@ -1572,7 +1553,6 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-        new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -1723,9 +1703,10 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                ..
             } => {
                 // Extract existing fragments once for reuse
                 let existing_fragments = maybe_existing_fragments?;
@@ -1934,17 +1915,11 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
-                if let Some(mem_wal_to_merge) = mem_wal_to_merge {
-                    update_mem_wal_index_in_indices_list(
-                        self.read_version,
-                        current_manifest.map_or(1, |m| m.version + 1),
+                if !merged_generations.is_empty() {
+                    update_mem_wal_index_merged_generations(
                         &mut final_indices,
-                        vec![],
-                        vec![MemWal {
-                            state: lance_index::mem_wal::State::Merged,
-                            ..mem_wal_to_merge.clone()
-                        }],
-                        vec![mem_wal_to_merge.clone()],
+                        current_manifest.map_or(1, |m| m.version + 1),
+                        merged_generations.clone(),
                     )?;
                 }
             }
@@ -2154,18 +2129,11 @@ impl Transaction {
 
                 final_fragments.extend(unmodified_fragments);
             }
-            Operation::UpdateMemWalState {
-                added,
-                updated,
-                removed,
-            } => {
-                update_mem_wal_index_in_indices_list(
-                    self.read_version,
-                    current_manifest.map_or(1, |m| m.version + 1),
+            Operation::UpdateMemWalState { merged_generations } => {
+                update_mem_wal_index_merged_generations(
                     &mut final_indices,
-                    added.clone(),
-                    updated.clone(),
-                    removed.clone(),
+                    current_manifest.map_or(1, |m| m.version + 1),
+                    merged_generations.clone(),
                 )?;
             }
             Operation::UpdateBases { .. } => {
@@ -2191,12 +2159,8 @@ impl Transaction {
         let mut manifest = if let Some(current_manifest) = current_manifest {
             // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
             // So we always use new_from_previous which preserves base_paths
-            let mut prev_manifest = Manifest::new_from_previous(
-                current_manifest,
-                schema,
-                Arc::new(final_fragments),
-                new_blob_version,
-            );
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -2211,19 +2175,29 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            Manifest::new(
+            let mut manifest = Manifest::new(
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
-                new_blob_version,
                 reference_paths,
-            )
+            );
+            if manifest.data_storage_format.lance_file_version()? >= LanceFileVersion::V2_2 {
+                manifest.config_mut().insert(
+                    BLOB_VERSION_CONFIG_KEY.to_string(),
+                    BlobVersion::V2.config_value().to_string(),
+                );
+            }
+            manifest
         };
 
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_stable_row_ids)?;
+            apply_feature_flags(
+                &mut manifest,
+                config.use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -2549,18 +2523,13 @@ impl Transaction {
                 return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id), location!()));
             }
 
-            let index = indices
+            // Skip indices that no longer exist (may have been removed by concurrent operation)
+            let Some(index) = indices
                 .iter_mut()
                 .find(|idx| idx.uuid == rewritten_index.old_id)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "Invalid compaction plan refers to index {} which does not exist",
-                            rewritten_index.old_id
-                        ),
-                        location!(),
-                    )
-                })?;
+            else {
+                continue;
+            };
 
             index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
                 index.fragment_bitmap.as_ref().ok_or_else(|| {
@@ -2810,9 +2779,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 initial_bases,
             })) => {
                 let config_upsert_option = if config_upsert_values.is_empty() {
-                    Some(config_upsert_values)
-                } else {
                     None
+                } else {
+                    Some(config_upsert_values)
                 };
 
                 Operation::Overwrite {
@@ -2898,9 +2867,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2912,13 +2882,19 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
-                mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
+                merged_generations: merged_generations
+                    .into_iter()
+                    .map(|m| MergedGeneration::try_from(m).unwrap())
+                    .collect(),
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
                     1 => Some(UpdateMode::RewriteColumns),
                     _ => Some(UpdateMode::RewriteRows),
                 },
+                inserted_rows_filter: inserted_rows
+                    .map(|ik| KeyExistenceFilter::try_from(&ik))
+                    .transpose()?,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -3015,23 +2991,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState {
-                    added,
-                    updated,
-                    removed,
-                },
+                pb::transaction::UpdateMemWalState { merged_generations },
             )) => Operation::UpdateMemWalState {
-                added: added
+                merged_generations: merged_generations
                     .into_iter()
-                    .map(|m| MemWal::try_from(m).unwrap())
-                    .collect(),
-                updated: updated
-                    .into_iter()
-                    .map(|m| MemWal::try_from(m).unwrap())
-                    .collect(),
-                removed: removed
-                    .into_iter()
-                    .map(|m| MemWal::try_from(m).unwrap())
+                    .map(|m| MergedGeneration::try_from(m).unwrap())
                     .collect(),
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
@@ -3046,51 +3010,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                 });
             }
         };
-        let blobs_op = message
-            .blob_operation
-            .map(|blob_op| match blob_op {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments,
-                }) => Result::Ok(Operation::Append {
-                    fragments: fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                }),
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments,
-                    schema,
-                    schema_metadata: _schema_metadata, // TODO: handle metadata
-                    config_upsert_values,
-                    initial_bases,
-                }) => {
-                    let config_upsert_option = if config_upsert_values.is_empty() {
-                        Some(config_upsert_values)
-                    } else {
-                        None
-                    };
-
-                    Ok(Operation::Overwrite {
-                        fragments: fragments
-                            .into_iter()
-                            .map(Fragment::try_from)
-                            .collect::<Result<Vec<_>>>()?,
-                        schema: Schema::from(&Fields(schema)),
-                        config_upsert_values: config_upsert_option,
-                        initial_bases: if initial_bases.is_empty() {
-                            None
-                        } else {
-                            Some(initial_bases.into_iter().map(BasePath::from).collect())
-                        },
-                    })
-                }
-            })
-            .transpose()?;
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
-            blobs_op,
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -3115,7 +3038,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::io(
+                    Error::invalid_input(
                         "required field (old_id) missing from message".to_string(),
                         location!(),
                     )
@@ -3125,7 +3048,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::io(
+                    Error::invalid_input(
                         "required field (new_id) missing from message".to_string(),
                         location!(),
                     )
@@ -3267,9 +3190,10 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -3278,7 +3202,10 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
-                mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
+                merged_generations: merged_generations
+                    .iter()
+                    .map(pb::MergedGeneration::from)
+                    .collect(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
                     .as_ref()
@@ -3287,6 +3214,7 @@ impl From<&Transaction> for pb::Transaction {
                         UpdateMode::RewriteColumns => 1,
                     })
                     .unwrap_or(0),
+                inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -3328,23 +3256,11 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState {
-                added,
-                updated,
-                removed,
-            } => {
+            Operation::UpdateMemWalState { merged_generations } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
-                    added: added
+                    merged_generations: merged_generations
                         .iter()
-                        .map(pb::mem_wal_index_details::MemWal::from)
-                        .collect::<Vec<_>>(),
-                    updated: updated
-                        .iter()
-                        .map(pb::mem_wal_index_details::MemWal::from)
-                        .collect::<Vec<_>>(),
-                    removed: removed
-                        .iter()
-                        .map(pb::mem_wal_index_details::MemWal::from)
+                        .map(pb::MergedGeneration::from)
                         .collect::<Vec<_>>(),
                 })
             }
@@ -3359,40 +3275,6 @@ impl From<&Transaction> for pb::Transaction {
             }
         };
 
-        let blob_operation = value.blobs_op.as_ref().map(|op| match op {
-            Operation::Append { fragments } => {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                })
-            }
-            Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values,
-                initial_bases,
-            } => {
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                    config_upsert_values: config_upsert_values
-                        .clone()
-                        .unwrap_or(Default::default()),
-                    initial_bases: initial_bases
-                        .as_ref()
-                        .map(|paths| {
-                            paths
-                                .iter()
-                                .cloned()
-                                .map(|bp: BasePath| -> pb::BasePath { bp.into() })
-                                .collect::<Vec<pb::BasePath>>()
-                        })
-                        .unwrap_or_default(),
-                })
-            }
-            _ => panic!("Invalid blob operation: {:?}", value),
-        });
-
         let transaction_properties = value
             .transaction_properties
             .as_ref()
@@ -3402,7 +3284,6 @@ impl From<&Transaction> for pb::Transaction {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
-            blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
         }
@@ -3686,7 +3567,6 @@ mod tests {
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(original_fragments),
             DataStorageFormat::new(LanceFileVersion::V2_0),
-            None,
             HashMap::new(),
         );
 
@@ -4451,5 +4331,29 @@ mod tests {
 
         // Verify idx_e removed (bad field)
         assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
+    }
+
+    #[test]
+    fn test_handle_rewrite_indices_skips_missing_index() {
+        use uuid::Uuid;
+
+        // Create an empty indices list
+        let mut indices = vec![];
+
+        // Create rewritten_indices referring to a non-existent index
+        let rewritten_indices = vec![RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any {
+                type_url: String::new(),
+                value: vec![],
+            },
+            new_index_version: 1,
+        }];
+
+        // Should succeed (skip missing index) instead of error
+        let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
+        assert!(result.is_ok());
+        assert!(indices.is_empty());
     }
 }

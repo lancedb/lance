@@ -4,6 +4,9 @@ on:
     # Trigger on published to include both stable and preview/beta releases
     types: [published]
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - .github/workflows/java-publish.yml
   workflow_dispatch:
@@ -24,7 +27,7 @@ on:
 jobs:
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-2404-8x-arm64
+    runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -191,11 +194,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - uses: Swatinem/rust-cache@v2
-      - name: Set up Java 8
+      - name: Set up Java 11
         uses: actions/setup-java@v4
         with:
           distribution: corretto
-          java-version: 8
+          java-version: 11
           cache: "maven"
           server-id: ossrh
           server-username: SONATYPE_USER
@@ -217,7 +220,7 @@ jobs:
       - name: Set github
         run: |
           git config --global user.email "Lance Github Runner"
-          git config --global user.name "dev+gha@lancedb.com"
+          git config --global user.name "dev+gha@lance.org"
       - name: Dry run
         if: |
           github.event_name == 'pull_request' ||
@@ -225,7 +228,7 @@ jobs:
         working-directory: java
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
-      - name: Publish with Java 8
+      - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
           inputs.mode == 'release'

@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use crate::file::object_store_from_uri_or_path;
+use crate::rt;
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -23,7 +25,7 @@ use arrow_schema::DataType;
 use lance::datatypes::Schema;
 use lance::Result;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::kmeans::{
@@ -33,6 +35,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use pyo3::intern;
+use pyo3::types::PyNone;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -40,8 +43,21 @@ use pyo3::{
     IntoPyObjectExt,
 };
 
-use crate::file::object_store_from_uri_or_path;
-use crate::rt;
+/// A wrapper around a JSON string that converts to a Python object
+/// using json.loads when marshalling to Python.
+#[derive(Debug, Clone)]
+pub struct PyJson(pub String);
+
+impl<'py> IntoPyObject<'py> for PyJson {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        let json_module = py.import("json")?;
+        json_module.call_method1("loads", (self.0,))
+    }
+}
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -115,7 +131,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        array: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
@@ -148,7 +168,7 @@ impl KMeans {
         cluster_ids.into_data().to_pyarrow(py)
     }
 
-    fn centroids(&self, py: Python) -> PyResult<PyObject> {
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         if let Some(kmeans) = self.trained_kmeans.as_ref() {
             let centroids: Float32Array = kmeans.centroids.as_primitive().clone();
             let fixed_size_arr =
@@ -161,7 +181,7 @@ impl KMeans {
                     })?;
             fixed_size_arr.into_data().to_pyarrow(py)
         } else {
-            Ok(py.None())
+            Ok(PyNone::get(py).to_owned().into_any())
         }
     }
 }
@@ -223,7 +243,7 @@ impl Hnsw {
         let mut writer = rt()
             .block_on(
                 Some(py),
-                FileWriter::<ManifestDescribing>::try_new(
+                PreviousFileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())
@@ -243,7 +263,7 @@ impl Hnsw {
         Ok(())
     }
 
-    fn vectors(&self, py: Python) -> PyResult<PyObject> {
+    fn vectors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.vectors.to_data().to_pyarrow(py)
     }
 }
@@ -263,7 +283,7 @@ where
 }
 
 /// Export a Vec of Lance types to a Python object.
-pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<PyObject>>
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<Py<PyAny>>>
 where
     PyLance<&'a T>: IntoPyObject<'a>,
 {

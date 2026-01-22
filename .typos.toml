@@ -11,6 +11,11 @@ afe = "afe"
 typ = "typ"
 rabit = "rabit"
 flate = "flate"
+Ines = "Ines"
+
+[default.expect]
+nprobs = "nprobes"
+nprob = "nprobe"
 
 [files]
 extend-exclude = ["notebooks/*.ipynb"]

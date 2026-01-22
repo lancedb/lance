@@ -15,8 +15,8 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -111,11 +111,27 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema
+    /// The unenforced primary key fields in the schema, ordered by position.
+    ///
+    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position value.
+    /// Fields without explicit positions (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit positions.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
-        self.fields_pre_order()
-            .filter(|f| f.unenforced_primary_key)
-            .collect::<Vec<_>>()
+        let mut pk_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_primary_key())
+            .collect();
+
+        pk_fields.sort_by_key(|f| {
+            let pk_position = f.unenforced_primary_key_position.unwrap_or(0);
+            if pk_position > 0 {
+                (false, pk_position as i32, f.id)
+            } else {
+                (true, f.id, f.id)
+            }
+        });
+
+        pk_fields
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
@@ -144,47 +160,6 @@ impl Schema {
         } else {
             Some(differences.join(", "))
         }
-    }
-
-    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
-        let fields = self
-            .fields
-            .iter()
-            .filter(|f| f.storage_class() == storage_class)
-            .cloned()
-            .collect();
-        Self {
-            fields,
-            metadata: self.metadata.clone(),
-        }
-    }
-
-    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
-    /// If there are no blob storage class fields, the second schema will be `None`.
-    /// The order of fields is preserved.
-    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
-        let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut sibling_fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields.iter() {
-            match field.storage_class() {
-                StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => sibling_fields.push(field.clone()),
-            }
-        }
-        (
-            Self {
-                fields: local_fields,
-                metadata: self.metadata.clone(),
-            },
-            if sibling_fields.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    fields: sibling_fields,
-                    metadata: self.metadata.clone(),
-                })
-            },
-        )
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -453,7 +428,7 @@ impl Schema {
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_struct() {
+                if field.data_type().is_nested() {
                     if let Some(f) = field.exclude(other_field) {
                         fields.push(f)
                     }
@@ -472,6 +447,62 @@ impl Schema {
     /// Field names containing dots must be quoted: parent."child.with.dot"
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.resolve(name).and_then(|fields| fields.last().copied())
+    }
+
+    /// Get a field by its path, with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    /// Field names containing dots must be quoted: parent."child.with.dot"
+    pub fn field_case_insensitive(&self, name: &str) -> Option<&Field> {
+        self.resolve_case_insensitive(name)
+            .and_then(|fields| fields.last().copied())
+    }
+
+    /// Given a string column reference, resolve the path of fields with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual fields from the schema (preserving original case).
+    pub fn resolve_case_insensitive(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let split = parse_field_path(column.as_ref()).ok()?;
+        if split.is_empty() {
+            return None;
+        }
+
+        if split.len() == 1 {
+            let field_name = &split[0];
+            // Try exact match first
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
+            }
+            // Fall back to case-insensitive match
+            if let Some(field) = self
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field_name))
+            {
+                return Some(vec![field]);
+            }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
+        let mut fields = Vec::with_capacity(split.len());
+        let first = &split[0];
+
+        // Find the first field (try exact match, then case-insensitive)
+        let field = self.fields.iter().find(|f| &f.name == first).or_else(|| {
+            self.fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(first))
+        })?;
+
+        let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+        if field.resolve_case_insensitive(&mut split_refs, &mut fields) {
+            Some(fields)
+        } else {
+            None
+        }
     }
 
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
@@ -554,7 +585,7 @@ impl Schema {
     // TODO: pub(crate)
     /// Get the maximum field id in the schema.
     ///
-    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
+    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id()`
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
@@ -738,6 +769,16 @@ impl TryFrom<&ArrowSchema> for Schema {
                             location: location!(),
                         });
                     }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a map type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
                 }
             }
         }
@@ -770,7 +811,7 @@ pub fn compare_fields(
     expected: &[Field],
     options: &SchemaCompareOptions,
 ) -> bool {
-    if options.allow_missing_if_nullable || options.ignore_field_order {
+    if options.allow_missing_if_nullable || options.ignore_field_order || options.allow_subschema {
         let expected_names = expected
             .iter()
             .map(|f| f.name.as_str())
@@ -797,6 +838,9 @@ pub fn compare_fields(
                     return false;
                 }
                 cumulative_position = *pos;
+            } else if options.allow_subschema {
+                // allow_subschema: allow missing any field
+                continue;
             } else if options.allow_missing_if_nullable && expected_field.nullable {
                 continue;
             } else {
@@ -844,7 +888,10 @@ pub fn explain_fields_difference(
         .map(prepend_path)
         .collect::<Vec<_>>();
     let missing_fields = expected_names.difference(&field_names);
-    let missing_fields = if options.allow_missing_if_nullable {
+    let missing_fields = if options.allow_subschema {
+        // allow_subschema: don't report any missing fields
+        Vec::new()
+    } else if options.allow_missing_if_nullable {
         missing_fields
             .filter(|f| {
                 let expected_field = expected.iter().find(|ef| ef.name == **f).unwrap();
@@ -963,7 +1010,9 @@ pub enum BlobHandling {
 
 impl BlobHandling {
     fn should_unload(&self, field: &Field) -> bool {
-        if !field.data_type().is_binary_like() {
+        // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
+        // even if the physical data type is not binary-like.
+        if !(field.data_type().is_binary_like() || field.is_blob()) {
             return false;
         }
         match self {
@@ -975,9 +1024,9 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field) -> Field {
+    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded()
+            field.into_unloaded_with_version(version)
         } else {
             field
         }
@@ -997,6 +1046,7 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
+    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -1014,6 +1064,7 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
+            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -1029,6 +1080,7 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
+            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1059,6 +1111,11 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
+        self
+    }
+
+    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
+        self.blob_version = blob_version;
         self
     }
 
@@ -1468,17 +1525,23 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-/// Format a field path, quoting field names that contain dots or backticks.
+/// Format a field path, quoting field names that require escaping.
 ///
-/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Field names are quoted if they contain any character that is not alphanumeric
+/// or underscore, to ensure safe SQL parsing.
+///
+/// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
+/// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
+/// For example: \["field`with`backticks"\] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
         .map(|field| {
-            if field.contains('.') || field.contains('`') {
-                // Quote this field
+            // Quote if the field contains any non-identifier character
+            // (i.e., anything other than alphanumeric or underscore)
+            let needs_quoting = field.chars().any(|c| !c.is_alphanumeric() && c != '_');
+            if needs_quoting {
                 // Escape backticks by doubling them (PostgreSQL style)
                 let escaped = field.replace('`', "``");
                 format!("`{}`", escaped)
@@ -1499,6 +1562,9 @@ pub fn format_field_path(fields: &[&str]) -> String {
 /// - "parent.child" -> “`parent`.`child`”
 /// - "parent.`child.with.dot`" -> “`parent`.`child.with.dot`”
 pub fn escape_field_path_for_project(name: &str) -> String {
+    if name == WILDCARD {
+        return name.to_string();
+    }
     let segments = parse_field_path(name).unwrap_or_else(|_| vec![name.to_string()]);
     segments
         .iter()
@@ -1513,9 +1579,22 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[test]
+    fn projection_from_schema_defaults_to_v1() {
+        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
+        let schema = Schema {
+            fields: vec![field],
+            metadata: HashMap::new(),
+        };
+
+        let projection = Projection::empty(Arc::new(schema));
+
+        assert_eq!(projection.blob_version, BlobVersion::V1);
+    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -2535,5 +2614,112 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        // When positions are specified, fields are ordered by their position values
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "2".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "b");
+        assert_eq!(pk_fields[1].name, "a");
+
+        // When positions are not specified, fields are ordered by their schema field id
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Int64, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "c");
+        assert_eq!(pk_fields[1].name, "d");
+
+        // Fields with explicit positions are ordered before fields without
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("e", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("f", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("g", DataType::Utf8, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 3);
+        assert_eq!(pk_fields[0].name, "f");
+        assert_eq!(pk_fields[1].name, "e");
+        assert_eq!(pk_fields[2].name, "g");
     }
 }

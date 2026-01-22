@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::exec::{get_session_context, LanceExecutionOptions};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
@@ -19,10 +20,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor
 use datafusion::common::DFSchema;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::{SessionContext, SessionState};
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -36,11 +34,11 @@ use datafusion::sql::planner::{
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
     Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+    ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, Between, BinaryExpr, Like, Operator},
+    logical_expr::{Between, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -163,22 +161,9 @@ struct LanceContextProvider {
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let config = SessionConfig::new();
-        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
-
-        let ctx = SessionContext::new_with_config_rt(config.clone(), runtime.clone());
-        crate::udf::register_functions(&ctx);
-
+        let ctx = get_session_context(&LanceExecutionOptions::default());
         let state = ctx.state();
-
-        // SessionState does not expose expr_planners, so we need to get them separately
-        let mut state_builder = SessionStateBuilder::new()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .with_default_features();
-
-        // unwrap safe because with_default_features sets expr_planners
-        let expr_planners = state_builder.expr_planners().as_ref().unwrap().clone();
+        let expr_planners = state.expr_planners().to_vec();
 
         Self {
             options: ConfigOptions::default(),
@@ -267,6 +252,23 @@ impl Planner {
         self
     }
 
+    /// Resolve a column name using case-insensitive matching against the schema.
+    /// Returns the actual field name if found, otherwise returns the original name.
+    fn resolve_column_name(&self, name: &str) -> String {
+        // Try exact match first
+        if self.schema.field_with_name(name).is_ok() {
+            return name.to_string();
+        }
+        // Fall back to case-insensitive match
+        for field in self.schema.fields() {
+            if field.name().eq_ignore_ascii_case(name) {
+                return field.name().clone();
+            }
+        }
+        // Not found in schema - return original (might be computed column, system column, etc.)
+        name.to_string()
+    }
+
     fn column(&self, idents: &[Ident]) -> Expr {
         fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
             for ident in idents {
@@ -283,14 +285,16 @@ impl Planner {
         if self.enable_relations && idents.len() > 1 {
             // Create qualified column reference (relation.column)
             let relation = &idents[0].value;
-            let column_name = &idents[1].value;
-            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let column_name = self.resolve_column_name(&idents[1].value);
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name));
             let mut result = column;
             handle_remaining_idents(&mut result, &idents[2..]);
             result
         } else {
             // Default behavior - treat as struct field access
-            let mut column = col(&idents[0].value);
+            // Use resolved column name to handle case-insensitive matching
+            let resolved_name = self.resolve_column_name(&idents[0].value);
+            let mut column = Expr::Column(Column::from_name(resolved_name));
             handle_remaining_idents(&mut column, &idents[1..]);
             column
         }
@@ -675,7 +679,7 @@ impl Planner {
                 Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
             // For example, DATE '2020-01-01'
-            SQLExpr::TypedString { data_type, value } => {
+            SQLExpr::TypedString(TypedString { data_type, value, .. }) => {
                 let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
                     expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
@@ -835,8 +839,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL filter clause.
     ///
-    /// Note: the returned expression must be passed through [optimize_expr()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_expr()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let ast_expr = parse_sql_filter(filter)?;
@@ -854,13 +858,17 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
-    /// Note: the returned expression must be passed through [optimize_filter()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_filter()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
-        if self.schema.field_with_name(expr).is_ok() {
-            return Ok(col(expr));
+        // First check if it's a simple column reference (no operators, functions, etc.)
+        // resolve_column_name tries exact match first, then falls back to case-insensitive
+        let resolved_name = self.resolve_column_name(expr);
+        if self.schema.field_with_name(&resolved_name).is_ok() {
+            return Ok(Expr::Column(Column::from_name(resolved_name)));
         }
 
+        // Parse as SQL expression
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
@@ -1014,7 +1022,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
-        logical_expr::{lit, Cast},
+        logical_expr::{col, lit, Cast},
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;

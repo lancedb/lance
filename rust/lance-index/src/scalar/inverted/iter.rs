@@ -1,46 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::hash_map;
-
 use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
-use fst::Streamer;
 
 use super::{
     builder::BLOCK_SIZE,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
     PostingList,
 };
-
-pub enum TokenSource<'a> {
-    HashMap(hash_map::Iter<'a, String, u32>),
-    Fst(fst::map::Stream<'a>),
-}
-pub struct TokenIterator<'a> {
-    source: TokenSource<'a>,
-}
-
-impl<'a> TokenIterator<'a> {
-    pub(crate) fn new(source: TokenSource<'a>) -> Self {
-        Self { source }
-    }
-}
-
-impl Iterator for TokenIterator<'_> {
-    type Item = (String, u32);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.source {
-            TokenSource::HashMap(iter) => iter
-                .next()
-                .map(|(token, token_id)| (token.clone(), *token_id)),
-            TokenSource::Fst(iter) => iter.next().map(|(token, token_id)| {
-                (String::from_utf8_lossy(token).into_owned(), token_id as u32)
-            }),
-        }
-    }
-}
 
 pub enum PostingListIterator<'a> {
     Plain(PlainPostingListIterator<'a>),

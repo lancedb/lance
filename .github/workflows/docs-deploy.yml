@@ -40,6 +40,16 @@ jobs:
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
+      - name: Checkout lance-namespace-impls
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-namespace-impls
+          path: lance-namespace-impls
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -59,27 +69,69 @@ jobs:
             - Namespace Spec: namespace
           EOF
           cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
-          cp lance-namespace/CONTRIBUTING.md docs/src/community/contributing/namespace.md
-          # Update contributing .pages to include namespace.md in navbar
-          echo "  - Namespace: namespace.md" >> docs/src/community/contributing/.pages
+      - name: Copy lance-namespace-impls docs
+        run: |
+          # Copy implementation specs to the integrations folder
+          cp lance-namespace-impls/docs/src/*.md docs/src/format/namespace/integrations/
+
+          # Copy .pages from lance-namespace-impls and append template entry
+          cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
+          echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
+      - name: Copy lance-huggingface docs
+        run: |
+          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Huggingface: huggingface
+          EOF
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
           cat >> docs/src/integrations/.pages << 'EOF'
             - Apache Spark: spark
           EOF
-          cp lance-spark/CONTRIBUTING.md docs/src/community/contributing/spark.md
-          # Update contributing .pages to include spark.md in navbar
-          echo "  - Apache Spark: spark.md" >> docs/src/community/contributing/.pages
       - name: Copy lance-ray docs
         run: |
           cp -r lance-ray/docs/src docs/src/integrations/ray
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
           EOF
-          cp lance-ray/CONTRIBUTING.md docs/src/community/contributing/ray.md
-          # Update contributing .pages to include ray.md in navbar
-          echo "  - Ray: ray.md" >> docs/src/community/contributing/.pages
+      - name: Copy contributing docs
+        run: |
+          mkdir -p docs/src/community/project-specific/lance
+
+          # Lance project files
+          cp CONTRIBUTING.md docs/src/community/project-specific/lance/general.md
+          cp release_process.md docs/src/community/project-specific/lance/release.md
+          cp rust/CONTRIBUTING.md docs/src/community/project-specific/lance/rust.md
+          cp python/CONTRIBUTING.md docs/src/community/project-specific/lance/python.md
+          cp docs/CONTRIBUTING.md docs/src/community/project-specific/lance/docs.md
+
+          # External project files
+          cp lance-ray/CONTRIBUTING.md docs/src/community/project-specific/ray.md
+          cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
+          cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
+          cp lance-namespace-impls/CONTRIBUTING.md docs/src/community/project-specific/namespace-impls.md || true
+
+          # Create .pages for project-specific
+          cat > docs/src/community/project-specific/.pages << 'EOF'
+          nav:
+            - index.md
+            - Lance: lance
+            - Lance Namespace: namespace.md
+            - Lance Namespace Impls: namespace-impls.md
+            - Lance Ray: ray.md
+            - Lance Spark: spark.md
+          EOF
+
+          # Create .pages for lance subfolder
+          cat > docs/src/community/project-specific/lance/.pages << 'EOF'
+          nav:
+            - General: general.md
+            - Release: release.md
+            - Rust: rust.md
+            - Python: python.md
+            - Docs: docs.md
+          EOF
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

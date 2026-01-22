@@ -1,8 +1,8 @@
 [package]
 name = "pylance"
-version = "0.38.3-beta.10"
+version = "2.1.0-beta.0"
 edition = "2021"
-authors = ["Lance Devs <dev@lancedb.com>"]
+authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
 exclude = ["python/lance/conftest.py"]
 publish = false
@@ -12,17 +12,16 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "56.1", features = ["pyarrow"] }
-arrow-array = "56.1"
-arrow-data = "56.1"
-arrow-schema = "56.1"
-arrow-select = "56.1"
-object_store = "0.12.3"
-datafusion = "50.0.0"
-datafusion-ffi = "50.0.0"
-datafusion-common = "50.0.0"
+arrow = { version = "57.0.0", features = ["pyarrow"] }
+arrow-array = "57.0.0"
+arrow-data = "57.0.0"
+arrow-schema = "57.0.0"
+object_store = "0.12.4"
+datafusion = "51.0.0"
+datafusion-ffi = "51.0.0"
+datafusion-common = "51.0.0"
 async-trait = "0.1"
-chrono = "0.4.41"
+chrono = "0.4.42"
 env_logger = "0.11.7"
 futures = "0.3"
 half = { version = "2.5", default-features = false, features = [
@@ -30,7 +29,6 @@ half = { version = "2.5", default-features = false, features = [
     "std",
 ] }
 lance = { path = "../rust/lance", features = [
-    "tensorflow",
     "dynamodb",
     "substrait",
 ] }
@@ -45,19 +43,22 @@ lance-index = { path = "../rust/lance-index", features = [
 ] }
 lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
+lance-namespace = { path = "../rust/lance-namespace" }
+lance-namespace-impls = { path = "../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 libc = "0.2.176"
 log = "0.4"
-prost = "0.13"
-prost-types = "0.13"
-pyo3 = { version = "0.25", features = [
+prost = "0.14.1"
+prost-types = "0.14.1"
+pyo3 = { version = "0.26", features = [
     "extension-module",
     "abi3-py39",
     "py-clone",
     "chrono",
 ] }
-tokio = { version = "1.23", features = ["rt-multi-thread"] }
+pythonize = "0.26"
+tokio = { version = "1.48", features = ["rt-multi-thread"] }
 uuid = "1.3.0"
 regex = "1"
 roaring = "0.10.1"
@@ -70,11 +71,22 @@ tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
 url = "2.5.0"
 bytes = "1.4"
-once_cell = "1.21.3"
 
 [features]
+default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
 
-[build-dependencies]
-prost-build = "0.11"
+[profile.ci]
+debug = "line-tables-only"
+inherits = "dev"
+incremental = false
+
+# This rule applies to every package except workspace members (dependencies
+# such as `arrow` and `tokio`). It disables debug info and related features on
+# dependencies so their binaries stay smaller, improving cache reuse.
+[profile.ci.package."*"]
+debug = false
+debug-assertions = false
+strip = "debuginfo"
+incremental = false

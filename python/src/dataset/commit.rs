@@ -22,8 +22,8 @@ use lance_core::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-static PY_CONFLICT_ERROR: LazyLock<PyResult<PyObject>> = LazyLock::new(|| {
-    Python::with_gil(|py| {
+static PY_CONFLICT_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
+    Python::attach(|py| {
         py.import("lance")
             .and_then(|lance| lance.getattr("commit"))
             .and_then(|commit| commit.getattr("CommitConflictError"))
@@ -53,18 +53,18 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
 }
 
 pub struct PyCommitLock {
-    inner: PyObject,
+    inner: Py<PyAny>,
 }
 
 impl PyCommitLock {
-    pub fn new(inner: PyObject) -> Self {
+    pub fn new(inner: Py<PyAny>) -> Self {
         Self { inner }
     }
 }
 
 impl Debug for PyCommitLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let repr = Python::with_gil(|py| {
+        let repr = Python::attach(|py| {
             self.inner
                 .call_method0(py, "__repr__")?
                 .extract::<String>(py)
@@ -81,7 +81,7 @@ impl CommitLock for PyCommitLock {
     type Lease = PyCommitLease;
 
     async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
-        let lease = Python::with_gil(|py| -> Result<_, CommitError> {
+        let lease = Python::attach(|py| -> Result<_, CommitError> {
             let lease = self
                 .inner
                 .call1(py, (version,))
@@ -96,13 +96,13 @@ impl CommitLock for PyCommitLock {
 }
 
 pub struct PyCommitLease {
-    inner: PyObject,
+    inner: Py<PyAny>,
 }
 
 #[async_trait::async_trait]
 impl CommitLease for PyCommitLease {
     async fn release(&self, success: bool) -> Result<(), CommitError> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if success {
                 self.inner
                     .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))

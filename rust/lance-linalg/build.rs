@@ -76,7 +76,14 @@ fn main() -> Result<(), String> {
         build_f16_with_flags("lsx", &["-mlsx"]).unwrap();
         build_f16_with_flags("lasx", &["-mlasx"]).unwrap();
     } else {
-        return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
+        // Only error if fp16kernels was explicitly requested on unsupported platform.
+        // This allows builds on iOS, Android, etc. when the feature is disabled.
+        //
+        // Note: We use CARGO_FEATURE_* env var instead of cfg!() because cfg!()
+        // checks the build script's features, not the library's features.
+        if env::var("CARGO_FEATURE_FP16KERNELS").is_ok() {
+            return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
+        }
     }
     Ok(())
 }
@@ -92,7 +99,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     let mut builder = cc::Build::new();
     builder
         // We use clang #pragma to yields better vectorization
-        // See https://github.com/lancedb/lance/pull/2885
+        // See https://github.com/lance-format/lance/pull/2885
         // .compiler("clang")
         .std("c17")
         .file("src/simd/f16.c")

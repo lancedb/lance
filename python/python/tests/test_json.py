@@ -40,16 +40,15 @@ def test_json_basic_write_read():
         # Read back the dataset
         dataset = lance.dataset(dataset_path)
 
-        # Verify storage schema
-        assert len(dataset.schema) == 2
-        assert dataset.schema.field("id").type == pa.int32()
-
-        # Check that JSON field is stored as JSONB internally
-        storage_field = dataset.schema.field("data")
-        assert storage_field.type == pa.large_binary()
-        assert storage_field.metadata is not None
-        assert b"ARROW:extension:name" in storage_field.metadata
-        assert storage_field.metadata[b"ARROW:extension:name"] == b"lance.json"
+        # Verify logical schema exposed to users
+        logical_schema = dataset.schema
+        assert len(logical_schema) == 2
+        assert logical_schema.field("id").type == pa.int32()
+        logical_field = logical_schema.field("data")
+        assert (
+            str(logical_field.type) == "extension<arrow.json>"
+            or logical_field.type == pa.utf8()
+        )
 
         # Read data back
         result_table = dataset.to_table()
@@ -214,6 +213,16 @@ def test_json_path_queries():
         result = dataset.to_table(
             filter="json_extract(data, '$.user.name') = '\"Alice\"'"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_extract(data, '$.user.name') = '\"Alice\"'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -256,19 +265,53 @@ def test_json_get_functions():
 
         # Test json_get_string
         result = dataset.to_table(filter="json_get_string(data, 'name') = 'Alice'")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_string(data, 'name') = 'Alice'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test json_get_int with type coercion
         result = dataset.to_table(filter="json_get_int(data, 'age') > 28")
+        sql = (
+            dataset.sql("SELECT * FROM dataset WHERE json_get_int(data, 'age') > 28")
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (30) and Charlie ("35" -> 35)
 
         # Test json_get_bool with type coercion
         result = dataset.to_table(filter="json_get_bool(data, 'active') = true")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_bool(data, 'active') = true"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (true) and Charlie ("true" -> true)
 
         # Test json_get_float
         result = dataset.to_table(filter="json_get_float(data, 'score') > 90")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_float(data, 'score') > 90"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (95.5) and Charlie ("92" -> 92.0)
 
 
@@ -305,6 +348,18 @@ def test_nested_json_access():
                     'name')
                 = 'Alice'"""
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_get_string("
+                "json_get(json_get(data, 'user'), 'profile'), "
+                "'name') = 'Alice'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -312,6 +367,16 @@ def test_nested_json_access():
         result = dataset.to_table(
             filter="json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -343,15 +408,162 @@ def test_json_array_operations():
         result = dataset.to_table(
             filter="json_array_contains(data, '$.items', 'apple')"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_array_contains(data, '$.items', 'apple')"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test array length
         result = dataset.to_table(filter="json_array_length(data, '$.counts') > 3")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_array_length(data, '$.counts') > 3"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test empty array
         result = dataset.to_table(filter="json_array_length(data, '$.items') = 0")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_array_length(data, '$.items') = 0"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 3
+
+
+def test_json_filter_append_missing_json_cast(tmp_path: Path):
+    """Ensure appending via dataset.schema keeps JSON columns valid."""
+
+    dataset_path = tmp_path / "json_append_issue.lance"
+
+    initial_table = pa.table(
+        {
+            "article_metadata": pa.array(
+                [json.dumps({"article_journal": "Cell"})], type=pa.json_()
+            ),
+            "article_journal": pa.array(["Cell"], type=pa.string()),
+        }
+    )
+
+    lance.write_dataset(initial_table, dataset_path)
+    dataset = lance.dataset(dataset_path)
+    schema = dataset.schema
+    field = schema.field("article_metadata")
+    assert str(field.type) == "extension<arrow.json>" or field.type == pa.utf8()
+
+    append_table = pa.table(
+        {
+            "article_metadata": pa.array(
+                [
+                    json.dumps({"article_journal": "PLoS One"}),
+                    json.dumps({"article_journal": "Nature"}),
+                ],
+                type=pa.json_(),
+            ),
+            "article_journal": pa.array(["PLoS One", "Nature"], type=pa.string()),
+        }
+    )
+
+    append_cast = append_table.cast(schema)
+    first_value = append_cast.column("article_metadata").to_pylist()[0]
+    assert isinstance(first_value, str)
+
+    lance.write_dataset(append_cast, dataset_path, mode="append")
+    dataset = lance.dataset(dataset_path)
+    assert dataset.count_rows() == 3
+
+    result = dataset.to_table(
+        filter="json_get(article_metadata, 'article_journal') IS NOT NULL"
+    )
+    sql = (
+        dataset.sql(
+            "SELECT * FROM dataset WHERE "
+            "json_get(article_metadata, 'article_journal') IS NOT NULL"
+        )
+        .build()
+        .to_batch_records()
+    )
+    sql_result = pa.Table.from_batches(sql)
+
+    assert result == sql_result
+    assert result.num_rows == 3
+    assert result.column("article_journal").to_pylist() == [
+        "Cell",
+        "PLoS One",
+        "Nature",
+    ]
+
+
+def test_json_limit_offset_batch_transfer_preserves_extension_metadata(tmp_path: Path):
+    """Ensure JSON extension metadata survives limit/offset scans.
+
+    This covers recreating a table by reading a source dataset in chunks and
+    appending each chunk into a new dataset.
+    """
+
+    source_path = tmp_path / "json_source.lance"
+    dest_path = tmp_path / "json_dest.lance"
+
+    num_rows = 25
+    batch_size = 10
+
+    table = pa.table(
+        {
+            "id": pa.array(range(num_rows), type=pa.int32()),
+            "meta": pa.array(
+                [json.dumps({"i": i}) for i in range(num_rows)], type=pa.json_()
+            ),
+        }
+    )
+
+    lance.write_dataset(table, source_path)
+    source = lance.dataset(source_path)
+
+    first_batch = source.to_table(limit=batch_size)
+    meta_field = first_batch.schema.field("meta")
+    assert (
+        str(meta_field.type) == "extension<arrow.json>" or meta_field.type == pa.utf8()
+    )
+
+    lance.write_dataset(first_batch, dest_path, mode="overwrite")
+
+    offset = batch_size
+    while True:
+        batch = source.to_table(limit=batch_size, offset=offset)
+        if batch.num_rows == 0:
+            break
+
+        assert batch.schema == first_batch.schema
+        meta_field = batch.schema.field("meta")
+        assert (
+            str(meta_field.type) == "extension<arrow.json>"
+            or meta_field.type == pa.utf8()
+        )
+
+        lance.write_dataset(batch, dest_path, mode="append")
+        offset += batch_size
+
+    dest = lance.dataset(dest_path)
+    assert dest.count_rows() == num_rows
+
+    # Ensure JSON functions still recognize the column as JSON.
+    assert dest.to_table(filter="json_get(meta, 'i') IS NOT NULL").num_rows == num_rows

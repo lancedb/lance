@@ -25,7 +25,7 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -203,19 +203,6 @@ impl UpdateBuilder {
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .any(|f| !f.is_default_storage())
-        {
-            return Err(Error::NotSupported {
-                source: "Updating datasets containing non-default storage columns".into(),
-                location: location!(),
-            });
-        }
-
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
@@ -254,7 +241,7 @@ pub struct UpdateData {
     removed_fragment_ids: Vec<u64>,
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
-    affected_rows: RowIdTreeMap,
+    affected_rows: RowAddrTreeMap,
     num_updated_rows: u64,
 }
 
@@ -313,7 +300,7 @@ impl UpdateJob {
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(e) => Err(DataFusionError::Execution(e.to_string())),
+                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
@@ -322,7 +309,7 @@ impl UpdateJob {
             .manifest()
             .data_storage_format
             .lance_file_version()?;
-        let written = write_fragments_internal(
+        let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
@@ -332,14 +319,6 @@ impl UpdateJob {
             None, // TODO: support multiple bases for update
         )
         .await?;
-
-        if written.blob.is_some() {
-            return Err(Error::NotSupported {
-                source: "Updating blob columns".into(),
-                location: location!(),
-            });
-        }
-        let mut new_fragments = written.default.0;
 
         let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
             message: format!("Failed to receive row ids: {}", err),
@@ -372,7 +351,7 @@ impl UpdateJob {
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
-        let affected_rows = RowIdTreeMap::from(row_addrs.as_ref().clone());
+        let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 
         let num_updated_rows = new_fragments
             .iter()
@@ -409,17 +388,13 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
+            inserted_rows_filter: None,
         };
 
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

@@ -58,7 +58,7 @@ impl RabitQuantizer {
 
         let rotate_mat = match T::FLOAT_TYPE {
             FloatType::Float16 | FloatType::Float32 | FloatType::Float64 => {
-                let rotate_mat = T::ArrayType::from(rotate_mat);
+                let rotate_mat = <T::ArrayType as FloatArray<T>>::from_values(rotate_mat);
                 FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
             }
             _ => unimplemented!("RabitQ does not support data type: {:?}", T::FLOAT_TYPE),
