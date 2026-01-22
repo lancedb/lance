@@ -974,8 +974,8 @@ impl Dataset {
         }
 
         if let Some(blob_handling) = blob_handling {
-            let handling = if let Ok(handling) = blob_handling.extract::<&str>() {
-                match handling {
+            let handling = if let Ok(handling) = blob_handling.extract::<String>() {
+                match handling.as_str() {
                     "all_binary" => BlobHandling::AllBinary,
                     "blobs_descriptions" => BlobHandling::BlobsDescriptions,
                     "all_descriptions" => BlobHandling::AllDescriptions,

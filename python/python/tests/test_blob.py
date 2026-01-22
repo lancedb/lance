@@ -56,7 +56,11 @@ def test_scan_blob_as_binary(tmp_path):
     table = pa.table(
         [arr],
         schema=pa.schema(
-            [pa.field("blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"})]
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
         ),
     )
     ds = lance.write_dataset(table, tmp_path / "test_ds")
