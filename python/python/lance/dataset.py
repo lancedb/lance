@@ -1024,7 +1024,8 @@ class LanceDataset(pa.dataset.Dataset):
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
         blob_handling: str, default None
-            Controls how blob columns are returned. See ``LanceDataset.scanner`` for details.
+            Controls how blob columns are returned. See ``LanceDataset.scanner`` for
+            details.
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
