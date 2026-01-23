@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -77,6 +78,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -497,6 +499,9 @@ pub struct Scanner {
     /// Filter.
     filter: LanceFilter,
 
+    /// Optional allowlist of row ids (in dataset row-id space)
+    row_id_allowlist: Option<Arc<RowAddrMask>>,
+
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
 
@@ -770,6 +775,7 @@ impl Scanner {
             prefilter: false,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
+            row_id_allowlist: None,
             full_text_query: None,
             batch_size: None,
             batch_readahead: get_num_compute_intensive_cpus(),
@@ -809,6 +815,19 @@ impl Scanner {
     pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
         self.blob_handling = blob_handling;
         self.apply_blob_handling();
+        self
+    }
+
+    /// Provide an allowlist of row ids (in dataset row-id space).
+    ///
+    /// For unstable row ids, the allowlist must come from the same snapshot.
+    /// For stable row ids, values remain valid across versions.
+    pub fn row_id_allowlist<I>(&mut self, row_ids: I) -> &mut Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let allow_list: RowAddrTreeMap = row_ids.into_iter().collect();
+        self.row_id_allowlist = Some(Arc::new(RowAddrMask::from_allowed(allow_list)));
         self
     }
 
@@ -2043,7 +2062,20 @@ impl Scanner {
                     .full_expr
                     .as_ref()
                     .and_then(TakeOperation::try_from_expr);
-                if let Some((take_op, remainder)) = take_op {
+                if let Some(allowlist) = &self.row_id_allowlist {
+                    // Apply the allowlist as a hard constraint and intersect any explicit take.
+                    let mut mask = allowlist.as_ref().clone();
+                    if let Some((take_op, remainder)) = take_op {
+                        let take_mask = self.take_op_as_row_id_mask(take_op).await?;
+                        mask = mask & take_mask;
+                        filter_plan.expr_filter_plan = remainder
+                            .map(ExprFilterPlan::new_refine_only)
+                            .unwrap_or(ExprFilterPlan::default());
+                    } else {
+                        filter_plan.expr_filter_plan.make_refine_only();
+                    }
+                    self.mask_as_take_input(mask)?
+                } else if let Some((take_op, remainder)) = take_op {
                     // If there is any remainder use it as the filter (we don't even try and combine an indexed
                     // search on the filter with a take as that seems excessive)
                     filter_plan.expr_filter_plan = remainder
@@ -2371,9 +2403,7 @@ impl Scanner {
         }
     }
 
-    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_addrs = RowAddrTreeMap::from_iter(u64s);
-        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
+    fn mask_as_take_input(&self, row_addr_mask: RowAddrMask) -> Result<Arc<dyn ExecutionPlan>> {
         let index_result = IndexExprResult::Exact(row_addr_mask);
         let fragments_covered =
             RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
@@ -2384,6 +2414,66 @@ impl Scanner {
             stream,
         ));
         Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_addrs = RowAddrTreeMap::from_iter(u64s);
+        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
+        self.mask_as_take_input(row_addr_mask)
+    }
+
+    async fn row_addrs_to_row_ids(&self, row_addrs: &[u64]) -> Result<Vec<u64>> {
+        if !self.dataset.manifest.uses_stable_row_ids() {
+            return Ok(row_addrs.to_vec());
+        }
+
+        let mut addrs_by_frag: HashMap<u32, Vec<u32>> = HashMap::new();
+        for addr in row_addrs.iter().copied() {
+            if addr == RowAddress::TOMBSTONE_ROW {
+                continue;
+            }
+            let addr = RowAddress::new_from_u64(addr);
+            addrs_by_frag
+                .entry(addr.fragment_id())
+                .or_default()
+                .push(addr.row_offset());
+        }
+
+        if addrs_by_frag.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut row_ids = Vec::new();
+        for fragment in self.dataset.manifest.fragments.iter() {
+            let frag_id = fragment.id as u32;
+            let Some(offsets) = addrs_by_frag.remove(&frag_id) else {
+                continue;
+            };
+            let sequence = load_row_id_sequence(self.dataset.as_ref(), fragment).await?;
+            row_ids.extend(
+                offsets
+                    .into_iter()
+                    .filter_map(|offset| sequence.get(offset as usize)),
+            );
+        }
+
+        Ok(row_ids)
+    }
+
+    async fn take_op_as_row_id_mask(&self, take_op: TakeOperation) -> Result<RowAddrMask> {
+        let row_ids = match take_op {
+            TakeOperation::RowIds(ids) => ids,
+            TakeOperation::RowAddrs(addrs) => self.row_addrs_to_row_ids(&addrs).await?,
+            TakeOperation::RowOffsets(offsets) => {
+                let mut addrs =
+                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
+                self.row_addrs_to_row_ids(&addrs).await?
+            }
+        };
+        Ok(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            row_ids,
+        )))
     }
 
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
