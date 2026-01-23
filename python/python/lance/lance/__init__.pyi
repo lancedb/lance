@@ -240,6 +240,7 @@ class _Dataset:
         fast_search: Optional[bool] = None,
         full_text_query: Optional[dict] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
     ) -> _Scanner: ...
