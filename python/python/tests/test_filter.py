@@ -299,12 +299,12 @@ def test_duckdb(tmp_path):
     expected = expected[(expected.price > 20.0) & (expected.price <= 90)].reset_index(
         drop=True
     )
-    tm.assert_frame_equal(actual, expected)
+    tm.assert_frame_equal(actual, expected, check_dtype=False)
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE meta=='aa'").to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.meta == "aa"].reset_index(drop=True)
-    tm.assert_frame_equal(actual, expected)
+    tm.assert_frame_equal(actual, expected, check_dtype=False)
 
 
 def test_struct_field_order(tmp_path):

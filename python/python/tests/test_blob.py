@@ -50,6 +50,25 @@ def test_blob_descriptions(tmp_path):
     assert descriptions.field(1) == expected_sizes
 
 
+def test_scan_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+
 @pytest.fixture
 def dataset_with_blobs(tmp_path):
     values = pa.array([b"foo", b"bar", b"baz"], pa.large_binary())

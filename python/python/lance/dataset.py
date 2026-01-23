@@ -693,6 +693,9 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: Optional[bool] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[
+            Literal["all_binary", "blobs_descriptions", "all_descriptions"]
+        ] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
@@ -780,6 +783,12 @@ class LanceDataset(pa.dataset.Dataset):
             of the rows.  If your filter is more selective (e.g. find by id) you may
             want to set this to True.  If your filter is not very selective (e.g.
             matches 20% of the rows) you may want to set this to False.
+        blob_handling: str, default None
+            Controls how blob columns are returned.
+
+            - "all_binary": read blob columns as binary / large_binary values
+            - "blobs_descriptions": read blob columns as descriptions (default)
+            - "all_descriptions": read all binary columns as descriptions
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
@@ -870,6 +879,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.scan_in_order, scan_in_order)
         setopt(builder.with_fragments, fragments)
         setopt(builder.late_materialization, late_materialization)
+        setopt(builder.blob_handling, blob_handling)
         setopt(builder.with_row_id, with_row_id)
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
@@ -958,6 +968,7 @@ class LanceDataset(pa.dataset.Dataset):
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
@@ -1012,6 +1023,9 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
+        blob_handling: str, default None
+            Controls how blob columns are returned. See ``LanceDataset.scanner`` for
+            details.
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
@@ -1073,6 +1087,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
+            blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
@@ -1455,6 +1470,7 @@ class LanceDataset(pa.dataset.Dataset):
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
@@ -1483,6 +1499,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
+            blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
@@ -2138,11 +2155,11 @@ class LanceDataset(pa.dataset.Dataset):
         ...             .execute(new_table)
         {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
         >>> dataset.to_table().sort_by("a").to_pandas()
-           a  b     c
-        0  1  a     x
-        1  2  x     y
-        2  3  y     z
-        3  4  z  None
+           a  b    c
+        0  1  a    x
+        1  2  x    y
+        2  3  y    z
+        3  4  z  NaN
         """
         return MergeInsertBuilder(self._ds, on)
 
@@ -4581,6 +4598,7 @@ class ScannerBuilder:
         self._substrait_filter = None
         self._prefilter = False
         self._late_materialization = None
+        self._blob_handling = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
@@ -4774,6 +4792,20 @@ class ScannerBuilder:
         self, late_materialization: bool | List[str]
     ) -> ScannerBuilder:
         self._late_materialization = late_materialization
+        return self
+
+    def blob_handling(self, blob_handling: Optional[str]) -> ScannerBuilder:
+        if blob_handling is None:
+            self._blob_handling = None
+            return self
+
+        allowed = {"all_binary", "blobs_descriptions", "all_descriptions"}
+        if blob_handling not in allowed:
+            raise ValueError(
+                f"Invalid blob_handling: {blob_handling}. Expected one of: "
+                + ", ".join(sorted(allowed))
+            )
+        self._blob_handling = blob_handling
         return self
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
@@ -5053,6 +5085,7 @@ class ScannerBuilder:
             self._fast_search,
             self._full_text_query,
             self._late_materialization,
+            self._blob_handling,
             self._use_scalar_index,
             self._include_deleted_rows,
             self._scan_stats_callback,
