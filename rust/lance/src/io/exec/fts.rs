@@ -20,6 +20,7 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
@@ -80,6 +81,7 @@ pub struct MatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -114,6 +116,7 @@ impl MatchQueryExec {
         query: MatchQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
+        allowlist_mask: Option<Arc<RowAddrMask>>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -126,6 +129,7 @@ impl MatchQueryExec {
             query,
             params,
             prefilter_source,
+            allowlist_mask,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -174,6 +178,7 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
+                    allowlist_mask: self.allowlist_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -199,6 +204,7 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
+                    allowlist_mask: self.allowlist_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -222,6 +228,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let allowlist_mask = self.allowlist_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -247,6 +254,7 @@ impl ExecutionPlan for MatchQueryExec {
                 &prefilter_source,
                 ds,
                 &[index_meta],
+                allowlist_mask,
             )?;
 
             let inverted_idx = index
@@ -510,6 +518,7 @@ pub struct PhraseQueryExec {
     query: PhraseQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -543,6 +552,7 @@ impl PhraseQueryExec {
         query: PhraseQuery,
         mut params: FtsSearchParams,
         prefilter_source: PreFilterSource,
+        allowlist_mask: Option<Arc<RowAddrMask>>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -557,6 +567,7 @@ impl PhraseQueryExec {
             query,
             params,
             prefilter_source,
+            allowlist_mask,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -598,6 +609,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 query: self.query.clone(),
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
+                allowlist_mask: self.allowlist_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -621,6 +633,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
+                    allowlist_mask: self.allowlist_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -644,6 +657,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let allowlist_mask = self.allowlist_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -669,6 +683,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 &prefilter_source,
                 ds,
                 &[index_meta],
+                allowlist_mask,
             )?;
 
             let index = index
@@ -1210,6 +1225,7 @@ pub mod tests {
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             PreFilterSource::None,
+            None,
         );
         match_query
             .execute(0, Arc::new(TaskContext::default()))
@@ -1242,6 +1258,7 @@ pub mod tests {
             PhraseQuery::new("blah".to_string()),
             FtsSearchParams::new().with_phrase_slop(Some(0)),
             PreFilterSource::None,
+            None,
         );
         phrase_query
             .execute(0, Arc::new(TaskContext::default()))
@@ -1254,6 +1271,7 @@ pub mod tests {
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             PreFilterSource::None,
+            None,
         );
 
         let boost_input_two = MatchQueryExec::new(
@@ -1261,6 +1279,7 @@ pub mod tests {
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             PreFilterSource::None,
+            None,
         );
 
         let boost_query = BoostQueryExec::new(

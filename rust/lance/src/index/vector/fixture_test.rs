@@ -278,6 +278,7 @@ mod test {
                 Arc::new(DatasetPreFilter {
                     deleted_ids: None,
                     filtered_ids: None,
+                    extra_mask: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
                 &NoOpMetricsCollector,

@@ -3009,6 +3009,7 @@ impl Scanner {
             query.clone(),
             params.clone(),
             prefilter_source.clone(),
+            self.row_id_allowlist.clone(),
         )))
     }
 
@@ -3040,6 +3041,7 @@ impl Scanner {
                     query.clone(),
                     params.clone(),
                     prefilter_source.clone(),
+                    self.row_id_allowlist.clone(),
                 ));
 
                 let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
@@ -3868,7 +3870,13 @@ impl Scanner {
         let prefilter_source = self
             .prefilter_source(filter_plan, self.get_indexed_frags(index))
             .await?;
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let inner_fanout_search = new_knn_exec(
+            self.dataset.clone(),
+            index,
+            q,
+            prefilter_source,
+            self.row_id_allowlist.clone(),
+        )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -3927,6 +3935,7 @@ impl Scanner {
                 index,
                 &query,
                 prefilter_source.clone(),
+                self.row_id_allowlist.clone(),
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,

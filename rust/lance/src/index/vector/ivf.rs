@@ -2672,7 +2672,12 @@ mod tests {
             base_id: None,
         };
 
-        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(
+            dataset.clone(),
+            &[index_meta],
+            None,
+            None,
+        ));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);

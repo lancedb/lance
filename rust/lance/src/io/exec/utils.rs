@@ -51,6 +51,7 @@ pub(crate) fn build_prefilter(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
+    extra_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -67,6 +68,7 @@ pub(crate) fn build_prefilter(
         ds,
         index_meta,
         prefilter_loader,
+        extra_mask,
     )))
 }
 

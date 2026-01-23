@@ -36,6 +36,7 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::ROW_ID;
 use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
 use lance_datafusion::utils::{
@@ -324,6 +325,7 @@ pub fn new_knn_exec(
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -337,6 +339,7 @@ pub fn new_knn_exec(
         indices.to_vec(),
         query.clone(),
         prefilter_source,
+        allowlist_mask,
     )?;
 
     Ok(Arc::new(sub_index))
@@ -599,6 +602,7 @@ pub struct ANNIvfSubIndexExec {
 
     /// Prefiltering input
     prefilter_source: PreFilterSource,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
 
     /// Datafusion Plan Properties
     properties: PlanProperties,
@@ -613,6 +617,7 @@ impl ANNIvfSubIndexExec {
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
+        allowlist_mask: Option<Arc<RowAddrMask>>,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::Index {
@@ -635,6 +640,7 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            allowlist_mask,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -955,6 +961,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                allowlist_mask: self.allowlist_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -978,6 +985,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let column = self.query.column.clone();
         let indices = self.indices.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let allowlist_mask = self.allowlist_mask.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
@@ -1034,6 +1042,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             ds.clone(),
             &indices,
             prefilter_loader,
+            allowlist_mask,
         ));
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));

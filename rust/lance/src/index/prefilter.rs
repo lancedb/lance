@@ -49,6 +49,8 @@ pub struct DatasetPreFilter {
     // these tasks only when we've done as much work as we can without them.
     pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowAddrMask>>>>,
     pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowAddrMask>>>,
+    // Optional allowlist mask to intersect with filter + deletion masks.
+    pub(super) extra_mask: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -58,6 +60,7 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
+        extra_mask: Option<Arc<RowAddrMask>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
@@ -74,6 +77,7 @@ impl DatasetPreFilter {
         Self {
             deleted_ids,
             filtered_ids,
+            extra_mask,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -238,6 +242,9 @@ impl PreFilter for DatasetPreFilter {
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
             let mut combined = RowAddrMask::default();
+            if let Some(extra_mask) = &self.extra_mask {
+                combined = combined & extra_mask.as_ref().clone();
+            }
             if let Some(filtered_ids) = &self.filtered_ids {
                 combined = combined & filtered_ids.get_ready();
             }
@@ -251,7 +258,7 @@ impl PreFilter for DatasetPreFilter {
     }
 
     fn is_empty(&self) -> bool {
-        self.deleted_ids.is_none() && self.filtered_ids.is_none()
+        self.deleted_ids.is_none() && self.filtered_ids.is_none() && self.extra_mask.is_none()
     }
 
     /// Get the row id mask for this prefilter
