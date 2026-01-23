@@ -100,6 +100,8 @@ pub fn compress_posting_list_with_scores<'a, F>(
 where
     F: FnMut(u32, u32) -> f32,
 {
+    // `length` comes from posting list size; zero would produce an invalid block
+    // (a max-score header with no doc/frequency data) and readers assume > 0 docs.
     debug_assert!(length > 0);
     if length < BLOCK_SIZE {
         let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
