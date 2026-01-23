@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{BooleanArray, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -18,7 +18,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{future, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::RowAddrMask;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
@@ -347,6 +347,7 @@ pub struct FlatMatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -382,6 +383,7 @@ impl FlatMatchQueryExec {
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
+        allowlist_mask: Option<Arc<RowAddrMask>>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -394,6 +396,7 @@ impl FlatMatchQueryExec {
             query,
             params,
             unindexed_input,
+            allowlist_mask,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -428,6 +431,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             query: self.query.clone(),
             params: self.params.clone(),
             unindexed_input,
+            allowlist_mask: self.allowlist_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -443,13 +447,18 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
+        let allowlist_mask = self.allowlist_mask.clone();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        let unindexed_input =
-            document_input(self.unindexed_input.execute(partition, context)?, &column)?;
+        let unindexed_input = self.unindexed_input.execute(partition, context)?;
+        let unindexed_input = match allowlist_mask {
+            Some(allowlist) => filter_stream_by_allowlist(unindexed_input, allowlist),
+            None => unindexed_input,
+        };
+        let unindexed_input = document_input(unindexed_input, &column)?;
 
         let schema = self.schema();
         let stream = stream::once(async move {
@@ -510,6 +519,39 @@ impl ExecutionPlan for FlatMatchQueryExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+fn filter_batch_by_allowlist(
+    batch: RecordBatch,
+    allowlist: &RowAddrMask,
+) -> DataFusionResult<RecordBatch> {
+    let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "allowlist requires '{}' column in FTS input",
+            ROW_ID
+        ))
+    })?;
+    let row_ids = row_ids.as_primitive::<UInt64Type>();
+    let mask = BooleanArray::from_iter(
+        row_ids
+            .iter()
+            .map(|value| Some(value.map(|id| allowlist.selected(id)).unwrap_or(false))),
+    );
+    arrow::compute::filter_record_batch(&batch, &mask)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn filter_stream_by_allowlist(
+    input: SendableRecordBatchStream,
+    allowlist: Arc<RowAddrMask>,
+) -> SendableRecordBatchStream {
+    let schema = input.schema();
+    let stream = input.and_then(move |batch| {
+        let allowlist = allowlist.clone();
+        async move { filter_batch_by_allowlist(batch, allowlist.as_ref()) }
+    });
+    let stream = stream.try_filter(|batch| future::ready(batch.num_rows() > 0));
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
 #[derive(Debug)]
@@ -1246,6 +1288,7 @@ pub mod tests {
             FtsSearchParams::default(),
             flat_input,
             FTS_SCHEMA.clone(),
+            None,
         );
         flat_match_query
             .execute(0, Arc::new(TaskContext::default()))

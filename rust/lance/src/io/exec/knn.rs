@@ -116,6 +116,7 @@ pub struct KNNVectorDistanceExec {
     pub query: ArrayRef,
     pub column: String,
     pub distance_type: DistanceType,
+    allowlist_mask: Option<Arc<RowAddrMask>>,
 
     output_schema: SchemaRef,
     properties: PlanProperties,
@@ -145,6 +146,7 @@ impl KNNVectorDistanceExec {
         column: &str,
         query: ArrayRef,
         distance_type: DistanceType,
+        allowlist_mask: Option<Arc<RowAddrMask>>,
     ) -> Result<Self> {
         let mut output_schema = input.schema().as_ref().clone();
         let (_, element_type) = get_vector_type(&(&output_schema).try_into()?, column)?;
@@ -174,6 +176,7 @@ impl KNNVectorDistanceExec {
             query,
             column: column.to_string(),
             distance_type,
+            allowlist_mask,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -214,6 +217,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             &self.column,
             self.query.clone(),
             self.distance_type,
+            self.allowlist_mask.clone(),
         )?))
     }
 
@@ -226,7 +230,18 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
+        let allowlist_mask = self.allowlist_mask.clone();
         let stream = input_stream
+            .and_then(move |batch| {
+                let allowlist_mask = allowlist_mask.clone();
+                async move {
+                    let batch = match allowlist_mask.as_ref() {
+                        Some(allowlist) => filter_batch_by_allowlist(batch, allowlist)?,
+                        None => batch,
+                    };
+                    Ok(batch)
+                }
+            })
             .try_filter(|batch| future::ready(batch.num_rows() > 0))
             .map(move |batch| {
                 let key = key.clone();
@@ -295,6 +310,26 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+fn filter_batch_by_allowlist(
+    batch: RecordBatch,
+    allowlist: &RowAddrMask,
+) -> DataFusionResult<RecordBatch> {
+    let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "allowlist requires '{}' column in KNN input",
+            ROW_ID
+        ))
+    })?;
+    let row_ids = row_ids.as_primitive::<UInt64Type>();
+    let mask = BooleanArray::from_iter(
+        row_ids
+            .iter()
+            .map(|value| Some(value.map(|id| allowlist.selected(id)).unwrap_or(false))),
+    );
+    arrow::compute::filter_record_batch(&batch, &mask)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -1536,6 +1571,7 @@ mod tests {
             "vector",
             Arc::new(generate_random_array(dim)),
             DistanceType::L2,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -3134,6 +3134,7 @@ impl Scanner {
             params.clone(),
             scan_node,
             FTS_SCHEMA.clone(),
+            self.row_id_allowlist.clone(),
         ));
         Ok(flat_match_plan)
     }
@@ -3706,6 +3707,7 @@ impl Scanner {
                     q.params(),
                     input,
                     schema,
+                    self.row_id_allowlist.clone(),
                 )))
             }
             _ => {
@@ -3763,6 +3765,7 @@ impl Scanner {
             &q.column,
             q.key.clone(),
             metric_type,
+            self.row_id_allowlist.clone(),
         )?);
 
         let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
