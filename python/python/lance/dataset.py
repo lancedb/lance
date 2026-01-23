@@ -693,7 +693,9 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: Optional[bool] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
-        blob_handling: Optional[Literal['all_binary', 'blobs_description', 'all_descriptions']] = None,
+        blob_handling: Optional[
+            Literal["all_binary", "blobs_description", "all_descriptions"]
+        ] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
