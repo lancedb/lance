@@ -108,6 +108,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
+crossbeam-skiplist = "0.1"
 datafusion = { version = "51.0.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
@@ -174,6 +175,7 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
 shellexpand = "3.0"
+slatedb = "0.3"
 snafu = "0.8"
 strum = "0.26"
 tantivy = { version = "0.24.1", features = ["stopwords"] }
