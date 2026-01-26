@@ -96,6 +96,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
+        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path =
             flushed_memtable_path(&self.base_path, &self.region_id, &random_hash, generation);
 
@@ -115,12 +116,7 @@ impl MemTableFlusher {
 
         let last_wal_entry_position = memtable.last_flushed_wal_entry_position();
         let new_manifest = self
-            .update_manifest(
-                epoch,
-                generation,
-                gen_path.as_ref(),
-                last_wal_entry_position,
-            )
+            .update_manifest(epoch, generation, &gen_folder_name, last_wal_entry_position)
             .await?;
 
         info!(
@@ -131,7 +127,7 @@ impl MemTableFlusher {
         Ok(FlushResult {
             generation: FlushedGeneration {
                 generation,
-                path: gen_path.to_string(),
+                path: gen_folder_name,
             },
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position: last_wal_entry_position,
@@ -205,6 +201,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
+        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path =
             flushed_memtable_path(&self.base_path, &self.region_id, &random_hash, generation);
 
@@ -290,12 +287,7 @@ impl MemTableFlusher {
 
         let last_wal_entry_position = memtable.last_flushed_wal_entry_position();
         let new_manifest = self
-            .update_manifest(
-                epoch,
-                generation,
-                gen_path.as_ref(),
-                last_wal_entry_position,
-            )
+            .update_manifest(epoch, generation, &gen_folder_name, last_wal_entry_position)
             .await?;
 
         info!(
@@ -306,7 +298,7 @@ impl MemTableFlusher {
         Ok(FlushResult {
             generation: FlushedGeneration {
                 generation,
-                path: gen_path.to_string(),
+                path: gen_folder_name,
             },
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position: last_wal_entry_position,
@@ -912,20 +904,11 @@ mod tests {
         assert_eq!(result.rows_flushed, 10);
 
         // Verify the flushed dataset has the BTree index
-        // result.generation.path is an object store path, so we construct the URI
-        // by using the base_uri and the relative portion of the path
-        let gen_path_str = result.generation.path.as_str();
-        let base_path_str = base_path.as_ref();
-        let relative_path = if let Some(stripped) = gen_path_str.strip_prefix(base_path_str) {
-            stripped.trim_start_matches('/')
-        } else {
-            gen_path_str
-        };
-        let gen_uri = if base_path_str.is_empty() {
-            format!("{}/{}", base_uri, gen_path_str)
-        } else {
-            format!("{}/{}", base_uri, relative_path)
-        };
+        // result.generation.path is just the folder name, construct full URI
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, region_id, result.generation.path
+        );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 
@@ -1107,18 +1090,10 @@ mod tests {
         assert_eq!(result.rows_flushed, num_vectors);
 
         // Verify the flushed dataset has the IVF-PQ index
-        let gen_path_str = result.generation.path.as_str();
-        let base_path_str = base_path.as_ref();
-        let relative_path = if let Some(stripped) = gen_path_str.strip_prefix(base_path_str) {
-            stripped.trim_start_matches('/')
-        } else {
-            gen_path_str
-        };
-        let gen_uri = if base_path_str.is_empty() {
-            format!("{}/{}", base_uri, gen_path_str)
-        } else {
-            format!("{}/{}", base_uri, relative_path)
-        };
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, region_id, result.generation.path
+        );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 
@@ -1270,18 +1245,10 @@ mod tests {
         assert_eq!(result.rows_flushed, 3);
 
         // Verify the flushed dataset has the FTS index
-        let gen_path_str = result.generation.path.as_str();
-        let base_path_str = base_path.as_ref();
-        let relative_path = if let Some(stripped) = gen_path_str.strip_prefix(base_path_str) {
-            stripped.trim_start_matches('/')
-        } else {
-            gen_path_str
-        };
-        let gen_uri = if base_path_str.is_empty() {
-            format!("{}/{}", base_uri, gen_path_str)
-        } else {
-            format!("{}/{}", base_uri, relative_path)
-        };
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, region_id, result.generation.path
+        );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 

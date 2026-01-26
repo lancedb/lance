@@ -2494,16 +2494,13 @@ mod region_writer_tests {
             "Should have at least one flushed generation"
         );
         for flushed_gen in &manifest.flushed_generations {
-            // The path is stored without leading "/" (e.g., "var/folders/.../gen_1")
-            // so we need to prepend "/" for absolute paths on Unix
-            let gen_path = if flushed_gen.path.starts_with("file:///") {
-                std::path::PathBuf::from(&flushed_gen.path[7..])
-            } else if flushed_gen.path.starts_with('/') {
-                std::path::PathBuf::from(&flushed_gen.path)
-            } else {
-                // Path is relative (no leading /) - prepend / for Unix absolute path
-                std::path::PathBuf::from(format!("/{}", flushed_gen.path))
-            };
+            // The path stored in manifest is relative to the region directory
+            // Construct full path: temp_dir/_mem_wal/region_id/generation_folder
+            let gen_path = temp_dir
+                .path()
+                .join("_mem_wal")
+                .join(region_id.to_string())
+                .join(&flushed_gen.path);
 
             // The generation directory should exist
             assert!(
