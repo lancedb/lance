@@ -1052,8 +1052,6 @@ impl RegionWriter {
         )?;
 
         // Start background MemTable flush handler
-        // Note: Freezing is handled by SharedWriterState, not this handler.
-        // This handler only processes frozen memtables from the queue.
         let memtable_handler =
             MemTableFlushHandler::new(state.clone(), flusher, epoch, stats.clone());
         task_executor.add_handler(

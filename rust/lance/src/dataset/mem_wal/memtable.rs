@@ -63,7 +63,7 @@ pub struct MemTable {
     /// Lance schema (for index operations).
     lance_schema: Schema,
 
-    /// Lock-free batch storage (replaces RwLock<Vec<RecordBatch>>).
+    /// Lock-free batch storage.
     /// Wrapped in Arc for sharing with scanners.
     batch_store: Arc<BatchStore>,
 
@@ -708,8 +708,6 @@ impl MemTable {
     }
 
     /// Get batch count.
-    ///
-    /// Note: This is now synchronous (no longer requires async).
     pub fn batch_count(&self) -> usize {
         self.batch_store.len()
     }
@@ -757,9 +755,6 @@ impl MemTable {
     }
 
     /// Check if all batches have been flushed to WAL.
-    ///
-    /// Uses the batch_store's watermark tracking instead of maintaining
-    /// a separate HashSet.
     pub fn all_flushed_to_wal(&self) -> bool {
         self.batch_store.pending_wal_flush_count() == 0
     }

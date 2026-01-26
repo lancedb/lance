@@ -28,8 +28,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-// Note: AtomicUsize is still used for doc_count
-
 use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;

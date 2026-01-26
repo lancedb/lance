@@ -34,9 +34,8 @@ pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 
 /// Watcher for batch durability using watermark-based tracking.
 ///
-/// Instead of per-batch oneshot channels, this uses a shared watch channel
-/// that broadcasts the durable watermark. The watcher waits until the
-/// watermark reaches or exceeds its target batch ID.
+/// Uses a shared watch channel that broadcasts the durable watermark.
+/// The watcher waits until the watermark reaches or exceeds its target batch ID.
 #[derive(Clone)]
 pub struct BatchDurableWatcher {
     /// Watch receiver for the durable watermark.
@@ -218,12 +217,7 @@ impl WalFlusher {
     /// Track a batch for WAL durability.
     ///
     /// Returns a `BatchDurableWatcher` that can be awaited for durability.
-    ///
-    /// Note: The actual batch data is stored in the BatchStore.
-    ///
-    /// # Arguments
-    ///
-    /// * `batch_position` - Batch ID (index in the BatchStore)
+    /// The actual batch data is stored in the BatchStore.
     pub fn track_batch(&self, batch_position: usize) -> BatchDurableWatcher {
         // Return a watcher that waits for this batch to become durable
         // batch_position is 0-indexed, so we wait for watermark > batch_position (i.e., >= batch_position + 1)

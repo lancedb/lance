@@ -79,7 +79,7 @@ The Lance core Rust SDK maintains one default implementation and is available th
 but integrations are free to build their own MemTable format depending on the specific use cases,
 as long as it follows the MemWAL storage layout, reader and writer requirements when flushing MemTable.
 
-Conceptually, becuase Lance uses [Arrow as its in-memory data exchange format](https://arrow.apache.org/docs/format/index.html),
+Conceptually, because Lance uses [Arrow as its in-memory data exchange format](https://arrow.apache.org/docs/format/index.html),
 for the ease of explanation in this spec, we will treat MemTable as a list of Arrow record batches,
 and each write into the MemTable is a new Arrow record batch.
 

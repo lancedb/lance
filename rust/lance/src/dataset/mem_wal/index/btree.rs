@@ -91,9 +91,6 @@ impl BTreeMemIndex {
     }
 
     /// Insert values from an Arrow array into the index.
-    ///
-    /// Uses typed array access for efficient batch extraction instead of
-    /// per-row ScalarValue::try_from_array calls.
     fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
         macro_rules! insert_primitive {
             ($array_type:ty, $scalar_variant:ident) => {{

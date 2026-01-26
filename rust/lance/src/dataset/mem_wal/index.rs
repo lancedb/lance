@@ -582,30 +582,21 @@ impl IndexStore {
             .find(|idx| idx.field_id() == field_id)
     }
 
-    /// Get a BTree index by column name (via field_id lookup).
-    ///
-    /// This resolves column → field_id internally, then finds the index.
-    /// Note: This currently uses column_name stored on the index for lookup.
-    /// For proper field_id resolution, use get_btree_by_field_id with the
-    /// field_id obtained from the schema.
+    /// Get a BTree index by column name.
     pub fn get_btree_by_column(&self, column: &str) -> Option<&BTreeMemIndex> {
         self.btree_indexes
             .values()
             .find(|idx| idx.column_name() == column)
     }
 
-    /// Get an IVF-PQ index by column name (via field_id lookup).
-    ///
-    /// This resolves column → field_id internally, then finds the index.
+    /// Get an IVF-PQ index by column name.
     pub fn get_ivf_pq_by_column(&self, column: &str) -> Option<&IvfPqMemIndex> {
         self.ivf_pq_indexes
             .values()
             .find(|idx| idx.column_name() == column)
     }
 
-    /// Get an FTS index by column name (via field_id lookup).
-    ///
-    /// This resolves column → field_id internally, then finds the index.
+    /// Get an FTS index by column name.
     pub fn get_fts_by_column(&self, column: &str) -> Option<&FtsMemIndex> {
         self.fts_indexes
             .values()
