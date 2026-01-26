@@ -586,8 +586,6 @@ pub(super) async fn alter_columns(
         })?;
 
         if let Some(nullable) = alteration.nullable {
-            // TODO: in the future, we could check the values of the column to see if
-            //       they are all non-null and thus the column could be made non-nullable.
             if field_src.nullable && !nullable {
                 validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
             }
