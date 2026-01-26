@@ -24,6 +24,7 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
+use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
@@ -196,7 +197,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -208,6 +209,7 @@ impl FileFragment {
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
+        blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
@@ -252,6 +254,24 @@ impl FileFragment {
         }
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
+        }
+        if let Some(blob_handling) = blob_handling {
+            let handling = if let Ok(handling) = blob_handling.extract::<String>() {
+                match handling.as_str() {
+                    "all_binary" => BlobHandling::AllBinary,
+                    "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+                    "all_descriptions" => BlobHandling::AllDescriptions,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                        )))
+                    }
+                }
+            } else {
+                return Err(PyTypeError::new_err("blob_handling must be a str"));
+            };
+
+            scanner.blob_handling(handling);
         }
         if let Some(orderings) = order_by {
             let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
