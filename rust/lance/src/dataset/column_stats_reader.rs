@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! High-level reader for column statistics with automatic type dispatching.
+//! High-level reader for consolidated column statistics with automatic type dispatching.
 //!
-//! This module provides a convenient API for reading column statistics
-//! from consolidated stats files with automatic type conversion based on
-//! the dataset schema.
+//! This module provides a convenient API for reading column statistics from consolidated
+//! stats files (created by [`column_stats_consolidator`](crate::dataset::column_stats_consolidator)) with automatic
+//! type conversion based on the dataset schema.
+//!
+//! # Overview
+//!
+//! Consolidated stats files store min/max values as strings. This module:
+//! 1. Reads the consolidated stats RecordBatch (list-based layout)
+//! 2. Converts string-encoded min/max values to strongly-typed [`ScalarValue`] based on
+//!    the dataset schema
+//! 3. Provides a convenient query API via [`ColumnStatsReader`]
+//!
 
 use std::sync::Arc;
 
@@ -406,15 +415,15 @@ fn parse_scalar_value(s: &str, data_type: &arrow_schema::DataType) -> Result<Sca
 mod tests {
     use super::*;
     // Re-import types that are used by the parent module but not re-exported
-    use crate::dataset::column_stats::create_consolidated_stats_schema;
+    use crate::dataset::column_stats_consolidator::create_consolidated_stats_schema;
     use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
     use arrow_array::{RecordBatch, StringArray as ArrowStringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
     use lance_file::writer::{
-        COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
-        COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD,
-        COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
+        COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD, COLUMN_STATS_NAN_COUNT_FIELD,
+        COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_LENGTH_FIELD,
+        COLUMN_STATS_ZONE_START_FIELD,
     };
 
     fn create_test_schema() -> Arc<Schema> {
@@ -430,7 +439,7 @@ mod tests {
 
     fn create_test_stats_batch() -> RecordBatch {
         // Create a consolidated stats batch with 2 columns: "id" and "name"
-        // Use the shared schema creation function from column_stats.rs
+        // Use the shared schema creation function from column_stats_consolidator.rs
         let schema = create_consolidated_stats_schema();
 
         // Build lists for "id" column (Int32) - use constants to match the schema

@@ -1,18 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Column statistics consolidation and reading utilities.
+//! Column statistics consolidation utilities.
 //!
-//! This module provides functionality for:
-//! 1. Consolidating per-fragment column statistics into a single file
-//! 2. Reading consolidated statistics with automatic type dispatching
+//! This module provides functionality for consolidating per-fragment column statistics
+//! into a single consolidated stats file. It works in conjunction with
+//! [`column_stats_reader`](crate::dataset::column_stats_reader) which provides
+//! the reading API.
 //!
-//! Per-fragment statistics are stored in each data file's global buffer.
-//! During compaction, these can be consolidated into a single column statistics
-//! file for efficient query planning.
+//! # Overview
+//!
+//! Per-fragment statistics are stored in each data file's global buffer in a **flat layout**
+//! (one row per zone per column). This module consolidates them into a **list-based layout**
+//! (one row per column, with lists of values across all fragments) with global offsets.
+//!
+//! # Workflow
+//!
+//! 1. **Per-fragment stats** (flat layout, local offsets) → stored in data files
+//! 2. **Consolidation** (this module) → converts to list-based layout with global offsets
+//! 3. **Reading** ([`column_stats_reader`](crate::dataset::column_stats_reader)) → provides
+//!    typed access to consolidated stats
+//!
+//! # Key Functions
+//!
+//! - [`consolidate_column_stats`] - Main entry point for consolidating stats from all fragments
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array};
@@ -40,8 +54,6 @@ use crate::dataset::fragment::FileFragment;
 use crate::{Dataset, Error};
 
 // Schema field definitions for consolidated statistics
-// Re-export from lance-file for consistency (these are used in the consolidated list-based layout)
-// Note: The flat layout uses these same field names but with different structure
 const FRAGMENT_ID_FIELD: &str = "fragment_id"; // Used in consolidated layout only
 
 /// Helper function to create a list field for consolidated statistics
@@ -194,7 +206,7 @@ pub async fn consolidate_column_stats(
         return Ok(None);
     }
 
-    // Step 4: Build consolidated batch (column-oriented)
+    // Step 4: Build consolidated batch
     let consolidated_batch = build_consolidated_batch(stats_by_column, dataset.schema())?;
 
     // Step 5: Write as Lance file (version is stored in metadata, not filename)
@@ -526,8 +538,8 @@ impl ZoneListBuilders {
     }
 }
 
-/// Create the Arrow schema for consolidated statistics
-pub(crate) fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
+/// Arrow schema for consolidated statistics (lazy static constant)
+pub(crate) static CONSOLIDATED_STATS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
     Arc::new(ArrowSchema::new(vec![
         ArrowField::new(COLUMN_STATS_COLUMN_NAME_FIELD, DataType::Utf8, false),
         create_list_field("fragment_ids", FRAGMENT_ID_FIELD, DataType::UInt64),
@@ -550,6 +562,13 @@ pub(crate) fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
         create_list_field("min_values", COLUMN_STATS_MIN_VALUE_FIELD, DataType::Utf8),
         create_list_field("max_values", COLUMN_STATS_MAX_VALUE_FIELD, DataType::Utf8),
     ]))
+});
+
+/// Get the Arrow schema for consolidated statistics
+///
+/// Returns a reference to the lazy static schema constant.
+pub(crate) fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
+    CONSOLIDATED_STATS_SCHEMA.clone()
 }
 
 /// Build a consolidated RecordBatch from collected statistics.

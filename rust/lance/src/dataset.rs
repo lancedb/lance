@@ -72,7 +72,7 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
-pub mod column_stats;
+pub mod column_stats_consolidator;
 pub mod column_stats_reader;
 pub mod delta;
 pub mod files;

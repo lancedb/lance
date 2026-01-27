@@ -128,6 +128,7 @@ use crate::dataset::write::COLUMN_STATS_ENABLED_KEY;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
+use lance_file::writer::{COLUMN_STATS_VERSION, COLUMN_STATS_VERSION_KEY};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -2174,11 +2175,19 @@ pub async fn commit_compaction(
     if options.consolidate_column_stats {
         let new_version = dataset.manifest.version;
         if let Some(stats_path) =
-            crate::dataset::column_stats::consolidate_column_stats(dataset, new_version).await?
+            crate::dataset::column_stats_consolidator::consolidate_column_stats(
+                dataset,
+                new_version,
+            )
+            .await?
         {
             // Update manifest config with stats file path
             let mut upsert_values = HashMap::new();
             upsert_values.insert("lance.column_stats.file".to_string(), stats_path);
+            upsert_values.insert(
+                COLUMN_STATS_VERSION_KEY.to_string(),
+                COLUMN_STATS_VERSION.to_string(),
+            );
 
             let config_update_txn = Transaction::new(
                 dataset.manifest.version,
