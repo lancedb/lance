@@ -802,7 +802,7 @@ fn pack_bits(
             // we also want to the next location in src, unless we wrote something
             // byte-aligned in which case the logic above would have already advanced
             let mut to_next_byte = 1;
-            if num_bits % 8 == 0 {
+            if num_bits.is_multiple_of(8) {
                 to_next_byte = 0;
             }
 
@@ -853,7 +853,7 @@ impl PageScheduler for BitpackedScheduler {
             .map(|range| {
                 let start_byte_offset = range.start * self.bits_per_value / 8;
                 let mut end_byte_offset = range.end * self.bits_per_value / 8;
-                if range.end * self.bits_per_value % 8 != 0 {
+                if !(range.end * self.bits_per_value).is_multiple_of(8) {
                     // If the end of the range is not byte-aligned, we need to read one more byte
                     end_byte_offset += 1;
 
@@ -1026,7 +1026,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                     // unless we wrote something byte-aligned in which case the logic above
                     // would have already advanced dst_idx
                     let mut to_next_byte = 1;
-                    if self.bits_per_value % 8 == 0 {
+                    if self.bits_per_value.is_multiple_of(8) {
                         to_next_byte = 0;
                     }
                     let next_dst_idx =

@@ -2403,10 +2403,23 @@ def compare_fts_results(
     single_df = single_machine_results.to_pandas()
     distributed_df = distributed_results.to_pandas()
 
-    # Sort both by row_id to ensure consistent ordering
-    if "_rowid" in single_df.columns:
-        single_df = single_df.sort_values("_rowid").reset_index(drop=True)
-        distributed_df = distributed_df.sort_values("_rowid").reset_index(drop=True)
+    # Normalize row ordering for comparisons.
+    #
+    # FTS search results do not guarantee a stable order for tied scores and
+    # different execution modes (single-machine vs distributed) may return rows
+    # in different (but equivalent) orders.
+    sort_cols = (
+        ["_rowid"]
+        if "_rowid" in single_df.columns
+        else [c for c in single_df.columns if c != "_score"]
+    )
+    if sort_cols:
+        single_df = single_df.sort_values(sort_cols, kind="mergesort").reset_index(
+            drop=True
+        )
+        distributed_df = distributed_df.sort_values(
+            sort_cols, kind="mergesort"
+        ).reset_index(drop=True)
 
     # Compare row IDs (most important)
     if "_rowid" in single_df.columns:
@@ -2418,8 +2431,8 @@ def compare_fts_results(
 
     # Compare scores with tolerance
     if "_score" in single_df.columns:
-        single_scores = single_df["_score"].values
-        distributed_scores = distributed_df["_score"].values
+        single_scores = single_df["_score"].to_numpy(dtype=float)
+        distributed_scores = distributed_df["_score"].to_numpy(dtype=float)
         score_diff = np.abs(single_scores - distributed_scores)
         max_diff = np.max(score_diff)
         assert max_diff <= tolerance, (
@@ -2430,27 +2443,11 @@ def compare_fts_results(
     # Compare other columns (exact match for non-score columns)
     for col in single_df.columns:
         if col not in ["_score"]:  # Skip score column (already compared with tolerance)
-            single_values = (
-                set(single_df[col])
-                if single_df[col].dtype == "object"
-                else single_df[col].values
+            np.testing.assert_array_equal(
+                single_df[col].to_numpy(dtype=object),
+                distributed_df[col].to_numpy(dtype=object),
+                err_msg=f"Column {col} values don't match",
             )
-            distributed_values = (
-                set(distributed_df[col])
-                if distributed_df[col].dtype == "object"
-                else distributed_df[col].values
-            )
-
-            if isinstance(single_values, set):
-                assert single_values == distributed_values, (
-                    f"Column {col} content mismatch"
-                )
-            else:
-                np.testing.assert_array_equal(
-                    single_values,
-                    distributed_values,
-                    err_msg=f"Column {col} values don't match",
-                )
 
     return True
 

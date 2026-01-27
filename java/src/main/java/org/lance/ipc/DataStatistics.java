@@ -27,7 +27,7 @@ public class DataStatistics implements Serializable {
   }
 
   // used for rust to add field statistics
-  public void addFiledStatistics(FieldStatistics fieldStatistics) {
+  public void addFieldStatistics(FieldStatistics fieldStatistics) {
     fields.add(fieldStatistics);
   }
 

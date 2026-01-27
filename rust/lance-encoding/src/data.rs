@@ -307,7 +307,7 @@ struct FixedWidthDataBlockBuilder {
 
 impl FixedWidthDataBlockBuilder {
     fn new(bits_per_value: u64, estimated_size_bytes: u64) -> Self {
-        assert!(bits_per_value % 8 == 0);
+        assert!(bits_per_value.is_multiple_of(8));
         Self {
             bits_per_value,
             bytes_per_value: bits_per_value / 8,

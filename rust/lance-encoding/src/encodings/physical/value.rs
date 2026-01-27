@@ -53,7 +53,7 @@ impl ValueEncoder {
         // or FSL<boolean> we might have some number of bits per value that isn't
         // divisible by 8.  In this case, to avoid chunking in the middle of a byte
         // we calculate how many 8-value words we can fit in a chunk.
-        let (bytes_per_word, values_per_word) = if data.bits_per_value % 8 == 0 {
+        let (bytes_per_word, values_per_word) = if data.bits_per_value.is_multiple_of(8) {
             (data.bits_per_value / 8, 1)
         } else {
             (data.bits_per_value, 8)
@@ -192,7 +192,7 @@ impl ValueEncoder {
         }
         // It's an estimate because validity buffers may have some padding bits
         let cum_bits_per_value = data.bits_per_value * cum_dim;
-        let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value % 8 == 0 {
+        let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value.is_multiple_of(8) {
             (cum_bits_per_value / 8, 1)
         } else {
             (cum_bits_per_value, 8)
