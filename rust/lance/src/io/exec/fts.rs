@@ -1216,7 +1216,15 @@ impl ExecutionPlan for BooleanQueryExec {
 pub mod tests {
     use std::sync::{Arc, Mutex};
 
+    use arrow::datatypes::UInt64Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Float32Array, Int32Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
+    use futures::{stream, TryStreamExt};
+    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+    use lance_core::ROW_ID;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
@@ -1254,6 +1262,84 @@ pub mod tests {
         fn consume(self) -> ExecutionSummaryCounts {
             self.collected_stats.lock().unwrap().take().unwrap()
         }
+    }
+
+    #[test]
+    fn test_filter_batch_by_allowlist() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("score", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3])),
+                Arc::new(Float32Array::from(vec![0.1_f32, 0.2, 0.3])),
+            ],
+        )
+        .unwrap();
+        let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([2_u64, 3]));
+        let filtered = super::filter_batch_by_allowlist(batch, &allowlist).unwrap();
+        let row_ids = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_ids.as_ref(), &[2_u64, 3]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_allowlist_missing_row_id() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([1_u64]));
+        let err = super::filter_batch_by_allowlist(batch, &allowlist).unwrap_err();
+        assert!(err.to_string().contains("allowlist requires"));
+    }
+
+    #[tokio::test]
+    async fn test_filter_stream_by_allowlist_drops_empty() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("score", DataType::Float32, false),
+        ]));
+        let batch_empty = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64])),
+                Arc::new(Float32Array::from(vec![0.1_f32])),
+            ],
+        )
+        .unwrap();
+        let batch_keep = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![2_u64, 3])),
+                Arc::new(Float32Array::from(vec![0.2_f32, 0.3])),
+            ],
+        )
+        .unwrap();
+
+        let input = stream::iter(vec![Ok(batch_empty), Ok(batch_keep)]);
+        let input = Box::pin(RecordBatchStreamAdapter::new(schema, input));
+        let allowlist = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            2_u64,
+        ])));
+        let filtered = super::filter_stream_by_allowlist(input, allowlist);
+        let batches = filtered.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let row_ids = batches[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_ids.as_ref(), &[2_u64]);
     }
 
     #[test]

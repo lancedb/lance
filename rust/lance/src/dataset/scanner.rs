@@ -5822,6 +5822,59 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_id_allowlist_with_take_rowoffset_stable() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
+        let dataset = &test_ds.dataset;
+
+        let batch = dataset
+            .scan()
+            .project(&[ROW_OFFSET])?
+            .with_row_id()
+            .try_into_batch()
+            .await?;
+        let row_offsets = batch
+            .column_by_name(ROW_OFFSET)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+
+        let allowlist = vec![row_ids[10], row_ids[20], row_ids[30]];
+        let offsets = vec![row_offsets[20], row_offsets[30], row_offsets[40]];
+        let filter = format!(
+            "_rowoffset IN ({}, {}, {}) AND i >= 0",
+            offsets[0], offsets[1], offsets[2]
+        );
+
+        let filtered = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .row_id_allowlist(allowlist)
+            .filter(&filter)?
+            .try_into_batch()
+            .await?;
+        let filtered_ids: BTreeSet<u64> = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(
+            filtered_ids,
+            BTreeSet::from_iter(vec![row_ids[20], row_ids[30]])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fts_allowlist_runtime() -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("s", DataType::Utf8, true),

@@ -1395,12 +1395,15 @@ mod tests {
     use super::*;
 
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
-    use arrow::datatypes::Float32Type;
+    use arrow::datatypes::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+        StringArray, UInt64Array,
     };
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::ROW_ID;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
@@ -1463,6 +1466,40 @@ mod tests {
         adjust_probes(&mut query, 10);
         assert_eq!(query.minimum_nprobes, 30);
         assert_eq!(query.maximum_nprobes, Some(50));
+    }
+
+    #[test]
+    fn test_filter_batch_by_allowlist() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("score", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3])),
+                Arc::new(Float32Array::from(vec![0.1_f32, 0.2, 0.3])),
+            ],
+        )
+        .unwrap();
+        let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([2_u64, 3]));
+        let filtered = filter_batch_by_allowlist(batch, &allowlist).unwrap();
+        let row_ids = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_ids.as_ref(), &[2_u64, 3]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let err = filter_batch_by_allowlist(batch, &allowlist).unwrap_err();
+        assert!(err.to_string().contains("allowlist requires"));
     }
 
     #[tokio::test]
