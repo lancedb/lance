@@ -5089,6 +5089,59 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[tokio::test]
+    async fn test_knn_allowlist_runtime() -> Result<()> {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        let all_row_ids = collect_row_ids(test_ds.dataset.scan()).await?;
+        assert!(all_row_ids.len() > 1);
+
+        let baseline_flat = {
+            let mut scan = test_ds.dataset.scan();
+            scan.nearest("vec", &key, 1).unwrap();
+            scan.use_index(false);
+            collect_row_ids(scan).await?
+        };
+        let mut candidate = *all_row_ids.last().unwrap();
+        if candidate == baseline_flat[0] {
+            candidate = all_row_ids[all_row_ids.len() - 2];
+        }
+        assert_ne!(candidate, baseline_flat[0]);
+
+        let filtered_flat = {
+            let mut scan = test_ds.dataset.scan();
+            scan.nearest("vec", &key, 1).unwrap();
+            scan.use_index(false);
+            scan.row_id_allowlist([candidate]);
+            collect_row_ids(scan).await?
+        };
+        assert_eq!(filtered_flat, vec![candidate]);
+
+        test_ds.make_vector_index().await?;
+        let all_row_ids = collect_row_ids(test_ds.dataset.scan()).await?;
+
+        let baseline_ann = {
+            let mut scan = test_ds.dataset.scan();
+            scan.nearest("vec", &key, 1).unwrap();
+            collect_row_ids(scan).await?
+        };
+        let mut candidate = *all_row_ids.last().unwrap();
+        if candidate == baseline_ann[0] {
+            candidate = all_row_ids[all_row_ids.len() - 2];
+        }
+        assert_ne!(candidate, baseline_ann[0]);
+
+        let filtered_ann = {
+            let mut scan = test_ds.dataset.scan();
+            scan.nearest("vec", &key, 1).unwrap();
+            scan.row_id_allowlist([candidate]);
+            collect_row_ids(scan).await?
+        };
+        assert_eq!(filtered_ann, vec![candidate]);
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_can_project_distance() {
@@ -5651,6 +5704,181 @@ mod test {
             .collect();
 
         assert_eq!(allowlist, filtered_ids);
+        Ok(())
+    }
+
+    async fn collect_row_ids(mut scan: Scanner) -> Result<Vec<u64>> {
+        scan.with_row_id();
+        let stream = scan.try_into_stream().await?;
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = concat_batches(&schema, &batches)?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        Ok(row_ids.to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_row_id_allowlist_unstable_row_ids() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false).await?;
+        let dataset = &test_ds.dataset;
+
+        let allowlist = vec![0_u64, 50_u64, (1_u64 << 32) + 10];
+        let filtered = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .row_id_allowlist(allowlist.clone())
+            .try_into_batch()
+            .await?;
+        let filtered_ids: BTreeSet<u64> = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(BTreeSet::from_iter(allowlist), filtered_ids);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allowlist_with_deletions() -> Result<()> {
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: false,
+            max_rows_per_file: 10,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+        dataset.delete("i = 1 OR i = 3").await.unwrap();
+
+        let allowlist = vec![1_u64, 3_u64, 4_u64];
+        let filtered = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .row_id_allowlist(allowlist)
+            .try_into_batch()
+            .await?;
+        let filtered_ids: Vec<u64> = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(filtered_ids, vec![4]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fts_allowlist_runtime() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Utf8, true),
+            ArrowField::new("i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "hello world",
+                    "goodbye",
+                    "hello there",
+                ])),
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+            ],
+        )?;
+        let tmp_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &tmp_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let params = lance_index::scalar::inverted::tokenizer::InvertedIndexParams::default()
+            .with_position(true);
+        dataset
+            .create_index(&["s"], IndexType::Inverted, None, &params, true)
+            .await?;
+
+        let query = FullTextSearchQuery::new("hello".to_owned());
+        let baseline_indexed = {
+            let mut scan = dataset.scan();
+            scan.full_text_search(query.clone()).unwrap();
+            collect_row_ids(scan).await?
+        };
+        assert!(!baseline_indexed.is_empty());
+
+        let allowlist = baseline_indexed.iter().take(2).copied().collect::<Vec<_>>();
+        let filtered_indexed = {
+            let mut scan = dataset.scan();
+            scan.full_text_search(query.clone()).unwrap();
+            scan.row_id_allowlist(allowlist.clone());
+            collect_row_ids(scan).await?
+        };
+        assert_eq!(
+            BTreeSet::from_iter(allowlist),
+            BTreeSet::from_iter(filtered_indexed)
+        );
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["hello new", "other"])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )?;
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(new_batch)], schema), None)
+            .await?;
+
+        let baseline_with_unindexed = {
+            let mut scan = dataset.scan();
+            scan.full_text_search(query.clone()).unwrap();
+            collect_row_ids(scan).await?
+        };
+        let baseline_set = BTreeSet::from_iter(baseline_indexed.clone());
+        let unindexed_only = BTreeSet::from_iter(baseline_with_unindexed)
+            .difference(&baseline_set)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!unindexed_only.is_empty());
+
+        let allowlist = vec![unindexed_only[0], *baseline_indexed.last().unwrap()];
+        let filtered_with_unindexed = {
+            let mut scan = dataset.scan();
+            scan.full_text_search(query).unwrap();
+            scan.row_id_allowlist(allowlist.clone());
+            collect_row_ids(scan).await?
+        };
+        assert_eq!(
+            BTreeSet::from_iter(allowlist),
+            BTreeSet::from_iter(filtered_with_unindexed)
+        );
         Ok(())
     }
 
