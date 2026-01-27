@@ -1077,7 +1077,7 @@ mod tests {
         }
 
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        finalize_distributed_merge(dataset.object_store(), &index_dir, Some("IVF_PQ"))
+        finalize_distributed_merge(dataset.object_store(), &index_dir, Option::from(IndexType::IvfPq))
             .await
             .unwrap();
 
