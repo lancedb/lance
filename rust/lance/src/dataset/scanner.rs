@@ -5792,6 +5792,36 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_id_allowlist_with_filter_plain_scan() -> Result<()> {
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let allowlist = vec![1_u64, 3_u64, 5_u64, 7_u64, 9_u64];
+        let filtered = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .row_id_allowlist(allowlist)
+            .filter("i >= 5")?
+            .try_into_batch()
+            .await?;
+        let filtered_ids: BTreeSet<u64> = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(filtered_ids, BTreeSet::from_iter(vec![5, 7, 9]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fts_allowlist_runtime() -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("s", DataType::Utf8, true),
