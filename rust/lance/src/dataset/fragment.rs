@@ -1590,7 +1590,9 @@ impl FileFragment {
         let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
-            let batch = joiner.collect(batch[join_column].clone()).await?;
+            let batch = joiner
+                .collect(&self.dataset, batch[join_column].clone())
+                .await?;
             updater.update(batch).await?;
         }
 

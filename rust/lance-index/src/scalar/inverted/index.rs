@@ -59,7 +59,7 @@ use super::{
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::compress_posting_list,
+    encoding::{compress_posting_list, compress_posting_list_with_scores},
     iter::CompressedPostingListIterator,
 };
 use super::{encoding::compress_positions, iter::PostingListIterator};
@@ -1912,18 +1912,13 @@ impl PostingListBuilder {
         }
     }
 
-    // assume the posting list is sorted by doc id
-    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    fn build_batch(
+        self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
         let length = self.len();
-        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-
-        let schema = inverted_list_schema(self.has_positions());
-        let compressed = compress_posting_list(
-            self.doc_ids.len(),
-            self.doc_ids.iter(),
-            self.frequencies.iter(),
-            block_max_scores.into_iter(),
-        )?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1934,7 +1929,7 @@ impl PostingListBuilder {
             )?) as ArrayRef,
             Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
             Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                self.len() as u32
+                length as u32,
             ))) as ArrayRef,
         ];
 
@@ -1956,6 +1951,37 @@ impl PostingListBuilder {
 
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+
+    // assume the posting list is sorted by doc id
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let schema = inverted_list_schema(self.has_positions());
+        let compressed = compress_posting_list(
+            self.doc_ids.len(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            block_max_scores.into_iter(),
+        )?;
+        self.build_batch(compressed, max_score, schema)
+    }
+
+    pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
+        let length = self.len();
+        let avgdl = docs.average_length();
+        let idf_scale = idf(length, docs.len()) * (K1 + 1.0);
+        let (compressed, max_score) = compress_posting_list_with_scores(
+            length,
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            |doc_id, freq| {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
+                let freq = freq as f32;
+                freq / (freq + doc_norm)
+            },
+            idf_scale,
+        )?;
+        self.build_batch(compressed, max_score, schema)
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -2221,7 +2247,7 @@ impl DocSet {
                 max_score = f32::MIN;
             }
         }
-        if length % BLOCK_SIZE > 0 {
+        if !length.is_multiple_of(BLOCK_SIZE) {
             max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
@@ -2562,10 +2588,12 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, UInt32Type};
 
     use super::*;
 
@@ -2605,6 +2633,54 @@ mod tests {
             .iter()
             .zip(expected.frequencies.iter())
             .all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn test_posting_list_batch_matches_docset_scoring() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE + 3;
+        for doc_id in 0..num_docs as u32 {
+            docs.append(doc_id as u64, doc_id % 7 + 1);
+        }
+
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        let freqs = doc_ids
+            .iter()
+            .map(|doc_id| doc_id % 5 + 1)
+            .collect::<Vec<_>>();
+
+        let mut builder_scores = PostingListBuilder::new(false);
+        let mut builder_docs = PostingListBuilder::new(false);
+        for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+            builder_scores.add(doc_id, PositionRecorder::Count(freq));
+            builder_docs.add(doc_id, PositionRecorder::Count(freq));
+        }
+
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let batch_scores = builder_scores.to_batch(block_max_scores).unwrap();
+        let batch_docs = builder_docs
+            .to_batch_with_docs(&docs, inverted_list_schema(false))
+            .unwrap();
+
+        let scores_posting = batch_scores[POSTING_COL].as_list::<i32>().value(0);
+        let scores_posting = scores_posting.as_binary::<i64>();
+        let docs_posting = batch_docs[POSTING_COL].as_list::<i32>().value(0);
+        let docs_posting = docs_posting.as_binary::<i64>();
+        assert_eq!(scores_posting, docs_posting);
+
+        let score_left = batch_scores[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let score_right = batch_docs[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert!((score_left - score_right).abs() < 1e-6);
+
+        let len_left = batch_scores[LENGTH_COL]
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let len_right = batch_docs[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        assert_eq!(len_left, len_right);
     }
 
     #[tokio::test]

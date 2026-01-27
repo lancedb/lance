@@ -6,6 +6,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -79,7 +80,6 @@ impl<W: Writer + ?Sized> WriteExt for W {
     }
 }
 
-#[async_trait]
 pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn path(&self) -> &Path;
 
@@ -90,16 +90,16 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn io_parallelism(&self) -> usize;
 
     /// Object/File Size.
-    async fn size(&self) -> object_store::Result<usize>;
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
 
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations
     /// may not need the size beforehand.
-    async fn get_all(&self) -> object_store::Result<Bytes>;
+    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>>;
 }

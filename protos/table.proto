@@ -527,13 +527,13 @@ message RegionManifest {
   // A writer must increment this when claiming the region.
   uint64 writer_epoch = 2;
 
-  // The most recent WAL entry ID that has been flushed to a MemTable.
-  // During recovery, replay starts from replay_after_wal_id + 1.
-  uint64 replay_after_wal_id = 3;
+  // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
+  // During recovery, replay starts from replay_after_wal_entry_position + 1.
+  uint64 replay_after_wal_entry_position = 3;
 
-  // The most recent WAL entry ID at the time manifest was updated.
+  // The most recent WAL entry position (0-based) at the time manifest was updated.
   // This is a hint, not authoritative - recovery must list files to find actual state.
-  uint64 wal_id_last_seen = 4;
+  uint64 wal_entry_position_last_seen = 4;
 
   // Next generation ID to create (incremented after each MemTable flush).
   uint64 current_generation = 6;
@@ -591,8 +591,8 @@ message IndexCatchupProgress {
 //   version: uint64
 //   region_spec_id: uint32
 //   writer_epoch: uint64
-//   replay_after_wal_id: uint64
-//   wal_id_last_seen: uint64
+//   replay_after_wal_entry_position: uint64
+//   wal_entry_position_last_seen: uint64
 //   current_generation: uint64
 //   merged_generation: uint64
 //   flushed_generations: list<struct<generation: uint64, path: string>>

@@ -240,6 +240,7 @@ class _Dataset:
         fast_search: Optional[bool] = None,
         full_text_query: Optional[dict] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
     ) -> _Scanner: ...
@@ -442,15 +443,17 @@ class _Fragment:
     ) -> pa.RecordBatch: ...
     def scanner(
         self,
-        columns: Optional[List[str]],
-        columns_with_transform: Optional[List[Tuple[str, str]]],
-        batch_size: Optional[int],
-        filter: Optional[str],
-        limit: Optional[int],
-        offset: Optional[int],
-        with_row_id: Optional[bool],
-        batch_readahead: Optional[int],
-        **kwargs,
+        columns: Optional[List[str]] = None,
+        columns_with_transform: Optional[List[Tuple[str, str]]] = None,
+        batch_size: Optional[int] = None,
+        filter: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        batch_readahead: Optional[int] = None,
+        blob_handling: Optional[str] = None,
+        order_by: Optional[List[Any]] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
 use arrow_array::{new_null_array, Array, RecordBatch, RecordBatchReader};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
@@ -15,9 +16,6 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use snafu::location;
 use tokio::task;
-
-use crate::datatypes::lance_supports_nulls;
-use crate::{Dataset, Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub struct HashJoiner {
@@ -133,7 +131,11 @@ impl HashJoiner {
     /// Collecting the data using the index column from left table.
     ///
     /// Will run in parallel over columns using all available cores.
-    pub(super) async fn collect(&self, index_column: ArrayRef) -> Result<RecordBatch> {
+    pub(super) async fn collect(
+        &self,
+        dataset: &Dataset,
+        index_column: ArrayRef,
+    ) -> Result<RecordBatch> {
         if index_column.data_type() != &self.index_type {
             return Err(Error::invalid_input(
                 format!(
@@ -180,29 +182,18 @@ impl HashJoiner {
                 async move {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-                        interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::invalid_input(
-                                format!("HashJoiner: {}", err),
-                                location!(),
-                            ))
+                        interleave(array_refs.as_ref(), indices.as_ref()).map_err(|err| {
+                            Error::invalid_input(format!("HashJoiner: {}", err), location!())
+                        })
                     })
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            if array.null_count() > 0 && !lance_supports_nulls(array.data_type()) {
-                                return Err(Error::invalid_input(format!(
-                                    "Found rows on LHS that do not match any rows on RHS. Lance would need to write \
-                                    nulls on the RHS, but Lance does not yet support nulls for type {:?}.",
-                                    array.data_type()
-                                ), location!()));
-                            }
+                            Self::check_lance_support_null(&array, dataset)?;
                             Ok(array)
-                        },
+                        }
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(
-                            format!("HashJoiner: {}", err),
-                            location!(),
-                        )),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
                     }
                 }
             })
@@ -211,6 +202,27 @@ impl HashJoiner {
             .await?;
 
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
+    }
+
+    pub fn check_lance_support_null(array: &ArrayRef, dataset: &Dataset) -> Result<()> {
+        if array.null_count() > 0 && !dataset.lance_supports_nulls(array.data_type()) {
+            return Err(Error::invalid_input(
+                format!(
+                    "Join produced null values for type: {:?}, but storing \
+                     nulls for this data type is not supported by the \
+                     dataset's current Lance file format version: {:?}. This \
+                     can be caused by an explicit null in the new data.",
+                    array.data_type(),
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()
+                        .unwrap()
+                ),
+                location!(),
+            ));
+        }
+        Ok(())
     }
 
     /// Collecting the data using the index column from left table,
@@ -271,25 +283,7 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            if array.null_count() > 0
-                                && !dataset.lance_supports_nulls(array.data_type())
-                            {
-                                return Err(Error::invalid_input(
-                                    format!(
-                                        "Join produced null values for type: {:?}, but storing \
-                                        nulls for this data type is not supported by the \
-                                        dataset's current Lance file format version: {:?}. This \
-                                        can be caused by an explicit null in the new data.",
-                                        array.data_type(),
-                                        dataset
-                                            .manifest()
-                                            .data_storage_format
-                                            .lance_file_version()
-                                            .unwrap()
-                                    ),
-                                    location!(),
-                                ));
-                            }
+                            Self::check_lance_support_null(&array, dataset)?;
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
@@ -311,9 +305,18 @@ impl HashJoiner {
 mod tests {
 
     use super::*;
-
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::utils::tempfile::TempDir;
+
+    async fn create_dataset() -> Dataset {
+        let uri = TempDir::default().path_str();
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
+        let batches = RecordBatchIterator::new(std::iter::empty().map(Ok), schema.clone());
+        Dataset::write(batches, &uri, None).await.unwrap();
+
+        Dataset::open(&uri).await.unwrap()
+    }
 
     #[tokio::test]
     async fn test_joiner_collect() {
@@ -343,6 +346,8 @@ mod tests {
         ));
         let joiner = HashJoiner::try_new(batches, "i").await.unwrap();
 
+        let dataset = create_dataset().await;
+
         let indices = Arc::new(Int32Array::from_iter(&[
             Some(15),
             None,
@@ -353,7 +358,7 @@ mod tests {
             Some(22),
             Some(11111), // not found
         ]));
-        let results = joiner.collect(indices).await.unwrap();
+        let results = joiner.collect(&dataset, indices).await.unwrap();
 
         assert_eq!(
             results.column_by_name("s").unwrap().as_ref(),
@@ -394,9 +399,11 @@ mod tests {
 
         let joiner = HashJoiner::try_new(batches, "i").await.unwrap();
 
+        let dataset = create_dataset().await;
+
         // Wrong type: was Int32, passing UInt32.
         let indices = Arc::new(UInt32Array::from_iter(&[Some(15)]));
-        let result = joiner.collect(indices).await;
+        let result = joiner.collect(&dataset, indices).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

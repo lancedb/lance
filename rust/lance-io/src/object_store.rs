@@ -1127,11 +1127,13 @@ mod tests {
             "delete",
         )
         .unwrap();
+        let file_url = Url::from_directory_path(&path).unwrap();
         let url = if scheme.is_empty() {
-            Url::from_directory_path(&path).unwrap()
+            file_url
         } else {
             let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
-            url.set_path(path.to_str().unwrap());
+            // Use the file:// URL's normalized path so this works on Windows too.
+            url.set_path(file_url.path());
             url
         };
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
