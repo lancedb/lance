@@ -564,6 +564,14 @@ impl FilteredReadStream {
                 }
             }
 
+            if let Some(allowlist_mask) = options.allowlist_mask.as_ref() {
+                let allowlist_ranges = row_id_sequence.mask_to_offset_ranges(allowlist_mask);
+                to_read = Self::intersect_ranges(&to_read, &allowlist_ranges);
+                if to_read.is_empty() {
+                    continue;
+                }
+            }
+
             // Apply index and apply scan range after filter if applicable
             Self::apply_index_to_fragment(
                 evaluated_index,
@@ -1220,6 +1228,8 @@ pub struct FilteredReadOptions {
     /// result to avoid applying this (and instead only apply the refine filter) but in some cases
     /// the index result does not cover all fragments or is not exact.
     pub full_filter: Option<Expr>,
+    /// Optional allowlist mask to restrict scan ranges up front.
+    pub allowlist_mask: Option<Arc<RowAddrMask>>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
@@ -1250,6 +1260,7 @@ impl FilteredReadOptions {
             projection,
             refine_filter: None,
             full_filter: None,
+            allowlist_mask: None,
             io_buffer_size_bytes: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
@@ -1399,6 +1410,12 @@ impl FilteredReadOptions {
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
     pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
         self.io_buffer_size_bytes = Some(io_buffer_size);
+        self
+    }
+
+    /// Restrict the scan to rows contained in the allowlist mask.
+    pub fn with_allowlist_mask(mut self, allowlist_mask: Arc<RowAddrMask>) -> Self {
+        self.allowlist_mask = Some(allowlist_mask);
         self
     }
 }
@@ -1861,7 +1878,11 @@ mod tests {
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{
+        address::RowAddress,
+        mask::{RowAddrMask, RowAddrTreeMap},
+        tempfile::TempStrDir,
+    };
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_index::{
         optimize::OptimizeOptions,
@@ -2158,6 +2179,45 @@ mod tests {
             .with_scan_range_before_filter(300..400)
             .unwrap();
         fixture.test_plan(options, &u32s(vec![])).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_allowlist_mask() {
+        let fixture = TestFixture::new().await;
+
+        let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(0, 1)),
+            u64::from(RowAddress::new_from_parts(0, 5)),
+            u64::from(RowAddress::new_from_parts(2, 60)),
+            u64::from(RowAddress::new_from_parts(3, 10)),
+        ]));
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_allowlist_mask(Arc::new(allowlist));
+
+        fixture
+            .test_plan(options, &u32s(vec![1..2, 5..6, 260..261, 310..311]))
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_allowlist_mask_with_scan_range() {
+        let fixture = TestFixture::new().await;
+
+        let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(0, 20)),
+            u64::from(RowAddress::new_from_parts(2, 60)),
+            u64::from(RowAddress::new_from_parts(3, 10)),
+        ]));
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_allowlist_mask(Arc::new(allowlist))
+            .with_scan_range_before_filter(10..130)
+            .unwrap();
+
+        fixture
+            .test_plan(options, &u32s(vec![20..21, 260..261]))
+            .await;
     }
 
     #[test_log::test(tokio::test)]

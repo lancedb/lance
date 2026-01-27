@@ -2074,7 +2074,36 @@ impl Scanner {
                     } else {
                         filter_plan.expr_filter_plan.make_refine_only();
                     }
-                    self.mask_as_take_input(mask)?
+                    let mut read_options =
+                        FilteredReadOptions::new(self.dataset.empty_projection().with_row_id())
+                            .with_allowlist_mask(Arc::new(mask.clone()));
+
+                    if let Some(fragments) = self.fragments.as_ref() {
+                        read_options = read_options.with_fragments(Arc::new(fragments.clone()));
+                    }
+
+                    if let Some(batch_size) = self.batch_size {
+                        read_options = read_options.with_batch_size(batch_size as u32);
+                    }
+
+                    if let Some(fragment_readahead) = self.fragment_readahead {
+                        read_options = read_options.with_fragment_readahead(fragment_readahead);
+                    }
+
+                    if self.include_deleted_rows {
+                        read_options = read_options.with_deleted_rows()?;
+                    }
+
+                    if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+                        read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+                    }
+
+                    let index_input = self.mask_as_take_input(mask)?;
+                    Arc::new(FilteredReadExec::try_new(
+                        self.dataset.clone(),
+                        read_options,
+                        Some(index_input),
+                    )?)
                 } else if let Some((take_op, remainder)) = take_op {
                     // If there is any remainder use it as the filter (we don't even try and combine an indexed
                     // search on the filter with a take as that seems excessive)
@@ -2347,6 +2376,10 @@ impl Scanner {
 
         if let Some(io_buffer_size_bytes) = self.io_buffer_size {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(allowlist_mask) = &self.row_id_allowlist {
+            read_options = read_options.with_allowlist_mask(allowlist_mask.clone());
         }
 
         let index_input = filter_plan.index_query.clone().map(|index_query| {
@@ -3110,23 +3143,48 @@ impl Scanner {
             let filter_columns = Planner::column_names_in_expr(expr);
             columns.extend(filter_columns);
         }
-        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-        let mut scan_node = self.scan_fragments(
-            true,
-            false,
-            false,
-            false,
-            false,
-            flat_fts_scan_schema,
-            Arc::new(fragments),
-            None,
-            false,
-        );
+        let fragments = Arc::new(fragments);
+        let scan_node: Arc<dyn ExecutionPlan> = if self.row_id_allowlist.is_some()
+            && !self.dataset.is_legacy_storage()
+        {
+            let mut read_filter = filter_plan.clone();
+            read_filter.make_refine_only();
+            let projection = self
+                .dataset
+                .empty_projection()
+                .with_row_id()
+                .union_columns(&columns, OnMissing::Error)?;
+            let PlannedFilteredScan { plan, .. } = self
+                .filtered_read(
+                    &read_filter,
+                    projection,
+                    false,
+                    Some(fragments.clone()),
+                    None,
+                    false,
+                )
+                .await?;
+            plan
+        } else {
+            let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
+            let mut scan_node = self.scan_fragments(
+                true,
+                false,
+                false,
+                false,
+                false,
+                flat_fts_scan_schema,
+                fragments.clone(),
+                None,
+                false,
+            );
 
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            // If there is a prefilter we need to manually apply it to the new data
-            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-        }
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                // If there is a prefilter we need to manually apply it to the new data
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+            }
+            scan_node
+        };
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
@@ -3317,29 +3375,54 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 columns.extend(filter_columns);
             }
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
+            let fragments = Arc::new(unindexed_fragments);
             // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
             // most common case is that fragments that are newer than the vector index are going to be newer
-            // than the scalar indices anyways
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
-                vector_scan_projection,
-                Arc::new(unindexed_fragments),
-                // Can't pushdown limit/offset in an ANN search
-                None,
-                // We are re-ordering anyways, so no need to get data in data
-                // in a deterministic order.
-                false,
-            );
+            // than the scalar indices anyways.
+            let scan_node: Arc<dyn ExecutionPlan> =
+                if self.row_id_allowlist.is_some() && !self.dataset.is_legacy_storage() {
+                    let mut read_filter = filter_plan.clone();
+                    read_filter.make_refine_only();
+                    let projection = self
+                        .dataset
+                        .empty_projection()
+                        .with_row_id()
+                        .union_columns(&columns, OnMissing::Error)?;
+                    let PlannedFilteredScan { plan, .. } = self
+                        .filtered_read(
+                            &read_filter,
+                            projection,
+                            false,
+                            Some(fragments.clone()),
+                            None,
+                            false,
+                        )
+                        .await?;
+                    plan
+                } else {
+                    let vector_scan_projection =
+                        Arc::new(self.dataset.schema().project(&columns).unwrap());
+                    let mut scan_node = self.scan_fragments(
+                        true,
+                        false,
+                        false,
+                        false,
+                        false,
+                        vector_scan_projection,
+                        fragments.clone(),
+                        // Can't pushdown limit/offset in an ANN search
+                        None,
+                        // We are re-ordering anyways, so no need to get data in data
+                        // in a deterministic order.
+                        false,
+                    );
 
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
-                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-            }
+                    if let Some(expr) = filter_plan.full_expr.as_ref() {
+                        // If there is a prefilter we need to manually apply it to the new data
+                        scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+                    }
+                    scan_node
+                };
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
 
@@ -5531,6 +5614,44 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_row_ids, actual_row_ids);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_allowlist_stable_row_ids() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
+        let dataset = &test_ds.dataset;
+
+        let batch = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .try_into_batch()
+            .await?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let row_id_values = row_ids.values();
+        let allowlist = vec![row_id_values[0], row_id_values[150], row_id_values[250]];
+
+        let filtered = dataset
+            .scan()
+            .project(&["i"])?
+            .with_row_id()
+            .row_id_allowlist(allowlist.clone())
+            .try_into_batch()
+            .await?;
+        let filtered_ids: Vec<u64> = filtered
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(allowlist, filtered_ids);
+        Ok(())
     }
 
     #[tokio::test]
@@ -7729,6 +7850,54 @@ mod test {
             |scan| scan.nearest("vec", &q, 6),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
+            expected,
+        )
+        .await?;
+
+        log::info!("Test case: Combined KNN/ANN with allowlist");
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=6), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=6), expr=...
+                      KNNVectorDistance: metric=l2
+                        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+                Take: columns=\"_distance, _rowid, (vec)\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=6), expr=...
+                      ANNSubIndex: name=..., k=6, deltas=1, metric=L2
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        } else {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=6), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=6), expr=...
+                      KNNVectorDistance: metric=l2
+                        LanceRead: uri=..., projection=[vec], num_fragments=1, range_before=None, range_after=None, \
+                        row_id=true, row_addr=false, full_filter=--, refine_filter=--
+                Take: columns=\"_distance, _rowid, (vec)\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=6), expr=...
+                      ANNSubIndex: name=..., k=6, deltas=1, metric=L2
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        };
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| Ok(scan.nearest("vec", &q, 6)?.row_id_allowlist([0_u64])),
             expected,
         )
         .await?;
