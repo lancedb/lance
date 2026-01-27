@@ -126,7 +126,7 @@ impl InlineBitpacking {
         }
 
         // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
+        let last_chunk_elem_num = if data.num_values.is_multiple_of(ELEMS_PER_CHUNK) {
             ELEMS_PER_CHUNK
         } else {
             data.num_values % ELEMS_PER_CHUNK
@@ -162,7 +162,7 @@ impl InlineBitpacking {
     }
 
     fn chunk_data(&self, data: FixedWidthDataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
-        assert!(data.bits_per_value % 8 == 0);
+        assert!(data.bits_per_value.is_multiple_of(8));
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
         let compressed = match bits_per_value {

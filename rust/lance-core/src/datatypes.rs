@@ -427,19 +427,6 @@ impl PartialEq for Dictionary {
     }
 }
 
-/// Returns true if Lance supports writing this datatype with nulls.
-pub fn lance_supports_nulls(datatype: &DataType) -> bool {
-    matches!(
-        datatype,
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::List(_)
-            | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _)
-    )
-}
-
 /// Physical storage mode for blob v2 descriptors (one byte, stored in the packed struct column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

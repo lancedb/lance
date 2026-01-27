@@ -453,7 +453,7 @@ impl RleMiniBlockDecompressor {
             }
         }
 
-        if values_buffer.len() % type_size != 0 || lengths_buffer.is_empty() {
+        if !values_buffer.len().is_multiple_of(type_size) || lengths_buffer.is_empty() {
             return Err(Error::InvalidInput {
                 location: location!(),
                 source: format!(
