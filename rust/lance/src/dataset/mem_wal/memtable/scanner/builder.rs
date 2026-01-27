@@ -275,6 +275,9 @@ pub struct MemTableScanner {
     /// Whether to include _rowid column in output.
     /// In MemTable, _rowid is the row_position (global row offset).
     with_row_id: bool,
+    /// Whether to include _rowaddr column in output.
+    /// Same value as _rowid but named for compatibility with LSM scanner.
+    with_row_address: bool,
 }
 
 impl MemTableScanner {
@@ -306,6 +309,7 @@ impl MemTableScanner {
             use_index: true,
             batch_size: None,
             with_row_id: false,
+            with_row_address: false,
         }
     }
 
@@ -335,6 +339,15 @@ impl MemTableScanner {
     /// In MemTable, _rowid is the row_position (global row offset).
     pub fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
+        self
+    }
+
+    /// Include the _rowaddr column in output.
+    ///
+    /// Same value as _rowid but named for compatibility with LSM scanner.
+    /// Used when scanning MemTable as part of a unified LSM scan.
+    pub fn with_row_address(&mut self) -> &mut Self {
+        self.with_row_address = true;
         self
     }
 
@@ -649,7 +662,10 @@ impl MemTableScanner {
     /// Get the output schema after projection.
     ///
     /// If `with_row_id` is true, adds `_rowid` column at the end.
+    /// If `with_row_address` is true, adds `_rowaddr` column at the end.
     pub fn output_schema(&self) -> SchemaRef {
+        use super::exec::ROW_ADDRESS_COLUMN;
+
         let mut fields: Vec<Field> = if let Some(ref projection) = self.projection {
             projection
                 .iter()
@@ -666,6 +682,11 @@ impl MemTableScanner {
         // Add _rowid column if requested
         if self.with_row_id {
             fields.push(Field::new(ROW_ID, DataType::UInt64, true));
+        }
+
+        // Add _rowaddr column if requested
+        if self.with_row_address {
+            fields.push(Field::new(ROW_ADDRESS_COLUMN, DataType::UInt64, true));
         }
 
         Arc::new(arrow_schema::Schema::new(fields))
@@ -733,6 +754,7 @@ impl MemTableScanner {
             self.output_schema(),
             self.schema.clone(),
             self.with_row_id,
+            self.with_row_address,
             filter_predicate,
             filter_expr,
         );
@@ -1284,5 +1306,122 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn test_output_schema_with_row_address() {
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let indexes = Arc::new(IndexStore::new());
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+
+        // Without with_row_address, schema should not include _rowaddr
+        let output_schema = scanner.output_schema();
+        assert_eq!(output_schema.fields().len(), 2);
+        assert!(output_schema.field_with_name("_rowaddr").is_err());
+
+        // With with_row_address, schema should include _rowaddr
+        scanner.with_row_address();
+        let output_schema = scanner.output_schema();
+        assert_eq!(output_schema.fields().len(), 3);
+        assert!(output_schema.field_with_name("_rowaddr").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scanner_with_row_address() {
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+
+        let indexes = create_index_store_with_batches(&batch_store, &schema, &[(0, 10)]);
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
+        scanner.with_row_address();
+
+        // Verify output schema includes _rowaddr
+        let output_schema = scanner.output_schema();
+        assert_eq!(output_schema.fields().len(), 3);
+        assert_eq!(output_schema.field(0).name(), "id");
+        assert_eq!(output_schema.field(1).name(), "name");
+        assert_eq!(output_schema.field(2).name(), "_rowaddr");
+        assert_eq!(output_schema.field(2).data_type(), &DataType::UInt64);
+
+        // Verify data includes correct row addresses
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(2).name(), "_rowaddr");
+
+        let row_addrs = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(row_addrs.len(), 10);
+        // Row addresses should be 0-9 for a single batch
+        for i in 0..10 {
+            assert_eq!(row_addrs.value(i), i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_plan_with_row_address() {
+        use crate::utils::test::assert_plan_node_equals;
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+
+        let indexes = create_index_store_with_batches(&batch_store, &schema, &[(0, 10)]);
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
+        scanner.with_row_address();
+
+        let plan = scanner.create_plan().await.unwrap();
+
+        // Verify plan structure with _rowaddr
+        assert_plan_node_equals(
+            plan,
+            "MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scanner_with_both_row_id_and_row_address() {
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+
+        let indexes = create_index_store_with_batches(&batch_store, &schema, &[(0, 5)]);
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
+        scanner.with_row_id();
+        scanner.with_row_address();
+
+        // Verify output schema includes both _rowid and _rowaddr
+        let output_schema = scanner.output_schema();
+        assert_eq!(output_schema.fields().len(), 4);
+        assert_eq!(output_schema.field(2).name(), "_rowid");
+        assert_eq!(output_schema.field(3).name(), "_rowaddr");
+
+        // Verify data
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_columns(), 4);
+
+        let row_ids = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let row_addrs = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+
+        // Both should have the same values
+        for i in 0..5 {
+            assert_eq!(row_ids.value(i), i as u64);
+            assert_eq!(row_addrs.value(i), i as u64);
+        }
     }
 }

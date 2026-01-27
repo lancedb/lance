@@ -16,5 +16,5 @@ mod vector;
 
 pub use btree::BTreeIndexExec;
 pub use fts::FtsIndexExec;
-pub use scan::MemTableScanExec;
+pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;

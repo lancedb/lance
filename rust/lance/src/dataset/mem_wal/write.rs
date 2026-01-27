@@ -1235,6 +1235,29 @@ impl RegionWriter {
         state.memtable.scan()
     }
 
+    /// Get an ActiveMemTableRef for use with LsmScanner.
+    ///
+    /// This provides read access to the current in-memory MemTable data
+    /// for unified LSM scanning across base table, flushed MemTables, and
+    /// active MemTable.
+    ///
+    /// # Returns
+    ///
+    /// An `ActiveMemTableRef` containing the batch store, index store, schema,
+    /// and generation of the current MemTable.
+    pub async fn active_memtable_ref(&self) -> crate::dataset::mem_wal::scanner::ActiveMemTableRef {
+        let state = self.state.read().await;
+        crate::dataset::mem_wal::scanner::ActiveMemTableRef {
+            batch_store: state.memtable.batch_store(),
+            index_store: state
+                .memtable
+                .indexes_arc()
+                .unwrap_or_else(|| Arc::new(IndexStore::new())),
+            schema: state.memtable.schema().clone(),
+            generation: state.memtable.generation(),
+        }
+    }
+
     /// Get WAL statistics.
     pub fn wal_stats(&self) -> WalStats {
         WalStats {
