@@ -7,7 +7,7 @@
 //! that are collected during file writing and stored in the file metadata.
 
 use arrow_array::ArrayRef;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField, Fields};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_common::ScalarValue;
 use datafusion_expr::Accumulator;
@@ -151,3 +151,41 @@ pub(super) fn scalar_value_to_string(value: &ScalarValue) -> String {
 
 /// Zone size for column statistics (1 million rows per zone)
 pub(super) const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
+
+/// Create Arrow struct type for ColumnZoneStatistics
+///
+/// This struct contains: min (Utf8), max (Utf8), null_count (UInt32), nan_count (UInt32),
+/// and bound which is a struct with fragment_id (UInt64), start (UInt64), length (UInt64)
+pub(super) fn create_column_zone_statistics_struct_type() -> DataType {
+    // ZoneBound struct fields
+    let zone_bound_fields = Fields::from(vec![
+        ArrowField::new("fragment_id", DataType::UInt64, false),
+        ArrowField::new("start", DataType::UInt64, false),
+        ArrowField::new("length", DataType::UInt64, false),
+    ]);
+
+    // ColumnZoneStatistics struct fields
+    DataType::Struct(Fields::from(vec![
+        ArrowField::new("min", DataType::Utf8, false),
+        ArrowField::new("max", DataType::Utf8, false),
+        ArrowField::new("null_count", DataType::UInt32, false),
+        ArrowField::new("nan_count", DataType::UInt32, false),
+        ArrowField::new("bound", DataType::Struct(zone_bound_fields), false),
+    ]))
+}
+
+/// Create Arrow struct type for consolidated zone statistics
+///
+/// This struct contains: fragment_id (UInt64), zone_start (UInt64), zone_length (UInt64),
+/// null_count (UInt32), nan_count (UInt32), min_value (Utf8), max_value (Utf8)
+pub fn create_consolidated_zone_struct_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        ArrowField::new("fragment_id", DataType::UInt64, false),
+        ArrowField::new("zone_start", DataType::UInt64, false),
+        ArrowField::new("zone_length", DataType::UInt64, false),
+        ArrowField::new("null_count", DataType::UInt32, false),
+        ArrowField::new("nan_count", DataType::UInt32, false),
+        ArrowField::new("min_value", DataType::Utf8, false),
+        ArrowField::new("max_value", DataType::Utf8, false),
+    ]))
+}

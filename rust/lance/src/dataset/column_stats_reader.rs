@@ -7,18 +7,12 @@
 //! stats files (created by [`column_stats_consolidator`](crate::dataset::column_stats_consolidator)) with automatic
 //! type conversion based on the dataset schema.
 //!
-//! # Overview
-//!
-//! Consolidated stats files store min/max values as strings. This module:
-//! 1. Reads the consolidated stats RecordBatch (list-based layout)
-//! 2. Converts string-encoded min/max values to strongly-typed [`ScalarValue`] based on
-//!    the dataset schema
-//! 3. Provides a convenient query API via [`ColumnStatsReader`]
-//!
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+};
 use datafusion::scalar::ScalarValue;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
@@ -63,61 +57,36 @@ impl ColumnStatsReader {
     }
 
     /// Get the list of column names that have statistics available.
+    ///
+    /// In the new columnar format, column names are the schema field names
+    /// (one column per dataset column in the stats batch).
     pub fn column_names(&self) -> Result<Vec<String>> {
-        use lance_file::writer::COLUMN_STATS_COLUMN_NAME_FIELD;
-        let column_names = self
+        // In the new format, each column in the stats batch corresponds to a dataset column
+        Ok(self
             .stats_batch
-            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected column '{}' in stats batch",
-                    COLUMN_STATS_COLUMN_NAME_FIELD
-                ),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected StringArray for column_names".to_string(),
-                location: location!(),
-            })?;
-
-        Ok((0..column_names.len())
-            .map(|i| column_names.value(i).to_string())
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
             .collect())
     }
 
     /// Read statistics for a specific column.
     ///
     /// Returns `None` if the column has no statistics available.
+    ///
+    /// In the new columnar format, the stats batch has one column per dataset column,
+    /// each containing a List<struct> with zone statistics.
     pub fn read_column_stats(&self, column_name: &str) -> Result<Option<ColumnStats>> {
-        use lance_file::writer::COLUMN_STATS_COLUMN_NAME_FIELD;
-        // Find the row index for this column
-        let column_names = self
-            .stats_batch
-            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected column '{}' in stats batch",
-                    COLUMN_STATS_COLUMN_NAME_FIELD
-                ),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected StringArray for column_names".to_string(),
-                location: location!(),
-            })?;
+        // Check if column exists in stats batch (one column per dataset column)
+        let column_array = self.stats_batch.column_by_name(column_name);
 
-        // Check if column exists in stats batch
-        let row_idx = (0..column_names.len()).find(|&i| column_names.value(i) == column_name);
-
-        if row_idx.is_none() {
+        if column_array.is_none() {
             // Column not in stats - return None (no stats available)
             return Ok(None);
         }
-        let row_idx = row_idx.unwrap();
+
+        let column_array = column_array.unwrap();
 
         // Get the field from the dataset schema
         let field = self.dataset_schema.field(column_name);
@@ -128,192 +97,176 @@ impl ColumnStatsReader {
         }
         let field = field.unwrap();
 
-        // Extract arrays for this column using column names for better readability
-        use lance_file::writer::{
-            COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
-            COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD,
-            COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
-        };
-
-        let fragment_ids_ref = self
-            .stats_batch
-            .column_by_name("fragment_ids")
-            .ok_or_else(|| Error::Internal {
-                message: "Expected 'fragment_ids' column in stats batch".to_string(),
-                location: location!(),
-            })?
+        // Extract the ListArray for this column (one row total, so use row 0)
+        let list_array = column_array
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for fragment_ids".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let fragment_ids = fragment_ids_ref
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected UInt64Array in fragment_ids list".to_string(),
+                message: format!("Expected ListArray for column '{}'", column_name),
                 location: location!(),
             })?;
 
-        let zone_starts_ref = self
-            .stats_batch
-            .column_by_name("zone_starts")
+        // Check if batch is empty (0 rows)
+        if list_array.len() == 0 {
+            return Ok(None);
+        }
+
+        // Extract the StructArray from the list (row 0, since there's only one row)
+        if list_array.is_null(0) || list_array.value_length(0) == 0 {
+            return Ok(None);
+        }
+
+        let struct_array_ref = list_array.value(0);
+        let struct_array = struct_array_ref
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::Internal {
+                message: format!("Expected StructArray in list for column '{}'", column_name),
+                location: location!(),
+            })?;
+
+        // Extract fields from the struct
+        let fragment_id_array = struct_array
+            .column_by_name("fragment_id")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'zone_starts' column ({}) in stats batch",
-                    COLUMN_STATS_ZONE_START_FIELD
+                    "Missing 'fragment_id' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
             .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for zone_starts".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let zone_starts = zone_starts_ref
-            .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected UInt64Array in zone_starts list".to_string(),
+                message: format!(
+                    "Expected UInt64Array for 'fragment_id' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
-        let zone_lengths_ref = self
-            .stats_batch
-            .column_by_name("zone_lengths")
+        let zone_start_array = struct_array
+            .column_by_name("zone_start")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'zone_lengths' column ({}) in stats batch",
-                    COLUMN_STATS_ZONE_LENGTH_FIELD
+                    "Missing 'zone_start' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
             .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for zone_lengths".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let zone_lengths = zone_lengths_ref
-            .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected UInt64Array in zone_lengths list".to_string(),
+                message: format!(
+                    "Expected UInt64Array for 'zone_start' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
-        let null_counts_ref = self
-            .stats_batch
-            .column_by_name("null_counts")
+        let zone_length_array = struct_array
+            .column_by_name("zone_length")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'null_counts' column ({}) in stats batch",
-                    COLUMN_STATS_NULL_COUNT_FIELD
+                    "Missing 'zone_length' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for null_counts".to_string(),
+                message: format!(
+                    "Expected UInt64Array for 'zone_length' in column '{}'",
+                    column_name
+                ),
+                location: location!(),
+            })?;
+
+        let null_count_array = struct_array
+            .column_by_name("null_count")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Missing 'null_count' field in struct for column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?
-            .value(row_idx);
-        let null_counts = null_counts_ref
             .as_any()
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected UInt32Array in null_counts list".to_string(),
+                message: format!(
+                    "Expected UInt32Array for 'null_count' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
-        let nan_counts_ref = self
-            .stats_batch
-            .column_by_name("nan_counts")
+        let nan_count_array = struct_array
+            .column_by_name("nan_count")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'nan_counts' column ({}) in stats batch",
-                    COLUMN_STATS_NAN_COUNT_FIELD
+                    "Missing 'nan_count' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for nan_counts".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let nan_counts = nan_counts_ref
             .as_any()
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected UInt32Array in nan_counts list".to_string(),
+                message: format!(
+                    "Expected UInt32Array for 'nan_count' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
-        let min_values_ref = self
-            .stats_batch
-            .column_by_name("min_values")
+        let min_value_array = struct_array
+            .column_by_name("min_value")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'min_values' column ({}) in stats batch",
-                    COLUMN_STATS_MIN_VALUE_FIELD
+                    "Missing 'min_value' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
             .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for min_values".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let min_values_str = min_values_ref
-            .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected StringArray in min_values list".to_string(),
+                message: format!(
+                    "Expected StringArray for 'min_value' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
-        let max_values_ref = self
-            .stats_batch
-            .column_by_name("max_values")
+        let max_value_array = struct_array
+            .column_by_name("max_value")
             .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Expected 'max_values' column ({}) in stats batch",
-                    COLUMN_STATS_MAX_VALUE_FIELD
+                    "Missing 'max_value' field in struct for column '{}'",
+                    column_name
                 ),
                 location: location!(),
             })?
             .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Expected ListArray for max_values".to_string(),
-                location: location!(),
-            })?
-            .value(row_idx);
-        let max_values_str = max_values_ref
-            .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| Error::Internal {
-                message: "Expected StringArray in max_values list".to_string(),
+                message: format!(
+                    "Expected StringArray for 'max_value' in column '{}'",
+                    column_name
+                ),
                 location: location!(),
             })?;
 
         // Parse min/max values with automatic type dispatching
-        let mut min_values = Vec::with_capacity(min_values_str.len());
-        let mut max_values = Vec::with_capacity(max_values_str.len());
+        let num_zones = fragment_id_array.len();
+        let mut min_values = Vec::with_capacity(num_zones);
+        let mut max_values = Vec::with_capacity(num_zones);
 
-        for i in 0..min_values_str.len() {
-            let min_str = min_values_str.value(i);
-            let max_str = max_values_str.value(i);
+        for i in 0..num_zones {
+            let min_str = min_value_array.value(i);
+            let max_str = max_value_array.value(i);
 
             let min_val = parse_scalar_value(min_str, &field.data_type())?;
             let max_val = parse_scalar_value(max_str, &field.data_type())?;
@@ -323,11 +276,11 @@ impl ColumnStatsReader {
         }
 
         Ok(Some(ColumnStats {
-            fragment_ids: fragment_ids.values().to_vec(),
-            zone_starts: zone_starts.values().to_vec(),
-            zone_lengths: zone_lengths.values().to_vec(),
-            null_counts: null_counts.values().to_vec(),
-            nan_counts: nan_counts.values().to_vec(),
+            fragment_ids: fragment_id_array.values().to_vec(),
+            zone_starts: zone_start_array.values().to_vec(),
+            zone_lengths: zone_length_array.values().to_vec(),
+            null_counts: null_count_array.values().to_vec(),
+            nan_counts: nan_count_array.values().to_vec(),
             min_values,
             max_values,
         }))
@@ -416,15 +369,9 @@ mod tests {
     use super::*;
     // Re-import types that are used by the parent module but not re-exported
     use crate::dataset::column_stats_consolidator::create_consolidated_stats_schema;
-    use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
-    use arrow_array::{RecordBatch, StringArray as ArrowStringArray};
+    use arrow_array::{ArrayRef, ListArray, RecordBatch, StringArray as ArrowStringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
-    use lance_file::writer::{
-        COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD, COLUMN_STATS_NAN_COUNT_FIELD,
-        COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_LENGTH_FIELD,
-        COLUMN_STATS_ZONE_START_FIELD,
-    };
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(
@@ -439,103 +386,113 @@ mod tests {
 
     fn create_test_stats_batch() -> RecordBatch {
         // Create a consolidated stats batch with 2 columns: "id" and "name"
-        // Use the shared schema creation function from column_stats_consolidator.rs
-        let schema = create_consolidated_stats_schema();
+        // New format: one row total, one column per dataset column, each containing List<struct>
+        use arrow_array::StructArray;
+        use arrow_buffer::OffsetBuffer;
+        use lance_file::writer::create_consolidated_zone_struct_type;
 
-        // Build lists for "id" column (Int32) - use constants to match the schema
-        // Note: "fragment_id" is used in consolidated layout (not in flat layout constants)
-        let mut fragment_ids_builder = ListBuilder::new(UInt64Builder::new())
-            .with_field(ArrowField::new("fragment_id", DataType::UInt64, false));
-        fragment_ids_builder.values().append_value(0);
-        fragment_ids_builder.values().append_value(1);
-        fragment_ids_builder.append(true);
+        let dataset_schema = create_test_schema();
+        let schema = create_consolidated_stats_schema(&dataset_schema);
+        let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
 
-        let mut zone_starts_builder = ListBuilder::new(UInt64Builder::new()).with_field(
-            ArrowField::new(COLUMN_STATS_ZONE_START_FIELD, DataType::UInt64, false),
-        );
-        zone_starts_builder.values().append_value(0);
-        zone_starts_builder.values().append_value(100);
-        zone_starts_builder.append(true);
+        // Build struct array for "id" column: 2 zones
+        let id_struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 1])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_start", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 100])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_length", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![100, 100])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("nan_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
+                Arc::new(ArrowStringArray::from(vec!["0", "100"])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
+                Arc::new(ArrowStringArray::from(vec!["99", "199"])) as ArrayRef,
+            ),
+        ]);
 
-        let mut zone_lengths_builder = ListBuilder::new(UInt64Builder::new()).with_field(
-            ArrowField::new(COLUMN_STATS_ZONE_LENGTH_FIELD, DataType::UInt64, false),
-        );
-        zone_lengths_builder.values().append_value(100);
-        zone_lengths_builder.values().append_value(100);
-        zone_lengths_builder.append(true);
+        // Build struct array for "name" column: 2 zones
+        let name_struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 1])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_start", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 100])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_length", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![100, 100])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("nan_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
+                Arc::new(ArrowStringArray::from(vec!["alice", "mike"])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
+                Arc::new(ArrowStringArray::from(vec!["jenny", "zoe"])) as ArrayRef,
+            ),
+        ]);
 
-        let mut null_counts_builder = ListBuilder::new(UInt32Builder::new()).with_field(
-            ArrowField::new(COLUMN_STATS_NULL_COUNT_FIELD, DataType::UInt32, false),
-        );
-        null_counts_builder.values().append_value(0);
-        null_counts_builder.values().append_value(0);
-        null_counts_builder.append(true);
-
-        let mut nan_counts_builder = ListBuilder::new(UInt32Builder::new()).with_field(
-            ArrowField::new(COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32, false),
-        );
-        nan_counts_builder.values().append_value(0);
-        nan_counts_builder.values().append_value(0);
-        nan_counts_builder.append(true);
-
-        let mut mins_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-            COLUMN_STATS_MIN_VALUE_FIELD,
-            DataType::Utf8,
+        // Wrap each struct array in a ListArray (one list per column, one row total)
+        let list_field = Arc::new(ArrowField::new(
+            "zone",
+            consolidated_zone_struct_type.clone(),
             false,
         ));
-        mins_builder.values().append_value("0");
-        mins_builder.values().append_value("100");
-        mins_builder.append(true);
+        let id_list = ListArray::try_new(
+            list_field.clone(),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(id_struct_array) as ArrayRef,
+            None,
+        )
+        .unwrap();
 
-        let mut maxs_builder = ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-            COLUMN_STATS_MAX_VALUE_FIELD,
-            DataType::Utf8,
-            false,
-        ));
-        maxs_builder.values().append_value("99");
-        maxs_builder.values().append_value("199");
-        maxs_builder.append(true);
+        let name_list = ListArray::try_new(
+            list_field.clone(),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(name_struct_array) as ArrayRef,
+            None,
+        )
+        .unwrap();
 
-        // Build lists for "name" column (Utf8)
-        fragment_ids_builder.values().append_value(0);
-        fragment_ids_builder.values().append_value(1);
-        fragment_ids_builder.append(true);
-
-        zone_starts_builder.values().append_value(0);
-        zone_starts_builder.values().append_value(100);
-        zone_starts_builder.append(true);
-
-        zone_lengths_builder.values().append_value(100);
-        zone_lengths_builder.values().append_value(100);
-        zone_lengths_builder.append(true);
-
-        null_counts_builder.values().append_value(0);
-        null_counts_builder.values().append_value(0);
-        null_counts_builder.append(true);
-
-        nan_counts_builder.values().append_value(0);
-        nan_counts_builder.values().append_value(0);
-        nan_counts_builder.append(true);
-
-        mins_builder.values().append_value("alice");
-        mins_builder.values().append_value("mike");
-        mins_builder.append(true);
-
-        maxs_builder.values().append_value("jenny");
-        maxs_builder.values().append_value("zoe");
-        maxs_builder.append(true);
+        // Schema has 3 fields (id, name, score), but we only create stats for id and name
+        // So we need to create a schema with just those two columns for the stats batch
+        let stats_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::List(list_field.clone()), false),
+            ArrowField::new("name", DataType::List(list_field.clone()), false),
+        ]));
 
         RecordBatch::try_new(
-            schema,
+            stats_schema,
             vec![
-                Arc::new(ArrowStringArray::from(vec!["id", "name"])),
-                Arc::new(fragment_ids_builder.finish()),
-                Arc::new(zone_starts_builder.finish()),
-                Arc::new(zone_lengths_builder.finish()),
-                Arc::new(null_counts_builder.finish()),
-                Arc::new(nan_counts_builder.finish()),
-                Arc::new(mins_builder.finish()),
-                Arc::new(maxs_builder.finish()),
+                Arc::new(id_list) as ArrayRef,
+                Arc::new(name_list) as ArrayRef,
             ],
         )
         .unwrap()
@@ -705,7 +662,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Create empty stats batch using the shared schema function
-        let stats_schema = create_consolidated_stats_schema();
+        let stats_schema = create_consolidated_stats_schema(&schema);
 
         let empty_batch = RecordBatch::new_empty(stats_schema);
         let reader = ColumnStatsReader::new(schema, empty_batch);

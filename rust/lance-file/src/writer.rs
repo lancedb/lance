@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_core::utils::zone::FileZoneBuilder;
 
 use arrow_data::ArrayData;
@@ -254,7 +254,13 @@ enum PageSpillState {
 
 // Column statistics types and processors are defined in the column_stats submodule
 mod column_stats;
-use column_stats::{COLUMN_STATS_ZONE_SIZE, ColumnStatisticsProcessor, scalar_value_to_string};
+use column_stats::{
+    COLUMN_STATS_ZONE_SIZE, ColumnStatisticsProcessor, create_column_zone_statistics_struct_type,
+    scalar_value_to_string,
+};
+
+// Re-export for use in consolidation
+pub use column_stats::create_consolidated_zone_struct_type;
 
 pub struct FileWriter {
     writer: Box<dyn Writer>,
@@ -1056,30 +1062,24 @@ impl FileWriter {
             )
         })?;
 
-        // Transposed (flat) layout: one row per zone per column
-        // It provides better simplicity and read efficiency compared to the nested layout (one row per column with nested lists)
-        // As the column statistics data is minimal compared to the data itself, the trade off of more row numbers is acceptable.
+        // Columnar layout: one column per dataset column, each containing ColumnZoneStatistics structs
+        // Rows = zones (one row per zone)
         //
         // Example layout for a dataset with 2 columns ("id", "price") and 2 zones:
-        // ┌─────────────┬─────────┬────────────┬─────────────┬────────────┬───────────┬───────────┬───────────┐
-        // │ column_name │ zone_id │ zone_start │ zone_length │ null_count │ nan_count │ min_value │ max_value │
-        // ├─────────────┼─────────┼────────────┼─────────────┼────────────┼───────────┼───────────┼───────────┤
-        // │ "id"        │ 0       │ 0          │ 1000000     │ 0          │ 0         │ "1"       │ "1000000" │
-        // │ "id"        │ 1       │ 1000000    │ 500000      │ 0          │ 0         │ "1000001" │ "1500000" │
-        // │ "price"     │ 0       │ 0          │ 1000000     │ 0          │ 0         │ "9.99"    │ "99.99"   │
-        // │ "price"     │ 1       │ 1000000    │ 500000      │ 5          │ 0         │ "10.50"   │ "100.50"  │
-        // └─────────────┴─────────┴────────────┴─────────────┴────────────┴───────────┴───────────┴───────────┘
+        // ┌─────────────────────────────────────┬─────────────────────────────────────┐
+        // │ id (ColumnZoneStatistics)           │ price (ColumnZoneStatistics)        │
+        // ├─────────────────────────────────────┼─────────────────────────────────────┤
+        // │ {min:"1", max:"1000000", ...}       │ {min:"9.99", max:"99.99", ...}      │
+        // │ {min:"1000001", max:"2000000", ...} │ {min:"10.50", max:"100.50", ...}    │
+        // └─────────────────────────────────────┴─────────────────────────────────────┘
         //
-        // Each row represents one zone for one column. No nested structures (lists).
-        // Build flat arrays (one row per zone per column)
-        let mut column_names = Vec::new();
-        let mut zone_ids = Vec::new();
-        let mut zone_starts = Vec::new();
-        let mut zone_lengths = Vec::new();
-        let mut null_counts = Vec::new();
-        let mut nan_counts = Vec::new();
-        let mut min_values = Vec::new();
-        let mut max_values = Vec::new();
+        // Each row represents one zone. Each column contains ColumnZoneStatistics for that dataset column.
+
+        use arrow_array::StructArray;
+
+        // Collect zones for each column
+        let mut column_zones: Vec<(String, Vec<column_stats::ColumnZoneStatistics>)> = Vec::new();
+        let mut num_zones = None;
 
         for (field, processor) in schema.fields.iter().zip(processors.into_iter()) {
             let zones = processor.finalize()?;
@@ -1089,53 +1089,119 @@ impl FileWriter {
                 continue;
             }
 
-            // Add one row per zone for this column
-            for (zone_idx, zone) in zones.iter().enumerate() {
-                column_names.push(field.name.clone());
-                zone_ids.push(zone_idx as u32);
-                zone_starts.push(zone.bound.start);
-                zone_lengths.push(zone.bound.length as u64);
-                null_counts.push(zone.null_count);
-                nan_counts.push(zone.nan_count);
-                // Serialize ScalarValue as string - only store the value, not the type
-                min_values.push(scalar_value_to_string(&zone.min));
-                max_values.push(scalar_value_to_string(&zone.max));
+            // All columns should have the same number of zones in a single file
+            if let Some(expected_zones) = num_zones {
+                if zones.len() != expected_zones {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "Column statistics mismatch: column '{}' has {} zones but expected {}",
+                            field.name,
+                            zones.len(),
+                            expected_zones
+                        ),
+                        location: location!(),
+                    });
+                }
+            } else {
+                num_zones = Some(zones.len());
             }
+
+            column_zones.push((field.name.clone(), zones));
         }
 
         // If no statistics were collected, return early
-        if column_names.is_empty() {
+        if column_zones.is_empty() {
             return Ok(());
         }
 
-        // Create Arrow arrays (flat, no lists)
-        let column_name_array = Arc::new(StringArray::from(column_names)) as ArrayRef;
-        let zone_id_array = Arc::new(arrow_array::UInt32Array::from(zone_ids)) as ArrayRef;
-        let zone_start_array = Arc::new(arrow_array::UInt64Array::from(zone_starts)) as ArrayRef;
-        let zone_length_array = Arc::new(arrow_array::UInt64Array::from(zone_lengths)) as ArrayRef;
-        let null_count_array = Arc::new(arrow_array::UInt32Array::from(null_counts)) as ArrayRef;
-        let nan_count_array = Arc::new(arrow_array::UInt32Array::from(nan_counts)) as ArrayRef;
-        let min_value_array = Arc::new(StringArray::from(min_values)) as ArrayRef;
-        let max_value_array = Arc::new(StringArray::from(max_values)) as ArrayRef;
+        let num_zones = num_zones.unwrap();
 
-        // Create schema for the statistics RecordBatch (flat schema, no lists)
-        let stats_schema = create_column_stats_flat_schema();
+        // Build struct arrays for each column
+        let column_zone_stats_type = create_column_zone_statistics_struct_type();
+        let mut column_arrays: Vec<ArrayRef> = Vec::new();
+        let mut schema_fields: Vec<ArrowField> = Vec::new();
 
-        // Create RecordBatch (flat structure)
-        let stats_batch = RecordBatch::try_new(
-            stats_schema,
-            vec![
-                column_name_array,
-                zone_id_array,
-                zone_start_array,
-                zone_length_array,
-                null_count_array,
-                nan_count_array,
-                min_value_array,
-                max_value_array,
-            ],
-        )
-        .map_err(|e| {
+        for (col_name, zones) in &column_zones {
+            // Build arrays for each field in ColumnZoneStatistics
+            let mut min_values = Vec::with_capacity(num_zones);
+            let mut max_values = Vec::with_capacity(num_zones);
+            let mut null_counts = Vec::with_capacity(num_zones);
+            let mut nan_counts = Vec::with_capacity(num_zones);
+            let mut fragment_ids = Vec::with_capacity(num_zones);
+            let mut zone_starts = Vec::with_capacity(num_zones);
+            let mut zone_lengths = Vec::with_capacity(num_zones);
+
+            for zone in zones {
+                min_values.push(scalar_value_to_string(&zone.min));
+                max_values.push(scalar_value_to_string(&zone.max));
+                null_counts.push(zone.null_count);
+                nan_counts.push(zone.nan_count);
+                fragment_ids.push(zone.bound.fragment_id);
+                zone_starts.push(zone.bound.start);
+                zone_lengths.push(zone.bound.length as u64);
+            }
+
+            // Build ZoneBound struct array
+            let zone_bound_struct = StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
+                    Arc::new(arrow_array::UInt64Array::from(fragment_ids)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("start", DataType::UInt64, false)),
+                    Arc::new(arrow_array::UInt64Array::from(zone_starts)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("length", DataType::UInt64, false)),
+                    Arc::new(arrow_array::UInt64Array::from(zone_lengths)) as ArrayRef,
+                ),
+            ]);
+
+            // Build ColumnZoneStatistics struct array
+            let column_stats_struct = StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("min", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(min_values)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("max", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(max_values)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
+                    Arc::new(arrow_array::UInt32Array::from(null_counts)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("nan_count", DataType::UInt32, false)),
+                    Arc::new(arrow_array::UInt32Array::from(nan_counts)) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new(
+                        "bound",
+                        DataType::Struct(Fields::from(vec![
+                            ArrowField::new("fragment_id", DataType::UInt64, false),
+                            ArrowField::new("start", DataType::UInt64, false),
+                            ArrowField::new("length", DataType::UInt64, false),
+                        ])),
+                        false,
+                    )),
+                    Arc::new(zone_bound_struct) as ArrayRef,
+                ),
+            ]);
+
+            schema_fields.push(ArrowField::new(
+                col_name,
+                column_zone_stats_type.clone(),
+                false,
+            ));
+            column_arrays.push(Arc::new(column_stats_struct) as ArrayRef);
+        }
+
+        // Create schema for the statistics RecordBatch (columnar: one column per dataset column)
+        let stats_schema = Arc::new(ArrowSchema::new(schema_fields));
+
+        // Create RecordBatch (columnar structure: one row per zone, one column per dataset column)
+        let stats_batch = RecordBatch::try_new(stats_schema, column_arrays).map_err(|e| {
             Error::invalid_input(
                 format!("Failed to create statistics batch: {}", e),
                 location!(),

@@ -10,40 +10,35 @@
 //!
 //! # Overview
 //!
-//! Per-fragment statistics are stored in each data file's global buffer in a **flat layout**
-//! (one row per zone per column). This module consolidates them into a **list-based layout**
-//! (one row per column, with lists of values across all fragments) with global offsets.
+//! Per-fragment statistics are stored in each data file's global buffer in a **columnar layout**
+//! (one column per dataset column, each row represents a zone, with type `ColumnZoneStatistics`).
+//! This module consolidates them into a **columnar layout** with one row total
+//! (one column per dataset column, each containing a `List<struct<...>>` with zone statistics).
 //!
 //! # Workflow
 //!
-//! 1. **Per-fragment stats** (flat layout, local offsets) → stored in data files
-//! 2. **Consolidation** (this module) → converts to list-based layout with global offsets
+//! 1. **Per-fragment stats** (columnar layout, local offsets) → stored in data files
+//! 2. **Consolidation** (this module) → converts to columnar layout with one row, local offsets preserved
 //! 3. **Reading** ([`column_stats_reader`](crate::dataset::column_stats_reader)) → provides
 //!    typed access to consolidated stats
 //!
-//! # Key Functions
-//!
-//! - [`consolidate_column_stats`] - Main entry point for consolidating stats from all fragments
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use arrow_array::builder::{ListBuilder, StringBuilder, UInt32Builder, UInt64Builder};
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_buffer::OffsetBuffer;
 // These are only used in tests
 #[cfg_attr(not(test), allow(unused_imports))]
-use arrow_array::{Float32Array, ListArray};
+use arrow_array::Float32Array;
+use arrow_array::StructArray;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_core::utils::zone::ZoneBound;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::FileReader;
-use lance_file::writer::{
-    COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
-    COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_LENGTH_FIELD,
-    COLUMN_STATS_ZONE_START_FIELD,
-};
+use lance_file::writer::create_consolidated_zone_struct_type;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -53,23 +48,14 @@ use snafu::location;
 use crate::dataset::fragment::FileFragment;
 use crate::{Dataset, Error};
 
-// Schema field definitions for consolidated statistics
-const FRAGMENT_ID_FIELD: &str = "fragment_id"; // Used in consolidated layout only
-
-/// Helper function to create a list field for consolidated statistics
-fn create_list_field(name: &str, item_name: &str, item_type: DataType) -> ArrowField {
-    ArrowField::new(
-        name,
-        DataType::List(Arc::new(ArrowField::new(item_name, item_type, false))),
-        false,
-    )
-}
-
 /// Consolidated statistics for a single zone of a single column.
 #[derive(Debug, Clone)]
 pub struct ZoneStats {
     /// Zone boundary information (fragment_id, start offset, length)
     pub bound: ZoneBound,
+    /// Zone ID within the fragment (0, 1, 2, ...)
+    /// This is the index of the zone within the fragment file
+    pub zone_id: u32,
     pub null_count: u32,
     pub nan_count: u32,
     pub min: String, // ScalarValue as string (no type prefix)
@@ -83,51 +69,77 @@ pub struct ZoneStats {
 ///
 /// # How It Works
 ///
-/// Each fragment file contains per-fragment statistics in a **flat layout** (see writer.rs):
+/// Each fragment file contains per-fragment statistics in a **columnar layout** (see writer.rs):
+/// Each dataset column maps to a column in the stats file, with type `ColumnZoneStatistics` (struct).
+/// Each row represents a zone.
 ///
-/// **Fragment 0 stats** (rows 0-2M, local offsets):
+/// **Fragment file layout**:
 /// ```text
-/// ┌─────────────┬─────────┬────────────┬─────────────┬────────────┬───────────┐
-/// │ column_name │ zone_id │ zone_start │ zone_length │ min_value  │ max_value │
-/// ├─────────────┼─────────┼────────────┼─────────────┼────────────┼───────────┤
-/// │ "id"        │ 0       │ 0          │ 1000000     │ "1"        │ "1000000" │
-/// │ "id"        │ 1       │ 1000000    │ 1000000     │ "1000001"  │ "2000000" │
-/// │ "price"     │ 0       │ 0          │ 1000000     │ "9.99"     │ "99.99"   │
-/// │ "price"     │ 1       │ 1000000    │ 1000000     │ "10.50"    │ "100.50"  │
-/// └─────────────┴─────────┴────────────┴─────────────┴────────────┴───────────┘
+/// ┌─────────────┬──────────────────────────────┬──────────────────────────────┐
+/// │ Row (Zone)  │ "id" (ColumnZoneStatistics)  │ "price" (ColumnZoneStatistics)│
+/// ├─────────────┼──────────────────────────────┼──────────────────────────────┤
+/// │ 0           │ {min, max, null_count, ...}  │ {min, max, null_count, ...}  │
+/// │ 1           │ {min, max, null_count, ...}  │ {min, max, null_count, ...}  │
+/// │ ...         │ ...                          │ ...                          │
+/// └─────────────┴──────────────────────────────┴──────────────────────────────┘
 /// ```
 ///
-/// **Fragment 1 stats** (rows 2M-4M, local offsets):
+/// **Fragment 0 stats** (2 zones, local offsets):
 /// ```text
-/// ┌─────────────┬─────────┬────────────┬─────────────┬────────────┬───────────┐
-/// │ column_name │ zone_id │ zone_start │ zone_length │ min_value  │ max_value │
-/// ├─────────────┼─────────┼────────────┼─────────────┼────────────┼───────────┤
-/// │ "id"        │ 0       │ 0          │ 1000000     │ "2000001"  │ "3000000" │
-/// │ "id"        │ 1       │ 1000000    │ 1000000     │ "3000001"  │ "4000000" │
-/// │ "price"     │ 0       │ 0          │ 1000000     │ "15.00"    │ "150.00"  │
-/// │ "price"     │ 1       │ 1000000    │ 1000000     │ "20.00"    │ "200.00"  │
-/// └─────────────┴─────────┴────────────┴─────────────┴────────────┴───────────┘
+/// Row 0 (zone 0):
+///   "id": ColumnZoneStatistics{min="1", max="1000000", null_count=0, nan_count=0, bound={fragment_id=0, start=0, length=1000000}}
+///   "price": ColumnZoneStatistics{min="9.99", max="99.99", null_count=0, nan_count=0, bound={fragment_id=0, start=0, length=1000000}}
+///
+/// Row 1 (zone 1):
+///   "id": ColumnZoneStatistics{min="1000001", max="2000000", null_count=0, nan_count=0, bound={fragment_id=0, start=1000000, length=1000000}}
+///   "price": ColumnZoneStatistics{min="10.50", max="100.50", null_count=0, nan_count=0, bound={fragment_id=0, start=1000000, length=1000000}}
 /// ```
 ///
-/// This function **consolidates** them into a **list-based layout** with global offsets:
-///
-/// **Consolidated stats** (one row per column, across all fragments):
+/// **Fragment 1 stats** (2 zones, local offsets):
 /// ```text
-/// ┌─────────────┬──────────────┬─────────────────────┬───────────────┬────────────────────┐
-/// │ column_name │ fragment_ids │ zone_starts         │ min_values    │ max_values         │
-/// │ (string)    │ (list<u64>)  │ (list<u64>)         │ (list<str>)   │ (list<str>)        │
-/// ├─────────────┼──────────────┼─────────────────────┼───────────────┼────────────────────┤
-/// │ "id"        │ [0,0,1,1]    │ [0,1M,2M,3M] ←GLOBAL│ [1,1M,2M,3M]  │ [1M,2M,3M,4M]      │
-/// │ "price"     │ [0,0,1,1]    │ [0,1M,2M,3M] ←GLOBAL│ [9.99,10.50,  │ [99.99,100.50,     │
-/// │             │              │                     │  15.00,20.00] │  150.00,200.00]    │
-/// └─────────────┴──────────────┴─────────────────────┴───────────────┴────────────────────┘
+/// Row 0 (zone 0):
+///   "id": ColumnZoneStatistics{min="2000001", max="3000000", null_count=0, nan_count=0, bound={fragment_id=1, start=0, length=1000000}}
+///   "price": ColumnZoneStatistics{min="15.00", max="150.00", null_count=0, nan_count=0, bound={fragment_id=1, start=0, length=1000000}}
+///
+/// Row 1 (zone 1):
+///   "id": ColumnZoneStatistics{min="3000001", max="4000000", null_count=0, nan_count=0, bound={fragment_id=1, start=1000000, length=1000000}}
+///   "price": ColumnZoneStatistics{min="20.00", max="200.00", null_count=0, nan_count=0, bound={fragment_id=1, start=1000000, length=1000000}}
 /// ```
 ///
-/// **Key transformations**:
-/// - Fragment 0 local offset 0 → Global offset 0
-/// - Fragment 0 local offset 1M → Global offset 1M
-/// - Fragment 1 local offset 0 → Global offset 2M (base_offset = 2M)
-/// - Fragment 1 local offset 1M → Global offset 3M (base_offset + 1M)
+/// This function **consolidates** them into a **columnar layout** with one row total:
+/// Each dataset column maps to a column in the consolidated stats file, with type `List<struct<fragment_id, zone_start, zone_length, null_count, nan_count, min_value, max_value>>`.
+/// The list is ordered by zone_id first, then fragment_id. Zone offsets remain local (per fragment).
+///
+/// **Consolidated file layout**:
+/// ```text
+/// ┌─────┬──────────────────────────────────────┬──────────────────────────────────────┐
+/// │ Row │ "id" (List<struct<...>>)             │ "price" (List<struct<...>>)          │
+/// ├─────┼──────────────────────────────────────┼──────────────────────────────────────┤
+/// │ 0   │ [struct{...}, struct{...}, ...]     │ [struct{...}, struct{...}, ...]     │
+/// └─────┴──────────────────────────────────────┴──────────────────────────────────────┘
+/// ```
+///
+/// **Consolidated stats** (one row total, columnar):
+/// ```text
+/// Row 0:
+///   "id": List[
+///     struct{fragment_id=0, zone_start=0, zone_length=1000000, null_count=0, nan_count=0, min_value="1", max_value="1000000"},
+///     struct{fragment_id=1, zone_start=0, zone_length=1000000, null_count=0, nan_count=0, min_value="2000001", max_value="3000000"},
+///     struct{fragment_id=0, zone_start=1000000, zone_length=1000000, null_count=0, nan_count=0, min_value="1000001", max_value="2000000"},
+///     struct{fragment_id=1, zone_start=1000000, zone_length=1000000, null_count=0, nan_count=0, min_value="3000001", max_value="4000000"}
+///   ]
+///   "price": List[
+///     struct{fragment_id=0, zone_start=0, zone_length=1000000, null_count=0, nan_count=0, min_value="9.99", max_value="99.99"},
+///     struct{fragment_id=1, zone_start=0, zone_length=1000000, null_count=0, nan_count=0, min_value="15.00", max_value="150.00"},
+///     struct{fragment_id=0, zone_start=1000000, zone_length=1000000, null_count=0, nan_count=0, min_value="10.50", max_value="100.50"},
+///     struct{fragment_id=1, zone_start=1000000, zone_length=1000000, null_count=0, nan_count=0, min_value="20.00", max_value="200.00"}
+///   ]
+/// ```
+///
+/// **Key points**:
+/// - Zone offsets (`zone_start`) remain **local** (per fragment), not global
+/// - List elements are ordered by `(zone_id, fragment_id)`: all zone 0s first, then all zone 1s, etc.
+/// - Each dataset column has its own column in the consolidated file
 ///
 pub async fn consolidate_column_stats(
     dataset: &Dataset,
@@ -144,30 +156,18 @@ pub async fn consolidate_column_stats(
         }
     }
 
+    // TODO: Support partial stats dataset consolidation
     if fragments_with_stats < total_fragments {
-        log::info!(
-            "Skipping column stats consolidation: only {}/{} fragments have stats",
-            fragments_with_stats,
-            total_fragments
+        log::warn!(
+            "Skipping column stats consolidation: only {fragments_with_stats}/{total_fragments} fragments have stats"
         );
         return Ok(None);
     }
 
-    // Step 2: Build fragment offset map (for global offsets)
-    let mut fragment_offsets = HashMap::new();
-    let mut current_offset = 0u64;
-
-    for fragment in &fragments {
-        fragment_offsets.insert(fragment.id() as u64, current_offset);
-        current_offset += fragment.count_rows(None).await? as u64;
-    }
-
-    // Step 3: Collect stats from all fragments, organized by column
+    // Step 2: Collect stats from all fragments, organized by column
     let mut stats_by_column: HashMap<String, Vec<ZoneStats>> = HashMap::new();
 
     for fragment in &fragments {
-        let base_offset = fragment_offsets[&(fragment.id() as u64)];
-
         for data_file in &fragment.metadata().files {
             let file_path = dataset
                 .data_file_dir(data_file)?
@@ -176,15 +176,17 @@ pub async fn consolidate_column_stats(
 
             if let Some(file_stats) = file_stats {
                 for (col_name, zones) in file_stats {
-                    // Adjust zone_start to global offset
+                    // Keep local zone_start (per requirement: no global zone_start calculation)
+                    // Just update fragment_id
                     let adjusted_zones: Vec<ZoneStats> = zones
                         .into_iter()
                         .map(|z| ZoneStats {
                             bound: ZoneBound {
                                 fragment_id: fragment.id() as u64,
-                                start: base_offset + z.bound.start, // LOCAL → GLOBAL
+                                start: z.bound.start, // Keep local offset
                                 length: z.bound.length,
                             },
+                            zone_id: z.zone_id,
                             null_count: z.null_count,
                             nan_count: z.nan_count,
                             min: z.min,
@@ -206,10 +208,13 @@ pub async fn consolidate_column_stats(
         return Ok(None);
     }
 
-    // Step 4: Build consolidated batch
+    // Step 3: Build consolidated batch
     let consolidated_batch = build_consolidated_batch(stats_by_column, dataset.schema())?;
 
-    // Step 5: Write as Lance file (version is stored in metadata, not filename)
+    // Note: The schema is now dynamic (one column per dataset column), so we don't use
+    // the static CONSOLIDATED_STATS_SCHEMA anymore
+
+    // Step 4: Write as Lance file (version is stored in metadata, not filename)
     let stats_path = String::from("_stats/column_stats.lance");
     write_stats_file(
         dataset.object_store(),
@@ -278,18 +283,20 @@ async fn fragment_has_stats(dataset: &Dataset, fragment: &FileFragment) -> Resul
 /// Read column statistics from a single data file (.lance file).
 ///
 /// Returns a map from column name to list of zone statistics. The zones are
-/// stored in a flat layout in the data file (one row per zone per column), which
+/// stored in a columnar layout in the data file (one column per dataset column,
+/// each row represents a zone, with type `ColumnZoneStatistics`), which
 /// this function converts to a nested structure for easier processing.
 ///
 /// # Example
 ///
-/// For a data file with 2 columns and 2 zones each, the flat layout in the file:
+/// For a data file with 2 columns and 2 zones each, the columnar layout in the file:
 /// ```text
-/// column_name | zone_id | zone_start | zone_length | ...
-/// "id"        | 0       | 0          | 1000000     | ...
-/// "id"        | 1       | 1000000    | 500000      | ...
-/// "price"     | 0       | 0          | 1000000     | ...
-/// "price"     | 1       | 1000000    | 500000      | ...
+/// ┌─────┬──────────────────────────────┬──────────────────────────────┐
+/// │ Row │ "id" (ColumnZoneStatistics)  │ "price" (ColumnZoneStatistics)│
+/// ├─────┼──────────────────────────────┼──────────────────────────────┤
+/// │ 0   │ {min, max, null_count, ...}  │ {min, max, null_count, ...}  │
+/// │ 1   │ {min, max, null_count, ...}  │ {min, max, null_count, ...}  │
+/// └─────┴──────────────────────────────┴──────────────────────────────┘
 /// ```
 ///
 /// Gets converted to:
@@ -327,290 +334,351 @@ async fn read_fragment_column_stats(
         return Ok(None);
     };
 
-    // Parse the column-oriented stats batch
+    // Parse the columnar stats batch: one column per dataset column, each containing ColumnZoneStatistics structs
+    // Rows = zones (one row per zone)
     let mut result = HashMap::new();
+    use arrow_array::StructArray;
 
-    let column_names = stats_batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected StringArray for column_names".to_string(),
-            location: location!(),
-        })?;
+    let num_zones = stats_batch.num_rows();
+    let schema = stats_batch.schema();
 
-    let zone_ids = stats_batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected UInt32Array for zone_ids".to_string(),
-            location: location!(),
-        })?;
+    // Iterate over each column in the batch (each column corresponds to a dataset column)
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let col_name = field.name();
+        let column_array = stats_batch.column(col_idx);
 
-    let zone_starts = stats_batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected UInt64Array for zone_starts".to_string(),
-            location: location!(),
-        })?;
-
-    let zone_lengths = stats_batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected UInt64Array for zone_lengths".to_string(),
-            location: location!(),
-        })?;
-
-    let null_counts = stats_batch
-        .column(4)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected UInt32Array for null_counts".to_string(),
-            location: location!(),
-        })?;
-
-    let nan_counts = stats_batch
-        .column(5)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected UInt32Array for nan_counts".to_string(),
-            location: location!(),
-        })?;
-
-    let min_values = stats_batch
-        .column(6)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected StringArray for min_values".to_string(),
-            location: location!(),
-        })?;
-
-    let max_values = stats_batch
-        .column(7)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::Internal {
-            message: "Expected StringArray for max_values".to_string(),
-            location: location!(),
-        })?;
-
-    // Process each row (one row per zone per column) and convert from flat layout
-    // to nested structure. Zones must arrive in order (zone_id 0, 1, 2, ...) as they
-    // are written in order and Arrow IPC preserves row order.
-    for row_idx in 0..stats_batch.num_rows() {
-        let col_name = column_names.value(row_idx).to_string();
-        let zone_id = zone_ids.value(row_idx) as usize;
-
-        let zone_stat = ZoneStats {
-            bound: ZoneBound {
-                fragment_id: 0, // Will be set by caller when computing global offsets
-                start: zone_starts.value(row_idx),
-                length: zone_lengths.value(row_idx) as usize,
-            },
-            null_count: null_counts.value(row_idx),
-            nan_count: nan_counts.value(row_idx),
-            min: min_values.value(row_idx).to_string(),
-            max: max_values.value(row_idx).to_string(),
-        };
-
-        // Get or create the zones vector for this column
-        let zones_for_column = result.entry(col_name.clone()).or_insert_with(Vec::new);
-
-        // Zones must arrive in order. If they don't, it indicates a bug in the writer
-        // or data corruption. Assert to fail fast rather than silently handling it.
-        if zone_id != zones_for_column.len() {
-            return Err(Error::Internal {
+        // Extract the StructArray for this column
+        let struct_array = column_array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::Internal {
                 message: format!(
-                    "Column stats zones arrived out of order: expected zone_id {}, got {} for column '{}'",
-                    zones_for_column.len(),
-                    zone_id,
+                    "Expected StructArray for column '{}' in column stats",
                     col_name
                 ),
                 location: location!(),
-            });
+            })?;
+
+        // Extract fields from the ColumnZoneStatistics struct
+        let min_array = struct_array
+            .column_by_name("min")
+            .ok_or_else(|| Error::Internal {
+                message: format!("Missing 'min' field in column stats for '{}'", col_name),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected StringArray for 'min' field in column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let max_array = struct_array
+            .column_by_name("max")
+            .ok_or_else(|| Error::Internal {
+                message: format!("Missing 'max' field in column stats for '{}'", col_name),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected StringArray for 'max' field in column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let null_count_array = struct_array
+            .column_by_name("null_count")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Missing 'null_count' field in column stats for '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected UInt32Array for 'null_count' field in column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let nan_count_array = struct_array
+            .column_by_name("nan_count")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Missing 'nan_count' field in column stats for '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected UInt32Array for 'nan_count' field in column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        // Extract the bound struct
+        let bound_struct = struct_array
+            .column_by_name("bound")
+            .ok_or_else(|| Error::Internal {
+                message: format!("Missing 'bound' field in column stats for '{}'", col_name),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected StructArray for 'bound' field in column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let fragment_id_array = bound_struct
+            .column_by_name("fragment_id")
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Missing 'fragment_id' in bound struct for column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected UInt64Array for 'fragment_id' in bound struct for column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let start_array = bound_struct
+            .column_by_name("start")
+            .ok_or_else(|| Error::Internal {
+                message: format!("Missing 'start' in bound struct for column '{}'", col_name),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected UInt64Array for 'start' in bound struct for column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        let length_array = bound_struct
+            .column_by_name("length")
+            .ok_or_else(|| Error::Internal {
+                message: format!("Missing 'length' in bound struct for column '{}'", col_name),
+                location: location!(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Expected UInt64Array for 'length' in bound struct for column '{}'",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+
+        // Process each zone (row) for this column
+        // zone_idx is the zone_id within the fragment
+        let mut zones = Vec::with_capacity(num_zones);
+        for zone_idx in 0..num_zones {
+            let zone_stat = ZoneStats {
+                bound: ZoneBound {
+                    fragment_id: fragment_id_array.value(zone_idx),
+                    start: start_array.value(zone_idx),
+                    length: length_array.value(zone_idx) as usize,
+                },
+                zone_id: zone_idx as u32,
+                null_count: null_count_array.value(zone_idx),
+                nan_count: nan_count_array.value(zone_idx),
+                min: min_array.value(zone_idx).to_string(),
+                max: max_array.value(zone_idx).to_string(),
+            };
+            zones.push(zone_stat);
         }
 
-        zones_for_column.push(zone_stat);
+        result.insert(col_name.to_string(), zones);
     }
 
     Ok(Some(result))
 }
 
-/// Builder structure for list columns in consolidated statistics
-struct ZoneListBuilders {
-    fragment_ids: ListBuilder<UInt64Builder>,
-    zone_starts: ListBuilder<UInt64Builder>,
-    zone_lengths: ListBuilder<UInt64Builder>,
-    null_counts: ListBuilder<UInt32Builder>,
-    nan_counts: ListBuilder<UInt32Builder>,
-    mins: ListBuilder<StringBuilder>,
-    maxs: ListBuilder<StringBuilder>,
-}
-
-impl ZoneListBuilders {
-    fn new() -> Self {
-        Self {
-            fragment_ids: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                FRAGMENT_ID_FIELD,
-                DataType::UInt64,
-                false,
-            )),
-            zone_starts: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_ZONE_START_FIELD,
-                DataType::UInt64,
-                false,
-            )),
-            zone_lengths: ListBuilder::new(UInt64Builder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_ZONE_LENGTH_FIELD,
-                DataType::UInt64,
-                false,
-            )),
-            null_counts: ListBuilder::new(UInt32Builder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_NULL_COUNT_FIELD,
-                DataType::UInt32,
-                false,
-            )),
-            nan_counts: ListBuilder::new(UInt32Builder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_NAN_COUNT_FIELD,
-                DataType::UInt32,
-                false,
-            )),
-            mins: ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_MIN_VALUE_FIELD,
-                DataType::Utf8,
-                false,
-            )),
-            maxs: ListBuilder::new(StringBuilder::new()).with_field(ArrowField::new(
-                COLUMN_STATS_MAX_VALUE_FIELD,
-                DataType::Utf8,
-                false,
-            )),
-        }
-    }
-
-    /// Append zone statistics to the builders
-    fn append_zones(&mut self, zones: &[ZoneStats]) {
-        for zone in zones {
-            self.fragment_ids
-                .values()
-                .append_value(zone.bound.fragment_id);
-            self.zone_starts.values().append_value(zone.bound.start);
-            self.zone_lengths
-                .values()
-                .append_value(zone.bound.length as u64);
-            self.null_counts.values().append_value(zone.null_count);
-            self.nan_counts.values().append_value(zone.nan_count);
-            self.mins.values().append_value(&zone.min);
-            self.maxs.values().append_value(&zone.max);
-        }
-    }
-
-    /// Finish lists for the current column (creates one row)
-    fn finish_column(&mut self) {
-        self.fragment_ids.append(true);
-        self.zone_starts.append(true);
-        self.zone_lengths.append(true);
-        self.null_counts.append(true);
-        self.nan_counts.append(true);
-        self.mins.append(true);
-        self.maxs.append(true);
-    }
-
-    /// Finalize and build Arrow arrays
-    fn build_arrays(mut self) -> Vec<ArrayRef> {
-        vec![
-            Arc::new(self.fragment_ids.finish()) as ArrayRef,
-            Arc::new(self.zone_starts.finish()) as ArrayRef,
-            Arc::new(self.zone_lengths.finish()) as ArrayRef,
-            Arc::new(self.null_counts.finish()) as ArrayRef,
-            Arc::new(self.nan_counts.finish()) as ArrayRef,
-            Arc::new(self.mins.finish()) as ArrayRef,
-            Arc::new(self.maxs.finish()) as ArrayRef,
-        ]
-    }
-}
-
-/// Arrow schema for consolidated statistics (lazy static constant)
-pub(crate) static CONSOLIDATED_STATS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
-    Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(COLUMN_STATS_COLUMN_NAME_FIELD, DataType::Utf8, false),
-        create_list_field("fragment_ids", FRAGMENT_ID_FIELD, DataType::UInt64),
-        create_list_field(
-            "zone_starts",
-            COLUMN_STATS_ZONE_START_FIELD,
-            DataType::UInt64,
-        ),
-        create_list_field(
-            "zone_lengths",
-            COLUMN_STATS_ZONE_LENGTH_FIELD,
-            DataType::UInt64,
-        ),
-        create_list_field(
-            "null_counts",
-            COLUMN_STATS_NULL_COUNT_FIELD,
-            DataType::UInt32,
-        ),
-        create_list_field("nan_counts", COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32),
-        create_list_field("min_values", COLUMN_STATS_MIN_VALUE_FIELD, DataType::Utf8),
-        create_list_field("max_values", COLUMN_STATS_MAX_VALUE_FIELD, DataType::Utf8),
-    ]))
-});
-
-/// Get the Arrow schema for consolidated statistics
+/// Create Arrow schema for consolidated statistics
 ///
-/// Returns a reference to the lazy static schema constant.
-pub(crate) fn create_consolidated_stats_schema() -> Arc<ArrowSchema> {
-    CONSOLIDATED_STATS_SCHEMA.clone()
+/// Schema: one column per dataset column, each of type List<struct>
+/// where struct contains: fragment_id, zone_start, zone_length, null_count, nan_count, min_value, max_value
+/// One row total
+pub(crate) fn create_consolidated_stats_schema(dataset_schema: &Schema) -> Arc<ArrowSchema> {
+    let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
+
+    let fields: Vec<ArrowField> = dataset_schema
+        .fields
+        .iter()
+        .map(|field| {
+            ArrowField::new(
+                &field.name,
+                DataType::List(Arc::new(ArrowField::new(
+                    "zone",
+                    consolidated_zone_struct_type.clone(),
+                    false,
+                ))),
+                false,
+            )
+        })
+        .collect();
+
+    Arc::new(ArrowSchema::new(fields))
 }
 
 /// Build a consolidated RecordBatch from collected statistics.
 ///
-/// Uses column-oriented layout: one row per dataset column, each field is a list.
+/// Uses columnar layout: one row total, one column per dataset column.
+/// Each column is List<struct> where struct contains zone statistics.
+/// List is ordered by zone_id first, then fragment_id.
 fn build_consolidated_batch(
     stats_by_column: HashMap<String, Vec<ZoneStats>>,
     dataset_schema: &Schema,
 ) -> Result<RecordBatch> {
-    let mut column_names = Vec::new();
-    let mut builders = ZoneListBuilders::new();
+    let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
+    let mut column_arrays: Vec<ArrayRef> = Vec::new();
+    let mut schema_fields: Vec<ArrowField> = Vec::new();
+
+    // Get the full schema (for all columns) to ensure consistency
+    let full_schema = create_consolidated_stats_schema(dataset_schema);
+    let full_schema_fields: HashMap<String, Arc<ArrowField>> = full_schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.clone()))
+        .collect();
 
     // Process each dataset column (in schema order)
     for field in dataset_schema.fields.iter() {
         let col_name = &field.name;
 
         if let Some(mut zones) = stats_by_column.get(col_name).cloned() {
-            // Sort zones by (fragment_id, zone_start) for consistency
-            zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
+            // Sort zones by zone_id first, then fragment_id (as per requirements)
+            zones.sort_by_key(|z| (z.zone_id, z.bound.fragment_id));
 
-            column_names.push(col_name.clone());
+            // Build arrays for the struct fields
+            let mut fragment_ids = Vec::with_capacity(zones.len());
+            let mut zone_starts = Vec::with_capacity(zones.len());
+            let mut zone_lengths = Vec::with_capacity(zones.len());
+            let mut null_counts = Vec::with_capacity(zones.len());
+            let mut nan_counts = Vec::with_capacity(zones.len());
+            let mut min_values = Vec::with_capacity(zones.len());
+            let mut max_values = Vec::with_capacity(zones.len());
 
-            // Append zone data and finish the list for this column
-            builders.append_zones(&zones);
-            builders.finish_column();
+            for zone in &zones {
+                fragment_ids.push(zone.bound.fragment_id);
+                zone_starts.push(zone.bound.start);
+                zone_lengths.push(zone.bound.length as u64);
+                null_counts.push(zone.null_count);
+                nan_counts.push(zone.nan_count);
+                min_values.push(zone.min.clone());
+                max_values.push(zone.max.clone());
+            }
+
+            // Build the struct array for this column's zones
+            let zone_struct_array = StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
+                    Arc::new(UInt64Array::from(fragment_ids.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("zone_start", DataType::UInt64, false)),
+                    Arc::new(UInt64Array::from(zone_starts.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("zone_length", DataType::UInt64, false)),
+                    Arc::new(UInt64Array::from(zone_lengths.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
+                    Arc::new(UInt32Array::from(null_counts.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("nan_count", DataType::UInt32, false)),
+                    Arc::new(UInt32Array::from(nan_counts.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(min_values.clone())) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(max_values.clone())) as ArrayRef,
+                ),
+            ]);
+
+            // Wrap in a List array (one list containing all zones for this column)
+            // Create offsets: [0, zones.len()] to represent a single list
+            let offsets = OffsetBuffer::from_lengths([zones.len()]);
+            let list_field = Arc::new(ArrowField::new(
+                "zone",
+                consolidated_zone_struct_type.clone(),
+                false,
+            ));
+            let list_array = ListArray::try_new(
+                list_field.clone(),
+                offsets,
+                Arc::new(zone_struct_array) as ArrayRef,
+                None,
+            )
+            .map_err(|e| Error::Internal {
+                message: format!(
+                    "Failed to create ListArray for column '{}': {}",
+                    col_name, e
+                ),
+                location: location!(),
+            })?;
+
+            // Use the field definition from the full schema to ensure consistency
+            let schema_field = full_schema_fields
+                .get(col_name)
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Column '{}' not found in consolidated stats schema",
+                        col_name
+                    ),
+                    location: location!(),
+                })?;
+            schema_fields.push((**schema_field).clone());
+            column_arrays.push(Arc::new(list_array) as ArrayRef);
         }
     }
 
-    if column_names.is_empty() {
+    if column_arrays.is_empty() {
         return Err(Error::Internal {
             message: "[ColumnStats] No column statistics to consolidate".to_string(),
             location: location!(),
         });
     }
 
-    // Build final arrays
-    let column_name_array = Arc::new(StringArray::from(column_names)) as ArrayRef;
-    let mut arrays = vec![column_name_array];
-    arrays.extend(builders.build_arrays());
+    // Create schema: one column per dataset column, each of type List<struct>
+    let schema = Arc::new(ArrowSchema::new(schema_fields));
 
-    // Create RecordBatch
-    RecordBatch::try_new(create_consolidated_stats_schema(), arrays).map_err(|e| Error::Internal {
+    // Create RecordBatch: one row total
+    RecordBatch::try_new(schema, column_arrays).map_err(|e| Error::Internal {
         message: format!(
             "[ColumnStats] Failed to create consolidated stats batch: {}",
             e
@@ -808,133 +876,137 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        // 2 rows (id, name columns)
-        assert_eq!(batch.num_rows(), 2);
+        // New format: 1 row total, 2 columns (id, name)
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
 
-        // Verify full content using debug output
-        let column_names = batch.column_by_name("column_name").unwrap();
-        let fragment_ids = batch.column_by_name("fragment_ids").unwrap();
-        let zone_starts = batch.column_by_name("zone_starts").unwrap();
-        let zone_lengths = batch.column_by_name("zone_lengths").unwrap();
-        let null_counts = batch.column_by_name("null_counts").unwrap();
-        let nan_counts = batch.column_by_name("nan_counts").unwrap();
-        let mins = batch.column_by_name("min_values").unwrap();
-        let maxs = batch.column_by_name("max_values").unwrap();
+        // Verify "id" column stats
+        let id_column = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let id_struct = id_column.value(0);
+        let id_struct = id_struct.as_any().downcast_ref::<StructArray>().unwrap();
 
-        // Row 0: "id" column stats
+        let fragment_ids = id_struct
+            .column_by_name("fragment_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(
-            column_names
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "id"
-        );
-        assert_eq!(
-            format!(
-                "{:?}",
-                fragment_ids
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(0)
-            ),
+            format!("{:?}", fragment_ids),
             format!("{:?}", UInt64Array::from(vec![0, 1, 2]))
         );
+
+        let zone_starts = id_struct
+            .column_by_name("zone_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                zone_starts
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(0)
-            ),
-            format!("{:?}", UInt64Array::from(vec![0, 100, 200]))
+            format!("{:?}", zone_starts),
+            format!("{:?}", UInt64Array::from(vec![0, 0, 0])) // Local offsets
         );
+
+        let zone_lengths = id_struct
+            .column_by_name("zone_length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                zone_lengths
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(0)
-            ),
+            format!("{:?}", zone_lengths),
             format!("{:?}", UInt64Array::from(vec![100, 100, 100]))
         );
+
+        let null_counts = id_struct
+            .column_by_name("null_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                null_counts
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(0)
-            ),
+            format!("{:?}", null_counts),
             format!("{:?}", UInt32Array::from(vec![0, 0, 0]))
         );
+
+        let nan_counts = id_struct
+            .column_by_name("nan_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                nan_counts
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(0)
-            ),
+            format!("{:?}", nan_counts),
             format!("{:?}", UInt32Array::from(vec![0, 0, 0]))
         );
+        let mins = id_struct
+            .column_by_name("min_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                mins.as_any().downcast_ref::<ListArray>().unwrap().value(0)
-            ),
+            format!("{:?}", mins),
             format!("{:?}", StringArray::from(vec!["0", "100", "200"]))
         );
+        let maxs = id_struct
+            .column_by_name("max_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                maxs.as_any().downcast_ref::<ListArray>().unwrap().value(0)
-            ),
+            format!("{:?}", maxs),
             format!("{:?}", StringArray::from(vec!["99", "199", "299"]))
         );
 
-        // Row 1: "name" column stats
+        // Verify "name" column stats
+        let name_column = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let name_struct = name_column.value(0);
+        let name_struct = name_struct.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let name_fragment_ids = name_struct
+            .column_by_name("fragment_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(
-            column_names
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(1),
-            "name"
-        );
-        assert_eq!(
-            format!(
-                "{:?}",
-                fragment_ids
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value(1)
-            ),
+            format!("{:?}", name_fragment_ids),
             format!("{:?}", UInt64Array::from(vec![0, 1, 2]))
         );
+
+        let name_mins = name_struct
+            .column_by_name("min_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                mins.as_any().downcast_ref::<ListArray>().unwrap().value(1)
-            ),
+            format!("{:?}", name_mins),
             format!(
                 "{:?}",
                 StringArray::from(vec!["name_0", "name_100", "name_200"])
             )
         );
+        let name_maxs = name_struct
+            .column_by_name("max_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                maxs.as_any().downcast_ref::<ListArray>().unwrap().value(1)
-            ),
+            format!("{:?}", name_maxs),
             format!(
                 "{:?}",
                 StringArray::from(vec!["name_99", "name_199", "name_299"])
@@ -943,8 +1015,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_global_offset_calculation() {
-        // Test that zone offsets are correctly adjusted to global positions
+    async fn test_local_offset_preservation() {
+        // Test that zone offsets remain local (per fragment), not global
         use lance_core::utils::tempfile::TempStrDir;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -999,28 +1071,54 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        // Verify zone_starts contain global offsets
-        let zone_starts = batch
-            .column_by_name("zone_starts")
+        // Verify zone_starts are local (per fragment)
+        // In the new columnar format, we need to read from the List<struct> column
+        let value_column = batch
+            .column_by_name("value")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
+            .unwrap();
+
+        let struct_array = value_column.value(0);
+        let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let zone_starts = struct_array
+            .column_by_name("zone_start")
             .unwrap()
-            .value(0);
-        let zone_starts = zone_starts.as_any().downcast_ref::<UInt64Array>().unwrap();
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
 
-        // Should have at least 1 zone, first zone starts at 0
+        let fragment_ids = struct_array
+            .column_by_name("fragment_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // Should have at least 1 zone
         assert!(!zone_starts.is_empty());
-        assert_eq!(zone_starts.value(0), 0);
 
-        // If there are multiple zones, verify global offset calculation
-        // Fragment 1 starts at row 100, so any zone from fragment 1 should have offset >= 100
-        if zone_starts.len() > 1 {
-            let second_zone_start = zone_starts.value(1);
-            assert!(
-                second_zone_start >= 100,
-                "Second zone should start at or after row 100 (fragment 1 boundary), got {}",
-                second_zone_start
+        // Verify that zones from the same fragment have local offsets (starting from 0)
+        // Zones are ordered by zone_id first, then fragment_id
+        let mut fragment_zone_starts: HashMap<u64, Vec<u64>> = HashMap::new();
+        for i in 0..zone_starts.len() {
+            let frag_id = fragment_ids.value(i);
+            let zone_start = zone_starts.value(i);
+            fragment_zone_starts
+                .entry(frag_id)
+                .or_insert_with(Vec::new)
+                .push(zone_start);
+        }
+
+        // Each fragment should have zones starting from 0 (local offsets)
+        for (frag_id, starts) in fragment_zone_starts {
+            let min_start = starts.iter().min().unwrap();
+            assert_eq!(
+                *min_start, 0,
+                "Fragment {} zones should start at local offset 0, but minimum is {}",
+                frag_id, min_start
             );
         }
     }
@@ -1101,55 +1199,55 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        // Should have 3 rows (one for each column)
-        assert_eq!(batch.num_rows(), 3);
+        // New format: 1 row total, 3 columns (int_col, float_col, string_col)
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 3);
 
-        let column_names = batch
-            .column_by_name("column_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(column_names.value(0), "int_col");
-        assert_eq!(column_names.value(1), "float_col");
-        assert_eq!(column_names.value(2), "string_col");
-
-        // Verify min/max for int_col (row 0)
-        let mins = batch
-            .column_by_name("min_values")
+        // Verify int_col
+        let int_col = batch
+            .column_by_name("int_col")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        let maxs = batch
-            .column_by_name("max_values")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
+        let int_struct = int_col.value(0);
+        let int_struct = int_struct.as_any().downcast_ref::<StructArray>().unwrap();
 
-        // int_col: values [0, 100)
-        let int_mins_array = mins.value(0);
-        let int_mins = int_mins_array
+        let int_mins = int_struct
+            .column_by_name("min_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let int_maxs_array = maxs.value(0);
-        let int_maxs = int_maxs_array
+        let int_maxs = int_struct
+            .column_by_name("max_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(int_mins.value(0), "0");
         assert_eq!(int_maxs.value(int_maxs.len() - 1), "99");
 
-        // float_col: random values, verify they are valid and min <= max
-        let float_mins_array = mins.value(1);
-        let float_mins = float_mins_array
+        // Verify float_col
+        let float_col = batch
+            .column_by_name("float_col")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let float_struct = float_col.value(0);
+        let float_struct = float_struct.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let float_mins_array = float_struct
+            .column_by_name("min_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let float_maxs_array = maxs.value(1);
-        let float_maxs = float_maxs_array
+        let float_mins = float_mins_array;
+        let float_maxs = float_struct
+            .column_by_name("max_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -1170,37 +1268,55 @@ mod tests {
             assert!(max_val.is_finite(), "Float max should be finite");
         }
 
-        // string_col: values ["str_0", "str_99"]
-        let str_mins_array = mins.value(2);
-        let str_mins = str_mins_array
+        // Verify string_col
+        let string_col = batch
+            .column_by_name("string_col")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let string_struct = string_col.value(0);
+        let string_struct = string_struct
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let str_mins = string_struct
+            .column_by_name("min_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let str_maxs_array = maxs.value(2);
-        let str_maxs = str_maxs_array
+        let str_maxs = string_struct
+            .column_by_name("max_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(str_mins.value(0), "str_0");
         assert_eq!(str_maxs.value(str_maxs.len() - 1), "str_99");
 
-        // Verify null_counts are all zero (no nulls)
-        let null_counts = batch
-            .column_by_name("null_counts")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        for i in 0..3 {
-            let col_null_counts_array = null_counts.value(i);
-            let col_null_counts = col_null_counts_array
+        // Verify null_counts are all zero (no nulls) for all columns
+        let columns = vec!["int_col", "float_col", "string_col"];
+        for col_name in columns {
+            let col = batch
+                .column_by_name(col_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let struct_array = col.value(0);
+            let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+            let col_null_counts = struct_array
+                .column_by_name("null_count")
+                .unwrap()
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .unwrap();
             let total: u32 = (0..col_null_counts.len())
                 .map(|j| col_null_counts.value(j))
                 .sum();
-            assert_eq!(total, 0, "Column {} should have no nulls", i);
+            assert_eq!(total, 0, "Column {} should have no nulls", col_name);
         }
     }
 
@@ -1245,79 +1361,73 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        assert_eq!(batch.num_rows(), 1); // One column: "id"
+        assert_eq!(batch.num_rows(), 1); // One row total
+        assert_eq!(batch.num_columns(), 1); // One column: "id"
 
-        let column_names = batch
-            .column_by_name("column_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(column_names.value(0), "id");
-
-        let fragment_ids = batch
-            .column_by_name("fragment_ids")
+        // In new format: "id" column contains List<struct>
+        let id_column = batch
+            .column_by_name("id")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
+            .unwrap();
+
+        let struct_array = id_column.value(0);
+        let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Extract fields from struct
+        let fragment_ids = struct_array
+            .column_by_name("fragment_id")
             .unwrap()
-            .value(0);
-        let fragment_ids = fragment_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert!(!fragment_ids.is_empty()); // At least one zone
         assert_eq!(fragment_ids.value(0), 0); // Fragment 0
 
         // Verify min/max for "id" column: [0, 99]
-        let mins = batch
-            .column_by_name("min_values")
+        let mins = struct_array
+            .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let mins = mins.as_any().downcast_ref::<StringArray>().unwrap();
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(mins.value(0), "0");
 
-        let maxs = batch
-            .column_by_name("max_values")
+        let maxs = struct_array
+            .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let maxs = maxs.as_any().downcast_ref::<StringArray>().unwrap();
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(maxs.value(maxs.len() - 1), "99");
 
         // Verify zone_starts begin at 0
-        let zone_starts = batch
-            .column_by_name("zone_starts")
+        let zone_starts = struct_array
+            .column_by_name("zone_start")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let zone_starts = zone_starts.as_any().downcast_ref::<UInt64Array>().unwrap();
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(zone_starts.value(0), 0);
 
         // Verify zone_lengths sum to 100
-        let zone_lengths = batch
-            .column_by_name("zone_lengths")
+        let zone_lengths = struct_array
+            .column_by_name("zone_length")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let zone_lengths = zone_lengths.as_any().downcast_ref::<UInt64Array>().unwrap();
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         let total_length: u64 = (0..zone_lengths.len()).map(|i| zone_lengths.value(i)).sum();
         assert_eq!(total_length, 100);
 
         // Verify null_counts are zero
-        let null_counts = batch
-            .column_by_name("null_counts")
+        let null_counts = struct_array
+            .column_by_name("null_count")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         let null_counts = null_counts.as_any().downcast_ref::<UInt32Array>().unwrap();
         let total_nulls: u32 = (0..null_counts.len()).map(|i| null_counts.value(i)).sum();
         assert_eq!(total_nulls, 0);
@@ -1388,26 +1498,25 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        assert_eq!(batch.num_rows(), 2); // Two columns: "id" and "value"
+        assert_eq!(batch.num_rows(), 1); // One row total
+        assert_eq!(batch.num_columns(), 2); // Two columns: "id" and "value"
 
-        let column_names = batch
-            .column_by_name("column_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(column_names.value(0), "id");
-        assert_eq!(column_names.value(1), "value");
-
-        // Verify "id" column (row 0) has zones from both fragments
-        let fragment_ids = batch
-            .column_by_name("fragment_ids")
+        // Verify "id" column has zones from both fragments
+        let id_column = batch
+            .column_by_name("id")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
+            .unwrap();
+        let id_struct = id_column.value(0);
+        let id_struct = id_struct.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let fragment_ids = id_struct
+            .column_by_name("fragment_id")
             .unwrap()
-            .value(0);
-        let fragment_ids = fragment_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert!(
             fragment_ids.len() >= 2,
             "Should have zones from multiple fragments"
@@ -1416,42 +1525,43 @@ mod tests {
         assert_eq!(fragment_ids.value(0), 0);
         assert_eq!(fragment_ids.value(fragment_ids.len() - 1), 1);
 
-        let mins = batch
-            .column_by_name("min_values")
+        let mins = id_struct
+            .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
-        let maxs = batch
-            .column_by_name("max_values")
+        let maxs = id_struct
+            .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
 
         // Verify min/max for "id" column spans the full range [0, 99999]
-        let id_mins_array = mins.value(0);
-        let id_mins = id_mins_array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let id_maxs_array = maxs.value(0);
-        let id_maxs = id_maxs_array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(id_mins.value(0), "0"); // First zone starts at 0
-        let last_max: i64 = id_maxs.value(id_maxs.len() - 1).parse().unwrap();
+        assert_eq!(mins.value(0), "0"); // First zone starts at 0
+        let last_max: i64 = maxs.value(maxs.len() - 1).parse().unwrap();
         assert_eq!(last_max, 99999); // Last zone ends at 99999
 
         // Verify min/max for "value" column (Float32)
-        let value_mins_array = mins.value(1);
-        let value_mins = value_mins_array
+        let value_column = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let value_struct = value_column.value(0);
+        let value_struct = value_struct.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let value_mins = value_struct
+            .column_by_name("min_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let value_maxs_array = maxs.value(1);
-        let value_maxs = value_maxs_array
+        let value_maxs = value_struct
+            .column_by_name("max_value")
+            .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -1460,50 +1570,48 @@ mod tests {
         assert_eq!(first_min, 0.0);
         assert_eq!(last_max, 99999.0);
 
-        // Verify zone_starts span the full dataset with global offsets
-        let zone_starts = batch
-            .column_by_name("zone_starts")
+        // Verify zone_starts are local (per fragment)
+        let zone_starts = id_struct
+            .column_by_name("zone_start")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let zone_starts = zone_starts.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(zone_starts.value(0), 0); // First fragment starts at 0
-        assert!(
-            zone_starts.value(zone_starts.len() - 1) >= 50000,
-            "Last zone should be in second fragment (offset >= 50000)"
-        );
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        // First zone should start at local offset 0
+        assert_eq!(zone_starts.value(0), 0);
 
         // Verify zone_lengths sum to 100000 total rows
-        let zone_lengths = batch
-            .column_by_name("zone_lengths")
+        let zone_lengths = id_struct
+            .column_by_name("zone_length")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         let zone_lengths = zone_lengths.as_any().downcast_ref::<UInt64Array>().unwrap();
         let total_length: u64 = (0..zone_lengths.len()).map(|i| zone_lengths.value(i)).sum();
         assert_eq!(total_length, 100000);
 
-        // Verify null_counts are all zero
-        let null_counts = batch
-            .column_by_name("null_counts")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        for col_idx in 0..2 {
-            let col_null_counts_array = null_counts.value(col_idx);
-            let col_null_counts = col_null_counts_array
+        // Verify null_counts are all zero for both columns
+        let columns = vec!["id", "value"];
+        for col_name in columns {
+            let col = batch
+                .column_by_name(col_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let struct_array = col.value(0);
+            let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+            let col_null_counts = struct_array
+                .column_by_name("null_count")
+                .unwrap()
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .unwrap();
             let total: u32 = (0..col_null_counts.len())
                 .map(|i| col_null_counts.value(i))
                 .sum();
-            assert_eq!(total, 0, "Column {} should have no nulls", col_idx);
+            assert_eq!(total, 0, "Column {} should have no nulls", col_name);
         }
     }
 
@@ -1553,17 +1661,28 @@ mod tests {
         let batches = read_stats_file(&dataset, &stats_path).await;
         let batch = &batches[0];
 
-        assert_eq!(batch.num_rows(), 2); // Two columns
+        assert_eq!(batch.num_rows(), 1); // One row total
+        assert_eq!(batch.num_columns(), 2); // Two columns: "id" and "nullable_value"
 
-        // Check null_counts for nullable_value column (row 1)
-        let null_counts = batch
-            .column_by_name("null_counts")
+        // Check null_counts for nullable_value column
+        let nullable_col = batch
+            .column_by_name("nullable_value")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
+            .unwrap();
+        let nullable_struct = nullable_col.value(0);
+        let nullable_struct = nullable_struct
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let null_counts = nullable_struct
+            .column_by_name("null_count")
             .unwrap()
-            .value(1); // nullable_value column
-        let null_counts = null_counts.as_any().downcast_ref::<UInt32Array>().unwrap();
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         let total_nulls: u32 = (0..null_counts.len()).map(|i| null_counts.value(i)).sum();
         assert_eq!(total_nulls, 34); // 34 values are null (every 3rd: 0, 3, 6, ..., 99)
     }
