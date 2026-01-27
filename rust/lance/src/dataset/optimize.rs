@@ -129,6 +129,7 @@ use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
 use lance_file::writer::{COLUMN_STATS_VERSION, COLUMN_STATS_VERSION_KEY};
+use lance_table::format::pb;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -2181,24 +2182,20 @@ pub async fn commit_compaction(
             )
             .await?
         {
-            // Update manifest config with stats file path
-            let mut upsert_values = HashMap::new();
-            upsert_values.insert("lance.column_stats.file".to_string(), stats_path);
-            upsert_values.insert(
-                COLUMN_STATS_VERSION_KEY.to_string(),
-                COLUMN_STATS_VERSION.to_string(),
-            );
+            // Update manifest with column stats using protobuf struct
+            let column_stats = pb::ColumnStats {
+                path: stats_path,
+                version: COLUMN_STATS_VERSION,
+            };
 
             let config_update_txn = Transaction::new(
                 dataset.manifest.version,
                 Operation::UpdateConfig {
-                    config_updates: Some(crate::dataset::transaction::translate_config_updates(
-                        &upsert_values,
-                        &[],
-                    )),
+                    config_updates: None,
                     table_metadata_updates: None,
                     schema_metadata_updates: None,
                     field_metadata_updates: HashMap::new(),
+                    column_stats: Some(column_stats),
                 },
                 None,
             );
@@ -8002,14 +7999,14 @@ mod tests {
 
         // Verify stats file was created
         dataset = Dataset::open(test_uri).await.unwrap();
-        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
+        let column_stats = dataset.manifest.column_stats.as_ref();
         assert!(
-            stats_file.is_some(),
+            column_stats.is_some(),
             "Stats should be consolidated even with deletions"
         );
 
         // Read and verify the stats file content
-        let stats_path = stats_file.unwrap();
+        let stats_path = &column_stats.unwrap().path;
         let full_path = dataset.base.child(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
@@ -8157,16 +8154,12 @@ mod tests {
             .unwrap();
         dataset = Dataset::open(test_uri).await.unwrap();
 
-        let first_stats_file = dataset
-            .manifest
-            .config
-            .get("lance.column_stats.file")
-            .cloned();
-        assert!(first_stats_file.is_some());
+        let first_column_stats = dataset.manifest.column_stats.as_ref();
+        assert!(first_column_stats.is_some());
 
         // Verify the first stats file content after first compaction
-        let stats_path = first_stats_file.as_ref().unwrap();
-        let full_path = dataset.base.child(stats_path.as_str());
+        let first_stats_path = first_column_stats.unwrap().path.clone();
+        let full_path = dataset.base.child(first_stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -8279,22 +8272,19 @@ mod tests {
         compact_files(&mut dataset, options, None).await.unwrap();
         dataset = Dataset::open(test_uri).await.unwrap();
 
-        let second_stats_file = dataset
-            .manifest
-            .config
-            .get("lance.column_stats.file")
-            .cloned();
-        assert!(second_stats_file.is_some());
+        let second_column_stats = dataset.manifest.column_stats.as_ref();
+        assert!(second_column_stats.is_some());
 
-        // Stats file path stays the same (version is stored in metadata)
+        // Stats file path stays the same (version is stored in column_stats field)
+        let second_stats_path = second_column_stats.unwrap().path.clone();
         assert_eq!(
-            first_stats_file, second_stats_file,
+            first_stats_path, second_stats_path,
             "Stats file path should remain the same (_stats/column_stats.lance)"
         );
         // But the file content is updated with new version metadata
 
         // Read and verify the final stats file content
-        let stats_path = second_stats_file.unwrap();
+        let stats_path = &second_stats_path;
         let full_path = dataset.base.child(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
@@ -8448,14 +8438,14 @@ mod tests {
 
         // Verify stats file was created
         dataset = Dataset::open(test_uri).await.unwrap();
-        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
+        let column_stats = dataset.manifest.column_stats.as_ref();
         assert!(
-            stats_file.is_some(),
+            column_stats.is_some(),
             "Stats should work with stable row IDs"
         );
 
         // Read and verify the stats file content
-        let stats_path = stats_file.unwrap();
+        let stats_path = &column_stats.unwrap().path;
         let full_path = dataset.base.child(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
@@ -8579,12 +8569,11 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 0);
         assert_eq!(metrics.fragments_added, 0);
 
-        // Stats file should still not exist (no compaction happened)
+        // Stats should still not exist (no compaction happened)
         dataset = Dataset::open(test_uri).await.unwrap();
-        let stats_file = dataset.manifest.config.get("lance.column_stats.file");
         assert!(
-            stats_file.is_none(),
-            "No stats file should be created when no compaction happens"
+            dataset.manifest.column_stats.is_none(),
+            "No stats should be created when no compaction happens"
         );
     }
 }

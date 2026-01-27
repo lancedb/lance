@@ -51,7 +51,7 @@ message Transaction {
     repeated uint64 deleted_fragment_ids = 2;
     // The predicate that was evaluated
     //
-    // This may be used to determine whether the delete would have affected 
+    // This may be used to determine whether the delete would have affected
     // files written by a concurrent transaction.
     string predicate = 3;
   }
@@ -166,15 +166,19 @@ message Transaction {
 
   // An operation that clones a dataset.
   message Clone {
-    // - true:  Performs a metadata-only clone (copies manifest without data files).
-    //          The cloned dataset references original data through `base_paths`,
-    //          suitable for experimental scenarios or rapid metadata migration.
-    // - false: Performs a full deep clone using the underlying object storage's native
-    //          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side
-    //          bulk copy operations to bypass download/upload bottlenecks, achieving
-    //          near-linear speedup for large datasets (typically 3-10x faster than
-    //          manual file transfers). The operation maintains atomicity and data
-    //          integrity guarantees provided by the storage backend.
+    // - true:  Performs a metadata-only clone (copies manifest without data
+    // files).
+    //          The cloned dataset references original data through
+    //          `base_paths`, suitable for experimental scenarios or rapid
+    //          metadata migration.
+    // - false: Performs a full deep clone using the underlying object storage's
+    // native
+    //          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages
+    //          server-side bulk copy operations to bypass download/upload
+    //          bottlenecks, achieving near-linear speedup for large datasets
+    //          (typically 3-10x faster than manual file transfers). The
+    //          operation maintains atomicity and data integrity guarantees
+    //          provided by the storage backend.
     bool is_shallow = 1;
     // the reference name in the source dataset
     // in most cases it should be the branch or tag name in the source dataset
@@ -183,10 +187,11 @@ message Transaction {
     uint64 ref_version = 3;
     // the absolute base path of the source dataset for cloning
     string ref_path = 4;
-    // if the target dataset is a branch, this is the branch name of the target dataset
+    // if the target dataset is a branch, this is the branch name of the target
+    // dataset
     optional string branch_name = 5;
   }
-  
+
   // Exact set of key hashes for conflict detection.
   // Used when the number of inserted rows is small.
   message ExactKeySetFilter {
@@ -202,21 +207,23 @@ message Transaction {
     // Number of bits in the bitmap.
     uint32 num_bits = 2;
     // Number of items the filter was sized for.
-    // Used for intersection validation (filters with different sizes cannot be compared).
-    // Default: 8192
+    // Used for intersection validation (filters with different sizes cannot be
+    // compared). Default: 8192
     uint64 number_of_items = 3;
     // False positive probability the filter was sized for.
-    // Used for intersection validation (filters with different parameters cannot be compared).
-    // Default: 0.00057
+    // Used for intersection validation (filters with different parameters
+    // cannot be compared). Default: 0.00057
     double probability = 4;
   }
 
-  // A filter for checking key existence in set of rows inserted by a merge insert operation.
-  // Only created when the merge insert's ON columns match the schema's unenforced primary key.
-  // The presence of this filter indicates strict primary key conflict detection should be used.
-  // Can use either an exact set (for small row counts) or a Bloom filter (for large row counts).
+  // A filter for checking key existence in set of rows inserted by a merge
+  // insert operation. Only created when the merge insert's ON columns match the
+  // schema's unenforced primary key. The presence of this filter indicates
+  // strict primary key conflict detection should be used. Can use either an
+  // exact set (for small row counts) or a Bloom filter (for large row counts).
   message KeyExistenceFilter {
-    // Field IDs of columns participating in the key (must match unenforced primary key).
+    // Field IDs of columns participating in the key (must match unenforced
+    // primary key).
     repeated int32 field_ids = 1;
     // The underlying data structure storing the key hashes.
     oneof data {
@@ -243,15 +250,17 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// List of MemWAL shard generations to mark as merged after this transaction
+    /// List of MemWAL region generations to mark as merged after this
+    /// transaction
     repeated MergedGeneration merged_generations = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
     repeated uint32 fields_for_preserving_frag_bitmap = 6;
     // The mode of update
     UpdateMode update_mode = 7;
-    // Filter for checking existence of keys in newly inserted rows, used for conflict detection.
-    // Only tracks keys from INSERT operations during merge insert, not updates.
+    // Filter for checking existence of keys in newly inserted rows, used for
+    // conflict detection. Only tracks keys from INSERT operations during merge
+    // insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
     // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
     map<uint64, UInt32List> updated_fragment_offsets = 9;
@@ -259,19 +268,19 @@ message Transaction {
 
   // The mode of update operation
   enum UpdateMode {
-
     /// rows are deleted in current fragments and rewritten in new fragments.
     /// This is most optimal when the majority of columns are being rewritten
     /// or only a few rows are being updated.
     REWRITE_ROWS = 0;
 
-    /// within each fragment, columns are fully rewritten and inserted as new data files.
-    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
-    /// but a small subset of columns are affected.
+    /// within each fragment, columns are fully rewritten and inserted as new
+    /// data files. Old versions of columns are tombstoned. This is most optimal
+    /// when most rows are affected but a small subset of columns are affected.
     REWRITE_COLUMNS = 1;
   }
 
-  // An entry for a map update. If value is not set, the key will be removed from the map.
+  // An entry for a map update. If value is not set, the key will be removed
+  // from the map.
   message UpdateMapEntry {
     // The key of the map entry to update.
     string key = 1;
@@ -285,14 +294,17 @@ message Transaction {
     // If false, the new entries will be merged with the existing map.
     bool replace = 2;
   }
-  
-  // An operation that updates the table config, table metadata, schema metadata,
-  // or field metadata.
+
+  // An operation that updates the table config, table metadata, schema
+  // metadata, or field metadata.
   message UpdateConfig {
     UpdateMap config_updates = 6;
     UpdateMap table_metadata_updates = 7;
     UpdateMap schema_metadata_updates = 8;
     map<int32, UpdateMap> field_metadata_updates = 9;
+    // Column statistics metadata update.
+    // If present, updates the column_stats field in the manifest.
+    optional lance.table.ColumnStats column_stats = 10;
 
     // Deprecated -------------------------------
     map<string, string> upsert_values = 1;
@@ -371,7 +383,8 @@ message Transaction {
     DataOverlay data_overlay = 115;
   }
 
-  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented
+  // blob dataset ops.
   reserved 200, 202;
   reserved "blob_append", "blob_overwrite";
 }

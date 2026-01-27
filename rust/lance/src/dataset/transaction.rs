@@ -431,6 +431,7 @@ pub enum Operation {
         table_metadata_updates: Option<UpdateMap>,
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
+        column_stats: Option<pb::ColumnStats>,
     },
     /// Update merged generations in MemWAL index.
     /// This is used during merge-insert to atomically record which
@@ -669,18 +670,21 @@ impl PartialEq for Operation {
                     table_metadata_updates: a_table_metadata,
                     schema_metadata_updates: a_schema,
                     field_metadata_updates: a_field,
+                    column_stats: a_column_stats,
                 },
                 Self::UpdateConfig {
                     config_updates: b_config,
                     table_metadata_updates: b_table_metadata,
                     schema_metadata_updates: b_schema,
                     field_metadata_updates: b_field,
+                    column_stats: b_column_stats,
                 },
             ) => {
                 a_config == b_config
                     && a_table_metadata == b_table_metadata
                     && a_schema == b_schema
                     && a_field == b_field
+                    && a_column_stats == b_column_stats
             }
             (
                 Self::DataReplacement { replacements: a },
@@ -2388,6 +2392,7 @@ impl Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                column_stats,
             } => {
                 if let Some(config_updates) = config_updates {
                     let mut config = manifest.config.clone();
@@ -2404,6 +2409,10 @@ impl Transaction {
                     apply_update_map(&mut schema_metadata, schema_metadata_updates);
                     manifest.schema.metadata = schema_metadata;
                 }
+                if let Some(column_stats) = column_stats {
+                    manifest.column_stats = Some(column_stats.clone());
+                }
+
                 // The unenforced primary and clustering keys are reserved
                 // schema properties: each is immutable once set, and its
                 // reserved metadata keys cannot be written with an invalid
@@ -3301,6 +3310,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                         table_metadata_updates: None,
                         schema_metadata_updates,
                         field_metadata_updates,
+                        column_stats: None,
                     }
                 } else {
                     // Use new-style fields directly (convert from protobuf)
@@ -3321,6 +3331,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                                 (*field_id, UpdateMap::from(pb_update_map))
                             })
                             .collect(),
+                        column_stats: update_config.column_stats.clone(),
                     }
                 }
             }
@@ -3595,6 +3606,7 @@ impl From<&Transaction> for pb::Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                column_stats,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 config_updates: config_updates
                     .as_ref()
@@ -3611,6 +3623,7 @@ impl From<&Transaction> for pb::Transaction {
                         (*field_id, pb::transaction::UpdateMap::from(update_map))
                     })
                     .collect(),
+                column_stats: column_stats.clone(),
                 // Leave old fields empty - we only write new-style fields
                 upsert_values: Default::default(),
                 delete_keys: Default::default(),

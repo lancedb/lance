@@ -181,6 +181,12 @@ message Manifest {
   // appropriately.
   map<string, string> config = 16;
 
+  // Column statistics metadata.
+  //
+  // If present, indicates that consolidated column statistics are available
+  // for this dataset version.
+  optional ColumnStats column_stats = 22;
+
   // Metadata associated with the table.
   //
   // This is a key-value map that can be used to store arbitrary metadata
@@ -231,6 +237,19 @@ message BasePath {
 message VersionAuxData {
   // key-value metadata.
   map<string, bytes> metadata = 3;
+}
+
+// Column statistics metadata.
+//
+// Stores information about consolidated column statistics for the dataset.
+message ColumnStats {
+  // Path to the consolidated column statistics file, relative to the dataset root.
+  // For example: "_stats/column_stats.lance"
+  string path = 1;
+  // Version of the column statistics format.
+  // This allows for future evolution of the format (e.g., different directory
+  // structure, different schema, etc.)
+  uint32 version = 2;
 }
 
 // Metadata describing an index.

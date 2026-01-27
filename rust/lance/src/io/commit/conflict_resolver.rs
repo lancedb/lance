@@ -1873,6 +1873,7 @@ mod tests {
             table_metadata_updates: None,
             schema_metadata_updates,
             field_metadata_updates,
+            column_stats: None,
         }
     }
 

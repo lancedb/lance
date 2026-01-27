@@ -3620,6 +3620,7 @@ impl Dataset {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates,
+                column_stats: None,
             },
         )
         .await

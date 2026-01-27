@@ -101,6 +101,9 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Column statistics metadata.
+    pub column_stats: Option<pb::ColumnStats>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -196,6 +199,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            column_stats: None,
         }
     }
 
@@ -227,6 +231,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            column_stats: previous.column_stats.clone(),
         }
     }
 
@@ -289,6 +294,7 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            column_stats: self.column_stats.clone(),
         }
     }
 
@@ -592,6 +598,12 @@ impl DeepSizeOf for BasePath {
         self.name.deep_size_of_children(context)
             + self.path.deep_size_of_children(context) * 2
             + size_of::<bool>()
+    }
+}
+
+impl DeepSizeOf for pb::ColumnStats {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context) + size_of::<u32>()
     }
 }
 
@@ -931,6 +943,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            column_stats: p.column_stats,
         })
     }
 }
@@ -994,6 +1007,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            column_stats: m.column_stats.clone(),
         }
     }
 }
