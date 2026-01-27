@@ -133,7 +133,7 @@ def _create_indices(ds: lance.LanceDataset):
     Args:
         ds: Lance dataset to create indices on
     """
-    existing_indices = [idx.name for idx in ds.list_indices()]
+    existing_indices = {idx.name for idx in ds.describe_indices()}
 
     # Create inverted index with position support for phrase queries
     # This index supports both match and phrase queries
@@ -164,7 +164,7 @@ def _create(dataset_uri: str):
         LOGGER.info("Dataset exists with %s rows", f"{row_count:,}")
 
         # Check if indices exist
-        existing_indices = [idx.name for idx in ds.list_indices()]
+        existing_indices = {idx.name for idx in ds.describe_indices()}
         if "text_fts_idx" in existing_indices:
             LOGGER.info("Dataset and indices already exist, skipping generation")
             return
