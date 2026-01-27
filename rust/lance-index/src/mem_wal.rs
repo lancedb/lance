@@ -153,8 +153,11 @@ pub struct RegionManifest {
     pub version: u64,
     pub region_spec_id: u32,
     pub writer_epoch: u64,
-    pub replay_after_wal_id: u64,
-    pub wal_id_last_seen: u64,
+    /// The most recent WAL entry position (0-based) flushed to a MemTable.
+    /// Recovery replays from `replay_after_wal_entry_position + 1`.
+    pub replay_after_wal_entry_position: u64,
+    /// The most recent WAL entry position (0-based) when manifest was updated.
+    pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
     pub flushed_generations: Vec<FlushedGeneration>,
 }
@@ -172,8 +175,8 @@ impl From<&RegionManifest> for pb::RegionManifest {
             version: rm.version,
             region_spec_id: rm.region_spec_id,
             writer_epoch: rm.writer_epoch,
-            replay_after_wal_id: rm.replay_after_wal_id,
-            wal_id_last_seen: rm.wal_id_last_seen,
+            replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
+            wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
             flushed_generations: rm.flushed_generations.iter().map(|fg| fg.into()).collect(),
         }
@@ -192,8 +195,8 @@ impl TryFrom<pb::RegionManifest> for RegionManifest {
             version: rm.version,
             region_spec_id: rm.region_spec_id,
             writer_epoch: rm.writer_epoch,
-            replay_after_wal_id: rm.replay_after_wal_id,
-            wal_id_last_seen: rm.wal_id_last_seen,
+            replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
+            wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
             flushed_generations: rm
                 .flushed_generations

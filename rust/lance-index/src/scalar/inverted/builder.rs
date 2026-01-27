@@ -19,7 +19,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -465,19 +465,30 @@ impl InnerBuilder {
             id,
             self.with_position
         );
-        let mut batches = stream::iter(posting_lists)
-            .map(|posting_list| {
-                let block_max_scores = docs.calculate_block_max_scores(
-                    posting_list.doc_ids.iter(),
-                    posting_list.frequencies.iter(),
-                );
-                spawn_cpu(move || posting_list.to_batch(block_max_scores))
-            })
-            .buffered(get_num_compute_intensive_cpus());
+        let schema = inverted_list_schema(self.with_position);
+        let docs_for_batches = docs.clone();
+        let schema_for_batches = schema.clone();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+        let producer = spawn_cpu(move || {
+            for posting_list in posting_lists {
+                let batch =
+                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches.clone());
+                let is_err = batch.is_err();
+                if tx.blocking_send(batch).is_err() {
+                    break;
+                }
+                if is_err {
+                    break;
+                }
+            }
+            Ok(())
+        });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        while let Some(batch) = batches.try_next().await? {
+        while let Some(batch) = rx.recv().await {
+            let batch = batch?;
             num_posting_lists += 1;
             let start = std::time::Instant::now();
             writer.write_record_batch(batch).await?;
@@ -493,6 +504,9 @@ impl InnerBuilder {
             }
         }
 
+        // Errors from batch generation are sent through the channel and surfaced via `batch?`.
+        // Awaiting the producer here is just to propagate panics/cancellation.
+        producer.await?;
         writer.finish().await?;
         Ok(())
     }

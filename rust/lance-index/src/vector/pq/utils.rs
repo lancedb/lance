@@ -19,7 +19,7 @@ where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let dim = fsl.value_length() as usize;
-    if dim % m != 0 {
+    if !dim.is_multiple_of(m) {
         return Err(Error::invalid_input(
             format!(
                 "num_sub_vectors must divide vector dimension {}, but got {}",

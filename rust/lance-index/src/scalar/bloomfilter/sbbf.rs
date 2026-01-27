@@ -243,7 +243,7 @@ pub struct Sbbf {
 impl Sbbf {
     /// Create a new SBBF from raw bitset data
     pub fn new(bitset: &[u8]) -> Result<Self> {
-        if bitset.len() % 32 != 0 {
+        if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
                 message: format!(
                     "Bitset length must be a multiple of 32, got {}",

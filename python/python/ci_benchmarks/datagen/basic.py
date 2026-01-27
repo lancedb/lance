@@ -58,7 +58,6 @@ def _create(dataset_uri: str):
                     dataset_uri,
                     schema=SCHEMA,
                     mode="append",
-                    use_legacy_format=False,
                 )
             else:
                 raise Exception(
@@ -72,7 +71,6 @@ def _create(dataset_uri: str):
             dataset_uri,
             schema=SCHEMA,
             mode="create",
-            use_legacy_format=False,
         )
     if ds.list_indices() == []:
         ds.create_scalar_index("row_number", "BTREE")
