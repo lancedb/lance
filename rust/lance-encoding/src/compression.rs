@@ -589,25 +589,25 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     return Ok(Box::new(VariableEncoder::default()));
                 }
 
-                // let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-                // let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+                let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
 
-                // // If values are very large then use block compression on a per-value basis
-                // //
-                // // TODO: Could maybe use median here
+                // If values are very large then use block compression on a per-value basis
+                //
+                // TODO: Could maybe use median here
 
-                // let per_value_requested =
-                //     if let Some(compression) = field_params.compression.as_deref() {
-                //         compression != "fsst"
-                //     } else {
-                //         false
-                //     };
+                let per_value_requested =
+                    if let Some(compression) = field_params.compression.as_deref() {
+                        compression != "fsst"
+                    } else {
+                        false
+                    };
 
-                // if (max_len > 32 * 1024 || per_value_requested)
-                //     && data_size >= FSST_LEAST_INPUT_SIZE as u64
-                // {
-                //     return Ok(Box::new(CompressedBufferEncoder::default()));
-                // }
+                if (max_len > 32 * 1024 || per_value_requested)
+                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                {
+                    return Ok(Box::new(CompressedBufferEncoder::default()));
+                }
 
                 if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
                     let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);

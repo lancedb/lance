@@ -1520,7 +1520,9 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // (part_id, path)
-        // The part_id is None for a basic index and Some(part_id) for a range-based index
+        // The part_id is None for a basic index
+        // For a range-based index we use Some(0), Some(1), ...
+        //   even if those weren't the original part ids
         let part_page_files: Vec<(Option<u32>, &str)> =
             if let Some(ranges_to_files) = &self.ranges_to_files {
                 // Range-based Index: Directly collect references to the file paths.
@@ -1535,22 +1537,16 @@ impl ScalarIndex for BTreeIndex {
             };
 
         let mapping = Arc::new(mapping.clone());
-        let train_schema = Arc::new(arrow_schema::Schema::from(self.train_schema()));
+        let train_schema = Arc::new(self.train_schema());
 
         // TODO: Could potentially parallelize this across parts, unclear it would be worth it
         for (part_id, page_file) in part_page_files {
             // Retrain on the remapped pages
-            // let schema = Arc::new(self.flat_schema());
-            // let mut sub_index_file = dest_store.new_index_file(page_file, schema).await?;
             let sub_index_reader = self.store.open_index_file(page_file).await?;
             let mapping = mapping.clone();
 
-            // Need to make two clones.  One to pass to the and_then closure and the second to pass to
-            // the RecordBatchStreamAdapter constructor.
             let train_schema_clone = train_schema.clone();
             let train_schema = train_schema.clone();
-
-            println!("Remapping part_id={:?} page_file={}", part_id, page_file);
 
             let remapped_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
                 .await
@@ -1558,16 +1554,8 @@ impl ScalarIndex for BTreeIndex {
                 .map_err(DataFusionError::from)
                 .and_then(move |batch| {
                     // Remap the batch and then convert from the serialized schema to the training input schema
-                    let old_num_rows = batch.num_rows();
                     let remapped =
                         FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
-                    if let Ok(remapped) = &remapped {
-                        println!(
-                            "Remapped {} rows into {} rows",
-                            old_num_rows,
-                            remapped.num_rows()
-                        );
-                    }
                     let with_train_schema = remapped.and_then(|batch| {
                         RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
                             .map_err(DataFusionError::from)
@@ -1585,7 +1573,7 @@ impl ScalarIndex for BTreeIndex {
 
         if let Some(ranges_to_files) = &self.ranges_to_files {
             let num_parts = ranges_to_files.len();
-            // Merge the lookups
+            // Merge the lookups if we are a range-based index
             let page_files = (0..num_parts)
                 .map(|part_id| part_page_data_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
