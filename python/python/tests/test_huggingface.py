@@ -14,7 +14,7 @@ pil = pytest.importorskip("PIL")
 
 def test_write_hf_dataset(tmp_path: Path):
     hf_ds = datasets.load_dataset(
-        "rotten_tomatoes",
+        "cornell-movie-review-data/rotten_tomatoes",
         split="train[:50]",
     )
 

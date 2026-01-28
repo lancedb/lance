@@ -112,6 +112,66 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     }
 }
 
+fn dict_encode_variable_width<T>(
+    variable_width_data_block: &VariableWidthBlock,
+    bits_per_offset: u8,
+    cardinality: u64,
+) -> (DataBlock, DataBlock)
+where
+    T: ArrowNativeType,
+    usize: TryFrom<T>,
+{
+    let mut map = HashMap::new();
+    let offsets = variable_width_data_block
+        .offsets
+        .borrow_to_typed_slice::<T>();
+    let offsets = offsets.as_ref();
+
+    let max_len = variable_width_data_block
+        .get_stat(Stat::MaxLength)
+        .expect("VariableWidth DataBlock should have valid `Stat::MaxLength` statistics");
+    let max_len = max_len.as_primitive::<UInt64Type>().value(0);
+
+    let mut dictionary_buffer: Vec<u8> = Vec::with_capacity((max_len * cardinality) as usize);
+    let mut dictionary_offsets_buffer = vec![T::default()];
+    let mut curr_idx = 0;
+    let mut indices_buffer = Vec::with_capacity(variable_width_data_block.num_values as usize);
+
+    offsets
+        .iter()
+        .zip(offsets.iter().skip(1))
+        .for_each(|(&start, &end)| {
+            let start_usize = usize::try_from(start).ok().unwrap();
+            let end_usize = usize::try_from(end).ok().unwrap();
+            let key = &variable_width_data_block.data[start_usize..end_usize];
+            let idx: i32 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
+                dictionary_buffer.extend_from_slice(key);
+                dictionary_offsets_buffer.push(T::from_usize(dictionary_buffer.len()).unwrap());
+                curr_idx += 1;
+                curr_idx - 1
+            });
+            indices_buffer.push(idx);
+        });
+
+    let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
+        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+        offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
+        bits_per_offset,
+        num_values: curr_idx as u64,
+        block_info: BlockInfo::default(),
+    });
+
+    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(indices_buffer),
+        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
+        num_values: variable_width_data_block.num_values,
+        block_info: BlockInfo::default(),
+    });
+    indices_data_block.compute_stat();
+
+    (indices_data_block, dictionary_data_block)
+}
+
 /// Dictionary encodes a data block
 ///
 /// Currently only supported for some common cases (string / binary / 64-bit / 128-bit)
@@ -197,117 +257,11 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> (DataBlock, DataBlock) {
                 ),
             }
         }
-        DataBlock::VariableWidth(ref mut variable_width_data_block) => {
+        DataBlock::VariableWidth(ref variable_width_data_block) => {
             match variable_width_data_block.bits_per_offset {
-                32 => {
-                    let mut map = HashMap::new();
-                    let offsets = variable_width_data_block
-                        .offsets
-                        .borrow_to_typed_slice::<u32>();
-                    let offsets = offsets.as_ref();
-
-                    let max_len = variable_width_data_block.get_stat(Stat::MaxLength).expect(
-                        "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                    );
-                    let max_len = max_len.as_primitive::<UInt64Type>().value(0);
-
-                    let mut dictionary_buffer: Vec<u8> =
-                        Vec::with_capacity((max_len * cardinality) as usize);
-                    let mut dictionary_offsets_buffer = vec![0];
-                    let mut curr_idx = 0;
-                    let mut indices_buffer =
-                        Vec::with_capacity(variable_width_data_block.num_values as usize);
-
-                    offsets
-                        .iter()
-                        .zip(offsets.iter().skip(1))
-                        .for_each(|(&start, &end)| {
-                            let key = &variable_width_data_block.data[start as usize..end as usize];
-                            let idx: i32 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
-                                dictionary_buffer.extend_from_slice(key);
-                                dictionary_offsets_buffer.push(dictionary_buffer.len() as u32);
-                                curr_idx += 1;
-                                curr_idx - 1
-                            });
-                            indices_buffer.push(idx);
-                        });
-
-                    let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
-                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                        offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
-                        bits_per_offset: 32,
-                        num_values: curr_idx as u64,
-                        block_info: BlockInfo::default(),
-                    });
-
-                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(indices_buffer),
-                        bits_per_value: 32,
-                        num_values: variable_width_data_block.num_values,
-                        block_info: BlockInfo::default(),
-                    });
-                    // Todo: if we decide to do eager statistics computing, wrap statistics computing
-                    // in DataBlock constructor.
-                    indices_data_block.compute_stat();
-
-                    (indices_data_block, dictionary_data_block)
-                }
-                64 => {
-                    let mut map = HashMap::new();
-                    let offsets = variable_width_data_block
-                        .offsets
-                        .borrow_to_typed_slice::<u64>();
-                    let offsets = offsets.as_ref();
-
-                    let max_len = variable_width_data_block.get_stat(Stat::MaxLength).expect(
-                        "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                    );
-                    let max_len = max_len.as_primitive::<UInt64Type>().value(0);
-
-                    let mut dictionary_buffer: Vec<u8> =
-                        Vec::with_capacity((max_len * cardinality) as usize);
-                    let mut dictionary_offsets_buffer = vec![0];
-                    let mut curr_idx = 0;
-                    let mut indices_buffer =
-                        Vec::with_capacity(variable_width_data_block.num_values as usize);
-
-                    offsets
-                        .iter()
-                        .zip(offsets.iter().skip(1))
-                        .for_each(|(&start, &end)| {
-                            let key = &variable_width_data_block.data[start as usize..end as usize];
-                            let idx: i64 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
-                                dictionary_buffer.extend_from_slice(key);
-                                dictionary_offsets_buffer.push(dictionary_buffer.len() as u64);
-                                curr_idx += 1;
-                                curr_idx - 1
-                            });
-                            indices_buffer.push(idx);
-                        });
-
-                    let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
-                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                        offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
-                        bits_per_offset: 64,
-                        num_values: curr_idx as u64,
-                        block_info: BlockInfo::default(),
-                    });
-
-                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(indices_buffer),
-                        bits_per_value: 64,
-                        num_values: variable_width_data_block.num_values,
-                        block_info: BlockInfo::default(),
-                    });
-                    // Todo: if we decide to do eager statistics computing, wrap statistics computing
-                    // in DataBlock constructor.
-                    indices_data_block.compute_stat();
-
-                    (indices_data_block, dictionary_data_block)
-                }
-                _ => {
-                    unreachable!()
-                }
+                32 => dict_encode_variable_width::<u32>(variable_width_data_block, 32, cardinality),
+                64 => dict_encode_variable_width::<u64>(variable_width_data_block, 64, cardinality),
+                _ => unreachable!("Variable width offsets can only be 32 or 64 bits"),
             }
         }
         _ => {

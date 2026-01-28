@@ -656,8 +656,8 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     actual_chain.extend(chain);
                 }
             }
-            Layout::AllNullLayout(_) => {
-                // No value encoding for all null
+            Layout::ConstantLayout(_) => {
+                // Constant layout does not describe a value encoding chain.
             }
             Layout::BlobLayout(blob) => {
                 if let Some(inner_layout) = &blob.inner_layout {
@@ -685,6 +685,19 @@ fn verify_page_encoding(
     match &page.description {
         PageEncoding::Structural(layout) => {
             collect_page_encoding(layout, &mut actual_chain)?;
+
+            // All-null structural pages may legitimately contain no encodings to verify.
+            // This can happen even when compression is configured because there is no value data
+            // (and rep/def compression is not currently described in the page layout).
+            if actual_chain.is_empty() && page.data.is_empty() {
+                if let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+                    layout.layout.as_ref()
+                {
+                    if cl.inline_value.is_none() {
+                        return Ok(());
+                    }
+                }
+            }
         }
         PageEncoding::Legacy(_) => {
             // We don't need to care about legacy.

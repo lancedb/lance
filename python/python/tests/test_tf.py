@@ -91,6 +91,44 @@ def test_filter(tf_dataset):
         assert batch["a"].shape == (100,)
 
 
+def test_namespace_table_id(monkeypatch):
+    calls = {}
+
+    class DummyScanner:
+        def __init__(self):
+            self._batch = pa.record_batch([pa.array([1, 2])], names=["a"])
+            self.projected_schema = self._batch.schema
+
+        def to_batches(self):
+            yield self._batch
+
+    class DummyDataset:
+        def scanner(self, **kwargs):
+            return DummyScanner()
+
+    def fake_dataset(uri=None, **kwargs):
+        calls["uri"] = uri
+        calls["kwargs"] = kwargs
+        return DummyDataset()
+
+    monkeypatch.setattr(lance, "dataset", fake_dataset)
+
+    ns = object()
+    ds = from_lance(
+        None,
+        namespace=ns,
+        table_id=["tbl"],
+        ignore_namespace_table_storage_options=True,
+    )
+
+    assert calls["kwargs"]["namespace"] is ns
+    assert calls["kwargs"]["table_id"] == ["tbl"]
+    assert calls["kwargs"]["ignore_namespace_table_storage_options"] is True
+
+    batches = list(ds)
+    assert [b["a"].numpy().tolist() for b in batches] == [[1, 2]]
+
+
 def test_scan_use_tf_data(tf_dataset):
     ds = tf.data.Dataset.from_lance(tf_dataset)
     for idx, batch in enumerate(ds):
