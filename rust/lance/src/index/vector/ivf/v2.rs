@@ -673,6 +673,7 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+    const FAST_TEST_TARGET_PARTITION_SIZE: usize = 200;
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
@@ -955,7 +956,7 @@ mod tests {
         description: &str,
     ) {
         const INDEX_NAME: &str = "vector_idx";
-        const APPEND_ROWS: usize = 50_000;
+        const APPEND_ROWS: usize = 2_000;
 
         dataset
             .create_index(
@@ -980,10 +981,7 @@ mod tests {
         // Append tightly clustered vectors so data flows into the same partition.
         append_dataset::<Float32Type>(&mut dataset, APPEND_ROWS, 0.0..0.05).await;
 
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
@@ -1038,10 +1036,7 @@ mod tests {
         compact_after_deletions(dataset).await;
 
         append_constant_vector(dataset, ROWS_TO_APPEND_FOR_JOIN, &template_values).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(dataset).await;
 
         let post_ctx = load_vector_index_context(dataset, "vector", index_name).await;
         let post_partitions = post_ctx.num_partitions();
@@ -1108,6 +1103,13 @@ mod tests {
         dataset.append(batches, params).await.unwrap();
     }
 
+    async fn fast_optimize_indices(dataset: &mut Dataset) {
+        // Use a smaller split/join threshold to keep these tests fast
+        let optimize_options =
+            OptimizeOptions::new().target_partition_size_override(FAST_TEST_TARGET_PARTITION_SIZE);
+        dataset.optimize_indices(&optimize_options).await.unwrap();
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn append_and_verify_append_phase(
         dataset: &mut Dataset,
@@ -1120,10 +1122,7 @@ mod tests {
         expect_split: bool,
     ) {
         append_constant_vector(dataset, rows_to_append, template).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(dataset).await;
 
         let stats_json = dataset.index_statistics(index_name).await.unwrap();
         let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
@@ -1547,10 +1546,7 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
 
         // optimize after delete all rows
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
 
         let query = vectors.value(0);
         let results = dataset
@@ -2451,10 +2447,7 @@ mod tests {
             .unwrap();
 
         append_dataset::<Float32Type>(&mut dataset, 1, 0.0..1.0).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
     }
 
     #[tokio::test]
@@ -2512,7 +2505,7 @@ mod tests {
     #[tokio::test]
     async fn test_remap_join_on_second_delta() {
         const INDEX_NAME: &str = "vector_idx";
-        const BASE_ROWS_PER_PARTITION: usize = 3_000;
+        const BASE_ROWS_PER_PARTITION: usize = 300;
         const SMALL_APPEND_ROWS: usize = 64;
         let offsets = [-50.0, 50.0];
 
@@ -2533,7 +2526,8 @@ mod tests {
         .unwrap();
 
         let centroids = build_centroids_for_offsets(&offsets);
-        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        let mut ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        ivf_params.target_partition_size = Some(FAST_TEST_TARGET_PARTITION_SIZE);
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
@@ -2574,10 +2568,7 @@ mod tests {
         )
         .await;
 
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
 
         let stats_before: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
@@ -2629,12 +2620,9 @@ mod tests {
             vec![base_partition_count, base_partition_count]
         );
 
-        const LARGE_APPEND_ROWS: usize = 40_000;
+        const LARGE_APPEND_ROWS: usize = 1_200;
         append_constant_vector(&mut dataset, LARGE_APPEND_ROWS, &template_values).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stats_after_split: serde_json::Value =
@@ -2656,20 +2644,20 @@ mod tests {
     async fn test_spfresh_join_split() {
         // Two join cycles followed by three append cycles:
         // 1. Each deletion shrinks the smallest partition and verifies the partition count.
-        // 2. Append #1 (10k rows) creates a delta index without splitting.
-        // 3. Append #2 and #3 (40k rows each) trigger splits, forcing merges and validating partition sizes.
+        // 2. Append #1 (150 rows) creates a delta index without splitting.
+        // 3. Append #2 and #3 (400 rows each) trigger splits, forcing merges and validating partition sizes.
 
         const INDEX_NAME: &str = "vector_idx";
         const NLIST: usize = 3;
-        const FIRST_APPEND_ROWS: usize = 10_000;
-        const SECOND_APPEND_ROWS: usize = 30_000;
-        const THIRD_APPEND_ROWS: usize = 35_000;
+        const FIRST_APPEND_ROWS: usize = 150;
+        const SECOND_APPEND_ROWS: usize = 400;
+        const THIRD_APPEND_ROWS: usize = 400;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
         // Two small clusters (for joins) and two large clusters (for splits).
-        let cluster_sizes = [100, 4_000, 4_000];
+        let cluster_sizes = [30, 300, 300];
         let total_rows: usize = cluster_sizes.iter().sum();
 
         let mut centroid_values = Vec::new();
@@ -2727,7 +2715,8 @@ mod tests {
         .await
         .unwrap();
 
-        let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+        let mut ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+        ivf_params.target_partition_size = Some(FAST_TEST_TARGET_PARTITION_SIZE);
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
@@ -2838,9 +2827,17 @@ mod tests {
         let (dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         // Create an IVF-PQ index with 2 partitions
-        // For IvfPq, target_partition_size = 8192
-        // Split triggers when partition_size > 4 * 8192 = 32,768
-        let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::Cosine, 50);
+        // Split triggers when partition_size > 4 * FAST_TEST_TARGET_PARTITION_SIZE
+        let mut ivf_params = IvfBuildParams::new(2);
+        ivf_params.target_partition_size = Some(FAST_TEST_TARGET_PARTITION_SIZE);
+        let pq_params = PQBuildParams {
+            num_bits: 8,
+            num_sub_vectors: DIM / 8,
+            max_iters: 50,
+            ..Default::default()
+        };
+        let params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params);
         verify_partition_split_after_append(dataset, test_uri, params, "multivector data").await;
     }
 
@@ -2856,7 +2853,7 @@ mod tests {
         let test_uri = test_dir.as_str();
 
         const MULTIVEC_PER_ROW: usize = 3;
-        let cluster_sizes = [4000, 4000, 400];
+        let cluster_sizes = [300, 300, 30];
         let offsets: Vec<f32> = vec![0.0, 10.0, 20.0];
         let nlist = offsets.len();
         let mut dataset = {
@@ -2877,7 +2874,8 @@ mod tests {
 
         const SMALL_APPEND_FOR_JOIN: usize = 32;
         let centroids = build_centroids_for_offsets(&offsets);
-        let ivf_params = IvfBuildParams::try_with_centroids(nlist, centroids).unwrap();
+        let mut ivf_params = IvfBuildParams::try_with_centroids(nlist, centroids).unwrap();
+        ivf_params.target_partition_size = Some(FAST_TEST_TARGET_PARTITION_SIZE);
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::Cosine,
             ivf_params,
@@ -2952,16 +2950,10 @@ mod tests {
 
         // Append a tiny batch and optimize incrementally to trigger the join path.
         append_dataset::<Float32Type>(&mut dataset, SMALL_APPEND_FOR_JOIN, 0.0..0.01).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-        dataset
-            // A second pass ensures the incremental index sees the reduced
-            // partition sizes and applies the join.
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
+        fast_optimize_indices(&mut dataset).await;
+        // A second pass ensures the incremental index sees the reduced
+        // partition sizes and applies the join.
+        fast_optimize_indices(&mut dataset).await;
 
         // Verify partition count decreased after join
         let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
