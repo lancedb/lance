@@ -92,7 +92,7 @@ impl WikiTextBatchReader {
                         }
                         token_builder.append(true);
                         self.cur_samples_cnt += 1;
-                        if self.cur_samples_cnt % 5000 == 0 {
+                        if self.cur_samples_cnt.is_multiple_of(5000) {
                             println!("Processed {} rows", self.cur_samples_cnt);
                         }
                         if self.cur_samples_cnt >= self.num_samples {

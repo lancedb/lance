@@ -1,7 +1,6 @@
 nav:
   - Apache DataFusion: datafusion.md
   - DuckDB: duckdb.md
-  - Huggingface: huggingface.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
   - Tensorflow: tensorflow.md

@@ -129,7 +129,7 @@ impl ProductQuantizer {
         })?;
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        if NUM_BITS == 4 && num_sub_vectors % 2 != 0 {
+        if NUM_BITS == 4 && !num_sub_vectors.is_multiple_of(2) {
             return Err(Error::Index {
                 message: format!(
                     "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",

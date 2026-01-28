@@ -669,7 +669,7 @@ pub async fn auto_cleanup_hook(
             }
         };
 
-        if interval != 0 && manifest.version % interval != 0 {
+        if interval != 0 && !manifest.version.is_multiple_of(interval) {
             return Ok(None);
         }
     } else {

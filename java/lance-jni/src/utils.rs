@@ -276,7 +276,7 @@ pub fn get_vector_index_params(
                 let jarray: JFloatArray = centroids_obj.into();
                 let length = env.get_array_length(&jarray)?;
                 if length > 0 {
-                    if (length as usize) % num_partitions != 0 {
+                    if !(length as usize).is_multiple_of(num_partitions) {
                         return Err(Error::input_error(format!(
                             "Invalid IVF centroids: length {} is not divisible by num_partitions {}",
                             length, num_partitions

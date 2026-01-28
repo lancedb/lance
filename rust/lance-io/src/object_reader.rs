@@ -4,7 +4,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use futures::{
@@ -17,6 +16,35 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
+
+trait StaticGetRange {
+    fn path(&self) -> &Path;
+    fn get_range(&self) -> BoxFuture<'static, OSResult<GetResult>>;
+}
+
+/// A wrapper around an object store and a path that implements a static
+/// get_range method by assuming self is stored in an Arc.
+struct GetRequest {
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+    options: GetOptions,
+}
+
+impl StaticGetRange for Arc<GetRequest> {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn get_range(&self) -> BoxFuture<'static, OSResult<GetResult>> {
+        let store_and_path = self.clone();
+        Box::pin(async move {
+            store_and_path
+                .object_store
+                .get_opts(&store_and_path.path, store_and_path.options.clone())
+                .await
+        })
+    }
+}
 
 /// Object Reader
 ///
@@ -58,64 +86,62 @@ impl CloudObjectReader {
             download_retry_count,
         })
     }
+}
 
-    // Retries for the initial request are handled by object store, but
-    // there are no retries for failures that occur during the streaming
-    // of the response body. Thus we add an outer retry loop here.
-    async fn do_with_retry<'a, O>(
-        &self,
-        f: impl Fn() -> BoxFuture<'a, OSResult<O>>,
-    ) -> OSResult<O> {
-        let mut retries = 3;
-        loop {
-            match f().await {
-                Ok(val) => return Ok(val),
-                Err(err) => {
-                    if retries == 0 {
-                        return Err(err);
-                    }
-                    retries -= 1;
+// Retries for the initial request are handled by object store, but
+// there are no retries for failures that occur during the streaming
+// of the response body. Thus we add an outer retry loop here.
+async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone) -> OSResult<O> {
+    let mut retries = 3;
+    loop {
+        let f = f.clone();
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                if retries == 0 {
+                    return Err(err);
                 }
-            }
-        }
-    }
-
-    // We have a separate retry loop here.  This is because object_store does not
-    // attempt retries on downloads that fail during streaming of the response body.
-    //
-    // However, this failure is pretty common (e.g. timeout) and we want to retry in these
-    // situations.  In addition, we provide additional logging information in these
-    // failures cases.
-    async fn do_get_with_outer_retry<'a>(
-        &self,
-        f: impl Fn() -> BoxFuture<'a, OSResult<GetResult>> + Copy,
-        desc: impl Fn() -> String,
-    ) -> OSResult<Bytes> {
-        let mut retries = self.download_retry_count;
-        loop {
-            let get_result = self.do_with_retry(f).await?;
-            match get_result.bytes().await {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
-                    if retries == 0 {
-                        log::warn!("Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}", desc(), self.path, self.download_retry_count, err);
-                        return Err(err);
-                    }
-                    log::debug!(
-                        "Retrying {} from {} (remaining retries: {}).  Error details: {:?}",
-                        desc(),
-                        self.path,
-                        retries,
-                        err
-                    );
-                    retries -= 1;
-                }
+                retries -= 1;
             }
         }
     }
 }
 
-#[async_trait]
+// We have a separate retry loop here.  This is because object_store does not
+// attempt retries on downloads that fail during streaming of the response body.
+//
+// However, this failure is pretty common (e.g. timeout) and we want to retry in these
+// situations.  In addition, we provide additional logging information in these
+// failures cases.
+async fn do_get_with_outer_retry(
+    download_retry_count: usize,
+    get_request: Arc<GetRequest>,
+    desc: impl Fn() -> String,
+) -> OSResult<Bytes> {
+    let mut retries = download_retry_count;
+    loop {
+        let get_request_clone = get_request.clone();
+        let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
+        match get_result.bytes().await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                if retries == 0 {
+                    log::warn!("Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}", desc(), get_request.path(), download_retry_count, err);
+                    return Err(err);
+                }
+                log::debug!(
+                    "Retrying {} from {} (remaining retries: {}).  Error details: {:?}",
+                    desc(),
+                    get_request.path(),
+                    retries,
+                    err
+                );
+                retries -= 1;
+            }
+        }
+    }
+}
+
 impl Reader for CloudObjectReader {
     fn path(&self) -> &Path {
         &self.path
@@ -130,50 +156,62 @@ impl Reader for CloudObjectReader {
     }
 
     /// Object/File Size.
-    async fn size(&self) -> object_store::Result<usize> {
-        self.size
-            .get_or_try_init(|| async move {
-                let meta = self
-                    .do_with_retry(|| self.object_store.head(&self.path))
-                    .await?;
-                Ok(meta.size as usize)
-            })
-            .await
-            .cloned()
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        Box::pin(async move {
+            self.size
+                .get_or_try_init(|| async move {
+                    let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
+                    Ok(meta.size as usize)
+                })
+                .await
+                .cloned()
+        })
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, range: Range<usize>) -> OSResult<Bytes> {
-        self.do_get_with_outer_retry(
-            || {
-                let options = GetOptions {
-                    range: Some(
-                        Range {
-                            start: range.start as u64,
-                            end: range.end as u64,
-                        }
-                        .into(),
-                    ),
-                    ..Default::default()
-                };
-                self.object_store.get_opts(&self.path, options)
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions {
+                range: Some(
+                    Range {
+                        start: range.start as u64,
+                        end: range.end as u64,
+                    }
+                    .into(),
+                ),
+                ..Default::default()
             },
-            || format!("range {:?}", range),
-        )
-        .await
+        });
+        Box::pin(do_get_with_outer_retry(
+            self.download_retry_count,
+            get_request,
+            move || format!("range {:?}", range),
+        ))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn get_all(&self) -> OSResult<Bytes> {
-        self.do_get_with_outer_retry(
-            || {
-                self.object_store
-                    .get_opts(&self.path, GetOptions::default())
-            },
-            || "read_all".to_string(),
-        )
-        .await
+    fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions::default(),
+        });
+        Box::pin(async move {
+            do_get_with_outer_retry(self.download_retry_count, get_request, || {
+                "read_all".to_string()
+            })
+            .await
+        })
     }
+}
+
+#[derive(Debug)]
+pub struct SmallReaderInner {
+    path: Path,
+    size: usize,
+    state: std::sync::Mutex<SmallReaderState>,
 }
 
 /// A reader for a file so small, we just eagerly read it all into memory.
@@ -183,11 +221,9 @@ impl Reader for CloudObjectReader {
 /// On the first read call, it will start the read. Multiple threads can call read at the same time.
 ///
 /// Once the read is complete, any thread can call read again to get the result.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SmallReader {
-    path: Path,
-    size: usize,
-    state: Arc<std::sync::Mutex<SmallReaderState>>,
+    inner: Arc<SmallReaderInner>,
 }
 
 enum SmallReaderState {
@@ -231,12 +267,16 @@ impl SmallReader {
             .shared(),
         );
         Self {
-            path,
-            size,
-            state: Arc::new(std::sync::Mutex::new(state)),
+            inner: Arc::new(SmallReaderInner {
+                path,
+                size,
+                state: std::sync::Mutex::new(state),
+            }),
         }
     }
+}
 
+impl SmallReaderInner {
     async fn wait(&self) -> OSResult<Bytes> {
         let future = {
             let state = self.state.lock().unwrap();
@@ -258,10 +298,9 @@ impl SmallReader {
     }
 }
 
-#[async_trait]
 impl Reader for SmallReader {
     fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
     fn block_size(&self) -> usize {
@@ -273,12 +312,15 @@ impl Reader for SmallReader {
     }
 
     /// Object/File Size.
-    async fn size(&self) -> OSResult<usize> {
-        Ok(self.size)
+    fn size(&self) -> BoxFuture<'_, OSResult<usize>> {
+        let size = self.inner.size;
+        Box::pin(async move { Ok(size) })
     }
 
-    async fn get_range(&self, range: Range<usize>) -> OSResult<Bytes> {
-        self.wait().await.and_then(|bytes| {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let bytes = inner.wait().await?;
             let start = range.start;
             let end = range.end;
             if start >= bytes.len() || end > bytes.len() {
@@ -297,16 +339,16 @@ impl Reader for SmallReader {
         })
     }
 
-    async fn get_all(&self) -> OSResult<Bytes> {
-        self.wait().await
+    fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
+        Box::pin(async move { self.inner.wait().await })
     }
 }
 
 impl DeepSizeOf for SmallReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        let mut size = self.path.as_ref().deep_size_of_children(context);
+        let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
-        if let Ok(guard) = self.state.try_lock() {
+        if let Ok(guard) = self.inner.state.try_lock() {
             if let SmallReaderState::Finished(Ok(data)) = &*guard {
                 size += data.len();
             }

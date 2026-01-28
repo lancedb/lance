@@ -3,7 +3,7 @@ name = "pylance"
 version = "2.1.0-beta.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
-rust-version = "1.80"
+rust-version = "1.88"
 exclude = ["python/lance/conftest.py"]
 publish = false
 

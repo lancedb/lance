@@ -662,26 +662,7 @@ macro_rules! impl_common_protobuf_utils {
                 }
             }
 
-            pub fn all_null_layout(
-                def_meaning: &[DefinitionInterpretation],
-            ) -> crate::format::$module::PageLayout {
-                crate::format::$module::PageLayout {
-                    layout: Some(
-                        crate::format::$module::page_layout::Layout::AllNullLayout(
-                            crate::format::$module::AllNullLayout {
-                                layers: def_meaning
-                                    .iter()
-                                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                                    .collect(),
-                            },
-                        ),
-                    ),
-                }
-            }
 
-            pub fn simple_all_null_layout() -> crate::format::$module::PageLayout {
-                Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
-            }
         }
     };
 }
@@ -689,6 +670,23 @@ macro_rules! impl_common_protobuf_utils {
 impl_common_protobuf_utils!(pb21, ProtobufUtils21);
 
 impl ProtobufUtils21 {
+    pub fn constant_layout(
+        def_meaning: &[DefinitionInterpretation],
+        inline_value: Option<Vec<u8>>,
+    ) -> crate::format::pb21::PageLayout {
+        crate::format::pb21::PageLayout {
+            layout: Some(crate::format::pb21::page_layout::Layout::ConstantLayout(
+                crate::format::pb21::ConstantLayout {
+                    inline_value: inline_value.map(bytes::Bytes::from),
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            )),
+        }
+    }
+
     pub fn packed_struct(
         values: crate::format::pb21::CompressiveEncoding,
         bits_per_values: Vec<u64>,

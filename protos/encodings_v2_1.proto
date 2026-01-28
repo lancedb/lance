@@ -147,13 +147,25 @@ message FullZipLayout {
   repeated RepDefLayer layers = 8;
 }
 
-// A layout used for pages where all values are null
+// A layout used for pages where all (visible) values are the same scalar value.
 //
-// There may be buffers of repetition and definition information
-// if required in order to interpret what kind of nulls are present
-message AllNullLayout {
+// This generalizes the prior AllNullLayout semantics for file_version >= 2.2.
+//
+// There may be buffers of repetition and definition information if required in order
+// to interpret what kind of nulls are present / which items are visible.
+message ConstantLayout {
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
   repeated RepDefLayer layers = 5;
+
+  // Inline fixed-width scalar value bytes.
+  //
+  // This MUST only be used for types where a single non-null element is represented by a single
+  // fixed-width Arrow value buffer (i.e. no offsets buffer, no child data).
+  //
+  // Constraints:
+  // - MUST be absent for an all-null page
+  // - MUST be <= 32 bytes if present
+  optional bytes inline_value = 6;
 }
 
 // A layout where large binary data is encoded externally and only
@@ -176,8 +188,8 @@ message PageLayout {
   oneof layout {
     // A layout used for pages where the data is small
     MiniBlockLayout mini_block_layout = 1;
-    // A layout used for pages where all values are null
-    AllNullLayout all_null_layout = 2;
+    // A layout used for pages where all (visible) values are the same scalar value or null.
+    ConstantLayout constant_layout = 2;
     // A layout used for pages where the data is large
     FullZipLayout full_zip_layout = 3;
     // A layout where large binary data is encoded externally
