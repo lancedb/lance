@@ -20,14 +20,16 @@
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
     buffer::LanceBuffer,
-    compression_config::{BssMode, CompressionFieldParams, CompressionParams},
+    compression_config::{AlpMode, BssMode, CompressionFieldParams, CompressionParams},
     constants::{
-        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY,
+        ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
+        RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
         logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
         physical::{
+            alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder},
             binary::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
@@ -160,6 +162,32 @@ fn try_bss_for_mini_block(
         )));
     }
     None
+}
+
+fn try_alp_for_mini_block(
+    field: &Field,
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+    version: LanceFileVersion,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    if version < LanceFileVersion::V2_2 {
+        return None;
+    }
+
+    match params.alp.unwrap_or(AlpMode::Off) {
+        AlpMode::On => {}
+        AlpMode::Off | AlpMode::Auto => return None,
+    }
+
+    match field.data_type() {
+        arrow_schema::DataType::Float32 if data.bits_per_value == 32 => {
+            Some(Box::new(AlpMiniBlockEncoder::new(32)))
+        }
+        arrow_schema::DataType::Float64 if data.bits_per_value == 64 => {
+            Some(Box::new(AlpMiniBlockEncoder::new(64)))
+        }
+        _ => None,
+    }
 }
 
 fn try_rle_for_mini_block(
@@ -392,6 +420,16 @@ impl DefaultCompressionStrategy {
             }
         }
 
+        // Parse ALP mode
+        if let Some(alp_str) = field.metadata.get(ALP_META_KEY) {
+            match AlpMode::parse(alp_str) {
+                Some(mode) => params.alp = Some(mode),
+                None => {
+                    log::warn!("Invalid ALP mode '{}', using default", alp_str);
+                }
+            }
+        }
+
         // Parse minichunk size
         if let Some(minichunk_size_str) = field
             .metadata
@@ -418,6 +456,7 @@ impl DefaultCompressionStrategy {
 
     fn build_fixed_width_compressor(
         &self,
+        field: &Field,
         params: &CompressionFieldParams,
         data: &FixedWidthDataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
@@ -425,7 +464,8 @@ impl DefaultCompressionStrategy {
             return Ok(Box::new(ValueEncoder::default()));
         }
 
-        let base = try_bss_for_mini_block(data, params)
+        let base = try_alp_for_mini_block(field, data, params, self.version)
+            .or_else(|| try_bss_for_mini_block(data, params))
             .or_else(|| try_rle_for_mini_block(data, params))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
@@ -510,7 +550,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                self.build_fixed_width_compressor(&field_params, fixed_width_data)
+                self.build_fixed_width_compressor(field, &field_params, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
                 self.build_variable_width_compressor(&field_params, variable_width_data)
@@ -746,6 +786,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
         match description.compression.as_ref().unwrap() {
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            Compression::Alp(alp) => Ok(Box::new(AlpMiniBlockDecompressor::from_description(alp)?)),
             #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(description) => {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
@@ -1183,6 +1224,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                alp: None,
                 minichunk_size: None,
             },
         );
@@ -1215,6 +1257,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                alp: None,
                 minichunk_size: None,
             },
         );
@@ -1380,6 +1423,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                alp: None,
                 minichunk_size: None,
             },
         );
@@ -1523,6 +1567,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                alp: None,
                 minichunk_size: None,
             },
         );
@@ -1613,6 +1658,40 @@ mod tests {
         // Should have BSS wrapped in general compression
         assert!(debug_str.contains("GeneralMiniBlockCompressor"));
         assert!(debug_str.contains("ByteStreamSplitEncoder"));
+    }
+
+    #[test]
+    fn test_alp_field_metadata_v2_2() {
+        let params = CompressionParams::new();
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+        let arrow_field =
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        let data = create_fixed_width_block(32, 100);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        assert!(format!("{:?}", compressor).contains("AlpMiniBlockEncoder"));
+    }
+
+    #[test]
+    fn test_alp_ignored_before_v2_2() {
+        let params = CompressionParams::new();
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+        let arrow_field =
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        let data = create_fixed_width_block(32, 100);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        assert!(!format!("{:?}", compressor).contains("AlpMiniBlockEncoder"));
     }
 
     #[test]

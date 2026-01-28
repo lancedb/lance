@@ -270,10 +270,10 @@ impl BlockDecompressor for InlineBitpacking {
 /// Each chunk of 1024 values is packed with a constant bit width. For the tail we compare the
 /// cost of padding and packing against storing the raw values: if padding yields a smaller
 /// representation we pack; otherwise we append the raw tail.
-fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
+pub(crate) fn bitpack_out_of_line_vec<T: ArrowNativeType + BitPacking>(
     data: FixedWidthDataBlock,
     compressed_bits_per_value: usize,
-) -> LanceBuffer {
+) -> Vec<T> {
     let data_buffer = data.data.borrow_to_typed_slice::<T>();
     let data_buffer = data_buffer.as_ref();
 
@@ -310,7 +310,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     if !last_chunk_is_runt {
-        return LanceBuffer::reinterpret_vec(output);
+        return output;
     }
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
@@ -346,7 +346,17 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
         output.extend_from_slice(&data_buffer[last_chunk_start..]);
     }
 
-    LanceBuffer::reinterpret_vec(output)
+    output
+}
+
+pub(crate) fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
+    data: FixedWidthDataBlock,
+    compressed_bits_per_value: usize,
+) -> LanceBuffer {
+    LanceBuffer::reinterpret_vec(bitpack_out_of_line_vec::<T>(
+        data,
+        compressed_bits_per_value,
+    ))
 }
 
 /// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width.
@@ -354,7 +364,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
 /// The compressed bit width is provided while the uncompressed width comes from `T`.
 /// Depending on the encoding decision the final chunk may be fully packed (with padding)
 /// or stored as raw tail values. We infer the layout from the buffer length.
-fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
+pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     data: FixedWidthDataBlock,
     num_values: usize,
     compressed_bits_per_value: usize,

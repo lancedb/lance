@@ -689,6 +689,22 @@ macro_rules! impl_common_protobuf_utils {
 impl_common_protobuf_utils!(pb21, ProtobufUtils21);
 
 impl ProtobufUtils21 {
+    pub fn alp(
+        bits_per_value: u32,
+        exponent_e: u32,
+        exponent_f: u32,
+    ) -> crate::format::pb21::CompressiveEncoding {
+        crate::format::pb21::CompressiveEncoding {
+            compression: Some(crate::format::pb21::compressive_encoding::Compression::Alp(
+                crate::format::pb21::Alp {
+                    bits_per_value,
+                    exponent_e,
+                    exponent_f,
+                },
+            )),
+        }
+    }
+
     pub fn packed_struct(
         values: crate::format::pb21::CompressiveEncoding,
         bits_per_values: Vec<u64>,

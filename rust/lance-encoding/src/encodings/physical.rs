@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod alp;
 pub mod binary;
 #[cfg(feature = "bitpacking")]
 pub mod bitpacking;

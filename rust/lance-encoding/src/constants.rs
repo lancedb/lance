@@ -48,3 +48,7 @@ pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 pub const BSS_META_KEY: &str = "lance-encoding:bss";
 /// Default BSS mode
 pub const DEFAULT_BSS_MODE: &str = "auto";
+
+/// ALP encoding metadata keys
+/// Metadata key for ALP (Adaptive Lossless floating-Point) encoding configuration
+pub const ALP_META_KEY: &str = "lance-encoding:alp";

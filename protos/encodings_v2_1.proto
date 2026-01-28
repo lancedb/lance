@@ -468,6 +468,29 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+// ALP: Adaptive Lossless floating-Point encoding (classic variant)
+//
+// ALP transforms floating-point values into integers using a pair of base-10
+// exponents (e, f) and stores exceptions for values that cannot be represented.
+//
+// This encoding is lossless in a bitwise sense for IEEE754 f32/f64 (exceptions store
+// original bit patterns).
+//
+// The input is a fixed-width data block of either 32-bit (f32) or 64-bit (f64).
+// The output is described by this message and is encoded into four buffers:
+//  - Buffer 0: bitpacked deltas of encoded integers
+//  - Buffer 1: per-chunk header (min + bit width)
+//  - Buffer 2: exception positions (u16 little-endian)
+//  - Buffer 3: exception values (raw IEEE754 bits, u32/u64 little-endian)
+message Alp {
+  // 32 for f32 and 64 for f64
+  uint32 bits_per_value = 1;
+  // exponent 'e' in the ALP transform (10^e)
+  uint32 exponent_e = 2;
+  // exponent 'f' in the ALP transform (10^f)
+  uint32 exponent_f = 3;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -484,5 +507,6 @@ message CompressiveEncoding {
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
         VariablePackedStruct variable_packed_struct = 13;
+        Alp alp = 14;
     }
 }
