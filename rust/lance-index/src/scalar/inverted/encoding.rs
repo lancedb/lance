@@ -90,6 +90,89 @@ pub fn compress_posting_list<'a>(
     Ok(builder.finish())
 }
 
+pub fn compress_posting_list_with_scores<'a, F>(
+    length: usize,
+    doc_ids: impl Iterator<Item = &'a u32>,
+    frequencies: impl Iterator<Item = &'a u32>,
+    mut score_for: F,
+    idf_scale: f32,
+) -> Result<(arrow::array::LargeBinaryArray, f32)>
+where
+    F: FnMut(u32, u32) -> f32,
+{
+    // `length` comes from posting list size; zero would produce an invalid block
+    // (a max-score header with no doc/frequency data) and readers assume > 0 docs.
+    debug_assert!(length > 0);
+    if length < BLOCK_SIZE {
+        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
+        let mut max_score = f32::MIN;
+        let mut doc_id_buffer = Vec::with_capacity(length);
+        let mut freq_buffer = Vec::with_capacity(length);
+        for (doc_id, freq) in std::iter::zip(doc_ids, frequencies) {
+            let doc_id = *doc_id;
+            let freq = *freq;
+            doc_id_buffer.push(doc_id);
+            freq_buffer.push(freq);
+            let score = score_for(doc_id, freq);
+            if score > max_score {
+                max_score = score;
+            }
+        }
+        let max_score = max_score * idf_scale;
+        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        compress_remainder(&doc_id_buffer, &mut builder)?;
+        compress_remainder(&freq_buffer, &mut builder)?;
+        builder.append_value("");
+        return Ok((builder.finish(), max_score));
+    }
+
+    let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(BLOCK_SIZE), length * 3);
+    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
+    let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
+    let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
+    let mut max_score = f32::MIN;
+    let mut block_max_score = f32::MIN;
+    for (doc_id, freq) in std::iter::zip(doc_ids, frequencies) {
+        let doc_id = *doc_id;
+        let freq = *freq;
+        doc_id_buffer.push(doc_id);
+        freq_buffer.push(freq);
+
+        let score = score_for(doc_id, freq);
+        if score > block_max_score {
+            block_max_score = score;
+        }
+
+        if doc_id_buffer.len() < BLOCK_SIZE {
+            continue;
+        }
+
+        let block_score = block_max_score * idf_scale;
+        if block_score > max_score {
+            max_score = block_score;
+        }
+        let _ = builder.write(block_score.to_le_bytes().as_ref())?;
+        compress_sorted_block(&doc_id_buffer, &mut buffer, &mut builder)?;
+        compress_block(&freq_buffer, &mut buffer, &mut builder)?;
+        builder.append_value("");
+        doc_id_buffer.clear();
+        freq_buffer.clear();
+        block_max_score = f32::MIN;
+    }
+
+    if !doc_id_buffer.is_empty() {
+        let block_score = block_max_score * idf_scale;
+        if block_score > max_score {
+            max_score = block_score;
+        }
+        let _ = builder.write(block_score.to_le_bytes().as_ref())?;
+        compress_remainder(&doc_id_buffer, &mut builder)?;
+        compress_remainder(&freq_buffer, &mut builder)?;
+        builder.append_value("");
+    }
+    Ok((builder.finish(), max_score))
+}
+
 #[inline]
 fn compress_sorted_block(
     data: &[u32],
