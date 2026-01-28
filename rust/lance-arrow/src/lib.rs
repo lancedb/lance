@@ -319,7 +319,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int16Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int16Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -338,7 +338,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -357,7 +357,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int64Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -376,7 +376,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt8Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt8Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -395,7 +395,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
