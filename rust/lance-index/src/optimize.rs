@@ -33,6 +33,9 @@ pub struct OptimizeOptions {
     ///
     /// NOTE: this option is only supported for v3 vector indices.
     pub retrain: bool,
+
+    /// Optional override for the target partition size used to trigger split/join.
+    pub target_partition_size_override: Option<usize>,
 }
 
 impl OptimizeOptions {
@@ -61,7 +64,13 @@ impl OptimizeOptions {
             num_indices_to_merge: None,
             index_names: None,
             retrain: true,
+            target_partition_size_override: None,
         }
+    }
+
+    pub fn target_partition_size_override(mut self, size: usize) -> Self {
+        self.target_partition_size_override = Some(size);
+        self
     }
 
     pub fn num_indices_to_merge(mut self, num: Option<usize>) -> Self {

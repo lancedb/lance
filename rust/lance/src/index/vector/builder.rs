@@ -715,55 +715,62 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )
         };
 
-        let (assign_batches, merge_indices, partition_adjustment) = if num_indices_to_merge
-            .is_some()
-            || self.optimize_options.is_none()
-        {
-            no_partition_adjustment()
-        } else {
-            match Self::check_partition_adjustment(ivf, reader.as_ref(), &self.existing_indices)? {
-                Some(partition_adjustment) => match partition_adjustment {
-                    PartitionAdjustment::Split(partition) => {
-                        // Perform split and record the fact for downstream build/merge
-                        log::info!(
-                            "split partition {}, will merge all {} delta indices",
-                            partition,
-                            self.existing_indices.len()
-                        );
-                        let split_results = self.split_partition(partition, ivf).await?;
-                        let Some(ivf) = self.ivf.as_mut() else {
-                            return Err(Error::invalid_input(
-                                "IVF not set before building partitions",
-                                location!(),
-                            ));
-                        };
-                        ivf.centroids = Some(split_results.new_centroids);
-                        (
-                            split_results.assign_batches,
-                            Arc::new(self.existing_indices.clone()),
-                            Some(partition_adjustment),
-                        )
-                    }
-                    PartitionAdjustment::Join(partition) => {
-                        log::info!("join partition {}", partition);
-                        let results = self.join_partition(partition, ivf).await?;
-                        let Some(ivf) = self.ivf.as_mut() else {
-                            return Err(Error::invalid_input(
-                                "IVF model not set before joining partition",
-                                location!(),
-                            ));
-                        };
-                        ivf.centroids = Some(results.new_centroids);
-                        (
-                            results.assign_batches,
-                            Arc::new(self.existing_indices.clone()),
-                            Some(partition_adjustment),
-                        )
-                    }
-                },
-                None => no_partition_adjustment(),
-            }
-        };
+        let (assign_batches, merge_indices, partition_adjustment) =
+            if num_indices_to_merge.is_some() || self.optimize_options.is_none() {
+                no_partition_adjustment()
+            } else {
+                let target_partition_size_override = self
+                    .optimize_options
+                    .as_ref()
+                    .and_then(|opt| opt.target_partition_size_override);
+                match Self::check_partition_adjustment(
+                    ivf,
+                    reader.as_ref(),
+                    &self.existing_indices,
+                    target_partition_size_override,
+                )? {
+                    Some(partition_adjustment) => match partition_adjustment {
+                        PartitionAdjustment::Split(partition) => {
+                            // Perform split and record the fact for downstream build/merge
+                            log::info!(
+                                "split partition {}, will merge all {} delta indices",
+                                partition,
+                                self.existing_indices.len()
+                            );
+                            let split_results = self.split_partition(partition, ivf).await?;
+                            let Some(ivf) = self.ivf.as_mut() else {
+                                return Err(Error::invalid_input(
+                                    "IVF not set before building partitions",
+                                    location!(),
+                                ));
+                            };
+                            ivf.centroids = Some(split_results.new_centroids);
+                            (
+                                split_results.assign_batches,
+                                Arc::new(self.existing_indices.clone()),
+                                Some(partition_adjustment),
+                            )
+                        }
+                        PartitionAdjustment::Join(partition) => {
+                            log::info!("join partition {}", partition);
+                            let results = self.join_partition(partition, ivf).await?;
+                            let Some(ivf) = self.ivf.as_mut() else {
+                                return Err(Error::invalid_input(
+                                    "IVF model not set before joining partition",
+                                    location!(),
+                                ));
+                            };
+                            ivf.centroids = Some(results.new_centroids);
+                            (
+                                results.assign_batches,
+                                Arc::new(self.existing_indices.clone()),
+                                Some(partition_adjustment),
+                            )
+                        }
+                    },
+                    None => no_partition_adjustment(),
+                }
+            };
         self.merged_num = merge_indices.len();
         log::info!(
             "merge {}/{} delta indices",
@@ -1181,9 +1188,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if batches.is_empty() {
             return Ok(None);
         }
-        let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-        // for multivector, we need to flatten the vectors
-        let batch = Flatten::new(&self.column).transform(&batch)?;
+        let mut batch = if batches.len() == 1 {
+            batches[0].clone()
+        } else {
+            arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?
+        };
+        let vector_col =
+            batch
+                .column_by_qualified_name(&self.column)
+                .ok_or(Error::invalid_input(
+                    format!(
+                        "vector column {} not found in batch {}",
+                        self.column,
+                        batch.schema()
+                    ),
+                    location!(),
+                ))?;
+        let needs_flatten = matches!(vector_col.data_type(), DataType::List(_));
+        if needs_flatten {
+            batch = Flatten::new(&self.column).transform(&batch)?;
+        }
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let vectors = batch
@@ -1206,10 +1230,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         reader: &dyn ShuffleReader,
         existing_indices: &[Arc<dyn VectorIndex>],
+        target_partition_size_override: Option<usize>,
     ) -> Result<Option<PartitionAdjustment>> {
         let index_type = IndexType::try_from(
             index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
         )?;
+        let target_partition_size =
+            target_partition_size_override.unwrap_or_else(|| index_type.target_partition_size());
 
         let mut split_partition = None;
         let mut join_partition = None;
@@ -1221,14 +1248,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 num_rows += index.partition_size(partition);
             }
             if num_rows > max_partition_size
-                && num_rows > MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size()
+                && num_rows > MAX_PARTITION_SIZE_FACTOR * target_partition_size
             {
                 max_partition_size = num_rows;
                 split_partition = Some(partition);
             }
             if ivf.num_partitions() > 1
                 && num_rows < min_partition_size
-                && num_rows < MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100
+                && num_rows < MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100
             {
                 min_partition_size = num_rows;
                 join_partition = Some(partition);
