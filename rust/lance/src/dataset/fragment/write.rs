@@ -4,7 +4,7 @@
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::{BlobVersion, Schema};
+use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -218,7 +218,6 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params.into_owned(),
             version,
-            BlobVersion::V1,
             None, // Fragment creation doesn't use target_bases
         )
         .await

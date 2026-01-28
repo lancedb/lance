@@ -735,8 +735,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_external_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -813,8 +815,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -878,8 +882,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_packed_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));

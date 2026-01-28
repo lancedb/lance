@@ -58,7 +58,6 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::datatypes::BlobVersion;
 use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
@@ -3088,9 +3087,6 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         {
             p.data_storage_version = Some(data_storage_version.parse().infer_error()?);
         }
-        if let Some(blob_version) = get_dict_opt::<String>(options, "blob_version")? {
-            p.blob_version = Some(parse_blob_version(&blob_version)?);
-        }
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
         }
@@ -3191,16 +3187,6 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         Some(p)
     };
     Ok(params)
-}
-
-fn parse_blob_version(value: &str) -> PyResult<BlobVersion> {
-    match value.to_lowercase().as_str() {
-        "v1" | "1" => Ok(BlobVersion::V1),
-        "v2" | "2" => Ok(BlobVersion::V2),
-        _ => Err(PyValueError::new_err(format!(
-            "Invalid blob_version: {value} (expected 'v1' or 'v2')"
-        ))),
-    }
 }
 
 fn prepare_vector_index_params(

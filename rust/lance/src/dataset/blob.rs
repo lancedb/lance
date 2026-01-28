@@ -24,15 +24,6 @@ use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
-pub const BLOB_VERSION_CONFIG_KEY: &str = "lance.blob.version";
-
-pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion {
-    config
-        .get(BLOB_VERSION_CONFIG_KEY)
-        .and_then(|value| BlobVersion::from_config_value(value))
-        .unwrap_or(BlobVersion::V1)
-}
-
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
@@ -1154,7 +1145,6 @@ mod tests {
 
         let params = WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
-            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
             ..Default::default()
         };
         let dataset = Arc::new(

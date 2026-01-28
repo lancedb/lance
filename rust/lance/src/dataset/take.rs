@@ -726,7 +726,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_take_blob_v1_from_legacy_large_binary_on_v2_2_by_default() {
+    async fn test_reject_legacy_blob_schema_on_v2_2() {
         let mut metadata = HashMap::new();
         metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
 
@@ -750,22 +750,12 @@ mod test {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(batch)], schema);
-        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+        let err = Dataset::write(batches, "memory://", Some(write_params))
             .await
-            .unwrap();
-
-        assert!(dataset
-            .config()
-            .get(crate::dataset::blob::BLOB_VERSION_CONFIG_KEY)
-            .is_none());
-
-        let proj = ProjectionRequest::from_columns(["blob"], dataset.schema());
-        let values = dataset.take(&[0u64], proj).await.unwrap();
-
-        let struct_arr = values.column(0).as_struct();
-        assert_eq!(struct_arr.fields().len(), 2);
-        assert_eq!(struct_arr.fields()[0].name(), "position");
-        assert_eq!(struct_arr.fields()[1].name(), "size");
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Legacy blob columns"));
+        assert!(msg.contains("lance.blob.v2"));
     }
 
     #[tokio::test]
@@ -780,7 +770,6 @@ mod test {
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
         let write_params = WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
-            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(batch)], schema);
@@ -789,15 +778,6 @@ mod test {
             .execute_stream(batches)
             .await
             .unwrap();
-
-        assert_eq!(
-            dataset
-                .config()
-                .get(crate::dataset::blob::BLOB_VERSION_CONFIG_KEY)
-                .unwrap()
-                .as_str(),
-            lance_core::datatypes::BlobVersion::V2.config_value()
-        );
 
         let proj = ProjectionRequest::from_columns(["blob"], dataset.schema());
         let values = dataset.take(&[0u64], proj).await.unwrap();

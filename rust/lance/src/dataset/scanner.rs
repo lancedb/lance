@@ -760,8 +760,7 @@ impl TakeOperation {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection_plan =
-            ProjectionPlan::full(dataset.clone(), dataset.blob_version()).unwrap();
+        let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
         let mut scanner = Self {
             dataset,
@@ -885,11 +884,7 @@ impl Scanner {
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
         self.explicit_projection = true;
-        self.projection_plan = ProjectionPlan::from_expressions(
-            self.dataset.clone(),
-            columns,
-            self.dataset.blob_version(),
-        )?;
+        self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
         if self.legacy_with_row_id {
             self.projection_plan.include_row_id();
         }

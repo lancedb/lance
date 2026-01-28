@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::{BlobVersion, NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -19,7 +19,6 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::location;
 
-use crate::dataset::blob::BLOB_VERSION_CONFIG_KEY;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
@@ -194,7 +193,7 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
-        let (written_fragments, _) = write_fragments_internal(
+        let (written_fragments, written_schema) = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -205,7 +204,7 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(schema, written_fragments, &context)?;
+        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
@@ -233,20 +232,6 @@ impl<'a> InsertBuilder<'a> {
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.older_than"),
                         format_duration(duration).to_string(),
-                    );
-                }
-                if let Some(blob_version) = context.params.blob_version {
-                    if blob_version != BlobVersion::V1
-                        && context.storage_version < LanceFileVersion::V2_2
-                    {
-                        return Err(Error::InvalidInput {
-                            source: "Blob version v2 requires file version >= 2.2".into(),
-                            location: location!(),
-                        });
-                    }
-                    upsert_values.insert(
-                        BLOB_VERSION_CONFIG_KEY.to_string(),
-                        blob_version.config_value().to_string(),
                     );
                 }
                 let config_upsert_values = if upsert_values.is_empty() {
@@ -455,9 +440,7 @@ mod test {
     use arrow_array::{BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
-    use lance_core::datatypes::BlobVersion;
 
-    use crate::dataset::ProjectionRequest;
     use crate::session::Session;
 
     use super::*;
@@ -538,7 +521,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_v2_2_dataset_with_forced_blob_v2() {
+    async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "blob",
             DataType::Binary,
@@ -558,30 +541,20 @@ mod test {
             .with_params(&WriteParams {
                 mode: WriteMode::Create,
                 data_storage_version: Some(LanceFileVersion::V2_2),
-                blob_version: Some(BlobVersion::V2),
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(
-            dataset
-                .manifest
-                .config
-                .get(BLOB_VERSION_CONFIG_KEY)
-                .map(String::as_str),
-            Some("2")
-        );
-
-        let batch = dataset
-            .take(
-                &[0u64],
-                ProjectionRequest::from_columns(["blob"], dataset.schema()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(batch.num_rows(), 1);
+        let err = dataset.unwrap_err();
+        match err {
+            Error::InvalidInput { source, .. } => {
+                let message = source.to_string();
+                assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("lance.blob.v2"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     mod external_error {

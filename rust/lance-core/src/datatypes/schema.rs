@@ -15,7 +15,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
@@ -1024,12 +1024,11 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
+    pub fn unload_if_needed(&self, mut field: Field) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded_with_version(version)
-        } else {
-            field
+            field.unloaded_mut();
         }
+        field
     }
 }
 
@@ -1046,7 +1045,6 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
-    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -1064,7 +1062,6 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
-            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -1080,7 +1077,6 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
-            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1111,11 +1107,6 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
-        self
-    }
-
-    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
-        self.blob_version = blob_version;
         self
     }
 
@@ -1582,19 +1573,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
-
-    #[test]
-    fn projection_from_schema_defaults_to_v1() {
-        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
-        let schema = Schema {
-            fields: vec![field],
-            metadata: HashMap::new(),
-        };
-
-        let projection = Projection::empty(Arc::new(schema));
-
-        assert_eq!(projection.blob_version, BlobVersion::V1);
-    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {

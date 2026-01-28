@@ -1128,7 +1128,6 @@ mod tests {
             commit_handler: Some(Arc::new(RenameCommitHandler)),
             mode: WriteMode::Create,
             data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
             ..Default::default()
         };
         InsertBuilder::new(&fixture.dataset_path)
@@ -1173,7 +1172,6 @@ mod tests {
             commit_handler: Some(Arc::new(RenameCommitHandler)),
             mode: WriteMode::Create,
             data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
             ..Default::default()
         };
         InsertBuilder::new(&fixture.dataset_path)

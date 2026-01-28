@@ -13,15 +13,12 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
-use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{
-    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
-};
+use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -402,7 +399,6 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
-        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -415,7 +411,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
+                    ProjectionPlan::from_schema(dataset, schema.as_ref())
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -423,10 +419,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
+                    ProjectionPlan::from_schema(dataset, &projection)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
     }
 }
@@ -1859,12 +1855,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone()).with_blob_version(self.blob_version())
+        Projection::empty(self.clone())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone()).with_blob_version(self.blob_version())
+        Projection::full(self.clone())
     }
 
     /// Get fragments.
@@ -2822,10 +2818,6 @@ impl Dataset {
     /// Get the dataset config from manifest
     pub fn config(&self) -> &HashMap<String, String> {
         &self.manifest.config
-    }
-
-    pub(crate) fn blob_version(&self) -> BlobVersion {
-        blob_version_from_config(&self.manifest.config)
     }
 
     /// Delete keys from the config.

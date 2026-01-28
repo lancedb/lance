@@ -263,7 +263,6 @@ def test_blob_extension_write_inline(tmp_path):
         table,
         tmp_path / "test_ds_v2",
         data_storage_version="2.2",
-        blob_version="v2",
     )
 
     desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
@@ -284,7 +283,6 @@ def test_blob_extension_write_external(tmp_path):
         table,
         tmp_path / "test_ds_v2_external",
         data_storage_version="2.2",
-        blob_version="v2",
     )
 
     blob = ds.take_blobs("blob", indices=[0])[0]
