@@ -312,24 +312,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
 
                 if train {
-                    let is_pq = matches!(vec_params.index_type(), IndexType::IvfPq);
-                    let is_distributed = self.fragments.as_ref().is_some_and(|ids| !ids.is_empty());
-
-                    if is_pq && is_distributed {
-                        // IVF_PQ distributed: keep logic isolated in builder layer and
-                        // delegate to a dedicated helper. This avoids touching the
-                        // generic IVF/RQ implementations in lance-index.
-                        Box::pin(build_distributed_vector_index(
-                            self.dataset,
-                            column,
-                            &index_name,
-                            &index_id.to_string(),
-                            vec_params,
-                            fri,
-                            self.fragments.as_ref().unwrap(),
-                        ))
-                        .await?;
-                    } else if self.fragments.is_some() {
+                    if self.fragments.is_some() {
                         // Non-PQ distributed indexing: use the generic distributed builder.
                         Box::pin(build_distributed_vector_index(
                             self.dataset,
