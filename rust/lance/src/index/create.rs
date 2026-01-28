@@ -312,8 +312,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
 
                 if train {
+                    // Check if this is distributed indexing (fragment-level)
                     if self.fragments.is_some() {
-                        // Non-PQ distributed indexing: use the generic distributed builder.
+                        // For distributed indexing, build only on specified fragments
+                        // This creates temporary index metadata without committing
                         Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
