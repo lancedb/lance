@@ -9,8 +9,8 @@ use crate::{
     index::{
         scalar::build_scalar_index,
         vector::{
-            build_distributed_vector_index, build_empty_vector_index,
-            build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+            build_distributed_vector_index, build_empty_vector_index, build_vector_index,
+            VectorIndexParams, LANCE_VECTOR_INDEX,
         },
         vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
     },
