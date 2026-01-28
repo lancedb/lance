@@ -203,7 +203,7 @@ pub(super) async fn write_pq_partitions(
                 if let Some(pq_code) = pq_index.code.as_ref() {
                     let row_ids = pq_index.row_ids.as_ref().unwrap();
                     let num_vectors = row_ids.len();
-                    if num_vectors == 0 || pq_code.len() == 0 {
+                    if num_vectors == 0 || pq_code.is_empty() {
                         continue;
                     }
                     if pq_code.len() % num_vectors != 0 {

@@ -611,7 +611,7 @@ pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::HashSet;
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_le, assert_lt};
@@ -642,7 +642,6 @@ mod tests {
         Dataset,
     };
     use lance_core::cache::LanceCache;
-    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
@@ -653,10 +652,10 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::DIST_COL;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::vector::{DIST_COL, PQ_CODE_COLUMN};
     use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};

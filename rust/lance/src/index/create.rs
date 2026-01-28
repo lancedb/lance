@@ -313,8 +313,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 if train {
                     let is_pq = matches!(vec_params.index_type(), IndexType::IvfPq);
-                    let is_distributed =
-                        self.fragments.as_ref().map_or(false, |ids| !ids.is_empty());
+                    let is_distributed = self.fragments.as_ref().is_some_and(|ids| !ids.is_empty());
 
                     if is_pq && is_distributed {
                         // IVF_PQ distributed: keep logic isolated in builder layer and
