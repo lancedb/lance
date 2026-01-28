@@ -1128,7 +1128,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
             codebook_position: Some(0),
             codebook: None,
-            transposed: true,
+            transposed: !is_pq,
         }));
         if let Some(extra_metadata) = metadata.extra_metadata()? {
             let idx = storage_writer.add_global_buffer(extra_metadata).await?;
