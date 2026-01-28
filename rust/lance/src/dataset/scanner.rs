@@ -5844,7 +5844,7 @@ mod test {
             .values();
 
         let allowlist = vec![row_ids[10], row_ids[20], row_ids[30]];
-        let offsets = vec![row_offsets[20], row_offsets[30], row_offsets[40]];
+        let offsets = [row_offsets[20], row_offsets[30], row_offsets[40]];
         let filter = format!(
             "_rowoffset IN ({}, {}, {}) AND i >= 0",
             offsets[0], offsets[1], offsets[2]
