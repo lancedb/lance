@@ -18,7 +18,6 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
-use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
@@ -149,8 +148,6 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
-        let mut preprocessor: Option<BlobPreprocessor> = None;
-
         let (major, minor) = writer.version().to_numbers();
 
         let data_file = DataFile::new_unstarted(filename, major, minor);
@@ -164,10 +161,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
-            let mut batch_chunk = batched_chunk?;
-            if let Some(pre) = preprocessor.as_mut() {
-                batch_chunk = preprocess_blob_batches(&batch_chunk, pre).await?;
-            }
+            let batch_chunk = batched_chunk?;
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
