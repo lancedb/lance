@@ -24,12 +24,13 @@ use crate::{
     },
 };
 use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
-use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
+use lance_arrow::DataTypeExt;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
     error::{Error, LanceOptionExt},
@@ -85,6 +86,7 @@ use crate::{
 };
 
 pub mod blob;
+pub mod constant;
 pub mod dict;
 pub mod fullzip;
 pub mod miniblock;
@@ -3071,13 +3073,23 @@ impl StructuralPrimitiveFieldScheduler {
                 scheduler.enable_cache = cache_repetition_index;
                 Box::new(scheduler)
             }
-            Layout::AllNullLayout(all_null) => {
-                let def_meaning = all_null
+            Layout::ConstantLayout(constant_layout) => {
+                let def_meaning = constant_layout
                     .layers
                     .iter()
                     .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
-                if def_meaning.len() == 1
+                let has_scalar_value = constant_layout.inline_value.is_some()
+                    || page_info.buffer_offsets_and_sizes.len() == 1
+                    || page_info.buffer_offsets_and_sizes.len() == 3;
+                if has_scalar_value {
+                    Box::new(constant::ConstantPageScheduler::try_new(
+                        page_info.buffer_offsets_and_sizes.clone(),
+                        constant_layout.inline_value.clone(),
+                        target_field.data_type(),
+                        def_meaning.into(),
+                    )?) as Box<dyn StructuralPageScheduler>
+                } else if def_meaning.len() == 1
                     && def_meaning[0] == DefinitionInterpretation::NullableItem
                 {
                     Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
@@ -3811,7 +3823,8 @@ impl PrimitiveStructuralEncoder {
         num_rows: u64,
         row_number: u64,
     ) -> Result<EncodedPage> {
-        let description = ProtobufUtils21::simple_all_null_layout();
+        let description =
+            ProtobufUtils21::constant_layout(&[DefinitionInterpretation::NullableItem], None);
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -3826,12 +3839,10 @@ impl PrimitiveStructuralEncoder {
     // different kinds of null)
     fn encode_complex_all_null(
         column_idx: u32,
-        repdefs: Vec<RepDefBuilder>,
+        repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
         num_rows: u64,
     ) -> Result<EncodedPage> {
-        let repdef = RepDefBuilder::serialize(repdefs);
-
         // TODO: Actually compress repdef
         let rep_bytes = if let Some(rep) = repdef.repetition_levels.as_ref() {
             LanceBuffer::reinterpret_slice(rep.clone())
@@ -3845,7 +3856,7 @@ impl PrimitiveStructuralEncoder {
             LanceBuffer::empty()
         };
 
-        let description = ProtobufUtils21::all_null_layout(&repdef.def_meaning);
+        let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, None);
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
@@ -3855,20 +3866,204 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    fn leaf_validity(
+        repdef: &crate::repdef::SerializedRepDefs,
+        num_values: usize,
+    ) -> Result<Option<BooleanBuffer>> {
+        let rep = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|rep| rep.as_ref().to_vec());
+        let def = repdef
+            .definition_levels
+            .as_ref()
+            .map(|def| def.as_ref().to_vec());
+        let mut unraveler = RepDefUnraveler::new(
+            rep,
+            def,
+            repdef.def_meaning.clone().into(),
+            num_values as u64,
+        );
+        if unraveler.is_all_valid() {
+            return Ok(None);
+        }
+        let mut validity = BooleanBufferBuilder::new(num_values);
+        unraveler.unravel_validity(&mut validity);
+        Ok(Some(validity.finish()))
+    }
+
+    fn is_constant_values(
+        arrays: &[ArrayRef],
+        scalar: &ArrayRef,
+        validity: Option<&BooleanBuffer>,
+    ) -> Result<bool> {
+        debug_assert_eq!(scalar.len(), 1);
+        debug_assert_eq!(scalar.null_count(), 0);
+
+        match scalar.data_type() {
+            DataType::Boolean => {
+                let mut global_idx = 0usize;
+                let scalar_val = scalar.as_boolean().value(0);
+                for arr in arrays {
+                    let bool_arr = arr.as_boolean();
+                    for i in 0..arr.len() {
+                        let is_valid = validity.map(|v| v.value(global_idx)).unwrap_or(true);
+                        global_idx += 1;
+                        if !is_valid {
+                            continue;
+                        }
+                        if bool_arr.value(i) != scalar_val {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            DataType::Utf8 => Self::is_constant_utf8::<i32>(arrays, scalar, validity),
+            DataType::LargeUtf8 => Self::is_constant_utf8::<i64>(arrays, scalar, validity),
+            DataType::Binary => Self::is_constant_binary::<i32>(arrays, scalar, validity),
+            DataType::LargeBinary => Self::is_constant_binary::<i64>(arrays, scalar, validity),
+            data_type => {
+                let mut global_idx = 0usize;
+                let Some(byte_width) = data_type.byte_width_opt() else {
+                    return Ok(false);
+                };
+                let scalar_data = scalar.to_data();
+                if scalar_data.buffers().len() != 1 || !scalar_data.child_data().is_empty() {
+                    return Ok(false);
+                }
+                let scalar_bytes = scalar_data.buffers()[0].as_slice();
+                if scalar_bytes.len() != byte_width {
+                    return Ok(false);
+                }
+
+                for arr in arrays {
+                    let data = arr.to_data();
+                    if data.buffers().is_empty() {
+                        return Ok(false);
+                    }
+                    let buf = data.buffers()[0].as_slice();
+                    let base = data.offset();
+                    for i in 0..arr.len() {
+                        let is_valid = validity.map(|v| v.value(global_idx)).unwrap_or(true);
+                        global_idx += 1;
+                        if !is_valid {
+                            continue;
+                        }
+                        let start = (base + i) * byte_width;
+                        if buf[start..start + byte_width] != scalar_bytes[..] {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn is_constant_utf8<O: arrow_array::OffsetSizeTrait>(
+        arrays: &[ArrayRef],
+        scalar: &ArrayRef,
+        validity: Option<&BooleanBuffer>,
+    ) -> Result<bool> {
+        debug_assert_eq!(scalar.len(), 1);
+        let scalar_val = scalar.as_string::<O>().value(0).as_bytes();
+        let mut global_idx = 0usize;
+        for arr in arrays {
+            let str_arr = arr.as_string::<O>();
+            for i in 0..arr.len() {
+                let is_valid = validity.map(|v| v.value(global_idx)).unwrap_or(true);
+                global_idx += 1;
+                if !is_valid {
+                    continue;
+                }
+                if str_arr.value(i).as_bytes() != scalar_val {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn is_constant_binary<O: arrow_array::OffsetSizeTrait>(
+        arrays: &[ArrayRef],
+        scalar: &ArrayRef,
+        validity: Option<&BooleanBuffer>,
+    ) -> Result<bool> {
+        debug_assert_eq!(scalar.len(), 1);
+        let scalar_val = scalar.as_binary::<O>().value(0);
+        let mut global_idx = 0usize;
+        for arr in arrays {
+            let bin_arr = arr.as_binary::<O>();
+            for i in 0..arr.len() {
+                let is_valid = validity.map(|v| v.value(global_idx)).unwrap_or(true);
+                global_idx += 1;
+                if !is_valid {
+                    continue;
+                }
+                if bin_arr.value(i) != scalar_val {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn find_constant_scalar(
+        arrays: &[ArrayRef],
+        validity: Option<&BooleanBuffer>,
+    ) -> Result<Option<ArrayRef>> {
+        if arrays.is_empty() {
+            return Ok(None);
+        }
+
+        let global_scalar_idx = if let Some(validity) = validity {
+            let Some(idx) = (0..validity.len()).find(|&i| validity.value(i)) else {
+                return Ok(None);
+            };
+            idx
+        } else {
+            0
+        };
+
+        let mut idx_remaining = global_scalar_idx;
+        let mut scalar_arr_idx = 0usize;
+        while scalar_arr_idx < arrays.len() {
+            let len = arrays[scalar_arr_idx].len();
+            if idx_remaining < len {
+                break;
+            }
+            idx_remaining -= len;
+            scalar_arr_idx += 1;
+        }
+
+        if scalar_arr_idx >= arrays.len() {
+            return Ok(None);
+        }
+
+        let scalar =
+            lance_arrow::scalar::extract_scalar_value(&arrays[scalar_arr_idx], idx_remaining)?;
+        if scalar.null_count() != 0 {
+            return Ok(None);
+        }
+        if !Self::is_constant_values(arrays, &scalar, validity)? {
+            return Ok(None);
+        }
+        Ok(Some(scalar))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_miniblock(
         column_idx: u32,
         field: &Field,
         compression_strategy: &dyn CompressionStrategy,
         data: DataBlock,
-        repdefs: Vec<RepDefBuilder>,
+        repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
         dictionary_data: Option<DataBlock>,
         num_rows: u64,
         support_large_chunk: bool,
     ) -> Result<EncodedPage> {
-        let repdef = RepDefBuilder::serialize(repdefs);
-
         if let DataBlock::AllNull(_null_block) = data {
             // We should not be using mini-block for all-null.  There are other structural
             // encodings for that.
@@ -4190,11 +4385,10 @@ impl PrimitiveStructuralEncoder {
         field: &Field,
         compression_strategy: &dyn CompressionStrategy,
         data: DataBlock,
-        repdefs: Vec<RepDefBuilder>,
+        repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
         num_lists: u64,
     ) -> Result<EncodedPage> {
-        let repdef = RepDefBuilder::serialize(repdefs);
         let max_rep = repdef
             .repetition_levels
             .as_ref()
@@ -4428,29 +4622,33 @@ impl PrimitiveStructuralEncoder {
         let support_large_chunk = self.support_large_chunk;
         let version = self.version;
         let task = spawn_cpu(move || {
-                let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
+            let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
+            let repdef = RepDefBuilder::serialize(repdefs);
 
             if num_values == 0 {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
                 log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
-                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
+                return Self::encode_complex_all_null(column_idx, repdef, row_number, num_rows);
             }
-            let num_nulls = arrays
-                .iter()
-                .map(|arr| arr.logical_nulls().map(|n| n.null_count()).unwrap_or(0) as u64)
-                .sum::<u64>();
 
-            if num_values == num_nulls {
-                return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
+            let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
+            let all_null = leaf_validity
+                .as_ref()
+                .map(|validity| validity.count_set_bits() == 0)
+                .unwrap_or(false);
+
+            if all_null {
+                return if is_simple_validity {
                     log::debug!(
                         "Encoding column {} with {} items ({} rows) using simple-null layout",
                         column_idx,
                         num_values,
                         num_rows
                     );
-                    // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
                 } else {
                     log::debug!(
@@ -4459,14 +4657,13 @@ impl PrimitiveStructuralEncoder {
                         num_values,
                         num_rows
                     );
-                    // If we get here then we have definition levels and we need to store those
-                    Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
+                    Self::encode_complex_all_null(column_idx, repdef, row_number, num_rows)
                 };
             }
 
             if let DataType::Struct(fields) = &field.data_type() {
                 if fields.is_empty() {
-                    if repdefs.iter().any(|rd| !rd.is_empty()) {
+                    if has_repdef_info {
                         return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
                     }
                     // This is maybe a little confusing but the reader should never look at this anyways and it
@@ -4476,6 +4673,25 @@ impl PrimitiveStructuralEncoder {
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
+
+            if version.resolve() >= LanceFileVersion::V2_2 {
+                if let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+                {
+                    log::debug!(
+                        "Encoding column {} with {} items ({} rows) using constant layout",
+                        column_idx,
+                        num_values,
+                        num_rows
+                    );
+                    return constant::encode_constant_page(
+                        column_idx,
+                        scalar,
+                        repdef,
+                        row_number,
+                        num_rows,
+                    );
+                }
+            }
 
             let requires_full_zip_packed_struct =
                 if let DataBlock::Struct(ref struct_data_block) = data_block {
@@ -4495,7 +4711,7 @@ impl PrimitiveStructuralEncoder {
                     &field,
                     compression_strategy.as_ref(),
                     data_block,
-                    repdefs,
+                    repdef,
                     row_number,
                     num_rows,
                 );
@@ -4514,7 +4730,7 @@ impl PrimitiveStructuralEncoder {
                     &field,
                     compression_strategy.as_ref(),
                     indices_data_block,
-                    repdefs,
+                    repdef,
                     row_number,
                     Some(dictionary_data_block),
                     num_rows,
@@ -4540,7 +4756,7 @@ impl PrimitiveStructuralEncoder {
                         &field,
                         compression_strategy.as_ref(),
                         indices_data_block,
-                        repdefs,
+                        repdef,
                         row_number,
                         Some(dictionary_data_block),
                         num_rows,
@@ -4557,7 +4773,7 @@ impl PrimitiveStructuralEncoder {
                         &field,
                         compression_strategy.as_ref(),
                         data_block,
-                        repdefs,
+                        repdef,
                         row_number,
                         None,
                         num_rows,
@@ -4574,7 +4790,7 @@ impl PrimitiveStructuralEncoder {
                         &field,
                         compression_strategy.as_ref(),
                         data_block,
-                        repdefs,
+                        repdef,
                         row_number,
                         num_rows,
                     )
@@ -5991,5 +6207,269 @@ mod tests {
         );
 
         assert!(!result, "Should not use dictionary encode based on size");
+    }
+
+    async fn encode_first_page(
+        field: arrow_schema::Field,
+        array: ArrayRef,
+        version: LanceFileVersion,
+    ) -> crate::encoder::EncodedPage {
+        use crate::encoder::{
+            default_encoding_strategy, ColumnIndexSequence, EncodingOptions, OutOfLineBuffers,
+            MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        use crate::repdef::RepDefBuilder;
+
+        let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+        let encoding_strategy = default_encoding_strategy(version);
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 1,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+            version,
+        };
+
+        let mut encoder = encoding_strategy
+            .create_field_encoder(
+                encoding_strategy.as_ref(),
+                &lance_field,
+                &mut column_index_seq,
+                &encoding_options,
+            )
+            .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let repdef = RepDefBuilder::default();
+        let num_rows = array.len() as u64;
+        let mut pages = Vec::new();
+        for task in encoder
+            .maybe_encode(array, &mut external_buffers, repdef, 0, num_rows)
+            .unwrap()
+        {
+            pages.push(task.await.unwrap());
+        }
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            pages.push(task.await.unwrap());
+        }
+        pages.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let val = vec![0xABu8; 33];
+        let arr: ArrayRef = Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                std::iter::repeat_n(Some(val.as_slice()), 256),
+                33,
+            )
+            .unwrap(),
+        );
+        let field = arrow_schema::Field::new("c", DataType::FixedSizeBinary(33), true);
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_none());
+        assert_eq!(page.data.len(), 1);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_out_of_line_utf8_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let arr: ArrayRef = Arc::new(arrow_array::StringArray::from_iter_values(
+            std::iter::repeat_n("hello", 512),
+        ));
+        let field = arrow_schema::Field::new("c", DataType::Utf8, true);
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_none());
+        assert_eq!(page.data.len(), 1);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_nullable_item_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
+            Some(7),
+            None,
+            Some(7),
+            None,
+            Some(7),
+        ]));
+        let field = arrow_schema::Field::new("c", DataType::Int32, true);
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_some());
+        assert_eq!(page.data.len(), 2);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_list_repdef_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.values().append_value(7);
+        builder.values().append_null();
+        builder.values().append_value(7);
+        builder.append(true);
+
+        builder.append(true);
+
+        builder.values().append_value(7);
+        builder.append(true);
+
+        builder.append_null();
+
+        let arr: ArrayRef = Arc::new(builder.finish());
+        let field = arrow_schema::Field::new(
+            "c",
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            true,
+        );
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_some());
+        assert_eq!(page.data.len(), 2);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+        use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
+
+        let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+        for _ in 0..64 {
+            builder.values().append_value(1);
+            builder.values().append_null();
+            builder.values().append_value(3);
+            builder.append(true);
+        }
+        let arr: ArrayRef = Arc::new(builder.finish());
+        let field = arrow_schema::Field::new(
+            "c",
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Int32, true)),
+                3,
+            ),
+            true,
+        );
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        if let PageEncoding::Structural(layout) = &page.description {
+            assert!(
+                !matches!(layout.layout.as_ref().unwrap(), Layout::ConstantLayout(_)),
+                "FixedSizeList should not use constant layout yet"
+            );
+        }
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_not_written_before_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
+        let field = arrow_schema::Field::new("c", DataType::Int32, true);
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_1).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            return;
+        };
+        assert!(
+            !matches!(layout.layout.as_ref().unwrap(), Layout::ConstantLayout(_)),
+            "Should not emit constant layout before v2.2"
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_max_file_version(LanceFileVersion::V2_1)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_all_null_constant_layout_still_works_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
+        let field = arrow_schema::Field::new("c", DataType::Int32, true);
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected layout in slot 2");
+        };
+        assert!(layout.inline_value.is_none());
+        assert_eq!(page.data.len(), 0);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 }
