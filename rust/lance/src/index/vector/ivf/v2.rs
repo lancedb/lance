@@ -1488,7 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ivfpq_two_fragments_single_vs_split_layout_and_rowids() {
+    async fn test_ivfpq_recall_performance_on_two_frags_single_vs_split() {
         const INDEX_NAME: &str = "vector_idx";
 
         let test_dir = TempStrDir::default();

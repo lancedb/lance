@@ -9,8 +9,8 @@ use crate::{
     index::{
         scalar::build_scalar_index,
         vector::{
-            build_distributed_vector_index, build_empty_vector_index, build_ivf_pq_distributed,
-            build_ivf_pq_single, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+            build_distributed_vector_index, build_empty_vector_index,
+            build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
         },
         vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
     },
@@ -319,7 +319,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         // IVF_PQ distributed: keep logic isolated in builder layer and
                         // delegate to a dedicated helper. This avoids touching the
                         // generic IVF/RQ implementations in lance-index.
-                        Box::pin(build_ivf_pq_distributed(
+                        Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -327,18 +327,6 @@ impl<'a> CreateIndexBuilder<'a> {
                             vec_params,
                             fri,
                             self.fragments.as_ref().unwrap(),
-                        ))
-                        .await?;
-                    } else if is_pq {
-                        // IVF_PQ single-machine build: keep behavior identical to upstream
-                        // by delegating to the standard vector index builder.
-                        Box::pin(build_ivf_pq_single(
-                            self.dataset,
-                            column,
-                            &index_name,
-                            &index_id.to_string(),
-                            vec_params,
-                            fri,
                         ))
                         .await?;
                     } else if self.fragments.is_some() {
@@ -354,7 +342,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         ))
                         .await?;
                     } else {
-                        // Standard full dataset indexing.
+                        // Standard full dataset indexing
                         Box::pin(build_vector_index(
                             self.dataset,
                             column,

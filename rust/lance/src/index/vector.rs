@@ -683,53 +683,6 @@ is not supported in distributed mode; skipping this shard",
     Ok(())
 }
 
-/// Build a single-machine IVF_PQ index.
-///
-/// This is a thin wrapper around `build_vector_index` that is only used
-/// for clarity at the builder layer so that the single-machine PQ build
-/// logic stays identical to the upstream path.
-#[instrument(level = "debug", skip(dataset))]
-pub(crate) async fn build_ivf_pq_single(
-    dataset: &Dataset,
-    column: &str,
-    name: &str,
-    uuid: &str,
-    params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
-) -> Result<()> {
-    // Delegate to the generic vector index builder. This keeps the
-    // single-machine IVF_PQ path identical to the upstream implementation.
-    build_vector_index(dataset, column, name, uuid, params, frag_reuse_index).await
-}
-
-/// Build a distributed IVF_PQ index for specific fragments.
-///
-/// This is a thin wrapper around `build_distributed_vector_index`. It is
-/// only used when `VectorIndexParams::index_type()` is `IndexType::IvfPq`
-/// and a non-empty `fragment_ids` list is provided at the Dataset/index
-/// builder layer. All core IVF/PQ logic remains inside lance-index.
-#[instrument(level = "debug", skip(dataset))]
-pub(crate) async fn build_ivf_pq_distributed(
-    dataset: &Dataset,
-    column: &str,
-    name: &str,
-    uuid: &str,
-    params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    fragment_ids: &[u32],
-) -> Result<()> {
-    build_distributed_vector_index(
-        dataset,
-        column,
-        name,
-        uuid,
-        params,
-        frag_reuse_index,
-        fragment_ids,
-    )
-    .await
-}
-
 /// Build a Vector Index
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_vector_index(
