@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gc
 import os
-import sys
 from typing import Callable
 
 import lance
@@ -17,23 +16,6 @@ MiB = 1024 * 1024
 
 def get_memory_usage() -> int:
     return psutil.Process(os.getpid()).memory_info().rss
-
-
-def maybe_trim_allocator() -> None:
-    # The leak checks in this file use RSS, which can include allocator arena growth.
-    # On Linux/glibc, malloc_trim helps return freed heap memory back to the OS and
-    # reduces test flakiness while still catching true leaks.
-    if sys.platform != "linux":
-        return
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL("libc.so.6")
-        trim = getattr(libc, "malloc_trim", None)
-        if trim is not None:
-            trim(0)
-    except Exception:
-        return
 
 
 def assert_noleaks(
@@ -66,7 +48,6 @@ def assert_noleaks(
     for _ in range(warmup_iterations):
         operation()
     gc.collect()
-    maybe_trim_allocator()
 
     baseline = get_memory_usage()
 
@@ -75,7 +56,6 @@ def assert_noleaks(
 
         if i > 0 and i % check_interval == 0:
             gc.collect()
-            maybe_trim_allocator()
             current = get_memory_usage()
             growth_mb = (current - baseline) / MiB
             if growth_mb > threshold_mb * leeway_factor:
@@ -86,7 +66,6 @@ def assert_noleaks(
                 )
 
     gc.collect()
-    maybe_trim_allocator()
     final = get_memory_usage()
     total_mb = (final - baseline) / MiB
 
