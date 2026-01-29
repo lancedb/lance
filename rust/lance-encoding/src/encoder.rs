@@ -302,7 +302,6 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
 pub fn default_encoding_strategy_with_params(
     version: LanceFileVersion,
     params: CompressionParams,
-    blob_version: BlobVersion,
 ) -> Result<Box<dyn FieldEncodingStrategy>> {
     match version.resolve() {
         LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
@@ -310,14 +309,13 @@ pub fn default_encoding_strategy_with_params(
             location!(),
         )),
         _ => {
-            if blob_version != BlobVersion::V1 && version < LanceFileVersion::V2_2 {
-                return Err(Error::InvalidInput {
-                    source: "Blob version v2 requires file version >= 2.2".into(),
-                    location: location!(),
-                });
-            }
             let compression_strategy =
                 Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
+            let blob_version = if version >= LanceFileVersion::V2_2 {
+                BlobVersion::V2
+            } else {
+                BlobVersion::V1
+            };
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,
@@ -856,35 +854,24 @@ mod tests {
         );
 
         // Test with V2.1 - should succeed
-        let strategy = default_encoding_strategy_with_params(
-            LanceFileVersion::V2_1,
-            params.clone(),
-            BlobVersion::V1,
-        )
-        .expect("Should succeed for V2.1");
+        let strategy =
+            default_encoding_strategy_with_params(LanceFileVersion::V2_1, params.clone())
+                .expect("Should succeed for V2.1");
 
         // Verify it's a StructuralEncodingStrategy
         assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
         assert!(format!("{:?}", strategy).contains("DefaultCompressionStrategy"));
 
         // Test with V2.0 - should fail
-        let err = default_encoding_strategy_with_params(
-            LanceFileVersion::V2_0,
-            params.clone(),
-            BlobVersion::V1,
-        )
-        .expect_err("Should fail for V2.0");
+        let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
+            .expect_err("Should fail for V2.0");
         assert!(err
             .to_string()
             .contains("only supported in Lance file version 2.1"));
 
         // Test with Legacy - should fail
-        let err = default_encoding_strategy_with_params(
-            LanceFileVersion::Legacy,
-            params,
-            BlobVersion::V1,
-        )
-        .expect_err("Should fail for Legacy");
+        let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
+            .expect_err("Should fail for Legacy");
         assert!(err
             .to_string()
             .contains("only supported in Lance file version 2.1"));

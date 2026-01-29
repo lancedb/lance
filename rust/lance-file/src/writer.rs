@@ -1100,7 +1100,6 @@ mod tests {
         let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
             LanceFileVersion::V2_1,
             params,
-            lance_core::datatypes::BlobVersion::V1,
         )
         .unwrap();
 
@@ -1249,7 +1248,6 @@ mod tests {
         let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
             LanceFileVersion::V2_1,
             params,
-            lance_core::datatypes::BlobVersion::V1,
         )
         .unwrap();
 
@@ -1352,7 +1350,6 @@ mod tests {
         let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
             LanceFileVersion::V2_1,
             params,
-            lance_core::datatypes::BlobVersion::V1,
         )
         .unwrap();
 

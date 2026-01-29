@@ -27,7 +27,6 @@ use crate::{
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
 use lance_core::datatypes::BlobKind;
-#[cfg(test)]
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
