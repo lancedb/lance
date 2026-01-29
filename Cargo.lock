@@ -383,6 +383,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-scalar"
+version = "3.0.0-beta.2"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+ "half",
+ "rstest 0.23.0",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "57.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

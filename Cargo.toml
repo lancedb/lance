@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "rust/arrow-scalar",
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
@@ -80,6 +81,7 @@ arrow-data = "57.0.0"
 arrow-ipc = { version = "57.0.0", features = ["zstd"] }
 arrow-ord = "57.0.0"
 arrow-row = "57.0.0"
+arrow-scalar = { version = "57.0.0", path = "./rust/arrow-scalar" }
 arrow-schema = "57.0.0"
 arrow-select = "57.0.0"
 async-recursion = "1.0"
