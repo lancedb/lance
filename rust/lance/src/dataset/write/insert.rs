@@ -29,6 +29,7 @@ use crate::dataset::write::{
 use crate::{Error, Result};
 use tracing::info;
 
+use super::COLUMN_STATS_DISABLED_KEY;
 use super::COLUMN_STATS_ENABLED_KEY;
 use super::WriteDestination;
 use super::WriteMode;
@@ -240,12 +241,11 @@ impl<'a> InsertBuilder<'a> {
                 let mut config_upsert_values: Option<HashMap<String, String>> = None;
 
                 // Set column stats policy (always set it when creating a new dataset)
-                // Convert disable_column_stats to enabled flag (invert)
                 config_upsert_values
                     .get_or_insert_with(HashMap::new)
                     .insert(
-                        String::from(COLUMN_STATS_ENABLED_KEY),
-                        if !context.params.disable_column_stats {
+                        String::from(COLUMN_STATS_DISABLED_KEY),
+                        if context.params.disable_column_stats {
                             String::from("true")
                         } else {
                             String::from("false")
@@ -770,7 +770,7 @@ mod test {
 
     #[tokio::test]
     async fn test_column_stats_policy_set_on_create() {
-        // Test that COLUMN_STATS_ENABLED_KEY is set in manifest when creating dataset with stats enabled
+        // Test that COLUMN_STATS_DISABLED_KEY is set in manifest when creating dataset with stats enabled
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -787,14 +787,14 @@ mod test {
             .await
             .unwrap();
 
-        // Check that the manifest has the column stats config
-        let config_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
-        assert_eq!(config_value, Some(&"true".to_string()));
+        // Check that the manifest has the column stats config (disabled=false when stats enabled)
+        let config_value = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
+        assert_eq!(config_value, Some(&"false".to_string()));
     }
 
     #[tokio::test]
-    async fn test_column_stats_policy_set_to_false_when_disabled() {
-        // Test that COLUMN_STATS_ENABLED_KEY is set to false when stats are explicitly disabled
+    async fn test_column_stats_policy_set_to_true_when_disabled() {
+        // Test that COLUMN_STATS_DISABLED_KEY is set to true when stats are explicitly disabled
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -811,9 +811,9 @@ mod test {
             .await
             .unwrap();
 
-        // Check that the manifest has the column stats config set to false
-        let config_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
-        assert_eq!(config_value, Some(&"false".to_string()));
+        // Check that the manifest has the column stats config set to true (disabled=true)
+        let config_value = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
+        assert_eq!(config_value, Some(&"true".to_string()));
     }
 
     #[tokio::test]
@@ -944,9 +944,9 @@ mod test {
             .await
             .unwrap();
 
-        // Verify initial policy is set
-        let initial_policy = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
-        assert_eq!(initial_policy, Some(&"true".to_string()));
+        // Verify initial policy is set (disabled=false when stats enabled)
+        let initial_policy = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
+        assert_eq!(initial_policy, Some(&"false".to_string()));
 
         // Try to append with wrong policy (should fail validation before write)
         let batch2 = RecordBatch::try_new(
@@ -975,8 +975,8 @@ mod test {
 
         // Verify policy is still unchanged (use the dataset object we already have)
         let dataset_after = dataset_arc.as_ref();
-        let policy_after = dataset_after.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
-        assert_eq!(policy_after, Some(&"true".to_string()));
+        let policy_after = dataset_after.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
+        assert_eq!(policy_after, Some(&"false".to_string()));
 
         // Verify dataset still has only original data (write never started)
         assert_eq!(dataset_after.count_rows(None).await.unwrap(), 3);
@@ -1005,9 +1005,9 @@ mod test {
             .await
             .unwrap();
 
-        // Verify policy key is set
-        let policy_value = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY);
-        assert_eq!(policy_value, Some(&"false".to_string()));
+        // Verify policy key is set (true = stats disabled)
+        let policy_value = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
+        assert_eq!(policy_value, Some(&"true".to_string()));
 
         // Appending with matching policy should work
         let batch2 = RecordBatch::try_new(

@@ -506,6 +506,7 @@ fn convert_to_java_operation_inner<'local>(
             table_metadata_updates,
             schema_metadata_updates,
             field_metadata_updates,
+            column_stats: _,
         } => {
             let config_updates_obj = export_update_map(env, &config_updates)?;
             let table_metadata_updates_obj = export_update_map(env, &table_metadata_updates)?;
@@ -1108,6 +1109,7 @@ fn convert_to_rust_operation(
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                column_stats: None,
             }
         }
         "Append" => {

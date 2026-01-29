@@ -10,9 +10,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
-};
+use arrow_array::{Array, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array};
 use datafusion::scalar::ScalarValue;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
@@ -76,7 +74,7 @@ impl ColumnStatsReader {
     /// Returns `None` if the column has no statistics available.
     ///
     /// In the new columnar format, the stats batch has one column per dataset column,
-    /// each containing a List<struct> with zone statistics.
+    /// each containing a `List<struct>` with zone statistics.
     pub fn read_column_stats(&self, column_name: &str) -> Result<Option<ColumnStats>> {
         // Check if column exists in stats batch (one column per dataset column)
         let column_array = self.stats_batch.column_by_name(column_name);
@@ -95,7 +93,7 @@ impl ColumnStatsReader {
             // Column not in schema - return None (no stats available)
             return Ok(None);
         }
-        let field = field.unwrap();
+        let _ = field.unwrap();
 
         // Extract the ListArray for this column (one row total, so use row 0)
         let list_array = column_array
@@ -221,56 +219,54 @@ impl ColumnStatsReader {
                 location: location!(),
             })?;
 
-        let min_value_array = struct_array
-            .column_by_name("min_value")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Missing 'min_value' field in struct for column '{}'",
-                    column_name
-                ),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected StringArray for 'min_value' in column '{}'",
-                    column_name
-                ),
-                location: location!(),
-            })?;
+        let min_value_array =
+            struct_array
+                .column_by_name("min_value")
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Missing 'min_value' field in struct for column '{}'",
+                        column_name
+                    ),
+                    location: location!(),
+                })?;
 
-        let max_value_array = struct_array
-            .column_by_name("max_value")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Missing 'max_value' field in struct for column '{}'",
-                    column_name
-                ),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected StringArray for 'max_value' in column '{}'",
-                    column_name
-                ),
-                location: location!(),
-            })?;
+        let max_value_array =
+            struct_array
+                .column_by_name("max_value")
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Missing 'max_value' field in struct for column '{}'",
+                        column_name
+                    ),
+                    location: location!(),
+                })?;
 
-        // Parse min/max values with automatic type dispatching
+        // Min/max are stored in the column's Arrow type; convert to ScalarValue per zone
         let num_zones = fragment_id_array.len();
         let mut min_values = Vec::with_capacity(num_zones);
         let mut max_values = Vec::with_capacity(num_zones);
 
         for i in 0..num_zones {
-            let min_str = min_value_array.value(i);
-            let max_str = max_value_array.value(i);
-
-            let min_val = parse_scalar_value(min_str, &field.data_type())?;
-            let max_val = parse_scalar_value(max_str, &field.data_type())?;
-
+            let min_val =
+                ScalarValue::try_from_array(min_value_array.as_ref(), i).map_err(|e| {
+                    Error::Internal {
+                        message: format!(
+                            "Failed to get min ScalarValue for column '{}' zone {}: {}",
+                            column_name, i, e
+                        ),
+                        location: location!(),
+                    }
+                })?;
+            let max_val =
+                ScalarValue::try_from_array(max_value_array.as_ref(), i).map_err(|e| {
+                    Error::Internal {
+                        message: format!(
+                            "Failed to get max ScalarValue for column '{}' zone {}: {}",
+                            column_name, i, e
+                        ),
+                        location: location!(),
+                    }
+                })?;
             min_values.push(min_val);
             max_values.push(max_val);
         }
@@ -287,89 +283,12 @@ impl ColumnStatsReader {
     }
 }
 
-/// Parse a ScalarValue from a debug-format string based on the expected type.
-fn parse_scalar_value(s: &str, data_type: &arrow_schema::DataType) -> Result<ScalarValue> {
-    use arrow_schema::DataType;
-
-    // The string now contains just the value without type prefix
-    // E.g., "42", "3.14", "hello" (no "Int32(...)" wrapper)
-
-    match data_type {
-        DataType::Int8 => Ok(ScalarValue::Int8(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Int8 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Int16 => Ok(ScalarValue::Int16(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Int16 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Int32 => Ok(ScalarValue::Int32(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Int32 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Int64 => Ok(ScalarValue::Int64(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Int64 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::UInt8 => Ok(ScalarValue::UInt8(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse UInt8 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::UInt16 => Ok(ScalarValue::UInt16(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse UInt16 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::UInt32 => Ok(ScalarValue::UInt32(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse UInt32 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::UInt64 => Ok(ScalarValue::UInt64(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse UInt64 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Float32 => Ok(ScalarValue::Float32(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Float32 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Float64 => Ok(ScalarValue::Float64(Some(s.parse().map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to parse Float64 from '{}': {}", s, e),
-                location: location!(),
-            }
-        })?))),
-        DataType::Utf8 => Ok(ScalarValue::Utf8(Some(s.to_string()))),
-        DataType::LargeUtf8 => Ok(ScalarValue::LargeUtf8(Some(s.to_string()))),
-        _ => Err(Error::Internal {
-            message: format!("Unsupported data type for stats parsing: {:?}", data_type),
-            location: location!(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     // Re-import types that are used by the parent module but not re-exported
     use crate::dataset::column_stats_consolidator::create_consolidated_stats_schema;
-    use arrow_array::{ArrayRef, ListArray, RecordBatch, StringArray as ArrowStringArray};
+    use arrow_array::{ArrayRef, ListArray, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
 
@@ -387,15 +306,16 @@ mod tests {
     fn create_test_stats_batch() -> RecordBatch {
         // Create a consolidated stats batch with 2 columns: "id" and "name"
         // New format: one row total, one column per dataset column, each containing List<struct>
-        use arrow_array::StructArray;
+        // min_value/max_value use the column's Arrow type (Int32 for id, Utf8 for name)
+        use arrow_array::{Int32Array, StringArray as ArrowStringArray, StructArray};
         use arrow_buffer::OffsetBuffer;
         use lance_file::writer::create_consolidated_zone_struct_type;
 
-        let dataset_schema = create_test_schema();
-        let schema = create_consolidated_stats_schema(&dataset_schema);
-        let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
+        let _dataset_schema = create_test_schema();
+        let id_zone_type = create_consolidated_zone_struct_type(&DataType::Int32);
+        let name_zone_type = create_consolidated_zone_struct_type(&DataType::Utf8);
 
-        // Build struct array for "id" column: 2 zones
+        // Build struct array for "id" column: 2 zones (min/max as Int32)
         let id_struct_array = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
@@ -418,16 +338,16 @@ mod tests {
                 Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
             ),
             (
-                Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
-                Arc::new(ArrowStringArray::from(vec!["0", "100"])) as ArrayRef,
+                Arc::new(ArrowField::new("min_value", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![0, 100])) as ArrayRef,
             ),
             (
-                Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
-                Arc::new(ArrowStringArray::from(vec!["99", "199"])) as ArrayRef,
+                Arc::new(ArrowField::new("max_value", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![99, 199])) as ArrayRef,
             ),
         ]);
 
-        // Build struct array for "name" column: 2 zones
+        // Build struct array for "name" column: 2 zones (min/max as Utf8)
         let name_struct_array = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
@@ -450,23 +370,20 @@ mod tests {
                 Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
             ),
             (
-                Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
+                Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
                 Arc::new(ArrowStringArray::from(vec!["alice", "mike"])) as ArrayRef,
             ),
             (
-                Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
+                Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
                 Arc::new(ArrowStringArray::from(vec!["jenny", "zoe"])) as ArrayRef,
             ),
         ]);
 
         // Wrap each struct array in a ListArray (one list per column, one row total)
-        let list_field = Arc::new(ArrowField::new(
-            "zone",
-            consolidated_zone_struct_type.clone(),
-            false,
-        ));
+        let id_list_field = Arc::new(ArrowField::new("zone", id_zone_type, false));
+        let name_list_field = Arc::new(ArrowField::new("zone", name_zone_type, false));
         let id_list = ListArray::try_new(
-            list_field.clone(),
+            id_list_field.clone(),
             OffsetBuffer::from_lengths([2]),
             Arc::new(id_struct_array) as ArrayRef,
             None,
@@ -474,7 +391,7 @@ mod tests {
         .unwrap();
 
         let name_list = ListArray::try_new(
-            list_field.clone(),
+            name_list_field.clone(),
             OffsetBuffer::from_lengths([2]),
             Arc::new(name_struct_array) as ArrayRef,
             None,
@@ -482,10 +399,9 @@ mod tests {
         .unwrap();
 
         // Schema has 3 fields (id, name, score), but we only create stats for id and name
-        // So we need to create a schema with just those two columns for the stats batch
         let stats_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::List(list_field.clone()), false),
-            ArrowField::new("name", DataType::List(list_field.clone()), false),
+            ArrowField::new("id", DataType::List(id_list_field), false),
+            ArrowField::new("name", DataType::List(name_list_field), false),
         ]));
 
         RecordBatch::try_new(
@@ -587,77 +503,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_parse_scalar_value_int_types() {
-        let cases = vec![
-            (DataType::Int8, "42", ScalarValue::Int8(Some(42))),
-            (DataType::Int16, "1000", ScalarValue::Int16(Some(1000))),
-            (DataType::Int32, "100000", ScalarValue::Int32(Some(100000))),
-            (
-                DataType::Int64,
-                "9999999999",
-                ScalarValue::Int64(Some(9999999999)),
-            ),
-            (DataType::UInt8, "255", ScalarValue::UInt8(Some(255))),
-            (DataType::UInt16, "65535", ScalarValue::UInt16(Some(65535))),
-            (
-                DataType::UInt32,
-                "4294967295",
-                ScalarValue::UInt32(Some(4294967295)),
-            ),
-            (
-                DataType::UInt64,
-                "18446744073709551615",
-                ScalarValue::UInt64(Some(18446744073709551615)),
-            ),
-        ];
-
-        for (data_type, input, expected) in cases {
-            let result = parse_scalar_value(input, &data_type).unwrap();
-            assert_eq!(result, expected, "Failed for type {:?}", data_type);
-        }
-    }
-
-    #[test]
-    fn test_parse_scalar_value_float_types() {
-        let result = parse_scalar_value("2.5", &DataType::Float32).unwrap();
-        assert_eq!(result, ScalarValue::Float32(Some(2.5)));
-
-        let result = parse_scalar_value("1.234567890123456", &DataType::Float64).unwrap();
-        assert_eq!(result, ScalarValue::Float64(Some(1.234567890123456)));
-    }
-
-    #[test]
-    fn test_parse_scalar_value_string_types() {
-        let result = parse_scalar_value("hello", &DataType::Utf8).unwrap();
-        assert_eq!(result, ScalarValue::Utf8(Some("hello".to_string())));
-
-        let result = parse_scalar_value("world", &DataType::LargeUtf8).unwrap();
-        assert_eq!(result, ScalarValue::LargeUtf8(Some("world".to_string())));
-    }
-
-    #[test]
-    fn test_parse_scalar_value_invalid_format() {
-        let result = parse_scalar_value("not_a_number", &DataType::Int32);
-        assert!(result.is_err());
-
-        let result = parse_scalar_value("not_a_float", &DataType::Float64);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_scalar_value_unsupported_type() {
-        let result = parse_scalar_value("true", &DataType::Boolean);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unsupported data type")
-        );
-    }
-
-    #[test]
     fn test_empty_stats_batch() {
         let schema = create_test_schema();
 

@@ -3,8 +3,9 @@
 
 //! Column statistics collection for Lance data files.
 //!
-//! This module provides per-zone column statistics (min, max, null_count, nan_count)
-//! that are collected during file writing and stored in the file metadata.
+//! This module provides per-zone column statistics
+//! that are collected during file writing and stored in the file metadata
+//! as a global buffer
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
@@ -14,6 +15,9 @@ use datafusion_expr::Accumulator;
 use lance_core::utils::zone::{ZoneBound, ZoneProcessor};
 use lance_core::{Error, Result};
 use snafu::location;
+
+/// Zone size for column statistics (1 million rows per zone)
+pub(super) const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
 
 /// Column statistics for a single zone
 #[derive(Debug, Clone)]
@@ -120,72 +124,33 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     }
 }
 
-/// Convert ScalarValue to string, extracting only the value without type prefix
-/// E.g., Int32(42) -> "42", Float64(3.14) -> "3.14", Utf8("hello") -> "hello"
-pub(super) fn scalar_value_to_string(value: &ScalarValue) -> String {
-    let debug_str = format!("{:?}", value);
-
-    // For string types, extract the quoted value
-    if debug_str.starts_with("Utf8(") || debug_str.starts_with("LargeUtf8(") {
-        // Extract content between quotes: Utf8("hello") -> "hello"
-        if let Some(start) = debug_str.find('"') {
-            if let Some(end) = debug_str.rfind('"') {
-                if end > start {
-                    return debug_str[start + 1..end].to_string();
-                }
-            }
-        }
-    }
-
-    // For numeric types, extract content between parentheses
-    // Int32(42) -> "42", Float64(3.14) -> "3.14"
-    if let Some(start) = debug_str.find('(') {
-        if let Some(end) = debug_str.rfind(')') {
-            return debug_str[start + 1..end].to_string();
-        }
-    }
-
-    // Fallback: return the whole debug string (shouldn't happen for supported types)
-    debug_str
-}
-
-/// Zone size for column statistics (1 million rows per zone)
-pub(super) const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
-
-/// Create Arrow struct type for ColumnZoneStatistics
-///
-/// This struct contains: min (Utf8), max (Utf8), null_count (UInt32), nan_count (UInt32),
-/// and bound which is a struct with fragment_id (UInt64), start (UInt64), length (UInt64)
-pub(super) fn create_column_zone_statistics_struct_type() -> DataType {
-    // ZoneBound struct fields
+/// Create Arrow struct type for file level ColumnZoneStatistics for a given column type.
+pub(super) fn create_column_zone_statistics_struct_type(column_type: &DataType) -> DataType {
     let zone_bound_fields = Fields::from(vec![
         ArrowField::new("fragment_id", DataType::UInt64, false),
         ArrowField::new("start", DataType::UInt64, false),
         ArrowField::new("length", DataType::UInt64, false),
     ]);
 
-    // ColumnZoneStatistics struct fields
     DataType::Struct(Fields::from(vec![
-        ArrowField::new("min", DataType::Utf8, false),
-        ArrowField::new("max", DataType::Utf8, false),
+        // min and max are nullable because they can be null for empty zones
+        ArrowField::new("min", column_type.clone(), true),
+        ArrowField::new("max", column_type.clone(), true),
         ArrowField::new("null_count", DataType::UInt32, false),
         ArrowField::new("nan_count", DataType::UInt32, false),
         ArrowField::new("bound", DataType::Struct(zone_bound_fields), false),
     ]))
 }
 
-/// Create Arrow struct type for consolidated zone statistics
-///
-/// This struct contains: fragment_id (UInt64), zone_start (UInt64), zone_length (UInt64),
-/// null_count (UInt32), nan_count (UInt32), min_value (Utf8), max_value (Utf8)
-pub fn create_consolidated_zone_struct_type() -> DataType {
+/// Create Arrow struct type for consolidated zone statistics for a given column type.
+pub fn create_consolidated_zone_struct_type(column_type: &DataType) -> DataType {
     DataType::Struct(Fields::from(vec![
         ArrowField::new("fragment_id", DataType::UInt64, false),
         ArrowField::new("zone_start", DataType::UInt64, false),
         ArrowField::new("zone_length", DataType::UInt64, false),
         ArrowField::new("null_count", DataType::UInt32, false),
         ArrowField::new("nan_count", DataType::UInt32, false),
-        ArrowField::new("min_value", DataType::Utf8, false),
-        ArrowField::new("max_value", DataType::Utf8, false),
+        ArrowField::new("min_value", column_type.clone(), true),
+        ArrowField::new("max_value", column_type.clone(), true),
     ]))
 }

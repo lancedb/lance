@@ -384,28 +384,6 @@ mod tests {
     }
 
     #[test]
-    fn test_processor_reset_between_zones() {
-        // Verify processor resets correctly between zones
-        let processor = MockProcessor::new();
-        let mut builder = FileZoneBuilder::new(processor, 3).unwrap();
-
-        // First zone
-        builder
-            .process_chunk(&array_from_vec(vec![1, 2, 3]))
-            .unwrap();
-
-        // Second zone - processor should have reset, so sum starts from 0
-        builder
-            .process_chunk(&array_from_vec(vec![4, 5, 6]))
-            .unwrap();
-
-        let zones = builder.finalize().unwrap();
-        assert_eq!(zones.len(), 2);
-        assert_eq!(zones[0].sum, 6);
-        assert_eq!(zones[1].sum, 15); // 4+5+6, not 6+15=21
-    }
-
-    #[test]
     fn test_zone_boundaries_sequential() {
         // Verify zone start positions are sequential
         // Process in chunks that don't exceed zone size

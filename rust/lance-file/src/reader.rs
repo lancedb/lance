@@ -2447,8 +2447,9 @@ impl ProjectedFileReader {
     /// Read column statistics from the file.
     ///
     /// Column statistics are stored as a global buffer containing an Arrow IPC
-    /// encoded RecordBatch. The batch uses a **flat (transposed) layout** with
-    /// one row per zone per column. See details in writer.rs
+    /// encoded RecordBatch. The batch uses a **columnar layout**: one column per
+    /// dataset column (each of type `ColumnZoneStatistics` struct), one row per zone.
+    /// See details in writer.rs
     ///
     pub async fn read_column_stats(&self) -> Result<Option<arrow_array::RecordBatch>> {
         // Check if column stats exist
@@ -2460,6 +2461,26 @@ impl ProjectedFileReader {
         else {
             return Ok(None);
         };
+
+        // Check version for forward compatibility
+        let version = self
+            .metadata
+            .file_schema
+            .metadata
+            .get(COLUMN_STATS_VERSION_KEY)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        // Skip stats from newer versions for forward compatibility
+        if version > COLUMN_STATS_VERSION {
+            log::warn!(
+                "Column stats version {} is newer than supported version {}. \
+                 Skipping column stats for forward compatibility.",
+                version,
+                COLUMN_STATS_VERSION
+            );
+            return Ok(None);
+        }
 
         // Parse the buffer index
         let buffer_index: usize = buffer_index_str.parse().map_err(|_| Error::Internal {
@@ -2496,26 +2517,6 @@ impl ProjectedFileReader {
 
         // The buffer is returned as a single chunk since we requested one range
         let stats_bytes = stats_bytes_vec.into_iter().next().unwrap();
-
-        // Check version for forward compatibility
-        let version = self
-            .metadata
-            .file_schema
-            .metadata
-            .get(COLUMN_STATS_VERSION_KEY)
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-
-        // Skip stats from newer versions for forward compatibility
-        if version > COLUMN_STATS_VERSION {
-            log::warn!(
-                "Column stats version {} is newer than supported version {}. \
-                 Skipping column stats for forward compatibility.",
-                version,
-                COLUMN_STATS_VERSION
-            );
-            return Ok(None);
-        }
 
         // Decode Arrow IPC format
         let cursor = Cursor::new(stats_bytes.as_ref());
@@ -3927,7 +3928,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_column_stats_reading() {
-        use arrow_array::{Int32Array, RecordBatch, StringArray};
+        use arrow_array::{Int32Array, RecordBatch};
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use std::sync::Arc;
 
@@ -3995,115 +3996,77 @@ mod tests {
             .unwrap()
             .expect("Expected column stats to be present");
 
-        // There are 8 columns in the stats batch, which correspond to the flat zone statistics format:
-        //  0: column_name   (String)   - Name of the column the stats belong to
-        //  1: zone_id       (UInt32)   - ID of the zone within the column
-        //  2: zone_start    (UInt64)   - Starting row offset of the zone
-        //  3: zone_length   (UInt64)   - Number of rows in this zone
-        //  4: null_count    (UInt32)   - Number of nulls in the zone
-        //  5: nan_count     (UInt32)   - Number of NaNs (if applicable) in the zone
-        //  6: min           (String)   - Minimum value (as string) in the zone (using scalar_value_to_string)
-        //  7: max           (String)   - Maximum value (as string) in the zone
-        //
-        // This matches the output from writing column stats with disable_column_stats: false (stats enabled)
-        assert_eq!(stats_batch.num_columns(), 8);
+        // Columnar layout: one column per dataset column, each of type ColumnZoneStatistics struct.
+        // One row per zone. Schema has one column "data" (Struct: min, max, null_count, nan_count, bound).
+        assert_eq!(stats_batch.num_columns(), 1);
         assert_eq!(
             stats_batch.schema().field(0).name(),
-            COLUMN_STATS_COLUMN_NAME_FIELD,
-            "First field should be column_name"
-        );
-        assert_eq!(
-            stats_batch.schema().field(1).name(),
-            COLUMN_STATS_ZONE_ID_FIELD,
-            "Second field should be zone_id"
-        );
-        assert_eq!(
-            stats_batch.schema().field(2).name(),
-            COLUMN_STATS_ZONE_START_FIELD,
-            "Third field should be zone_start"
-        );
-        assert_eq!(
-            stats_batch.schema().field(3).name(),
-            COLUMN_STATS_ZONE_LENGTH_FIELD,
-            "Fourth field should be zone_length"
+            "data",
+            "Single column should be named after the dataset column"
         );
 
-        // Verify we have at least one row (one per zone per column)
         assert!(
             stats_batch.num_rows() > 0,
-            "Should have at least one row (one per zone per column)"
+            "Should have at least one row (one per zone)"
         );
 
-        // Verify column_name contains "data"
-        let column_names = stats_batch
-            .column_by_name(COLUMN_STATS_COLUMN_NAME_FIELD)
+        let data_column = stats_batch.column_by_name("data").unwrap();
+        let data_struct = data_column
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+
+        use arrow_array::{UInt32Array, UInt64Array};
+        let min_val: i32 = data_struct
+            .column_by_name("min")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(column_names.value(0), "data");
-
-        // Verify zone_id is a UInt32 array
-        use arrow_array::UInt32Array;
-        let zone_ids = stats_batch
-            .column_by_name(COLUMN_STATS_ZONE_ID_FIELD)
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        let max_val: i32 = data_struct
+            .column_by_name("max")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        let null_counts = data_struct
+            .column_by_name("null_count")
             .unwrap()
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
-        assert_eq!(zone_ids.value(0), 0, "First zone should have zone_id = 0");
+        let nan_counts = data_struct
+            .column_by_name("nan_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let bound_column = data_struct.column_by_name("bound").unwrap();
+        let bound_struct = bound_column
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        let zone_starts = bound_struct
+            .column_by_name("start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let zone_lengths = bound_struct
+            .column_by_name("length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
 
-        // Verify zone_start and zone_length
-        use arrow_array::UInt64Array;
-        let zone_starts = stats_batch
-            .column_by_name(COLUMN_STATS_ZONE_START_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let zone_lengths = stats_batch
-            .column_by_name(COLUMN_STATS_ZONE_LENGTH_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
         assert_eq!(zone_starts.value(0), 0, "Zone should start at row 0");
         assert_eq!(zone_lengths.value(0), 5, "Zone should have 5 rows");
-
-        // Verify null_count and nan_count
-        let null_counts = stats_batch
-            .column_by_name(COLUMN_STATS_NULL_COUNT_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let nan_counts = stats_batch
-            .column_by_name(COLUMN_STATS_NAN_COUNT_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
         assert_eq!(null_counts.value(0), 0, "Should have 0 nulls");
         assert_eq!(nan_counts.value(0), 0, "Should have 0 NaNs (Int32 type)");
-
-        // Verify min_value and max_value (stored as strings in ScalarValue debug format)
-        let min_values = stats_batch
-            .column_by_name(COLUMN_STATS_MIN_VALUE_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let max_values = stats_batch
-            .column_by_name(COLUMN_STATS_MAX_VALUE_FIELD)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        // Data was [1, 2, 3, 4, 5], so min=1, max=5
-        // Values are now stored without type prefix
-        assert_eq!(min_values.value(0), "1", "Min value should be 1");
-        assert_eq!(max_values.value(0), "5", "Max value should be 5");
+        assert_eq!(min_val, 1, "Min value should be 1");
+        assert_eq!(max_val, 5, "Max value should be 5");
     }
 
     #[tokio::test]

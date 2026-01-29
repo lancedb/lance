@@ -55,8 +55,8 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 
-/// Manifest configuration key for column statistics policy
-pub const COLUMN_STATS_ENABLED_KEY: &str = "lance.column_stats.enabled";
+/// Manifest configuration key for column statistics policy (when true, stats are disabled)
+pub const COLUMN_STATS_DISABLED_KEY: &str = "lance.column_stats.disabled";
 
 pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
     if storage_version >= LanceFileVersion::V2_2 {
@@ -477,21 +477,19 @@ impl WriteParams {
     /// # Errors
     ///
     /// Returns an error if the manifest contains an invalid policy value or if
-    /// `disable_column_stats` doesn't match the dataset's policy (inverted).
+    /// `disable_column_stats` doesn't match the dataset's policy.
     pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
         if let Some(dataset) = dataset {
-            if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_ENABLED_KEY) {
-                let dataset_policy_enabled: bool = policy_str.parse().map_err(|_| {
+            if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY) {
+                let dataset_policy_disable: bool = policy_str.parse().map_err(|_| {
                     Error::invalid_input(
                         format!(
                             "[ColumnStats] Invalid value for {} in dataset config: {}",
-                            COLUMN_STATS_ENABLED_KEY, policy_str
+                            COLUMN_STATS_DISABLED_KEY, policy_str
                         ),
                         location!(),
                     )
                 })?;
-                // Convert enabled policy to disable flag (invert)
-                let dataset_policy_disable = !dataset_policy_enabled;
 
                 if self.disable_column_stats != dataset_policy_disable {
                     return Err(Error::invalid_input(

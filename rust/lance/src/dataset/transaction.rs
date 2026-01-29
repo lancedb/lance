@@ -3331,7 +3331,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                                 (*field_id, UpdateMap::from(pb_update_map))
                             })
                             .collect(),
-                        column_stats: update_config.column_stats.clone(),
+                        column_stats: update_config.column_stats,
                     }
                 }
             }

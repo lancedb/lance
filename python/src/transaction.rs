@@ -387,6 +387,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     table_metadata_updates,
                     schema_metadata_updates,
                     field_metadata_updates,
+                    column_stats: None,
                 };
                 Ok(Self(op))
             }
@@ -553,10 +554,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 }
             }
             Operation::UpdateConfig {
-                config_updates,
-                table_metadata_updates,
-                schema_metadata_updates,
-                field_metadata_updates,
+                ref config_updates,
+                ref table_metadata_updates,
+                ref schema_metadata_updates,
+                ref field_metadata_updates,
+                column_stats: _,
             } => {
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
                     let config = export_update_map(py, config_updates)?;

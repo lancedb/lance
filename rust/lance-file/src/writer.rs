@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_core::utils::zone::FileZoneBuilder;
 
@@ -33,6 +33,8 @@ use prost_types::Any;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
+
+use datafusion_common::ScalarValue;
 
 use crate::datatypes::FieldsWithMeta;
 use crate::format::MAGIC;
@@ -66,31 +68,6 @@ pub const COLUMN_STATS_BUFFER_INDEX_KEY: &str = "lance:column_stats:buffer_index
 pub const COLUMN_STATS_VERSION_KEY: &str = "lance:column_stats:version";
 /// Current version of column statistics format
 pub const COLUMN_STATS_VERSION: u32 = 1;
-
-// Schema field names for column statistics (flat layout)
-// These constants ensure consistency across schema creation
-pub const COLUMN_STATS_COLUMN_NAME_FIELD: &str = "column_name";
-pub const COLUMN_STATS_ZONE_ID_FIELD: &str = "zone_id";
-pub const COLUMN_STATS_ZONE_START_FIELD: &str = "zone_start";
-pub const COLUMN_STATS_ZONE_LENGTH_FIELD: &str = "zone_length";
-pub const COLUMN_STATS_NULL_COUNT_FIELD: &str = "null_count";
-pub const COLUMN_STATS_NAN_COUNT_FIELD: &str = "nan_count";
-pub const COLUMN_STATS_MIN_VALUE_FIELD: &str = "min_value";
-pub const COLUMN_STATS_MAX_VALUE_FIELD: &str = "max_value";
-
-/// Create the Arrow schema for column statistics (flat layout: one row per zone per column)
-pub fn create_column_stats_flat_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(COLUMN_STATS_COLUMN_NAME_FIELD, DataType::Utf8, false),
-        ArrowField::new(COLUMN_STATS_ZONE_ID_FIELD, DataType::UInt32, false),
-        ArrowField::new(COLUMN_STATS_ZONE_START_FIELD, DataType::UInt64, false),
-        ArrowField::new(COLUMN_STATS_ZONE_LENGTH_FIELD, DataType::UInt64, false),
-        ArrowField::new(COLUMN_STATS_NULL_COUNT_FIELD, DataType::UInt32, false),
-        ArrowField::new(COLUMN_STATS_NAN_COUNT_FIELD, DataType::UInt32, false),
-        ArrowField::new(COLUMN_STATS_MIN_VALUE_FIELD, DataType::Utf8, false),
-        ArrowField::new(COLUMN_STATS_MAX_VALUE_FIELD, DataType::Utf8, false),
-    ]))
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -256,7 +233,6 @@ enum PageSpillState {
 mod column_stats;
 use column_stats::{
     COLUMN_STATS_ZONE_SIZE, ColumnStatisticsProcessor, create_column_zone_statistics_struct_type,
-    scalar_value_to_string,
 };
 
 // Re-export for use in consolidation
@@ -1077,7 +1053,7 @@ impl FileWriter {
 
         use arrow_array::StructArray;
 
-        // Collect zones for each column
+        // Collect zones per column (name, zones). Arrow type is looked up from schema by name when writing.
         let mut column_zones: Vec<(String, Vec<column_stats::ColumnZoneStatistics>)> = Vec::new();
         let mut num_zones = None;
 
@@ -1116,15 +1092,26 @@ impl FileWriter {
 
         let num_zones = num_zones.unwrap();
 
-        // Build struct arrays for each column
-        let column_zone_stats_type = create_column_zone_statistics_struct_type();
+        // Build struct arrays for each column (min/max use column's actual type)
         let mut column_arrays: Vec<ArrayRef> = Vec::new();
         let mut schema_fields: Vec<ArrowField> = Vec::new();
 
         for (col_name, zones) in &column_zones {
-            // Build arrays for each field in ColumnZoneStatistics
-            let mut min_values = Vec::with_capacity(num_zones);
-            let mut max_values = Vec::with_capacity(num_zones);
+            let field = schema.field(col_name).ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Column '{}' not found in schema when building column stats",
+                    col_name
+                ),
+                location: location!(),
+            })?;
+            let data_type = field.data_type();
+
+            // Build min/max arrays from zone scalars; array type is inferred from ScalarValue
+            let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+
             let mut null_counts = Vec::with_capacity(num_zones);
             let mut nan_counts = Vec::with_capacity(num_zones);
             let mut fragment_ids = Vec::with_capacity(num_zones);
@@ -1132,14 +1119,14 @@ impl FileWriter {
             let mut zone_lengths = Vec::with_capacity(num_zones);
 
             for zone in zones {
-                min_values.push(scalar_value_to_string(&zone.min));
-                max_values.push(scalar_value_to_string(&zone.max));
                 null_counts.push(zone.null_count);
                 nan_counts.push(zone.nan_count);
                 fragment_ids.push(zone.bound.fragment_id);
                 zone_starts.push(zone.bound.start);
                 zone_lengths.push(zone.bound.length as u64);
             }
+
+            let column_zone_stats_type = create_column_zone_statistics_struct_type(&data_type);
 
             // Build ZoneBound struct array
             let zone_bound_struct = StructArray::from(vec![
@@ -1157,15 +1144,15 @@ impl FileWriter {
                 ),
             ]);
 
-            // Build ColumnZoneStatistics struct array
+            // Build ColumnZoneStatistics struct array (min/max are typed, nullable)
             let column_stats_struct = StructArray::from(vec![
                 (
-                    Arc::new(ArrowField::new("min", DataType::Utf8, false)),
-                    Arc::new(StringArray::from(min_values)) as ArrayRef,
+                    Arc::new(ArrowField::new("min", data_type.clone(), true)),
+                    min_array,
                 ),
                 (
-                    Arc::new(ArrowField::new("max", DataType::Utf8, false)),
-                    Arc::new(StringArray::from(max_values)) as ArrayRef,
+                    Arc::new(ArrowField::new("max", data_type.clone(), true)),
+                    max_array,
                 ),
                 (
                     Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
@@ -2750,8 +2737,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_column_stats_flat_layout() {
-        // Test that column statistics use flat (transposed) layout
-        use arrow_array::{Float64Array, Int32Array};
+        // Test that column statistics use columnar layout: one column per dataset column,
+        // each of type ColumnZoneStatistics struct, one row per zone.
+        use arrow_array::{Float64Array, Int32Array, StructArray, UInt64Array};
         use arrow_schema::Schema;
 
         let arrow_schema = Arc::new(Schema::new(vec![
@@ -2791,7 +2779,7 @@ mod tests {
         writer.write_batch(&batch).await.unwrap();
         writer.finish().await.unwrap();
 
-        // Read back and verify the flat layout
+        // Read back and verify the columnar layout
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
@@ -2815,88 +2803,54 @@ mod tests {
             .unwrap()
             .expect("Should have column stats");
 
-        // Verify flat schema (no lists)
+        // Columnar layout: one column per dataset column (id, value), one row per zone
         let schema = stats_batch.schema();
-        // Schema should have 8 fields: column_name, zone_id, zone_start, zone_length, null_count, nan_count, min_value, max_value
         assert_eq!(
             schema.fields().len(),
-            8,
-            "Schema fields: {:?}",
+            2,
+            "Schema: {:?}",
             schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
         );
-        assert_eq!(schema.field(0).name(), "column_name");
-        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
-        assert_eq!(schema.field(1).name(), "zone_id");
-        assert_eq!(schema.field(1).data_type(), &DataType::UInt32);
-        assert_eq!(schema.field(2).name(), "zone_start");
-        assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
-        assert_eq!(schema.field(3).name(), "zone_length");
-        assert_eq!(schema.field(3).data_type(), &DataType::UInt64);
-        assert_eq!(schema.field(4).name(), "null_count");
-        assert_eq!(schema.field(4).data_type(), &DataType::UInt32);
-        assert_eq!(schema.field(5).name(), "nan_count");
-        assert_eq!(schema.field(5).data_type(), &DataType::UInt32);
-        assert_eq!(schema.field(6).name(), "min_value");
-        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
-        assert_eq!(schema.field(7).name(), "max_value");
-        assert_eq!(schema.field(7).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "value");
 
-        // Should have 6 rows: 2 columns × 3 zones each
-        assert_eq!(stats_batch.num_rows(), 6);
+        // 3 zones → 3 rows
+        assert_eq!(stats_batch.num_rows(), 3);
 
-        // Verify data structure
-        let column_names = stats_batch
-            .column(0)
+        // Each column is a StructArray (ColumnZoneStatistics: min, max, null_count, nan_count, bound)
+        let id_col = stats_batch
+            .column_by_name("id")
+            .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
-        let zone_ids = stats_batch
-            .column(1)
+        let bound_col = id_col.column_by_name("bound").unwrap();
+        let bound_struct = bound_col.as_any().downcast_ref::<StructArray>().unwrap();
+        let starts = bound_struct
+            .column_by_name("start")
+            .unwrap()
             .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
+            .downcast_ref::<UInt64Array>()
             .unwrap();
-        let zone_starts = stats_batch
-            .column(2)
+        let lengths = bound_struct
+            .column_by_name("length")
+            .unwrap()
             .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .unwrap();
-        let zone_lengths = stats_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
+            .downcast_ref::<UInt64Array>()
             .unwrap();
 
-        // Verify first column (id) has 3 zones
-        assert_eq!(column_names.value(0), "id");
-        assert_eq!(zone_ids.value(0), 0);
-        assert_eq!(zone_starts.value(0), 0);
-        assert_eq!(zone_lengths.value(0), 1_000_000);
-
-        assert_eq!(column_names.value(1), "id");
-        assert_eq!(zone_ids.value(1), 1);
-        assert_eq!(zone_starts.value(1), 1_000_000);
-        assert_eq!(zone_lengths.value(1), 1_000_000);
-
-        assert_eq!(column_names.value(2), "id");
-        assert_eq!(zone_ids.value(2), 2);
-        assert_eq!(zone_starts.value(2), 2_000_000);
-        assert_eq!(zone_lengths.value(2), 500_000);
-
-        // Verify second column (value) has 3 zones
-        assert_eq!(column_names.value(3), "value");
-        assert_eq!(zone_ids.value(3), 0);
-        assert_eq!(zone_starts.value(3), 0);
-
-        assert_eq!(column_names.value(4), "value");
-        assert_eq!(zone_ids.value(4), 1);
-
-        assert_eq!(column_names.value(5), "value");
-        assert_eq!(zone_ids.value(5), 2);
+        assert_eq!(starts.value(0), 0);
+        assert_eq!(lengths.value(0), 1_000_000);
+        assert_eq!(starts.value(1), 1_000_000);
+        assert_eq!(lengths.value(1), 1_000_000);
+        assert_eq!(starts.value(2), 2_000_000);
+        assert_eq!(lengths.value(2), 500_000);
     }
 
     #[tokio::test]
     async fn test_column_stats_multiple_columns() {
-        // Test that stats are correctly computed for multiple columns with multiple zones
+        // Test that stats are correctly computed for multiple columns with multiple zones.
+        // Columnar layout: one column per dataset column (col1, col2, col3), one row per zone.
         use arrow_array::{Float64Array, Int32Array};
         use arrow_schema::Schema;
 
@@ -2963,46 +2917,33 @@ mod tests {
             .unwrap()
             .expect("Should have column stats");
 
-        // Should have 6 rows: 3 columns × 2 zones each
-        assert_eq!(stats_batch.num_rows(), 6);
+        // Columnar layout: 3 columns (col1, col2, col3), 2 rows (one per zone)
+        assert_eq!(stats_batch.num_columns(), 3);
+        assert_eq!(stats_batch.num_rows(), 2);
 
-        // Verify all required columns exist
-        assert!(stats_batch.column_by_name("column_name").is_some());
-        assert!(stats_batch.column_by_name("zone_id").is_some());
-        assert!(stats_batch.column_by_name("min_value").is_some());
-        assert!(stats_batch.column_by_name("max_value").is_some());
-        assert!(stats_batch.column_by_name("null_count").is_some());
+        assert!(stats_batch.column_by_name("col1").is_some());
+        assert!(stats_batch.column_by_name("col2").is_some());
+        assert!(stats_batch.column_by_name("col3").is_some());
 
-        let column_names = stats_batch
-            .column_by_name("column_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        // Verify we have stats for all 3 columns (each appears twice for 2 zones)
-        let mut col1_count = 0;
-        let mut col2_count = 0;
-        let mut col3_count = 0;
-
-        for i in 0..stats_batch.num_rows() {
-            match column_names.value(i) {
-                "col1" => col1_count += 1,
-                "col2" => col2_count += 1,
-                "col3" => col3_count += 1,
-                _ => panic!("Unexpected column name"),
-            }
+        // Each column is a StructArray (ColumnZoneStatistics) with min, max, null_count, nan_count, bound
+        for col_name in ["col1", "col2", "col3"] {
+            let col = stats_batch.column_by_name(col_name).unwrap();
+            let struct_arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .unwrap();
+            assert!(struct_arr.column_by_name("min").is_some());
+            assert!(struct_arr.column_by_name("max").is_some());
+            assert!(struct_arr.column_by_name("null_count").is_some());
+            assert!(struct_arr.column_by_name("bound").is_some());
         }
-
-        assert_eq!(col1_count, 2); // 2 zones
-        assert_eq!(col2_count, 2); // 2 zones
-        assert_eq!(col3_count, 2); // 2 zones
     }
 
     #[tokio::test]
     async fn test_column_stats_with_nulls_and_nans() {
-        // Test that null_count and nan_count are correctly tracked
-        use arrow_array::{Float64Array, Int32Array};
+        // Test that null_count and nan_count are correctly tracked.
+        // Columnar layout: one column per dataset column (id, value), one row per zone.
+        use arrow_array::{Float64Array, Int32Array, StructArray, UInt32Array};
         use arrow_schema::Schema;
 
         let arrow_schema = Arc::new(Schema::new(vec![
@@ -3063,38 +3004,52 @@ mod tests {
             .unwrap()
             .expect("Should have column stats");
 
-        // Should have 2 rows: 2 columns × 1 zone each (only 5 rows total)
-        assert_eq!(stats_batch.num_rows(), 2);
+        // Columnar layout: 2 columns (id, value), 1 row (one zone for 5 rows)
+        assert_eq!(stats_batch.num_columns(), 2);
+        assert_eq!(stats_batch.num_rows(), 1);
 
-        let column_names = stats_batch
-            .column(0)
+        let id_col = stats_batch
+            .column_by_name("id")
+            .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
-        let null_counts = stats_batch
-            .column(4)
+        let value_col = stats_batch
+            .column_by_name("value")
+            .unwrap()
             .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .unwrap();
-        let nan_counts = stats_batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
+            .downcast_ref::<StructArray>()
             .unwrap();
 
-        // Find id column stats
-        let id_idx = (0..stats_batch.num_rows())
-            .find(|&i| column_names.value(i) == "id")
+        let id_null_counts = id_col
+            .column_by_name("null_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
             .unwrap();
-        assert_eq!(null_counts.value(id_idx), 2); // 2 nulls in id column
-        assert_eq!(nan_counts.value(id_idx), 0); // No NaNs in int column
+        let id_nan_counts = id_col
+            .column_by_name("nan_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let value_null_counts = value_col
+            .column_by_name("null_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let value_nan_counts = value_col
+            .column_by_name("nan_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
 
-        // Find value column stats
-        let value_idx = (0..stats_batch.num_rows())
-            .find(|&i| column_names.value(i) == "value")
-            .unwrap();
-        assert_eq!(null_counts.value(value_idx), 0); // No nulls in value column
-        assert_eq!(nan_counts.value(value_idx), 2); // 2 NaNs in value column
+        assert_eq!(id_null_counts.value(0), 2); // 2 nulls in id column
+        assert_eq!(id_nan_counts.value(0), 0); // No NaNs in int column
+        assert_eq!(value_null_counts.value(0), 0); // No nulls in value column
+        assert_eq!(value_nan_counts.value(0), 2); // 2 NaNs in value column
     }
 
     #[tokio::test]

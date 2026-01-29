@@ -26,13 +26,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
-use arrow_buffer::OffsetBuffer;
-// These are only used in tests
-#[cfg_attr(not(test), allow(unused_imports))]
-use arrow_array::Float32Array;
 use arrow_array::StructArray;
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::scalar::ScalarValue;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_core::utils::zone::ZoneBound;
@@ -58,14 +56,15 @@ pub struct ZoneStats {
     pub zone_id: u32,
     pub null_count: u32,
     pub nan_count: u32,
-    pub min: String, // ScalarValue as string (no type prefix)
-    pub max: String, // ScalarValue as string (no type prefix)
+    pub min: ScalarValue,
+    pub max: ScalarValue,
 }
 
 /// Consolidate column statistics from all fragments into a single file.
 ///
 /// This function implements an "all-or-nothing" approach: if any fragment
 /// lacks column statistics, consolidation is skipped entirely.
+/// It should be relaxed in the future to support partial stats dataset consolidation. #5857
 ///
 /// # How It Works
 ///
@@ -141,10 +140,7 @@ pub struct ZoneStats {
 /// - List elements are ordered by `(zone_id, fragment_id)`: all zone 0s first, then all zone 1s, etc.
 /// - Each dataset column has its own column in the consolidated file
 ///
-pub async fn consolidate_column_stats(
-    dataset: &Dataset,
-    new_version: u64,
-) -> Result<Option<String>> {
+pub async fn consolidate_column_stats(dataset: &Dataset) -> Result<Option<String>> {
     // Step 1: Pre-check - ALL fragments must have stats (all-or-nothing)
     let fragments = dataset.get_fragments();
     let total_fragments = fragments.len();
@@ -176,8 +172,6 @@ pub async fn consolidate_column_stats(
 
             if let Some(file_stats) = file_stats {
                 for (col_name, zones) in file_stats {
-                    // Keep local zone_start (per requirement: no global zone_start calculation)
-                    // Just update fragment_id
                     let adjusted_zones: Vec<ZoneStats> = zones
                         .into_iter()
                         .map(|z| ZoneStats {
@@ -211,24 +205,19 @@ pub async fn consolidate_column_stats(
     // Step 3: Build consolidated batch
     let consolidated_batch = build_consolidated_batch(stats_by_column, dataset.schema())?;
 
-    // Note: The schema is now dynamic (one column per dataset column), so we don't use
-    // the static CONSOLIDATED_STATS_SCHEMA anymore
-
-    // Step 4: Write as Lance file (version is stored in metadata, not filename)
+    // Step 4: Write as Lance file
     let stats_path = String::from("_stats/column_stats.lance");
     write_stats_file(
         dataset.object_store(),
         &dataset.base.child(stats_path.as_str()),
         consolidated_batch,
-        new_version,
     )
     .await?;
 
     log::info!(
-        "Consolidated column stats from {} fragments into {} (version {})",
+        "Consolidated column stats from {} fragments into {}",
         total_fragments,
         stats_path,
-        new_version
     );
 
     Ok(Some(stats_path))
@@ -359,20 +348,11 @@ async fn read_fragment_column_stats(
                 location: location!(),
             })?;
 
-        // Extract fields from the ColumnZoneStatistics struct
+        // Extract min/max arrays (typed as the column's type in fragment stats)
         let min_array = struct_array
             .column_by_name("min")
             .ok_or_else(|| Error::Internal {
                 message: format!("Missing 'min' field in column stats for '{}'", col_name),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected StringArray for 'min' field in column '{}'",
-                    col_name
-                ),
                 location: location!(),
             })?;
 
@@ -380,15 +360,6 @@ async fn read_fragment_column_stats(
             .column_by_name("max")
             .ok_or_else(|| Error::Internal {
                 message: format!("Missing 'max' field in column stats for '{}'", col_name),
-                location: location!(),
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Expected StringArray for 'max' field in column '{}'",
-                    col_name
-                ),
                 location: location!(),
             })?;
 
@@ -502,6 +473,26 @@ async fn read_fragment_column_stats(
         // zone_idx is the zone_id within the fragment
         let mut zones = Vec::with_capacity(num_zones);
         for zone_idx in 0..num_zones {
+            let min_scalar =
+                ScalarValue::try_from_array(min_array.as_ref(), zone_idx).map_err(|e| {
+                    Error::Internal {
+                        message: format!(
+                            "Failed to get min ScalarValue for column '{}': {}",
+                            col_name, e
+                        ),
+                        location: location!(),
+                    }
+                })?;
+            let max_scalar =
+                ScalarValue::try_from_array(max_array.as_ref(), zone_idx).map_err(|e| {
+                    Error::Internal {
+                        message: format!(
+                            "Failed to get max ScalarValue for column '{}': {}",
+                            col_name, e
+                        ),
+                        location: location!(),
+                    }
+                })?;
             let zone_stat = ZoneStats {
                 bound: ZoneBound {
                     fragment_id: fragment_id_array.value(zone_idx),
@@ -511,8 +502,8 @@ async fn read_fragment_column_stats(
                 zone_id: zone_idx as u32,
                 null_count: null_count_array.value(zone_idx),
                 nan_count: nan_count_array.value(zone_idx),
-                min: min_array.value(zone_idx).to_string(),
-                max: max_array.value(zone_idx).to_string(),
+                min: min_scalar,
+                max: max_scalar,
             };
             zones.push(zone_stat);
         }
@@ -526,20 +517,17 @@ async fn read_fragment_column_stats(
 /// Create Arrow schema for consolidated statistics
 ///
 /// Schema: one column per dataset column, each of type List<struct>
-/// where struct contains: fragment_id, zone_start, zone_length, null_count, nan_count, min_value, max_value
-/// One row total
 pub(crate) fn create_consolidated_stats_schema(dataset_schema: &Schema) -> Arc<ArrowSchema> {
-    let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
-
     let fields: Vec<ArrowField> = dataset_schema
         .fields
         .iter()
         .map(|field| {
+            let column_type = field.data_type();
             ArrowField::new(
                 &field.name,
                 DataType::List(Arc::new(ArrowField::new(
                     "zone",
-                    consolidated_zone_struct_type.clone(),
+                    create_consolidated_zone_struct_type(&column_type),
                     false,
                 ))),
                 false,
@@ -559,7 +547,6 @@ fn build_consolidated_batch(
     stats_by_column: HashMap<String, Vec<ZoneStats>>,
     dataset_schema: &Schema,
 ) -> Result<RecordBatch> {
-    let consolidated_zone_struct_type = create_consolidated_zone_struct_type();
     let mut column_arrays: Vec<ArrayRef> = Vec::new();
     let mut schema_fields: Vec<ArrowField> = Vec::new();
 
@@ -579,14 +566,12 @@ fn build_consolidated_batch(
             // Sort zones by zone_id first, then fragment_id (as per requirements)
             zones.sort_by_key(|z| (z.zone_id, z.bound.fragment_id));
 
-            // Build arrays for the struct fields
+            // Build arrays for the struct fields; min/max use ScalarValue::iter_to_array (typed)
             let mut fragment_ids = Vec::with_capacity(zones.len());
             let mut zone_starts = Vec::with_capacity(zones.len());
             let mut zone_lengths = Vec::with_capacity(zones.len());
             let mut null_counts = Vec::with_capacity(zones.len());
             let mut nan_counts = Vec::with_capacity(zones.len());
-            let mut min_values = Vec::with_capacity(zones.len());
-            let mut max_values = Vec::with_capacity(zones.len());
 
             for zone in &zones {
                 fragment_ids.push(zone.bound.fragment_id);
@@ -594,11 +579,23 @@ fn build_consolidated_batch(
                 zone_lengths.push(zone.bound.length as u64);
                 null_counts.push(zone.null_count);
                 nan_counts.push(zone.nan_count);
-                min_values.push(zone.min.clone());
-                max_values.push(zone.max.clone());
             }
 
-            // Build the struct array for this column's zones
+            let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
+                .map_err(|e| Error::Internal {
+                    message: format!("Failed to build min array for column '{}': {}", col_name, e),
+                    location: location!(),
+                })?;
+            let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
+                .map_err(|e| Error::Internal {
+                    message: format!("Failed to build max array for column '{}': {}", col_name, e),
+                    location: location!(),
+                })?;
+
+            let column_type = field.data_type();
+            let consolidated_zone_struct_type = create_consolidated_zone_struct_type(&column_type);
+
+            // Build the struct array for this column's zones (min/max are typed)
             let zone_struct_array = StructArray::from(vec![
                 (
                     Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
@@ -621,12 +618,12 @@ fn build_consolidated_batch(
                     Arc::new(UInt32Array::from(nan_counts.clone())) as ArrayRef,
                 ),
                 (
-                    Arc::new(ArrowField::new("min_value", DataType::Utf8, false)),
-                    Arc::new(StringArray::from(min_values.clone())) as ArrayRef,
+                    Arc::new(ArrowField::new("min_value", column_type.clone(), true)),
+                    min_array,
                 ),
                 (
-                    Arc::new(ArrowField::new("max_value", DataType::Utf8, false)),
-                    Arc::new(StringArray::from(max_values.clone())) as ArrayRef,
+                    Arc::new(ArrowField::new("max_value", column_type.clone(), true)),
+                    max_array,
                 ),
             ]);
 
@@ -635,7 +632,7 @@ fn build_consolidated_batch(
             let offsets = OffsetBuffer::from_lengths([zones.len()]);
             let list_field = Arc::new(ArrowField::new(
                 "zone",
-                consolidated_zone_struct_type.clone(),
+                consolidated_zone_struct_type,
                 false,
             ));
             let list_array = ListArray::try_new(
@@ -692,7 +689,6 @@ async fn write_stats_file(
     object_store: &ObjectStore,
     path: &Path,
     batch: RecordBatch,
-    version: u64,
 ) -> Result<()> {
     use lance_file::writer::{FileWriter, FileWriterOptions};
 
@@ -707,11 +703,11 @@ async fn write_stats_file(
     let mut writer = FileWriter::try_new(
         object_store.create(path).await?,
         lance_schema,
-        FileWriterOptions::default(),
+        FileWriterOptions {
+            disable_column_stats: true, // Consolidated stats file has List<struct> columns; no per-column min/max
+            ..Default::default()
+        },
     )?;
-
-    // Store dataset version in file metadata
-    writer.add_schema_metadata("lance:dataset:version", version.to_string());
 
     writer.write_batch(&batch).await?;
     writer.finish().await?;
@@ -803,7 +799,7 @@ mod tests {
         batches
     }
     use crate::Dataset;
-    use arrow_array::{Int32Array, RecordBatchIterator, StringArray as ArrowStringArray};
+    use arrow_array::{Float32Array, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_testing::datagen::generate_random_array;
 
@@ -828,7 +824,7 @@ mod tests {
                 schema.clone(),
                 vec![
                     Arc::new(Int32Array::from_iter_values((i * 100)..((i + 1) * 100))),
-                    Arc::new(ArrowStringArray::from_iter_values(
+                    Arc::new(StringArray::from_iter_values(
                         ((i * 100)..((i + 1) * 100))
                             .map(|n| format!("name_{}", n))
                             .collect::<Vec<_>>(),
@@ -859,9 +855,7 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 3);
 
         // Test consolidation
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         assert!(
             result.is_some(),
@@ -948,21 +942,21 @@ mod tests {
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(
             format!("{:?}", mins),
-            format!("{:?}", StringArray::from(vec!["0", "100", "200"]))
+            format!("{:?}", Int32Array::from(vec![0, 100, 200]))
         );
         let maxs = id_struct
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(
             format!("{:?}", maxs),
-            format!("{:?}", StringArray::from(vec!["99", "199", "299"]))
+            format!("{:?}", Int32Array::from(vec![99, 199, 299]))
         );
 
         // Verify "name" column stats
@@ -1016,7 +1010,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_offset_preservation() {
-        // Test that zone offsets remain local (per fragment), not global
+        // Test that zone offsets remain local (per fragment), not global.
+        // 205 rows: fragment 0 has 100 rows; append of 105 with max_rows_per_file=100
+        // yields fragment 1 (100 rows) and fragment 2 (5 rows) — 3 zones total.
         use lance_core::utils::tempfile::TempStrDir;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1025,47 +1021,44 @@ mod tests {
             "value",
             DataType::Int32,
             false,
-        )])); // Note: Different from id_schema, using "value" field name
+        )]));
 
         let write_params = WriteParams {
             max_rows_per_file: 100,
-            disable_column_stats: false, // Stats enabled
+            disable_column_stats: false,
             ..Default::default()
         };
 
-        // Create 2 fragments with 100 rows each
-        for i in 0..2 {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(
-                    (i * 100)..((i + 1) * 100),
-                ))],
-            )
+        // Fragment 0: 100 rows (values 0..100)
+        let batch0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+        let reader0 = RecordBatchIterator::new(vec![Ok(batch0)], schema.clone());
+        Dataset::write(reader0, test_uri, Some(write_params.clone()))
+            .await
             .unwrap();
-            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-            if i == 0 {
-                Dataset::write(reader, test_uri, Some(write_params.clone()))
-                    .await
-                    .unwrap();
-            } else {
-                let _dataset = Dataset::open(test_uri).await.unwrap();
-                let append_params = WriteParams {
-                    mode: crate::dataset::WriteMode::Append,
-                    disable_column_stats: false, // Stats enabled
-                    ..Default::default()
-                };
-                Dataset::write(reader, test_uri, Some(append_params))
-                    .await
-                    .unwrap();
-            }
-        }
+        // Fragment 1: 105 rows (values 100..205) -> 2 files due to max_rows_per_file=100
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(100..205))],
+        )
+        .unwrap();
+        let reader1 = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        let append_params = WriteParams {
+            mode: crate::dataset::WriteMode::Append,
+            max_rows_per_file: 100,
+            disable_column_stats: false,
+            ..Default::default()
+        };
+        Dataset::write(reader1, test_uri, Some(append_params))
+            .await
+            .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let stats_path = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap()
-            .unwrap();
+        let stats_path = consolidate_column_stats(&dataset).await.unwrap().unwrap();
 
         // Read the consolidated stats file
         let batches = read_stats_file(&dataset, &stats_path).await;
@@ -1090,6 +1083,13 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
 
+        let zone_lengths = struct_array
+            .column_by_name("zone_length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
         let fragment_ids = struct_array
             .column_by_name("fragment_id")
             .unwrap()
@@ -1097,8 +1097,49 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
 
-        // Should have at least 1 zone
-        assert!(!zone_starts.is_empty());
+        let min_values = struct_array
+            .column_by_name("min_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        let max_values = struct_array
+            .column_by_name("max_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // 3 zones total: frag0 1 file, frag1 2 files (100 + 5 rows)
+        assert_eq!(
+            zone_starts.len(),
+            3,
+            "expected 3 zones for 205 rows (100 + 105)"
+        );
+        assert_eq!(zone_lengths.len(), 3);
+        assert_eq!(fragment_ids.len(), 3);
+
+        // Zone 0: fragment 0, start=0, length=100, min=0, max=99
+        assert_eq!(fragment_ids.value(0), 0);
+        assert_eq!(zone_starts.value(0), 0);
+        assert_eq!(zone_lengths.value(0), 100);
+        assert_eq!(min_values.value(0), 0);
+        assert_eq!(max_values.value(0), 99);
+
+        // Zone 1: fragment 1, first file, start=0, length=100, min=100, max=199
+        assert_eq!(fragment_ids.value(1), 1);
+        assert_eq!(zone_starts.value(1), 0);
+        assert_eq!(zone_lengths.value(1), 100);
+        assert_eq!(min_values.value(1), 100);
+        assert_eq!(max_values.value(1), 199);
+
+        // Zone 2: fragment 2 (second file from append), start=0, length=5, min=200, max=204
+        assert_eq!(fragment_ids.value(2), 2);
+        assert_eq!(zone_starts.value(2), 0);
+        assert_eq!(zone_lengths.value(2), 5);
+        assert_eq!(min_values.value(2), 200);
+        assert_eq!(max_values.value(2), 204);
 
         // Verify that zones from the same fragment have local offsets (starting from 0)
         // Zones are ordered by zone_id first, then fragment_id
@@ -1108,7 +1149,7 @@ mod tests {
             let zone_start = zone_starts.value(i);
             fragment_zone_starts
                 .entry(frag_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(zone_start);
         }
 
@@ -1148,9 +1189,7 @@ mod tests {
         dataset = Dataset::open(test_uri).await.unwrap();
 
         // Should still work but return None (no data to consolidate)
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         // With deletions, fragments still exist, so consolidation should work
         // This tests that we handle the case gracefully
@@ -1170,7 +1209,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from_iter_values(0..100)),
                 Arc::new(generate_random_array(100)),
-                Arc::new(ArrowStringArray::from_iter_values(
+                Arc::new(StringArray::from_iter_values(
                     (0..100).map(|i| format!("str_{}", i)),
                 )),
             ],
@@ -1188,9 +1227,7 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         assert!(result.is_some(), "Should handle multiple column types");
 
@@ -1217,16 +1254,16 @@ mod tests {
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
         let int_maxs = int_struct
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(int_mins.value(0), "0");
-        assert_eq!(int_maxs.value(int_maxs.len() - 1), "99");
+        assert_eq!(int_mins.value(0), 0);
+        assert_eq!(int_maxs.value(int_maxs.len() - 1), 99);
 
         // Verify float_col
         let float_col = batch
@@ -1238,24 +1275,23 @@ mod tests {
         let float_struct = float_col.value(0);
         let float_struct = float_struct.as_any().downcast_ref::<StructArray>().unwrap();
 
-        let float_mins_array = float_struct
+        let float_mins = float_struct
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Float32Array>()
             .unwrap();
-        let float_mins = float_mins_array;
         let float_maxs = float_struct
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Float32Array>()
             .unwrap();
         assert_eq!(float_mins.len(), float_maxs.len());
         // For each zone, verify min <= max
         for i in 0..float_mins.len() {
-            let min_val: f32 = float_mins.value(i).parse().unwrap();
-            let max_val: f32 = float_maxs.value(i).parse().unwrap();
+            let min_val: f32 = float_mins.value(i);
+            let max_val: f32 = float_maxs.value(i);
             assert!(
                 min_val <= max_val,
                 "Float column zone {}: min ({}) should be <= max ({})",
@@ -1347,9 +1383,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
 
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         assert!(
             result.is_some(),
@@ -1390,17 +1424,17 @@ mod tests {
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(mins.value(0), "0");
+        assert_eq!(mins.value(0), 0);
 
         let maxs = struct_array
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(maxs.value(maxs.len() - 1), "99");
+        assert_eq!(maxs.value(maxs.len() - 1), 99);
 
         // Verify zone_starts begin at 0
         let zone_starts = struct_array
@@ -1484,9 +1518,7 @@ mod tests {
         }
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         assert!(
             result.is_some(),
@@ -1525,23 +1557,23 @@ mod tests {
         assert_eq!(fragment_ids.value(0), 0);
         assert_eq!(fragment_ids.value(fragment_ids.len() - 1), 1);
 
+        // "id" column is Int64 in create_id_value_schema
         let mins = id_struct
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<arrow_array::Int64Array>()
             .unwrap();
         let maxs = id_struct
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<arrow_array::Int64Array>()
             .unwrap();
 
         // Verify min/max for "id" column spans the full range [0, 99999]
-        assert_eq!(mins.value(0), "0"); // First zone starts at 0
-        let last_max: i64 = maxs.value(maxs.len() - 1).parse().unwrap();
-        assert_eq!(last_max, 99999); // Last zone ends at 99999
+        assert_eq!(mins.value(0), 0); // First zone starts at 0
+        assert_eq!(maxs.value(maxs.len() - 1), 99999); // Last zone ends at 99999
 
         // Verify min/max for "value" column (Float32)
         let value_column = batch
@@ -1557,18 +1589,16 @@ mod tests {
             .column_by_name("min_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Float32Array>()
             .unwrap();
         let value_maxs = value_struct
             .column_by_name("max_value")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Float32Array>()
             .unwrap();
-        let first_min: f32 = value_mins.value(0).parse().unwrap();
-        let last_max: f32 = value_maxs.value(value_maxs.len() - 1).parse().unwrap();
-        assert_eq!(first_min, 0.0);
-        assert_eq!(last_max, 99999.0);
+        assert_eq!(value_mins.value(0), 0.0);
+        assert_eq!(value_maxs.value(value_maxs.len() - 1), 99999.0);
 
         // Verify zone_starts are local (per fragment)
         let zone_starts = id_struct
@@ -1647,9 +1677,7 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let result = consolidate_column_stats(&dataset, dataset.manifest.version + 1)
-            .await
-            .unwrap();
+        let result = consolidate_column_stats(&dataset).await.unwrap();
 
         assert!(
             result.is_some(),

@@ -124,7 +124,7 @@ use tracing::{info, warn};
 mod binary_copy;
 pub mod remapping;
 
-use crate::dataset::write::COLUMN_STATS_ENABLED_KEY;
+use crate::dataset::write::COLUMN_STATS_DISABLED_KEY;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
@@ -2174,13 +2174,8 @@ pub async fn commit_compaction(
 
     // Consolidate column statistics if enabled (after the commit)
     if options.consolidate_column_stats {
-        let new_version = dataset.manifest.version;
         if let Some(stats_path) =
-            crate::dataset::column_stats_consolidator::consolidate_column_stats(
-                dataset,
-                new_version,
-            )
-            .await?
+            crate::dataset::column_stats_consolidator::consolidate_column_stats(dataset).await?
         {
             // Update manifest with column stats using protobuf struct
             let column_stats = pb::ColumnStats {
