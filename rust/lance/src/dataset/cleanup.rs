@@ -738,9 +738,17 @@ fn tagged_old_versions_cleanup_error(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use super::*;
+    use crate::blob::{blob_field, BlobArrayBuilder};
+    use crate::{
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        index::vector::VectorIndexParams,
+    };
+    use all_asserts::{assert_gt, assert_lt};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::object_store::{
@@ -751,14 +759,6 @@ mod tests {
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use mock_instant::thread_local::MockClock;
     use snafu::location;
-    use super::*;
-    use crate::blob::{blob_field, BlobArrayBuilder};
-    use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
-        index::vector::VectorIndexParams,
-    };
-    use all_asserts::{assert_gt, assert_lt};
-    use lance_core::utils::tempfile::TempStrDir;
 
     #[derive(Debug)]
     struct MockObjectStore {
