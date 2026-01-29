@@ -251,6 +251,8 @@ impl ProjectionPlan {
         let mut with_row_id = false;
         let mut with_row_addr = false;
         let mut must_add_row_offset = false;
+        let mut with_row_last_updated_at_version = false;
+        let mut with_row_created_at_version = false;
 
         for field in projection.fields.iter() {
             if lance_core::is_system_column(&field.name) {
@@ -260,10 +262,14 @@ impl ProjectionPlan {
                     must_add_row_offset = true;
                 } else if field.name == ROW_ADDR {
                     with_row_addr = true;
+                } else if field.name == ROW_OFFSET {
+                    with_row_addr = true;
                     must_add_row_offset = true;
+                } else if field.name == ROW_LAST_UPDATED_AT_VERSION {
+                    with_row_last_updated_at_version = true;
+                } else if field.name == ROW_CREATED_AT_VERSION {
+                    with_row_created_at_version = true;
                 }
-                // Note: Other system columns like _rowoffset are computed differently
-                // and shouldn't appear in the schema at this point
             } else {
                 // Regular data column - validate it exists in base schema
                 if base.schema().field(&field.name).is_none() {
@@ -286,6 +292,8 @@ impl ProjectionPlan {
         let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
         physical_projection.with_row_id = with_row_id;
         physical_projection.with_row_addr = with_row_addr;
+        physical_projection.with_row_last_updated_at_version = with_row_last_updated_at_version;
+        physical_projection.with_row_created_at_version = with_row_created_at_version;
 
         // Build output expressions preserving the original order (including system columns)
         let exprs = projection
@@ -415,8 +423,18 @@ impl ProjectionPlan {
     #[instrument(skip_all, level = "debug")]
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
-        let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
+
+        // Need to add ROW_OFFSET to get filterable schema
+        let extra_columns = vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new(ROW_OFFSET, DataType::UInt64, true),
+        ];
+        let mut filterable_schema = self.physical_projection.to_schema();
+        filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?;
+
+        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
+
         // Run dummy plan to execute projection, do not log the plan run
         let stream = execute_plan(
             projection,

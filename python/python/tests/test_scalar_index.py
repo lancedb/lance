@@ -1554,6 +1554,35 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_btree_remap_big_deletions(tmp_path: Path):
+    # Write 15K rows in 3 fragments
+    ds = lance.write_dataset(pa.table({"a": range(5000)}), tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"a": range(5000, 10000)}), tmp_path, mode="append"
+    )
+    ds = lance.write_dataset(
+        pa.table({"a": range(10000, 15000)}), tmp_path, mode="append"
+    )
+
+    # Create index (will have 4 pages)
+    ds.create_scalar_index("a", index_type="BTREE")
+
+    # Delete a lot of data (now there will only be two pages worth)
+    ds.delete("a > 1000 AND a < 10000")
+
+    # Run compaction (deletions will be materialized)
+    ds.optimize.compact_files()
+
+    # Reload dataset and ensure index still works
+    ds = lance.dataset(tmp_path)
+
+    for idx in [0, 500, 1000, 10000, 13000, 14000, 14999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 1
+
+    for idx in [1001, 5000, 8000, 9999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 0
+
+
 def test_bitmap_remap(tmp_path: Path):
     # Make one full fragment
     tbl = pa.Table.from_arrays(

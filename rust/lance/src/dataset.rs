@@ -18,14 +18,14 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
@@ -335,47 +335,9 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // Separate data columns from system columns
-        // System columns need to be added to the schema manually since Schema::project
-        // doesn't include them (they're virtual columns)
-        let mut data_columns = Vec::new();
-        let mut system_fields = Vec::new();
-
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // For now we only support _rowid and _rowaddr in projections
-                if col == ROW_ID {
-                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
-                } else if col == ROW_ADDR {
-                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
-                }
-                // Note: Other system columns like _rowoffset are handled differently
-            } else {
-                data_columns.push(col.as_str());
-            }
-        }
-
-        // Project only the data columns
-        let mut schema = dataset_schema.project(&data_columns).unwrap();
-
-        // Add system fields in the order they appeared in the original columns list
-        // We need to reconstruct the proper order
-        let mut final_fields = Vec::new();
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // Find and add the system field
-                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            } else {
-                // Find and add the data field
-                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            }
-        }
-
-        schema.fields = final_fields;
+        let schema = dataset_schema
+            .project_preserve_system_columns(&columns)
+            .unwrap();
         Self::Schema(Arc::new(schema))
     }
 

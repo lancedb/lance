@@ -5,21 +5,24 @@ use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
+use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::Field as ArrowField;
+use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_expr::Expr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
-use lance_core::ROW_ADDR;
-use lance_datafusion::projection::ProjectionPlan;
+use lance_core::{ROW_ADDR, ROW_OFFSET};
+use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use snafu::location;
 
 use super::ProjectionRequest;
@@ -125,12 +128,37 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
+#[allow(clippy::needless_question_mark)]
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
+    // If we need row addresses in output, add to projection's output expressions
+    let projection = if builder.with_row_address {
+        let mut proj = (*projection).clone();
+        // Add _rowaddr to output if not already present
+        if !proj
+            .requested_output_expr
+            .iter()
+            .any(|c| c.name == ROW_ADDR)
+        {
+            proj.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ADDR)),
+                name: ROW_ADDR.to_string(),
+            });
+        }
+        Arc::new(proj)
+    } else {
+        projection
+    };
+
     let with_row_id_in_projection = projection.physical_projection.with_row_id;
     let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
+    let with_row_created_at_version_in_projection =
+        projection.physical_projection.with_row_created_at_version;
+    let with_row_last_updated_at_version_in_projection = projection
+        .physical_projection
+        .with_row_last_updated_at_version;
 
     let row_addrs = builder.get_row_addrs().await?.clone();
 
@@ -160,6 +188,8 @@ async fn do_take_rows(
         projection: Arc<Schema>,
         with_row_id: bool,
         with_row_addresses: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
@@ -168,14 +198,15 @@ async fn do_take_rows(
                     projection.as_ref(),
                     with_row_id,
                     with_row_addresses,
+                    with_row_created_at_version,
+                    with_row_last_updated_at_version,
                 )
                 .await
         }
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
-
-    let batch = if row_addr_stats.contiguous {
+    let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
@@ -195,7 +226,9 @@ async fn do_take_rows(
 
         let read_config = FragReadConfig::default()
             .with_row_id(with_row_id_in_projection)
-            .with_row_address(with_row_addr_in_projection);
+            .with_row_address(with_row_addr_in_projection)
+            .with_row_created_at_version(with_row_created_at_version_in_projection)
+            .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
         let reader = fragment.open(&physical_schema, read_config).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
@@ -243,6 +276,8 @@ async fn do_take_rows(
                 physical_schema.clone(),
                 with_row_id_in_projection,
                 with_row_addr_in_projection,
+                with_row_created_at_version_in_projection,
+                with_row_last_updated_at_version_in_projection,
             );
             batches.push(batch_fut);
         }
@@ -283,6 +318,8 @@ async fn do_take_rows(
                     physical_schema.clone(),
                     with_row_id_in_projection,
                     true,
+                    with_row_created_at_version_in_projection,
+                    with_row_last_updated_at_version_in_projection,
                 )
             })
             .buffered(builder.dataset.object_store.io_parallelism())
@@ -329,8 +366,8 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    let batch = projection.project_batch(batch).await?;
-    if builder.with_row_address {
+    if builder.with_row_address || projection.must_add_row_offset {
+        // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
             return Err(Error::NotSupported  {
             source: format!(
@@ -342,12 +379,26 @@ async fn do_take_rows(
             });
         }
 
-        let row_addr_col = Arc::new(UInt64Array::from(row_addrs));
-        let row_addr_field = ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-        Ok(batch.try_with_column(row_addr_field, row_addr_col)?)
-    } else {
-        Ok(batch)
+        let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
+
+        if projection.must_add_row_offset {
+            // compile and inject `ROW_OFFSET` column
+            let row_offset_col =
+                AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
+            let row_offset_field =
+                ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
+            batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+        }
+
+        if builder.with_row_address {
+            // inject `ROW_ADDR` column
+            let row_addr_field =
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
+            batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+        }
     }
+
+    Ok(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {

@@ -1299,7 +1299,7 @@ impl Dataset {
             Arc::new(
                 self.ds
                     .schema()
-                    .project(&columns)
+                    .project_preserve_system_columns(&columns)
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
