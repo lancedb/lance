@@ -350,10 +350,15 @@ impl Default for StructuralEncodingStrategy {
 
 impl StructuralEncodingStrategy {
     pub fn with_version(version: LanceFileVersion) -> Self {
+        let blob_version = if version >= LanceFileVersion::V2_2 {
+            BlobVersion::V2
+        } else {
+            BlobVersion::V1
+        };
         Self {
             compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
             version,
-            blob_version: BlobVersion::V1,
+            blob_version,
         }
     }
 

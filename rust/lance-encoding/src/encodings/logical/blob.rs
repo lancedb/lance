@@ -28,7 +28,6 @@ use crate::{
 };
 use lance_core::datatypes::BlobKind;
 #[cfg(test)]
-use lance_core::datatypes::BlobVersion;
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
@@ -518,7 +517,12 @@ mod tests {
         ]));
 
         // Use the standard test harness
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -593,9 +597,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_2)
-                .with_blob_version(BlobVersion::V2),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
             blob_metadata,
         )
         .await;
@@ -660,9 +662,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_2)
-                .with_blob_version(BlobVersion::V2),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
             blob_metadata,
         )
         .await;
@@ -724,9 +724,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_2)
-                .with_blob_version(BlobVersion::V2),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
             blob_metadata,
         )
         .await;

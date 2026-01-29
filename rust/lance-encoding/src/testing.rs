@@ -21,7 +21,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{datatypes::BlobVersion, utils::bit::pad_bytes, Result};
+use lance_core::{utils::bit::pad_bytes, Result};
 use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -32,8 +32,7 @@ use crate::{
     },
     encoder::{
         default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers, StructuralEncodingStrategy,
-        MIN_PAGE_BUFFER_ALIGNMENT,
+        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -403,7 +402,6 @@ pub struct TestCases {
     max_file_version: Option<LanceFileVersion>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
-    blob_version: Option<BlobVersion>,
 }
 
 impl Default for TestCases {
@@ -419,7 +417,6 @@ impl Default for TestCases {
             max_file_version: None,
             verify_encoding: None,
             expected_encoding: None,
-            blob_version: None,
         }
     }
 }
@@ -462,11 +459,6 @@ impl TestCases {
 
     pub fn with_min_file_version(mut self, version: LanceFileVersion) -> Self {
         self.min_file_version = Some(version);
-        self
-    }
-
-    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
-        self.blob_version = Some(blob_version);
         self
     }
 
@@ -754,26 +746,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for file_version in test_cases.get_versions() {
         for page_size in test_cases.page_sizes.iter() {
-            let encoding_strategy = if let Some(blob_version) = test_cases.blob_version {
-                if blob_version == BlobVersion::V1 {
-                    default_encoding_strategy(file_version)
-                } else {
-                    if file_version < LanceFileVersion::V2_2 {
-                        panic!("Blob version v2 requires file version >= 2.2");
-                    }
-                    match file_version.resolve() {
-                        LanceFileVersion::Legacy | LanceFileVersion::V2_0 => {
-                            panic!("Blob version v2 requires file version >= 2.2");
-                        }
-                        _ => Box::new(StructuralEncodingStrategy::with_version_and_blob_version(
-                            file_version,
-                            blob_version,
-                        )),
-                    }
-                }
-            } else {
-                default_encoding_strategy(file_version)
-            };
+            let encoding_strategy = default_encoding_strategy(file_version);
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
                 cache_bytes_per_column: *page_size,
