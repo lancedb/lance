@@ -419,36 +419,6 @@ impl StructuralEncodingStrategy {
 
         // Check if field is marked as blob
         if field.is_blob() {
-            if self.blob_version == BlobVersion::V2 && self.version < LanceFileVersion::V2_2 {
-                return Err(Error::InvalidInput {
-                    source: "Blob v2 requires file version >= 2.2".into(),
-                    location: location!(),
-                });
-            }
-
-            if self.blob_version == BlobVersion::V2 {
-                match data_type {
-                    DataType::Binary | DataType::LargeBinary | DataType::Struct(_) => {
-                        return Ok(Box::new(BlobV2StructuralEncoder::new(
-                            field,
-                            column_index.next_column_index(field.id as u32),
-                            options,
-                            self.compression_strategy.clone(),
-                        )?));
-                    }
-                    _ => {
-                        return Err(Error::InvalidInput {
-                            source: format!(
-                                "Blob encoding only supports Binary/LargeBinary or Struct, got {}",
-                                data_type
-                            )
-                            .into(),
-                            location: location!(),
-                        });
-                    }
-                }
-            }
-
             match data_type {
                 DataType::Binary | DataType::LargeBinary => {
                     return Ok(Box::new(BlobStructuralEncoder::new(
