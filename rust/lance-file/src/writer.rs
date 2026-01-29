@@ -310,22 +310,10 @@ impl FileWriter {
         schema.validate()?;
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
-        let encoding_strategy: Arc<dyn FieldEncodingStrategy> =
-            if let Some(encoding_strategy) = self.options.encoding_strategy.clone() {
-                encoding_strategy
-            } else {
-                let version = self.version();
-                match version.resolve() {
-                    LanceFileVersion::Legacy => {
-                        return Err(Error::invalid_input(
-                            "Cannot create encoding strategy for legacy file version",
-                            location!(),
-                        ));
-                    }
-                    LanceFileVersion::V2_0 => Arc::from(default_encoding_strategy(version)),
-                    _ => Arc::new(StructuralEncodingStrategy::with_version(version)),
-                }
-            };
+        let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
+            let version = self.version();
+            default_encoding_strategy(version).into()
+        });
 
         let encoding_options = EncodingOptions {
             cache_bytes_per_column,
