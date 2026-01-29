@@ -1218,7 +1218,7 @@ pub mod tests {
 
     use arrow::datatypes::UInt64Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Float32Array, Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{record_batch, Float32Array, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
@@ -1266,16 +1266,9 @@ pub mod tests {
 
     #[test]
     fn test_filter_batch_by_allowlist() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(ROW_ID, DataType::UInt64, false),
-            ArrowField::new("score", DataType::Float32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt64Array::from(vec![1_u64, 2, 3])),
-                Arc::new(Float32Array::from(vec![0.1_f32, 0.2, 0.3])),
-            ],
+        let batch = record_batch!(
+            (ROW_ID, UInt64, [1_u64, 2_u64, 3_u64]),
+            ("score", Float32, [0.1_f32, 0.2_f32, 0.3_f32])
         )
         .unwrap();
         let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([2_u64, 3]));
@@ -1290,13 +1283,7 @@ pub mod tests {
 
     #[test]
     fn test_filter_batch_by_allowlist_missing_row_id() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "x",
-            DataType::Int32,
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let batch = record_batch!(("x", Int32, [1_i32])).unwrap();
         let allowlist = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([1_u64]));
         let err = super::filter_batch_by_allowlist(batch, &allowlist).unwrap_err();
         assert!(err.to_string().contains("allowlist requires"));
@@ -1304,26 +1291,10 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_filter_stream_by_allowlist_drops_empty() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(ROW_ID, DataType::UInt64, false),
-            ArrowField::new("score", DataType::Float32, false),
-        ]));
-        let batch_empty = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(vec![1_u64])),
-                Arc::new(Float32Array::from(vec![0.1_f32])),
-            ],
-        )
-        .unwrap();
-        let batch_keep = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(vec![2_u64, 3])),
-                Arc::new(Float32Array::from(vec![0.2_f32, 0.3])),
-            ],
-        )
-        .unwrap();
+        let batch_empty = record_batch!((ROW_ID, UInt64, [1]), ("score", Float32, [0.1])).unwrap();
+        let batch_keep =
+            record_batch!((ROW_ID, UInt64, [2, 3]), ("score", Float32, [0.2, 0.3])).unwrap();
+        let schema = batch_empty.schema();
 
         let input = stream::iter(vec![Ok(batch_empty), Ok(batch_keep)]);
         let input = Box::pin(RecordBatchStreamAdapter::new(schema, input));
