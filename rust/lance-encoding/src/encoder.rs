@@ -428,6 +428,14 @@ impl StructuralEncodingStrategy {
                         self.compression_strategy.clone(),
                     )?));
                 }
+                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
+                    return Ok(Box::new(BlobV2StructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
                 DataType::Struct(_) => {
                     return Err(Error::InvalidInput {
                         source: "Blob struct input requires blob version v2".into(),
