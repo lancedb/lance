@@ -843,13 +843,6 @@ fn project_array(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
 }
 
 fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
-    if struct_array.fields().len() != struct_array.columns().len() {
-        return Err(ArrowError::SchemaError(format!(
-            "Invalid StructArray: {} fields but {} columns",
-            struct_array.fields().len(),
-            struct_array.columns().len()
-        )));
-    }
     if fields.is_empty() {
         return Ok(StructArray::new_empty_fields(
             struct_array.len(),
