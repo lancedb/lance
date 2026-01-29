@@ -2476,7 +2476,7 @@ impl Scanner {
             return Ok(Vec::new());
         }
 
-        let mut row_ids = Vec::new();
+        let mut row_ids = Vec::with_capacity(row_addrs.len());
         for fragment in self.dataset.manifest.fragments.iter() {
             let frag_id = fragment.id as u32;
             let Some(offsets) = addrs_by_frag.remove(&frag_id) else {
