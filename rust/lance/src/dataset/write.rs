@@ -193,6 +193,9 @@ pub struct WriteParams {
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
 
+    #[cfg(test)]
+    pub blob_version: Option<lance_core::datatypes::BlobVersion>,
+
     /// Experimental: if set to true, the writer will use stable row ids.
     /// These row ids are stable after compaction operations, but not after updates.
     /// This makes compaction more efficient, since with stable row ids no
@@ -260,6 +263,8 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             data_storage_version: None,
+            #[cfg(test)]
+            blob_version: None,
             enable_stable_row_ids: false,
             enable_v2_manifest_paths: true,
             session: None,
@@ -585,21 +590,6 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let write_storage_version = if let Some(dataset) = dataset {
-        let dataset_storage_version = dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
-        match params.mode {
-            WriteMode::Append | WriteMode::Create => dataset_storage_version,
-            WriteMode::Overwrite => params
-                .data_storage_version
-                .unwrap_or(dataset_storage_version),
-        }
-    } else {
-        params.storage_version_or_default()
-    };
-
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
@@ -622,19 +612,29 @@ pub async fn write_fragments_internal(
                     OnTypeMismatch::Error,
                 )?;
                 // Use the storage version from the dataset, ignoring any version from the user.
-                (write_schema, write_storage_version)
+                let data_storage_version = dataset
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_version()?;
+                (write_schema, data_storage_version)
             }
             WriteMode::Overwrite => {
                 // Overwrite, use the schema from the data.  If the user specified
                 // a storage version use that.  Otherwise use the version from the
                 // dataset.
-                (converted_schema, write_storage_version)
+                let data_storage_version = params.data_storage_version.unwrap_or(
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                );
+                (converted_schema, data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (converted_schema, write_storage_version)
+        (converted_schema, params.storage_version_or_default())
     };
 
     if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
@@ -822,31 +822,6 @@ pub async fn open_writer_with_options(
         })
     } else {
         let writer = object_store.create(&full_path).await?;
-        let has_blob_v2 = schema.fields.iter().any(|f| f.is_blob_v2());
-        if storage_version < LanceFileVersion::V2_2 && has_blob_v2 {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "Blob v2 requires file version >= 2.2 (got {:?})",
-                    storage_version
-                )
-                .into(),
-                location: location!(),
-            });
-        }
-        if storage_version >= LanceFileVersion::V2_2
-            && schema
-                .fields
-                .iter()
-                .any(|f| f.metadata.contains_key(BLOB_META_KEY))
-        {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
-                )
-                .into(),
-                location: location!(),
-            });
-        }
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
         let file_writer = current_writer::FileWriter::try_new(
             writer,
@@ -947,13 +922,11 @@ impl WriterGenerator {
             )
             .await?
         } else {
-            open_writer_with_options(
+            open_writer(
                 &self.object_store,
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
-                true,
-                None,
             )
             .await?
         };
