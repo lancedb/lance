@@ -19,7 +19,6 @@ use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
     EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
-    StructuralEncodingStrategy,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;

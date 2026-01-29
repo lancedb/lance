@@ -19,7 +19,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use lance_core::datatypes::{BlobVersion, Field, Schema};
+use lance_core::datatypes::{Field, Schema};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
@@ -311,15 +311,9 @@ pub fn default_encoding_strategy_with_params(
         _ => {
             let compression_strategy =
                 Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
-            let blob_version = if version >= LanceFileVersion::V2_2 {
-                BlobVersion::V2
-            } else {
-                BlobVersion::V1
-            };
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,
-                blob_version,
             }))
         }
     }
@@ -330,7 +324,6 @@ pub fn default_encoding_strategy_with_params(
 pub struct StructuralEncodingStrategy {
     pub compression_strategy: Arc<dyn CompressionStrategy>,
     pub version: LanceFileVersion,
-    pub blob_version: BlobVersion,
 }
 
 // For some reason, clippy thinks we can add Default to the above derive but
@@ -341,33 +334,15 @@ impl Default for StructuralEncodingStrategy {
         Self {
             compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
             version: LanceFileVersion::default(),
-            blob_version: BlobVersion::V1,
         }
     }
 }
 
 impl StructuralEncodingStrategy {
     pub fn with_version(version: LanceFileVersion) -> Self {
-        let blob_version = if version >= LanceFileVersion::V2_2 {
-            BlobVersion::V2
-        } else {
-            BlobVersion::V1
-        };
         Self {
             compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
             version,
-            blob_version,
-        }
-    }
-
-    pub fn with_version_and_blob_version(
-        version: LanceFileVersion,
-        blob_version: BlobVersion,
-    ) -> Self {
-        Self {
-            compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
-            version,
-            blob_version,
         }
     }
 
