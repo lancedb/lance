@@ -193,9 +193,6 @@ pub struct WriteParams {
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
 
-    #[cfg(test)]
-    pub blob_version: Option<lance_core::datatypes::BlobVersion>,
-
     /// Experimental: if set to true, the writer will use stable row ids.
     /// These row ids are stable after compaction operations, but not after updates.
     /// This makes compaction more efficient, since with stable row ids no
@@ -263,8 +260,6 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             data_storage_version: None,
-            #[cfg(test)]
-            blob_version: None,
             enable_stable_row_ids: false,
             enable_v2_manifest_paths: true,
             session: None,
