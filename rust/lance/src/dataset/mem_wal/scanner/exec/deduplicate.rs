@@ -27,20 +27,27 @@ use futures::{Stream, StreamExt};
 use lance_core::{Error, Result};
 use snafu::location;
 
-use super::generation_tag::GENERATION_COLUMN;
+use super::generation_tag::MEMTABLE_GEN_COLUMN;
 
 /// Column name for row address (used for ordering within generation).
 pub const ROW_ADDRESS_COLUMN: &str = "_rowaddr";
 
-/// Deduplicates rows by primary key, keeping the row with highest (_gen, _rowaddr).
+/// Deduplicates rows by primary key, keeping the row with highest (_memtable_gen, _rowaddr).
 ///
 /// # Algorithm
 ///
-/// 1. Sort input by (pk_columns, _gen DESC, _rowaddr DESC)
+/// 1. Sort input by (pk_columns, _memtable_gen DESC, _rowaddr DESC) - if not already sorted
 /// 2. Stream through sorted data, emit only first row per PK
 ///
-/// After sorting, the first occurrence of each PK has the highest (_gen, _rowaddr),
+/// After sorting, the first occurrence of each PK has the highest (_memtable_gen, _rowaddr),
 /// so we can deduplicate in a single streaming pass.
+///
+/// # Pre-sorted Input Optimization
+///
+/// When `input_sorted` is true, the input is assumed to already be sorted by
+/// (pk_columns ASC, _memtable_gen DESC, _rowaddr DESC). This allows skipping the internal
+/// sort, which is useful when the input comes from SortPreservingMergeExec that
+/// has already merged K pre-sorted streams.
 ///
 /// # Memory Efficiency
 ///
@@ -54,10 +61,12 @@ pub struct DeduplicateExec {
     pk_columns: Vec<String>,
     /// Output schema.
     schema: SchemaRef,
-    /// Whether to keep _gen in output.
-    keep_generation: bool,
+    /// Whether to keep _memtable_gen in output.
+    with_memtable_gen: bool,
     /// Whether to keep _rowaddr in output.
     keep_row_address: bool,
+    /// Whether the input is already sorted by (pk, _memtable_gen DESC, _rowaddr DESC).
+    input_sorted: bool,
     /// Plan properties.
     properties: PlanProperties,
 }
@@ -69,13 +78,38 @@ impl DeduplicateExec {
     ///
     /// * `input` - Child plan producing tagged rows
     /// * `pk_columns` - Primary key column names for deduplication
-    /// * `keep_generation` - Whether to include _gen in output
+    /// * `with_memtable_gen` - Whether to include _memtable_gen in output
     /// * `keep_row_address` - Whether to include _rowaddr in output
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         pk_columns: Vec<String>,
-        keep_generation: bool,
+        with_memtable_gen: bool,
         keep_row_address: bool,
+    ) -> Result<Self> {
+        Self::new_with_sorted(
+            input,
+            pk_columns,
+            with_memtable_gen,
+            keep_row_address,
+            false,
+        )
+    }
+
+    /// Create a new deduplication executor with pre-sorted input.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Child plan producing tagged rows
+    /// * `pk_columns` - Primary key column names for deduplication
+    /// * `with_memtable_gen` - Whether to include _memtable_gen in output
+    /// * `keep_row_address` - Whether to include _rowaddr in output
+    /// * `input_sorted` - Whether the input is already sorted by (pk, _memtable_gen DESC, _rowaddr DESC)
+    pub fn new_with_sorted(
+        input: Arc<dyn ExecutionPlan>,
+        pk_columns: Vec<String>,
+        with_memtable_gen: bool,
+        keep_row_address: bool,
+        input_sorted: bool,
     ) -> Result<Self> {
         let input_schema = input.schema();
 
@@ -89,11 +123,11 @@ impl DeduplicateExec {
             }
         }
 
-        if input_schema.column_with_name(GENERATION_COLUMN).is_none() {
+        if input_schema.column_with_name(MEMTABLE_GEN_COLUMN).is_none() {
             return Err(Error::invalid_input(
                 format!(
                     "Generation column '{}' not found in input schema",
-                    GENERATION_COLUMN
+                    MEMTABLE_GEN_COLUMN
                 ),
                 location!(),
             ));
@@ -115,7 +149,7 @@ impl DeduplicateExec {
             .iter()
             .filter(|f| {
                 let name = f.name();
-                if name == GENERATION_COLUMN && !keep_generation {
+                if name == MEMTABLE_GEN_COLUMN && !with_memtable_gen {
                     return false;
                 }
                 if name == ROW_ADDRESS_COLUMN && !keep_row_address {
@@ -127,7 +161,7 @@ impl DeduplicateExec {
             .collect();
         let schema = Arc::new(Schema::new(output_fields));
 
-        // Output is single partition after global sort + dedup
+        // Output is single partition after sort + dedup
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -139,8 +173,97 @@ impl DeduplicateExec {
             input,
             pk_columns,
             schema,
-            keep_generation,
+            with_memtable_gen,
             keep_row_address,
+            input_sorted,
+            properties,
+        })
+    }
+
+    /// Create a deduplication executor for pre-sorted input without _memtable_gen column.
+    ///
+    /// This is used when the input is already sorted by (pk ASC, _rowaddr DESC) with
+    /// newer generations appearing first (via stream ordering). The _memtable_gen column is
+    /// not required in the input schema unless `with_memtable_gen=true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Child plan producing rows sorted by (pk ASC, _rowaddr DESC)
+    /// * `pk_columns` - Primary key column names for deduplication
+    /// * `with_memtable_gen` - Whether to include _memtable_gen in output (requires _memtable_gen in input)
+    /// * `keep_row_address` - Whether to include _rowaddr in output
+    pub fn new_sorted(
+        input: Arc<dyn ExecutionPlan>,
+        pk_columns: Vec<String>,
+        with_memtable_gen: bool,
+        keep_row_address: bool,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+
+        // Validate that required columns exist
+        for col in &pk_columns {
+            if input_schema.column_with_name(col).is_none() {
+                return Err(Error::invalid_input(
+                    format!("Primary key column '{}' not found in input schema", col),
+                    location!(),
+                ));
+            }
+        }
+
+        // _memtable_gen column is only required if with_memtable_gen=true
+        if with_memtable_gen && input_schema.column_with_name(MEMTABLE_GEN_COLUMN).is_none() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Generation column '{}' not found in input schema (required when with_memtable_gen=true)",
+                    MEMTABLE_GEN_COLUMN
+                ),
+                location!(),
+            ));
+        }
+
+        if input_schema.column_with_name(ROW_ADDRESS_COLUMN).is_none() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Row address column '{}' not found in input schema",
+                    ROW_ADDRESS_COLUMN
+                ),
+                location!(),
+            ));
+        }
+
+        // Build output schema (may exclude internal columns)
+        let output_fields: Vec<Arc<Field>> = input_schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                let name = f.name();
+                if name == MEMTABLE_GEN_COLUMN && !with_memtable_gen {
+                    return false;
+                }
+                if name == ROW_ADDRESS_COLUMN && !keep_row_address {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let schema = Arc::new(Schema::new(output_fields));
+
+        // Output is single partition after dedup
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        );
+
+        Ok(Self {
+            input,
+            pk_columns,
+            schema,
+            with_memtable_gen,
+            keep_row_address,
+            input_sorted: true,
             properties,
         })
     }
@@ -169,12 +292,12 @@ impl DeduplicateExec {
             });
         }
 
-        // Sort by _gen DESC (higher generation = newer)
+        // Sort by _memtable_gen DESC (higher generation = newer)
         let (gen_idx, _) = input_schema
-            .column_with_name(GENERATION_COLUMN)
-            .expect("_gen column validated in constructor");
+            .column_with_name(MEMTABLE_GEN_COLUMN)
+            .expect("_memtable_gen column validated in constructor");
         sort_exprs.push(PhysicalSortExpr {
-            expr: Arc::new(Column::new(GENERATION_COLUMN, gen_idx)),
+            expr: Arc::new(Column::new(MEMTABLE_GEN_COLUMN, gen_idx)),
             options: SortOptions {
                 descending: true,
                 nulls_first: false,
@@ -226,7 +349,7 @@ impl DeduplicateExec {
             .enumerate()
             .filter(|(_, f)| {
                 let name = f.name();
-                if name == GENERATION_COLUMN && !self.keep_generation {
+                if name == MEMTABLE_GEN_COLUMN && !self.with_memtable_gen {
                     return false;
                 }
                 if name == ROW_ADDRESS_COLUMN && !self.keep_row_address {
@@ -247,10 +370,11 @@ impl DisplayAs for DeduplicateExec {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "DeduplicateExec: pk=[{}], keep_gen={}, keep_addr={}",
+                    "DeduplicateExec: pk=[{}], with_memtable_gen={}, keep_addr={}, input_sorted={}",
                     self.pk_columns.join(", "),
-                    self.keep_generation,
-                    self.keep_row_address
+                    self.with_memtable_gen,
+                    self.keep_row_address,
+                    self.input_sorted
                 )
             }
         }
@@ -288,11 +412,12 @@ impl ExecutionPlan for DeduplicateExec {
             ));
         }
         Ok(Arc::new(
-            Self::new(
+            Self::new_with_sorted(
                 children[0].clone(),
                 self.pk_columns.clone(),
-                self.keep_generation,
+                self.with_memtable_gen,
                 self.keep_row_address,
+                self.input_sorted,
             )
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))
@@ -303,9 +428,15 @@ impl ExecutionPlan for DeduplicateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        // Build and execute the sorted plan
-        let sorted_plan = self.build_sorted_plan()?;
-        let sorted_stream = sorted_plan.execute(partition, context)?;
+        // Either use input directly (if pre-sorted) or wrap in sort
+        let sorted_stream = if self.input_sorted {
+            // Input is already sorted, use directly
+            self.input.execute(partition, context)?
+        } else {
+            // Build and execute the sorted plan
+            let sorted_plan = self.build_sorted_plan()?;
+            sorted_plan.execute(partition, context)?
+        };
 
         Ok(Box::pin(DeduplicateStream::new(
             sorted_stream,
@@ -453,11 +584,11 @@ mod tests {
     use datafusion_physical_plan::test::TestMemoryExec;
 
     fn create_test_data() -> (SchemaRef, Vec<RecordBatch>) {
-        // Schema: id (PK), name, _gen, _rowaddr
+        // Schema: id (PK), name, _memtable_gen, _rowaddr
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", arrow_schema::DataType::Int32, false),
             Field::new("name", arrow_schema::DataType::Utf8, true),
-            Field::new(GENERATION_COLUMN, arrow_schema::DataType::UInt64, false),
+            Field::new(MEMTABLE_GEN_COLUMN, arrow_schema::DataType::UInt64, false),
             Field::new(ROW_ADDRESS_COLUMN, arrow_schema::DataType::UInt64, false),
         ]));
 
@@ -490,7 +621,7 @@ mod tests {
         let dedup = DeduplicateExec::new(
             input,
             vec!["id".to_string()],
-            false, // don't keep _gen
+            false, // don't keep _memtable_gen
             false, // don't keep _rowaddr
         )
         .unwrap();
@@ -542,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deduplicate_keep_generation() {
+    async fn test_deduplicate_with_memtable_gen() {
         let (schema, batches) = create_test_data();
 
         let input = TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap();
@@ -550,21 +681,21 @@ mod tests {
         let dedup = DeduplicateExec::new(
             input,
             vec!["id".to_string()],
-            true,  // keep _gen
+            true,  // keep _memtable_gen
             false, // don't keep _rowaddr
         )
         .unwrap();
 
-        // Output schema should have id, name, _gen
+        // Output schema should have id, name, _memtable_gen
         assert_eq!(dedup.schema().fields().len(), 3);
-        assert_eq!(dedup.schema().field(2).name(), GENERATION_COLUMN);
+        assert_eq!(dedup.schema().field(2).name(), MEMTABLE_GEN_COLUMN);
     }
 
     #[test]
     fn test_deduplicate_missing_pk_column() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", arrow_schema::DataType::Int32, false),
-            Field::new(GENERATION_COLUMN, arrow_schema::DataType::UInt64, false),
+            Field::new(MEMTABLE_GEN_COLUMN, arrow_schema::DataType::UInt64, false),
             Field::new(ROW_ADDRESS_COLUMN, arrow_schema::DataType::UInt64, false),
         ]));
 
@@ -590,7 +721,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", arrow_schema::DataType::Int32, false),
             Field::new("name", arrow_schema::DataType::Utf8, true),
-            Field::new(GENERATION_COLUMN, arrow_schema::DataType::UInt64, false),
+            Field::new(MEMTABLE_GEN_COLUMN, arrow_schema::DataType::UInt64, false),
             Field::new(ROW_ADDRESS_COLUMN, arrow_schema::DataType::UInt64, false),
         ]));
 

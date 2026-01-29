@@ -13,6 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result, ROW_ID};
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
 use snafu::location;
@@ -739,10 +740,13 @@ impl MemTableScanner {
         let projection_indices = self.compute_projection_indices()?;
 
         // Build filter predicate if present
+        // Note: optimize_expr() must be called before create_physical_expr() to handle
+        // type coercion (e.g., Int64 literal -> Int32 to match column type)
         let (filter_predicate, filter_expr) = if let Some(ref filter) = self.filter {
             let planner = Planner::new(self.schema.clone());
-            let predicate = planner.create_physical_expr(filter)?;
-            (Some(predicate), Some(filter.clone()))
+            let optimized = planner.optimize_expr(filter.clone())?;
+            let predicate = planner.create_physical_expr(&optimized)?;
+            (Some(predicate), Some(optimized))
         } else {
             (None, None)
         };
@@ -796,6 +800,7 @@ impl MemTableScanner {
             projection_indices,
             self.output_schema(),
             self.with_row_id,
+            self.with_row_address,
         )?;
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
@@ -890,6 +895,9 @@ impl MemTableScanner {
     }
 
     /// Extract a BTree-compatible predicate from the filter.
+    ///
+    /// This method also coerces literal values to match the column's data type
+    /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
         let filter = self.filter.as_ref()?;
 
@@ -899,11 +907,14 @@ impl MemTableScanner {
                 if let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
                 {
+                    // Coerce literal to match column type
+                    let coerced_lit = self.coerce_literal_to_column(&col.name, lit)?;
+
                     match binary.op {
                         datafusion::logical_expr::Operator::Eq => {
                             return Some(ScalarPredicate::Eq {
                                 column: col.name.clone(),
-                                value: lit.clone(),
+                                value: coerced_lit,
                             });
                         }
                         datafusion::logical_expr::Operator::Lt
@@ -911,14 +922,14 @@ impl MemTableScanner {
                             return Some(ScalarPredicate::Range {
                                 column: col.name.clone(),
                                 lower: None,
-                                upper: Some(lit.clone()),
+                                upper: Some(coerced_lit),
                             });
                         }
                         datafusion::logical_expr::Operator::Gt
                         | datafusion::logical_expr::Operator::GtEq => {
                             return Some(ScalarPredicate::Range {
                                 column: col.name.clone(),
-                                lower: Some(lit.clone()),
+                                lower: Some(coerced_lit),
                                 upper: None,
                             });
                         }
@@ -933,7 +944,8 @@ impl MemTableScanner {
                         .iter()
                         .filter_map(|e| {
                             if let Expr::Literal(lit, _) = e {
-                                Some(lit.clone())
+                                // Coerce each literal to match column type
+                                self.coerce_literal_to_column(&col.name, lit)
                             } else {
                                 None
                             }
@@ -952,6 +964,20 @@ impl MemTableScanner {
         }
 
         None
+    }
+
+    /// Coerce a literal value to match the column's data type.
+    fn coerce_literal_to_column(&self, column: &str, lit: &ScalarValue) -> Option<ScalarValue> {
+        let field = self.schema.field_with_name(column).ok()?;
+        let target_type = field.data_type();
+
+        // If types already match, return as-is
+        if &lit.data_type() == target_type {
+            return Some(lit.clone());
+        }
+
+        // Use safe_coerce_scalar to convert the value
+        safe_coerce_scalar(lit, target_type)
     }
 
     /// Check if a BTree index exists for a column.

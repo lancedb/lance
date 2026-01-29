@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Generation tagging execution node.
+//! MemTable generation tagging execution node.
 
 use std::any::Any;
 use std::fmt;
@@ -22,17 +22,21 @@ use futures::{Stream, StreamExt};
 
 use crate::dataset::mem_wal::scanner::data_source::LsmGeneration;
 
-/// Column name for generation number.
-pub const GENERATION_COLUMN: &str = "_gen";
-
-/// Wraps a scan executor to add generation column.
+/// Column name for MemTable generation in LSM scans.
 ///
-/// This node adds a `_gen` column with a constant value to all output batches.
+/// This column indicates which generation (MemTable flush version) a row came from:
+/// - Base table rows have generation 0
+/// - MemTable rows have generation 1, 2, 3, ... (higher = newer)
+pub const MEMTABLE_GEN_COLUMN: &str = "_memtable_gen";
+
+/// Wraps a scan executor to add MemTable generation column.
+///
+/// This node adds a `_memtable_gen` column with a constant value to all output batches.
 /// The generation column is used for deduplication ordering:
 /// - Base table: gen = 0
 /// - MemTables: gen = 1, 2, 3, ... (higher = newer)
 #[derive(Debug)]
-pub struct GenerationTagExec {
+pub struct MemtableGenTagExec {
     /// Child execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// Generation number to tag rows with.
@@ -43,7 +47,7 @@ pub struct GenerationTagExec {
     properties: PlanProperties,
 }
 
-impl GenerationTagExec {
+impl MemtableGenTagExec {
     /// Create a new generation tagging executor.
     pub fn new(input: Arc<dyn ExecutionPlan>, generation: LsmGeneration) -> Self {
         let input_schema = input.schema();
@@ -51,7 +55,7 @@ impl GenerationTagExec {
         // Build output schema: input columns + _gen
         let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
         fields.push(Arc::new(Field::new(
-            GENERATION_COLUMN,
+            MEMTABLE_GEN_COLUMN,
             DataType::UInt64,
             false,
         )));
@@ -79,21 +83,21 @@ impl GenerationTagExec {
     }
 }
 
-impl DisplayAs for GenerationTagExec {
+impl DisplayAs for MemtableGenTagExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "GenerationTagExec: gen={}", self.generation)
+                write!(f, "MemtableGenTagExec: gen={}", self.generation)
             }
         }
     }
 }
 
-impl ExecutionPlan for GenerationTagExec {
+impl ExecutionPlan for MemtableGenTagExec {
     fn name(&self) -> &str {
-        "GenerationTagExec"
+        "MemtableGenTagExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -118,7 +122,7 @@ impl ExecutionPlan for GenerationTagExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(datafusion::error::DataFusionError::Internal(
-                "GenerationTagExec requires exactly one child".to_string(),
+                "MemtableGenTagExec requires exactly one child".to_string(),
             ));
         }
         Ok(Arc::new(Self::new(children[0].clone(), self.generation)))
@@ -214,12 +218,12 @@ mod tests {
 
         let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
-        let tag_exec = GenerationTagExec::new(input, LsmGeneration::memtable(5));
+        let tag_exec = MemtableGenTagExec::new(input, LsmGeneration::memtable(5));
 
         // Verify schema has _gen column
         let output_schema = tag_exec.schema();
         assert_eq!(output_schema.fields().len(), 3);
-        assert_eq!(output_schema.field(2).name(), GENERATION_COLUMN);
+        assert_eq!(output_schema.field(2).name(), MEMTABLE_GEN_COLUMN);
         assert_eq!(output_schema.field(2).data_type(), &DataType::UInt64);
 
         // Execute and verify data
@@ -250,7 +254,7 @@ mod tests {
 
         let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
-        let tag_exec = GenerationTagExec::new(input, LsmGeneration::BASE_TABLE);
+        let tag_exec = MemtableGenTagExec::new(input, LsmGeneration::BASE_TABLE);
 
         let ctx = SessionContext::new();
         let stream = tag_exec.execute(0, ctx.task_ctx()).unwrap();
@@ -272,12 +276,12 @@ mod tests {
         let batch = create_test_batch();
         let schema = batch.schema();
         let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
-        let tag_exec = GenerationTagExec::new(input, LsmGeneration::memtable(3));
+        let tag_exec = MemtableGenTagExec::new(input, LsmGeneration::memtable(3));
 
         // Test fmt_as directly
         let mut buf = String::new();
         use std::fmt::Write;
         write!(buf, "{:?}", tag_exec).unwrap();
-        assert!(buf.contains("GenerationTagExec"));
+        assert!(buf.contains("MemtableGenTagExec"));
     }
 }

@@ -56,7 +56,7 @@ pub struct LsmScanner {
 
     // Internal columns
     with_row_address: bool,
-    with_generation: bool,
+    with_memtable_gen: bool,
 
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
@@ -84,7 +84,7 @@ impl LsmScanner {
             limit: None,
             offset: None,
             with_row_address: false,
-            with_generation: false,
+            with_memtable_gen: false,
             pk_columns,
         }
     }
@@ -149,13 +149,13 @@ impl LsmScanner {
         self
     }
 
-    /// Include `_gen` column in output.
+    /// Include `_memtable_gen` column in output.
     ///
     /// The generation column shows which data source each row came from:
     /// - 0: Base table
-    /// - 1, 2, ...: MemTable generations
-    pub fn with_generation(mut self) -> Self {
-        self.with_generation = true;
+    /// - 1, 2, ...: MemTable generations (higher = newer)
+    pub fn with_memtable_gen(mut self) -> Self {
+        self.with_memtable_gen = true;
         self
     }
 
@@ -180,7 +180,7 @@ impl LsmScanner {
                 self.filter.as_ref(),
                 self.limit,
                 self.offset,
-                self.with_generation,
+                self.with_memtable_gen,
                 self.with_row_address,
             )
             .await
