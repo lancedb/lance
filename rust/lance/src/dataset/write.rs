@@ -7,7 +7,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::BLOB_META_KEY;
-use lance_core::datatypes::BlobVersion;
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
@@ -853,7 +852,6 @@ pub async fn open_writer_with_options(
             writer,
             schema.clone(),
             FileWriterOptions {
-                blob_version: enable_blob_v2.then_some(BlobVersion::V2),
                 format_version: Some(storage_version),
                 ..Default::default()
             },

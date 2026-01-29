@@ -12,7 +12,6 @@ use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
-use lance_core::datatypes::BlobVersion;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
@@ -93,10 +92,6 @@ pub struct FileWriterOptions {
     /// while) might keep a much larger record batch around in memory (even though most
     /// of that batch's data has been written to disk)
     pub keep_original_array: Option<bool>,
-    /// Controls how blob columns are encoded.
-    ///
-    /// When unset, blob columns default to blob v1 encoding.
-    pub blob_version: Option<BlobVersion>,
     pub encoding_strategy: Option<Arc<dyn FieldEncodingStrategy>>,
     /// The format version to use when writing the file
     ///
@@ -320,13 +315,6 @@ impl FileWriter {
                 encoding_strategy
             } else {
                 let version = self.version();
-                let blob_version = self.options.blob_version.unwrap_or(BlobVersion::V1);
-                if blob_version != BlobVersion::V1 && version < LanceFileVersion::V2_2 {
-                    return Err(Error::invalid_input(
-                        "Blob version v2 requires file version >= 2.2",
-                        location!(),
-                    ));
-                }
                 match version.resolve() {
                     LanceFileVersion::Legacy => {
                         return Err(Error::invalid_input(
@@ -334,19 +322,8 @@ impl FileWriter {
                             location!(),
                         ));
                     }
-                    LanceFileVersion::V2_0 => {
-                        if blob_version != BlobVersion::V1 {
-                            return Err(Error::invalid_input(
-                                "Blob version v2 requires file version >= 2.2",
-                                location!(),
-                            ));
-                        }
-                        Arc::from(default_encoding_strategy(version))
-                    }
-                    _ => Arc::new(StructuralEncodingStrategy::with_version_and_blob_version(
-                        version,
-                        blob_version,
-                    )),
+                    LanceFileVersion::V2_0 => Arc::from(default_encoding_strategy(version)),
+                    _ => Arc::new(StructuralEncodingStrategy::with_version(version)),
                 }
             };
 
