@@ -13,7 +13,6 @@
  */
 package org.lance;
 
-import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
@@ -28,7 +27,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -105,7 +103,8 @@ public class TransactionTest {
         assertInstanceOf(CreateIndex.class, readTx.operation());
         CreateIndex op = (CreateIndex) readTx.operation();
         assertFalse(op.getNewIndices().isEmpty(), "newIndices should not be empty for CreateIndex");
-        assertTrue(op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
+        assertTrue(
+            op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
         assertEquals("btree_id_index", (op.getNewIndices().get(0).name()));
       }
     }
