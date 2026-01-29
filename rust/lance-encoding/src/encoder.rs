@@ -413,14 +413,14 @@ impl StructuralEncodingStrategy {
                 }
                 DataType::Struct(_) => {
                     return Err(Error::InvalidInput {
-                        source: "Blob struct input requires blob version v2".into(),
+                        source: "Blob v2 struct input requires file version >= 2.2".into(),
                         location: location!(),
                     });
                 }
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!(
-                            "Blob encoding only supports Binary/LargeBinary, got {}",
+                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
                             data_type
                         )
                         .into(),
