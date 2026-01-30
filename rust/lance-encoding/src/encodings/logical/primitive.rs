@@ -1279,35 +1279,34 @@ impl MiniBlockScheduler {
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
-            match dictionary_encoding.compression.as_ref().unwrap() {
-                Compression::Variable(_) => Some(MiniBlockSchedulerDictionary {
-                    dictionary_decompressor: decompressors
-                        .create_block_decompressor(dictionary_encoding)?
+            let dictionary_decompressor = decompressors
+                .create_block_decompressor(dictionary_encoding)?
+                .into();
+            let dictionary_data_alignment = match dictionary_encoding.compression.as_ref().unwrap()
+            {
+                Compression::Variable(_) => 4,
+                Compression::Flat(_) => 16,
+                Compression::General(_) => 1,
+                Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
+                    crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "Unsupported mini-block dictionary encoding: {:?}",
+                            dictionary_encoding.compression.as_ref().unwrap()
+                        )
                         .into(),
-                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                    dictionary_data_alignment: 4,
-                    num_dictionary_items,
-                }),
-                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
-                    dictionary_decompressor: decompressors
-                        .create_block_decompressor(dictionary_encoding)?
-                        .into(),
-                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                    dictionary_data_alignment: 16,
-                    num_dictionary_items,
-                }),
-                Compression::General(_) => Some(MiniBlockSchedulerDictionary {
-                    dictionary_decompressor: decompressors
-                        .create_block_decompressor(dictionary_encoding)?
-                        .into(),
-                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                    dictionary_data_alignment: 1,
-                    num_dictionary_items,
-                }),
-                _ => unreachable!(
-                    "Mini-block dictionary encoding must use Variable, Flat, or General compression"
-                ),
-            }
+                        location: location!(),
+                    })
+                }
+            };
+            Some(MiniBlockSchedulerDictionary {
+                dictionary_decompressor,
+                dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                dictionary_data_alignment,
+                num_dictionary_items,
+            })
         } else {
             None
         };
@@ -4903,6 +4902,7 @@ mod tests {
         FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
         StructuralPageScheduler,
     };
+    use crate::compression::DefaultDecompressionStrategy;
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::BlockInfo;
     use crate::decoder::PageEncoding;
@@ -4911,6 +4911,7 @@ mod tests {
     };
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
+    use crate::format::ProtobufUtils21;
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray, UInt64Array};
@@ -6068,6 +6069,44 @@ mod tests {
             .with_expected_encoding("dictionary");
 
         check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
+    #[test]
+    fn test_miniblock_dictionary_out_of_line_bitpacking_decode() {
+        let rows = 10_000;
+        let unique_values = 2_000;
+
+        let dictionary_encoding =
+            ProtobufUtils21::out_of_line_bitpacking(64, ProtobufUtils21::flat(11, None));
+        let layout = pb21::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: unique_values,
+            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: rows,
+            has_large_chunk: false,
+        };
+
+        let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (0, 0)];
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ rows,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let dictionary = scheduler.dictionary.unwrap();
+        assert_eq!(dictionary.num_dictionary_items, unique_values);
+        assert_eq!(
+            dictionary.dictionary_data_alignment,
+            crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
+        );
     }
 
     // Dictionary encoding decision tests
