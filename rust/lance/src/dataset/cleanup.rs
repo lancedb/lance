@@ -1669,6 +1669,7 @@ mod tests {
                     store_params: Some(self.os_params()),
                     commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode,
+                    disable_column_stats: true, // One commit per write for predictable file counts
                     ..Default::default()
                 }),
             )

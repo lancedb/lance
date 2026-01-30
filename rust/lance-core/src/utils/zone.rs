@@ -78,7 +78,6 @@ impl<P: ZoneProcessor> FileZoneBuilder<P> {
         if zone_size == 0 {
             return Err(crate::Error::invalid_input(
                 "zone size must be greater than zero",
-                snafu::location!(),
             ));
         }
         Ok(Self {

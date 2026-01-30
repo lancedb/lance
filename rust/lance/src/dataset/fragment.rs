@@ -4444,6 +4444,7 @@ mod tests {
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
             session: Some(session.clone()),
+            disable_column_stats: true, // Keep written bytes small for IOPS assertion
             ..Default::default()
         };
         let dataset = InsertBuilder::new("memory://test")

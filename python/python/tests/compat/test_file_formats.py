@@ -125,7 +125,12 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
 
     def create(self):
         batch = build_basic_types()
-        lance.write_dataset(batch, self.path, data_storage_version="0.1")
+        lance.write_dataset(
+            batch,
+            self.path,
+            data_storage_version="0.1",
+            disable_column_stats=True,
+        )
 
     def check_read(self):
         ds = lance.dataset(self.path)
@@ -136,5 +141,9 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         ds.delete("true")
         lance.write_dataset(
-            build_basic_types(), self.path, data_storage_version="0.1", mode="append"
+            build_basic_types(),
+            self.path,
+            data_storage_version="0.1",
+            mode="append",
+            disable_column_stats=True,
         )

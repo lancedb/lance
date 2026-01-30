@@ -255,8 +255,8 @@ pub struct FileWriter {
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
     page_spill: Option<PageSpillState>,
-    /// Column statistics processors (one per column), only initialized if disable_column_stats is false
-    column_stats_processors: Option<Vec<FileZoneBuilder<ColumnStatisticsProcessor>>>,
+    /// Column statistics processors (one per column; None for types that don't support min/max, e.g. List)
+    column_stats_processors: Option<Vec<Option<FileZoneBuilder<ColumnStatisticsProcessor>>>>,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -437,13 +437,10 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(
-                format!(
-                    "The field `{}` contained null values even though the field is marked non-null in the schema",
-                    field.name
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -512,13 +509,17 @@ impl FileWriter {
             .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
 
-        // Initialize column statistics processors if enabled
+        // Initialize column statistics processors if enabled; skip columns for which DataFusion
+        // min/max is not supported (try_new fails), so we stay in sync with DataFusion upgrades.
         if !self.options.disable_column_stats {
             let mut processors = Vec::new();
             for field in &self.schema.as_ref().unwrap().fields {
                 let data_type = field.data_type().clone();
-                let processor = ColumnStatisticsProcessor::new(data_type)?;
-                processors.push(FileZoneBuilder::new(processor, COLUMN_STATS_ZONE_SIZE)?);
+                let opt_processor = match ColumnStatisticsProcessor::new(data_type) {
+                    Ok(processor) => Some(FileZoneBuilder::new(processor, COLUMN_STATS_ZONE_SIZE)?),
+                    Err(_) => None,
+                };
+                processors.push(opt_processor);
             }
             self.column_stats_processors = Some(processors);
         }
@@ -660,9 +661,9 @@ impl FileWriter {
         self.write_pages(encoding_tasks).await?;
 
         // TODO: Reuse the other read path so that we dont need to do the calculation twice
-        // Accumulate column statistics if enabled
+        // Accumulate column statistics if enabled (skip columns with None processor, set at init from try_new).
         if let Some(ref mut processors) = self.column_stats_processors {
-            for (field, processor) in self
+            for (field, opt_processor) in self
                 .schema
                 .as_ref()
                 .unwrap()
@@ -670,7 +671,9 @@ impl FileWriter {
                 .iter()
                 .zip(processors.iter_mut())
             {
-                if let Some(array) = batch.column_by_name(&field.name) {
+                if let (Some(processor), Some(array)) =
+                    (opt_processor, batch.column_by_name(&field.name))
+                {
                     processor.process_chunk(array)?;
                 }
             }
@@ -1032,10 +1035,7 @@ impl FileWriter {
         };
 
         let schema = self.schema.as_ref().ok_or_else(|| {
-            Error::invalid_input(
-                "Cannot build statistics: schema not initialized",
-                location!(),
-            )
+            Error::invalid_input("Cannot build statistics: schema not initialized")
         })?;
 
         // Columnar layout: one column per dataset column, each containing ColumnZoneStatistics structs
@@ -1057,7 +1057,10 @@ impl FileWriter {
         let mut column_zones: Vec<(String, Vec<column_stats::ColumnZoneStatistics>)> = Vec::new();
         let mut num_zones = None;
 
-        for (field, processor) in schema.fields.iter().zip(processors.into_iter()) {
+        for (field, opt_processor) in schema.fields.iter().zip(processors.into_iter()) {
+            let Some(processor) = opt_processor else {
+                continue; // Unsupported type (e.g. List), skip column stats
+            };
             let zones = processor.finalize()?;
 
             // Skip columns with no zones
@@ -1068,15 +1071,12 @@ impl FileWriter {
             // All columns should have the same number of zones in a single file
             if let Some(expected_zones) = num_zones {
                 if zones.len() != expected_zones {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "Column statistics mismatch: column '{}' has {} zones but expected {}",
-                            field.name,
-                            zones.len(),
-                            expected_zones
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Column statistics mismatch: column '{}' has {} zones but expected {}",
+                        field.name,
+                        zones.len(),
+                        expected_zones
+                    )));
                 }
             } else {
                 num_zones = Some(zones.len());
@@ -1097,20 +1097,19 @@ impl FileWriter {
         let mut schema_fields: Vec<ArrowField> = Vec::new();
 
         for (col_name, zones) in &column_zones {
-            let field = schema.field(col_name).ok_or_else(|| Error::Internal {
-                message: format!(
+            let field = schema.field(col_name).ok_or_else(|| {
+                Error::internal(format!(
                     "Column '{}' not found in schema when building column stats",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
             let data_type = field.data_type();
 
             // Build min/max arrays from zone scalars; array type is inferred from ScalarValue
             let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
             let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
 
             let mut null_counts = Vec::with_capacity(num_zones);
             let mut nan_counts = Vec::with_capacity(num_zones);
@@ -1189,10 +1188,7 @@ impl FileWriter {
 
         // Create RecordBatch (columnar structure: one row per zone, one column per dataset column)
         let stats_batch = RecordBatch::try_new(stats_schema, column_arrays).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to create statistics batch: {}", e),
-                location!(),
-            )
+            Error::invalid_input(format!("Failed to create statistics batch: {}", e))
         })?;
 
         // Serialize to Arrow IPC format
@@ -1201,17 +1197,14 @@ impl FileWriter {
             let mut writer =
                 arrow_ipc::writer::FileWriter::try_new(&mut buffer, &stats_batch.schema())
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to create IPC writer: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to create IPC writer: {}", e))
                     })?;
-            writer.write(&stats_batch).map_err(|e| {
-                Error::invalid_input(format!("Failed to write statistics: {}", e), location!())
-            })?;
-            writer.finish().map_err(|e| {
-                Error::invalid_input(format!("Failed to finish IPC writer: {}", e), location!())
-            })?;
+            writer
+                .write(&stats_batch)
+                .map_err(|e| Error::invalid_input(format!("Failed to write statistics: {}", e)))?;
+            writer
+                .finish()
+                .map_err(|e| Error::invalid_input(format!("Failed to finish IPC writer: {}", e)))?;
         }
 
         // Store as global buffer

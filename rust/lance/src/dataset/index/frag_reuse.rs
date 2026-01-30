@@ -182,12 +182,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Compact and check index not caught up
+        // Compact and check index not caught up (disable column stats so version counts match)
         compact_files(
             &mut dataset,
             CompactionOptions {
                 target_rows_per_fragment: 2_000,
                 defer_index_remap: true,
+                consolidate_column_stats: false,
                 ..Default::default()
             },
             None,

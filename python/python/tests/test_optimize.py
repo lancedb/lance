@@ -34,7 +34,8 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_removed == 10
     assert metrics.files_added == 1
 
-    assert dataset.version == 3
+    # compact_files creates an extra commit for column stats metadata, so version is 4.
+    assert dataset.version == 4
 
 
 def test_blob_compaction(tmp_path: Path):
@@ -437,8 +438,9 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     metrics = Compaction.commit(dataset, [result1])
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added == 1
-    # Compaction occurs in two transactions so it increments the version by 2.
-    assert dataset.version == 3
+    # With default options (e.g. consolidate_column_stats), compaction uses multiple
+    # transactions (rewrite + column stats update), so version increments by 3.
+    assert dataset.version == 4
 
 
 def test_migration_via_fragment_apis(tmp_path):

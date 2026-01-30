@@ -14,7 +14,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::Accumulator;
 use lance_core::utils::zone::{ZoneBound, ZoneProcessor};
 use lance_core::{Error, Result};
-use snafu::location;
 
 /// Zone size for column statistics (1 million rows per zone)
 pub(super) const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
@@ -38,13 +37,40 @@ pub(super) struct ColumnStatisticsProcessor {
     nan_count: u32,
 }
 
+/// Returns true for types that support min/max aggregation.
+/// We exclude nested types (Struct, List, etc.) because DataFusion's try_new can succeed
+/// for them but comparison fails at runtime. For other types we delegate to try_new.
+fn supports_min_max(data_type: &DataType) -> bool {
+    // Exclude types that try_new accepts but fail at runtime when comparing.
+    // FixedSizeList is excluded because extension types (e.g. bfloat16) use it as storage;
+    // min/max arrays then lack extension metadata and cause schema mismatch.
+    if matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::RunEndEncoded(_, _)
+            | DataType::Dictionary(_, _)
+    ) {
+        return false;
+    }
+    MinAccumulator::try_new(data_type).is_ok() && MaxAccumulator::try_new(data_type).is_ok()
+}
+
 impl ColumnStatisticsProcessor {
     pub(super) fn new(data_type: DataType) -> Result<Self> {
-        // TODO: Upstream DataFusion accumulators does not handle many nested types
-        let min = MinAccumulator::try_new(&data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let max = MaxAccumulator::try_new(&data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        if !supports_min_max(&data_type) {
+            return Err(Error::invalid_input(format!(
+                "Column statistics (min/max) not supported for type {:?}",
+                data_type
+            )));
+        }
+        let min =
+            MinAccumulator::try_new(&data_type).map_err(|e| Error::invalid_input(e.to_string()))?;
+        let max =
+            MaxAccumulator::try_new(&data_type).map_err(|e| Error::invalid_input(e.to_string()))?;
         Ok(Self {
             data_type,
             min,
@@ -90,10 +116,10 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
         self.nan_count += Self::count_nans(array);
         self.min
             .update_batch(std::slice::from_ref(array))
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
         self.max
             .update_batch(std::slice::from_ref(array))
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
         Ok(())
     }
 
@@ -102,11 +128,11 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
             min: self
                 .min
                 .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+                .map_err(|e| Error::invalid_input(e.to_string()))?,
             max: self
                 .max
                 .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+                .map_err(|e| Error::invalid_input(e.to_string()))?,
             null_count: self.null_count,
             nan_count: self.nan_count,
             bound,
@@ -114,9 +140,9 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
 
         // Auto-reset for next zone
         self.min = MinAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
         self.max = MaxAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
         self.null_count = 0;
         self.nan_count = 0;
 

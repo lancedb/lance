@@ -7268,6 +7268,7 @@ def write_dataset(
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     blob_pack_file_size_threshold: Optional[int] = None,
+    disable_column_stats: bool = False,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -7529,6 +7530,7 @@ def write_dataset(
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
+        "disable_column_stats": disable_column_stats,
     }
 
     # Add namespace_client and table_id for storage options provider and managed

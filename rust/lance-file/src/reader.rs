@@ -1236,14 +1236,11 @@ impl FileReader {
                 )));
             }
             if *column_index >= metadata.column_infos.len() as u32 {
-                return Err(Error::invalid_input(
-                    format!(
-                        "The projection specified the column index {} but there are only {} columns in the file",
-                        column_index,
-                        metadata.column_infos.len()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "The projection specified the column index {} but there are only {} columns in the file",
+                    column_index,
+                    metadata.column_infos.len()
+                )));
             }
         }
         Ok(())
@@ -2483,24 +2480,20 @@ impl ProjectedFileReader {
         }
 
         // Parse the buffer index
-        let buffer_index: usize = buffer_index_str.parse().map_err(|_| Error::Internal {
-            message: format!(
+        let buffer_index: usize = buffer_index_str.parse().map_err(|_| {
+            Error::internal(format!(
                 "Invalid column stats buffer index in metadata: {}",
                 buffer_index_str
-            ),
-            location: location!(),
+            ))
         })?;
 
         // Check bounds
         if buffer_index >= self.metadata.file_buffers.len() {
-            return Err(Error::Internal {
-                message: format!(
-                    "Column stats buffer index {} out of bounds (only {} buffers)",
-                    buffer_index,
-                    self.metadata.file_buffers.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Column stats buffer index {} out of bounds (only {} buffers)",
+                buffer_index,
+                self.metadata.file_buffers.len()
+            )));
         }
 
         // Read the buffer
@@ -2520,17 +2513,15 @@ impl ProjectedFileReader {
 
         // Decode Arrow IPC format
         let cursor = Cursor::new(stats_bytes.as_ref());
-        let mut reader =
-            arrow_ipc::reader::FileReader::try_new(cursor, None).map_err(|e| Error::Internal {
-                message: format!("Failed to decode column stats Arrow IPC: {}", e),
-                location: location!(),
-            })?;
+        let mut reader = arrow_ipc::reader::FileReader::try_new(cursor, None).map_err(|e| {
+            Error::internal(format!("Failed to decode column stats Arrow IPC: {}", e))
+        })?;
 
         // Read the single batch
-        let batch = reader.next().transpose().map_err(|e| Error::Internal {
-            message: format!("Failed to read column stats batch: {}", e),
-            location: location!(),
-        })?;
+        let batch = reader
+            .next()
+            .transpose()
+            .map_err(|e| Error::internal(format!("Failed to read column stats batch: {}", e)))?;
 
         Ok(batch)
     }

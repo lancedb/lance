@@ -12,7 +12,7 @@ use lance_arrow::{
     BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{
-    BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -57,14 +57,6 @@ use super::utils::SchemaAdapter;
 
 /// Manifest configuration key for column statistics policy (when true, stats are disabled)
 pub const COLUMN_STATS_DISABLED_KEY: &str = "lance.column_stats.disabled";
-
-pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
-    if storage_version >= LanceFileVersion::V2_2 {
-        BlobVersion::V2
-    } else {
-        BlobVersion::V1
-    }
-}
 
 mod commit;
 pub mod delete;
@@ -482,25 +474,19 @@ impl WriteParams {
         if let Some(dataset) = dataset {
             if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY) {
                 let dataset_policy_disable: bool = policy_str.parse().map_err(|_| {
-                    Error::invalid_input(
-                        format!(
-                            "[ColumnStats] Invalid value for {} in dataset config: {}",
-                            COLUMN_STATS_DISABLED_KEY, policy_str
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "[ColumnStats] Invalid value for {} in dataset config: {}",
+                        COLUMN_STATS_DISABLED_KEY, policy_str
+                    ))
                 })?;
 
                 if self.disable_column_stats != dataset_policy_disable {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "[ColumnStats] Policy mismatch: dataset requires disable_column_stats={}, \
+                    return Err(Error::invalid_input(format!(
+                        "[ColumnStats] Policy mismatch: dataset requires disable_column_stats={}, \
                              but WriteParams has disable_column_stats={}. \
                              All fragments in a dataset must have consistent column statistics.",
-                            dataset_policy_disable, self.disable_column_stats
-                        ),
-                        location!(),
-                    ));
+                        dataset_policy_disable, self.disable_column_stats
+                    )));
                 }
             }
             // If no policy in manifest, use the value from WriteParams

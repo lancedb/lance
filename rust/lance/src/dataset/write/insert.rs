@@ -30,7 +30,6 @@ use crate::{Error, Result};
 use tracing::info;
 
 use super::COLUMN_STATS_DISABLED_KEY;
-use super::COLUMN_STATS_ENABLED_KEY;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
@@ -238,38 +237,42 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let mut config_upsert_values: Option<HashMap<String, String>> = None;
-
-                // Set column stats policy (always set it when creating a new dataset)
-                config_upsert_values
-                    .get_or_insert_with(HashMap::new)
-                    .insert(
-                        String::from(COLUMN_STATS_DISABLED_KEY),
-                        if context.params.disable_column_stats {
-                            String::from("true")
-                        } else {
-                            String::from("false")
-                        },
-                    );
-
-                // Set auto cleanup params if provided
-                if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
-                    let upsert_values = config_upsert_values.get_or_insert_with(HashMap::new);
-
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.interval"),
-                        auto_cleanup_params.interval.to_string(),
-                    );
-
-                    let duration = auto_cleanup_params
-                        .older_than
-                        .to_std()
-                        .map_err(|e| Error::invalid_input_source(e.into()))?;
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.older_than"),
-                        format_duration(duration).to_string(),
-                    );
-                }
+                // Only persist manifest config when it would be non-empty and meaningful for
+                // older readers. When disable_column_stats is true and there is no auto_cleanup,
+                // leave config empty so datasets are writable by old Lance versions that don't
+                // support FLAG_TABLE_CONFIG.
+                let config_upsert_values: Option<HashMap<String, String>> = {
+                    if context.params.disable_column_stats && context.params.auto_cleanup.is_none()
+                    {
+                        // Stats disabled, no auto_cleanup: empty config for old-Lance compatibility.
+                        None
+                    } else {
+                        let mut m = HashMap::new();
+                        m.insert(
+                            String::from(COLUMN_STATS_DISABLED_KEY),
+                            if context.params.disable_column_stats {
+                                String::from("true")
+                            } else {
+                                String::from("false")
+                            },
+                        );
+                        if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
+                            m.insert(
+                                String::from("lance.auto_cleanup.interval"),
+                                auto_cleanup_params.interval.to_string(),
+                            );
+                            let duration = auto_cleanup_params
+                                .older_than
+                                .to_std()
+                                .map_err(|e| Error::invalid_input_source(e.into()))?;
+                            m.insert(
+                                String::from("lance.auto_cleanup.older_than"),
+                                format_duration(duration).to_string(),
+                            );
+                        }
+                        Some(m)
+                    }
+                };
 
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
@@ -793,8 +796,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_column_stats_policy_set_to_true_when_disabled() {
-        // Test that COLUMN_STATS_DISABLED_KEY is set to true when stats are explicitly disabled
+    async fn test_column_stats_policy_empty_when_disabled_no_auto_cleanup() {
+        // When stats are disabled and there is no auto_cleanup, we leave manifest config empty
+        // so old Lance versions (that don't support FLAG_TABLE_CONFIG) can still write.
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -805,15 +809,16 @@ mod test {
         let dataset = InsertBuilder::new("memory://test_column_stats_disabled")
             .with_params(&WriteParams {
                 disable_column_stats: true, // Stats disabled
+                auto_cleanup: None,         // No auto_cleanup -> empty config for old-Lance compat
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await
             .unwrap();
 
-        // Check that the manifest has the column stats config set to true (disabled=true)
+        // Config is empty for old-Lance compatibility
         let config_value = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
-        assert_eq!(config_value, Some(&"true".to_string()));
+        assert_eq!(config_value, None);
     }
 
     #[tokio::test]
@@ -992,10 +997,11 @@ mod test {
         )
         .unwrap();
 
-        // Create a dataset normally with stats disabled
+        // Create a dataset with stats disabled and no auto_cleanup -> empty manifest config
         let dataset = InsertBuilder::new("memory://test_backwards_compat")
             .with_params(&WriteParams {
                 disable_column_stats: true, // Stats disabled
+                auto_cleanup: None,         // No auto_cleanup -> empty config
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(
@@ -1005,9 +1011,9 @@ mod test {
             .await
             .unwrap();
 
-        // Verify policy key is set (true = stats disabled)
+        // No policy key in manifest (empty config for old-Lance compatibility)
         let policy_value = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY);
-        assert_eq!(policy_value, Some(&"true".to_string()));
+        assert_eq!(policy_value, None);
 
         // Appending with matching policy should work
         let batch2 = RecordBatch::try_new(

@@ -6192,6 +6192,7 @@ mod tests {
             }),
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
+            column_stats: None,
         }
     }
 

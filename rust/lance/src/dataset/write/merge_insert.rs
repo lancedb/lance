@@ -6705,6 +6705,8 @@ mod tests {
         .unwrap();
     }
 
+    // Run with: cargo test -p lance --lib test_skip_auto_cleanup
+    // (Use --lib so only library tests run; otherwise other binaries report "0 passed".)
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         let tmpdir = TempStrDir::default();
@@ -6738,6 +6740,7 @@ mod tests {
         let dataset = Dataset::write(data, &dataset_uri, Some(write_params))
             .await
             .unwrap();
+        // Initial write creates version 1 (one commit).
         assert_eq!(dataset.version().version, 1);
 
         // Advance time
@@ -6759,6 +6762,7 @@ mod tests {
             .await
             .unwrap();
 
+        // First merge creates version 2 (one commit).
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
@@ -6781,12 +6785,13 @@ mod tests {
                 .await
                 .unwrap();
 
+        // Second merge creates version 3 (one commit). Auto cleanup runs after each commit, so version 1 is removed.
         assert_eq!(dataset2_extra.version().version, 3);
 
         // Load the dataset from disk to check versions
         let ds_check1 = DatasetBuilder::from_uri(&dataset_uri).load().await.unwrap();
 
-        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version, interval=1).
         assert!(
             ds_check1.checkout_version(1).await.is_err(),
             "Version 1 should have been cleaned up"
@@ -6817,12 +6822,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Third merge creates version 4 (one commit). No cleanup because skip_auto_cleanup was set.
         assert_eq!(dataset3.version().version, 4);
 
         // Load the dataset from disk to check versions
         let ds_check2 = DatasetBuilder::from_uri(&dataset_uri).load().await.unwrap();
 
-        // Version 2 should still exist because skip_auto_cleanup was enabled
+        // Version 2 should still exist because skip_auto_cleanup was enabled (no cleanup after version 4).
         assert!(
             ds_check2.checkout_version(2).await.is_ok(),
             "Version 2 should still exist because skip_auto_cleanup was enabled"

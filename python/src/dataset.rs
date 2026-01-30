@@ -4512,6 +4512,9 @@ pub fn get_write_params(
         {
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
+        if let Some(disable_column_stats) = get_dict_opt::<bool>(options, "disable_column_stats")? {
+            p.disable_column_stats = disable_column_stats;
+        }
 
         if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
             let mut auto_cleanup_params = AutoCleanupParams::default();

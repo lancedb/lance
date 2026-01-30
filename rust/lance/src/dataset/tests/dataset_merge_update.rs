@@ -1128,7 +1128,7 @@ async fn test_insert_skip_auto_cleanup() {
     let dataset = Dataset::write(data, &test_uri, Some(write_params))
         .await
         .unwrap();
-    assert_eq!(dataset.version().version, 1);
+    let version_after_write = dataset.version().version;
 
     // Advance time by 1 second
     MockClock::set_system_time(std::time::Duration::from_secs(2));
@@ -1150,7 +1150,8 @@ async fn test_insert_skip_auto_cleanup() {
         .await
         .unwrap();
 
-    assert_eq!(dataset2.version().version, 2);
+    let version_after_first_append = dataset2.version().version;
+    assert!(version_after_first_append > version_after_write);
 
     // Advance time
     MockClock::set_system_time(std::time::Duration::from_secs(3));
@@ -1166,17 +1167,24 @@ async fn test_insert_skip_auto_cleanup() {
         .await
         .unwrap();
 
-    assert_eq!(dataset2_extra.version().version, 3);
+    let version_after_second_append = dataset2_extra.version().version;
+    assert_eq!(version_after_second_append, version_after_first_append + 1);
 
-    // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+    // Version after initial write should be cleaned up due to auto cleanup (cleanup runs every version)
     assert!(
-        dataset2_extra.checkout_version(1).await.is_err(),
-        "Version 1 should have been cleaned up"
+        dataset2_extra
+            .checkout_version(version_after_write)
+            .await
+            .is_err(),
+        "Version {version_after_write} (after initial write) should have been cleaned up"
     );
-    // Version 2 should still exist
+    // Version after first append should still exist
     assert!(
-        dataset2_extra.checkout_version(2).await.is_ok(),
-        "Version 2 should still exist"
+        dataset2_extra
+            .checkout_version(version_after_first_append)
+            .await
+            .is_ok(),
+        "Version {version_after_first_append} (after first append) should still exist"
     );
 
     // Advance time
@@ -1199,17 +1207,23 @@ async fn test_insert_skip_auto_cleanup() {
         .await
         .unwrap();
 
-    assert_eq!(dataset3.version().version, 4);
+    assert_eq!(dataset3.version().version, version_after_second_append + 1);
 
-    // Version 2 should still exist because skip_auto_cleanup was enabled
+    // Version after first append should still exist because skip_auto_cleanup was enabled
     assert!(
-        dataset3.checkout_version(2).await.is_ok(),
-        "Version 2 should still exist because skip_auto_cleanup was enabled"
+        dataset3
+            .checkout_version(version_after_first_append)
+            .await
+            .is_ok(),
+        "Version {version_after_first_append} should still exist because skip_auto_cleanup was enabled"
     );
-    // Version 3 should also still exist
+    // Version after second append should also still exist
     assert!(
-        dataset3.checkout_version(3).await.is_ok(),
-        "Version 3 should still exist"
+        dataset3
+            .checkout_version(version_after_second_append)
+            .await
+            .is_ok(),
+        "Version {version_after_second_append} should still exist"
     );
 }
 

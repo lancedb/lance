@@ -1637,16 +1637,18 @@ def test_config_update_auto_cleanup(tmp_path):
 
 
 def test_access_config(tmp_path):
+    # We assert only on the test key's presence/absence, not on len(ds.config()),
+    # because the manifest config may contain other keys (e.g. column stats).
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     ds = lance.write_dataset(table, base_dir, mode="create")
     ds.update_config({"test_key": "test_value"})
     config_value = ds.config()["test_key"]
     assert config_value == "test_value"
-    assert 1 == len(ds.config())
+    assert "test_key" in ds.config()
 
     ds.delete_config_keys(["test_key"])
-    assert 0 == len(ds.config())
+    assert "test_key" not in ds.config()
 
 
 def test_auto_cleanup_invalid(tmp_path):

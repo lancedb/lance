@@ -35,6 +35,8 @@ use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_core::utils::zone::ZoneBound;
 use lance_encoding::decoder::DecoderPlugins;
+use lance_encoding::version::LanceFileVersion;
+use lance_file::determine_file_version;
 use lance_file::reader::FileReader;
 use lance_file::writer::create_consolidated_zone_struct_type;
 use lance_io::object_store::ObjectStore;
@@ -208,7 +210,7 @@ pub async fn consolidate_column_stats(dataset: &Dataset) -> Result<Option<String
     // Step 4: Write as Lance file
     let stats_path = String::from("_stats/column_stats.lance");
     write_stats_file(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         &dataset.base.child(stats_path.as_str()),
         consolidated_batch,
     )
@@ -239,6 +241,12 @@ async fn fragment_has_stats(dataset: &Dataset, fragment: &FileFragment) -> Resul
         let file_path = dataset
             .data_file_dir(data_file)?
             .child(data_file.path.as_str());
+        // Legacy (0.2) format does not have column stats; skip to avoid opening with v2 reader
+        if determine_file_version(dataset.object_store.as_ref(), &file_path, None).await?
+            == LanceFileVersion::Legacy
+        {
+            return Ok(false);
+        }
         let scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
             SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -251,10 +259,7 @@ async fn fragment_has_stats(dataset: &Dataset, fragment: &FileFragment) -> Resul
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &dataset
-                .session
-                .metadata_cache
-                .file_metadata_cache(&file_path),
+            &dataset.metadata_cache.file_metadata_cache(&file_path),
             dataset.file_reader_options.clone().unwrap_or_default(),
         )
         .await?;
@@ -299,6 +304,12 @@ async fn read_fragment_column_stats(
     dataset: &Dataset,
     file_path: &Path,
 ) -> Result<Option<HashMap<String, Vec<ZoneStats>>>> {
+    // Legacy (0.2) format does not have column stats; v2 reader would reject the file
+    if determine_file_version(dataset.object_store.as_ref(), file_path, None).await?
+        == LanceFileVersion::Legacy
+    {
+        return Ok(None);
+    }
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -311,10 +322,7 @@ async fn read_fragment_column_stats(
         file_scheduler,
         None,
         Arc::<DecoderPlugins>::default(),
-        &dataset
-            .session
-            .metadata_cache
-            .file_metadata_cache(file_path),
+        &dataset.metadata_cache.file_metadata_cache(file_path),
         dataset.file_reader_options.clone().unwrap_or_default(),
     )
     .await?;
@@ -774,10 +782,7 @@ mod tests {
             file_scheduler,
             None,
             Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
-            &dataset
-                .session
-                .metadata_cache
-                .file_metadata_cache(&full_path),
+            &dataset.metadata_cache.file_metadata_cache(&full_path),
             dataset.file_reader_options.clone().unwrap_or_default(),
         )
         .await
@@ -790,6 +795,7 @@ mod tests {
                 16,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let mut batches = Vec::new();

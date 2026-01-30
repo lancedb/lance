@@ -1029,6 +1029,7 @@ async fn test_write_manifest(
         Some(WriteParams {
             data_storage_version: Some(data_storage_version),
             auto_cleanup: None,
+            disable_column_stats: true, // No column stats; policy is still in config so FLAG_TABLE_CONFIG is set
             ..Default::default()
         }),
     );
@@ -1072,9 +1073,10 @@ async fn test_write_manifest(
     )
     .await
     .unwrap();
-    assert_eq!(
-        manifest.writer_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+    // Writer has deletion files; table config may be set if config is non-empty (e.g. column stats policy)
+    assert!(
+        manifest.writer_feature_flags & feature_flags::FLAG_DELETION_FILES != 0,
+        "writer_feature_flags should have FLAG_DELETION_FILES"
     );
     assert_eq!(
         manifest.reader_feature_flags,
