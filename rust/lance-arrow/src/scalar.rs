@@ -141,20 +141,28 @@ pub fn decode_scalar_from_inline_value(
     data_type: &DataType,
     inline_value: &[u8],
 ) -> Result<ArrayRef> {
-    let byte_width = data_type.byte_width_opt().ok_or_else(|| {
-        ArrowError::InvalidArgumentError(format!(
-            "Inline constant is not supported for non-fixed-stride data type {:?}",
-            data_type
-        ))
-    })?;
-
-    if inline_value.len() != byte_width {
-        return Err(ArrowError::InvalidArgumentError(format!(
+    // I expect our input to be safe here, but I added some debug_assert_eq statements just in case.
+    // If they are triggered, we may need to change them to return actual errors.
+    //
+    // Boolean values are bit-packed in Arrow and therefore are not "fixed-stride" in bytes.
+    // As a result, `byte_width_opt()` returns `None` for `DataType::Boolean`, even though a
+    // length-1 scalar can be represented inline using a single byte (matching `try_inline_value`).
+    if matches!(data_type, DataType::Boolean) {
+        debug_assert_eq!(
+            inline_value.len(),
+            1,
+            "Invalid boolean inline scalar length (expected 1 byte, got {})",
+            inline_value.len()
+        );
+    } else if let Some(byte_width) = data_type.byte_width_opt() {
+        debug_assert_eq!(
+            inline_value.len(),
+            byte_width,
             "Inline constant length mismatch for {:?}: expected {} bytes but got {}",
             data_type,
             byte_width,
             inline_value.len()
-        )));
+        );
     }
 
     let data = ArrayDataBuilder::new(data_type.clone())
@@ -187,7 +195,7 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{cast::AsArray, FixedSizeBinaryArray, Int32Array, StringArray};
+    use arrow_array::{cast::AsArray, BooleanArray, FixedSizeBinaryArray, Int32Array, StringArray};
 
     use super::*;
 
@@ -229,6 +237,16 @@ mod tests {
             decode_scalar_from_value_buffer(&DataType::FixedSizeBinary(33), &buf).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded.as_fixed_size_binary().value(0), val.as_slice());
+    }
+
+    #[test]
+    fn test_inline_value_boolean_round_trip() {
+        let scalar: ArrayRef = Arc::new(BooleanArray::from_iter([Some(true)]));
+        let inline = try_inline_value(&scalar).unwrap();
+        let decoded = decode_scalar_from_inline_value(&DataType::Boolean, &inline).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.null_count(), 0);
+        assert!(decoded.as_boolean().value(0));
     }
 
     #[test]
