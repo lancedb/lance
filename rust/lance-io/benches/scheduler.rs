@@ -99,12 +99,12 @@ fn bench_full_read(c: &mut Criterion) {
                                     .unwrap();
                             }
                             std::env::set_var("IO_THREADS", io_parallelism.to_string());
+                            let mut config = SchedulerConfig::default_for_testing();
+                            if use_lite_scheduler {
+                                config = config.with_lite_scheduler();
+                            }
                             runtime.block_on(async {
-                                let scheduler = ScanScheduler::try_new(
-                                    obj_store,
-                                    SchedulerConfig::default_for_testing(use_lite_scheduler),
-                                )
-                                .unwrap();
+                                let scheduler = ScanScheduler::new(obj_store, config);
                                 let file_scheduler = scheduler
                                     .open_file(&tmp_file, &CachedFileSize::unknown())
                                     .await
@@ -233,11 +233,11 @@ fn bench_random_read(c: &mut Criterion) {
                                         }
                                     }
 
-                                    let scheduler = ScanScheduler::try_new(
-                                        obj_store,
-                                        SchedulerConfig::default_for_testing(use_lite_scheduler),
-                                    )
-                                    .unwrap();
+                                    let mut config = SchedulerConfig::default_for_testing();
+                                    if use_lite_scheduler {
+                                        config = config.with_lite_scheduler();
+                                    }
+                                    let scheduler = ScanScheduler::new(obj_store, config);
                                     let file_scheduler = scheduler
                                         .open_file(&tmp_file, &CachedFileSize::unknown())
                                         .await
