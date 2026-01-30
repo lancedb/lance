@@ -959,7 +959,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "metric_type": "l2",
             "nbits": 8,
             "num_sub_vectors": 8,
-            "transposed": False,
+            "transposed": True,
         },
         "index_file_version": IndexFileVersion.V3,
     }

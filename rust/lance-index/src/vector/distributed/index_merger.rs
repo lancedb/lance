@@ -206,6 +206,7 @@ pub async fn init_writer_for_pq(
         FileWriterOptions::default(),
     )?;
     let mut pm_init = pm.clone();
+    pm_init.transposed = true;
     let cb = pm_init.codebook.as_ref().ok_or_else(|| Error::Index {
         message: "PQ codebook missing".to_string(),
         location: snafu::location!(),
@@ -777,16 +778,20 @@ pub async fn merge_partial_vector_auxiliary_files(
                     if existing_pm.num_sub_vectors != pm.num_sub_vectors
                         || existing_pm.nbits != pm.nbits
                         || existing_pm.dimension != pm.dimension
+                        || existing_pm.transposed != pm.transposed
                     {
                         return Err(Error::Index {
                             message: format!(
-                                "Distributed PQ merge: structural mismatch across shards; first(dim={}, m={}, nbits={}), current(dim={}, m={}, nbits={})",
+                                "Distributed PQ merge: structural mismatch across shards; first(\
+                                dim={}, m={}, nbits={}, transposed={}), current(dim={}, m={}, nbits={}, transposed={})",
                                 existing_pm.dimension,
                                 existing_pm.num_sub_vectors,
                                 existing_pm.nbits,
+                                existing_pm.transposed,
                                 pm.dimension,
                                 pm.num_sub_vectors,
-                                pm.nbits
+                                pm.nbits,
+                                pm.transposed
                             ),
                             location: location!(),
                         });
