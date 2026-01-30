@@ -11,6 +11,11 @@ on:
         description: "Tag to publish (e.g., v1.0.0)"
         required: true
         type: string
+      skip_check_repo:
+        description: "Skip checking if packages have been modified (useful for backfilling missed releases)"
+        required: false
+        type: boolean
+        default: false
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -87,6 +92,7 @@ jobs:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: "--all-features"
           path: .
+          check-repo: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_check_repo != true }}
   report-failure:
     name: Report Workflow Failure
     runs-on: ubuntu-latest
