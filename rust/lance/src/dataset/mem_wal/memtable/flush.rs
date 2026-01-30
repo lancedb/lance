@@ -108,7 +108,7 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        self.write_data_file(&gen_path, memtable).await?;
+        let rows_flushed = self.write_data_file(&gen_path, memtable).await?;
 
         let bloom_path = gen_path.child("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
@@ -129,23 +129,30 @@ impl MemTableFlusher {
                 generation,
                 path: gen_folder_name,
             },
-            rows_flushed: memtable.row_count(),
+            rows_flushed,
             covered_wal_entry_position: last_wal_entry_position,
         })
     }
 
-    async fn write_data_file(&self, path: &Path, memtable: &MemTable) -> Result<()> {
+    /// Write data file with batches in reverse order (newest first).
+    ///
+    /// Returns the total number of rows written, which is needed for
+    /// reversing row positions in indexes.
+    async fn write_data_file(&self, path: &Path, memtable: &MemTable) -> Result<usize> {
         use arrow_array::RecordBatchIterator;
 
         use crate::dataset::WriteParams;
 
         if memtable.row_count() == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
-        let batches = memtable.scan_batches().await?;
+        // Scan batches in reverse order (newest first) so that the flushed
+        // data is ordered from newest to oldest. This enables more efficient
+        // K-way merge during LSM scan.
+        let (batches, total_rows) = memtable.scan_batches_reversed().await?;
         if batches.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let uri = self.path_to_uri(path);
@@ -159,7 +166,7 @@ impl MemTableFlusher {
         };
         Dataset::write(reader, &uri, Some(write_params)).await?;
 
-        Ok(())
+        Ok(total_rows)
     }
 
     async fn write_bloom_filter(
@@ -213,10 +220,10 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        self.write_data_file(&gen_path, memtable).await?;
+        let total_rows = self.write_data_file(&gen_path, memtable).await?;
 
         let created_indexes = self
-            .create_indexes(&gen_path, index_configs, memtable.indexes())
+            .create_indexes(&gen_path, index_configs, memtable.indexes(), total_rows)
             .await?;
         if !created_indexes.is_empty() {
             info!(
@@ -235,7 +242,7 @@ impl MemTableFlusher {
                 if let MemIndexConfig::IvfPq(ivf_pq_config) = config {
                     if let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name) {
                         let mut index_meta = self
-                            .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index)
+                            .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
                             .await?;
 
                         // Fix up the index metadata with correct field index
@@ -306,11 +313,18 @@ impl MemTableFlusher {
     }
 
     /// Create BTree indexes on the flushed dataset.
+    ///
+    /// # Arguments
+    /// * `gen_path` - Path to the flushed generation folder
+    /// * `index_configs` - Index configurations
+    /// * `mem_indexes` - In-memory index registry (for preprocessed training data)
+    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
     async fn create_indexes(
         &self,
         gen_path: &Path,
         index_configs: &[MemIndexConfig],
         mem_indexes: Option<&super::super::index::IndexStore>,
+        total_rows: usize,
     ) -> Result<Vec<IndexMetadata>> {
         use arrow_array::RecordBatchIterator;
 
@@ -346,7 +360,10 @@ impl MemTableFlusher {
 
             if let Some(registry) = mem_indexes {
                 if let Some(btree_index) = registry.get_btree(&btree_cfg.name) {
-                    let training_batches = btree_index.to_training_batches(8192)?;
+                    // Use reversed training batches since the flushed data is in reverse order.
+                    // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
+                    let training_batches =
+                        btree_index.to_training_batches_reversed(8192, total_rows)?;
                     if !training_batches.is_empty() {
                         let schema = training_batches[0].schema();
                         let reader =
@@ -437,11 +454,18 @@ impl MemTableFlusher {
     ///
     /// Writes the index files directly using the pre-computed partition assignments
     /// and PQ codes from the in-memory index.
+    ///
+    /// # Arguments
+    /// * `gen_path` - Path to the flushed generation folder
+    /// * `config` - IVF-PQ index configuration
+    /// * `mem_index` - In-memory IVF-PQ index
+    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
     async fn create_ivf_pq_index(
         &self,
         gen_path: &Path,
         config: &super::super::index::IvfPqIndexConfig,
         mem_index: &super::super::index::IvfPqMemIndex,
+        total_rows: usize,
     ) -> Result<IndexMetadata> {
         use arrow_schema::{Field, Schema as ArrowSchema};
         use lance_core::ROW_ID;
@@ -465,8 +489,9 @@ impl MemTableFlusher {
         let index_uuid = uuid::Uuid::new_v4();
         let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
 
-        // Get partition data from in-memory index
-        let partition_batches = mem_index.to_partition_batches()?;
+        // Get partition data from in-memory index with reversed row positions
+        // since the flushed data is in reverse order.
+        let partition_batches = mem_index.to_partition_batches_reversed(total_rows)?;
         let ivf_model = mem_index.ivf_model();
         let pq = mem_index.pq();
         let distance_type = mem_index.distance_type();

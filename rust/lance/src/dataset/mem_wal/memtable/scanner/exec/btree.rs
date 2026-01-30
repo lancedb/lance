@@ -73,6 +73,7 @@ impl BTreeIndexExec {
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
     /// * `with_row_address` - Whether to include _rowaddr column (same as row position)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
@@ -474,8 +475,17 @@ mod tests {
             ],
         };
 
-        let exec =
-            BTreeIndexExec::new(batch_store, indexes, predicate, 0, None, schema, false, false).unwrap();
+        let exec = BTreeIndexExec::new(
+            batch_store,
+            indexes,
+            predicate,
+            0,
+            None,
+            schema,
+            false,
+            false,
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -530,8 +540,17 @@ mod tests {
         assert_eq!(total_rows, 0);
 
         // Query with max_visible=1 should see both batches
-        let exec =
-            BTreeIndexExec::new(batch_store, indexes, predicate, 1, None, schema, false, false).unwrap();
+        let exec = BTreeIndexExec::new(
+            batch_store,
+            indexes,
+            predicate,
+            1,
+            None,
+            schema,
+            false,
+            false,
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -642,13 +661,14 @@ mod tests {
                 None,
                 schema.clone(),
                 false,
+                false,
             )
             .unwrap(),
         );
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=false",
+            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=false, with_row_address=false",
         )
         .await
         .unwrap();
@@ -669,13 +689,14 @@ mod tests {
                 None,
                 schema_with_rowid,
                 true,
+                false,
             )
             .unwrap(),
         );
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=true",
+            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=true, with_row_address=false",
         )
         .await
         .unwrap();
