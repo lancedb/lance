@@ -188,7 +188,7 @@ async fn test_scan_constant_boolean_inline_value_v2_2() {
     )]));
 
     let rows = 1024usize;
-    let flags: ArrayRef = Arc::new(BooleanArray::from_iter(std::iter::repeat(true).take(rows)));
+    let flags: ArrayRef = Arc::new(BooleanArray::from_iter(std::iter::repeat_n(true, rows)));
     let batch = RecordBatch::try_new(schema.clone(), vec![flags]).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
 
