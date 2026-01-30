@@ -6,9 +6,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
-use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -283,8 +284,8 @@ impl MemTableFlusher {
                 }
             }
 
-            // Create FTS indexes
-            self.create_fts_indexes(&uri, index_configs, &mut dataset)
+            // Create FTS indexes from in-memory data (direct flush)
+            self.create_fts_indexes(&gen_path, index_configs, memtable.indexes(), total_rows)
                 .await?;
         }
 
@@ -393,17 +394,26 @@ impl MemTableFlusher {
         Ok(created_indexes)
     }
 
-    /// Create FTS (Full-Text Search) indexes on the flushed dataset.
+    /// Create FTS (Full-Text Search) indexes from in-memory data.
     ///
-    /// Uses the standard InvertedIndexBuilder with the same tokenizer parameters
-    /// that were used for the in-memory FTS index.
+    /// Directly writes the FTS index files using the pre-computed posting lists
+    /// and token data from the in-memory FTS index, avoiding re-tokenization.
+    ///
+    /// # Arguments
+    /// * `gen_path` - Path to the flushed generation folder
+    /// * `index_configs` - Index configurations
+    /// * `mem_indexes` - In-memory index registry (for preprocessed data)
+    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
     async fn create_fts_indexes(
         &self,
-        _uri: &str,
+        gen_path: &Path,
         index_configs: &[MemIndexConfig],
-        dataset: &mut Dataset,
+        mem_indexes: Option<&super::super::index::IndexStore>,
+        total_rows: usize,
     ) -> Result<()> {
-        use crate::index::CreateIndexBuilder;
+        use lance_index::pbold;
+        use lance_index::scalar::inverted::INVERTED_INDEX_VERSION;
+        use lance_index::scalar::lance_format::LanceIndexStore;
 
         let fts_configs: Vec<_> = index_configs
             .iter()
@@ -417,22 +427,83 @@ impl MemTableFlusher {
             return Ok(());
         }
 
+        let Some(registry) = mem_indexes else {
+            // No in-memory indexes, skip FTS creation
+            return Ok(());
+        };
+
+        // Open the dataset for index commits
+        let uri = self.path_to_uri(gen_path);
+        let mut dataset = Dataset::open(&uri).await?;
+
         for fts_cfg in fts_configs {
-            let mut builder = CreateIndexBuilder::new(
-                dataset,
-                &[fts_cfg.column.as_str()],
-                IndexType::Inverted,
-                &fts_cfg.params,
-            )
-            .name(fts_cfg.name.clone());
+            let Some(fts_index) = registry.get_fts(&fts_cfg.name) else {
+                continue;
+            };
 
-            let index_meta = builder.execute_uncommitted().await?;
+            if fts_index.is_empty() {
+                continue;
+            }
 
+            // Create a unique partition ID for this index
+            let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
+
+            // Build the index data with reversed row positions
+            let mut inner_builder =
+                fts_index.to_index_builder_reversed(partition_id, total_rows)?;
+
+            // Create the index store for writing
+            let index_uuid = uuid::Uuid::new_v4();
+            let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
+            let index_store = LanceIndexStore::new(
+                self.object_store.clone(),
+                index_dir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            );
+
+            // Write the index files
+            inner_builder.write(&index_store).await?;
+
+            // Write metadata file with partition info and params
+            self.write_fts_metadata(&index_store, partition_id, fts_cfg)
+                .await?;
+
+            // Create index metadata for commit
+            let details = pbold::InvertedIndexDetails::try_from(&fts_cfg.params)?;
+            let index_details = prost_types::Any::from_msg(&details).map_err(|e| {
+                Error::io(
+                    format!("Failed to serialize index details: {}", e),
+                    location!(),
+                )
+            })?;
+
+            let schema = dataset.schema();
+            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
+
+            let fragment_ids: roaring::RoaringBitmap = dataset
+                .get_fragments()
+                .iter()
+                .map(|f| f.id() as u32)
+                .collect();
+
+            let index_meta = IndexMetadata {
+                uuid: index_uuid,
+                name: fts_cfg.name.clone(),
+                fields: vec![field_idx],
+                dataset_version: dataset.version().version,
+                fragment_bitmap: Some(fragment_ids),
+                index_details: Some(Arc::new(index_details)),
+                index_version: INVERTED_INDEX_VERSION as i32,
+                created_at: None,
+                base_id: None,
+            };
+
+            // Commit the index to the dataset
             use crate::dataset::transaction::{Operation, Transaction};
             let transaction = Transaction::new(
                 index_meta.dataset_version,
                 Operation::CreateIndex {
-                    new_indices: vec![index_meta.clone()],
+                    new_indices: vec![index_meta],
                     removed_indices: vec![],
                 },
                 None,
@@ -442,10 +513,50 @@ impl MemTableFlusher {
                 .await?;
 
             info!(
-                "Created FTS index '{}' on column '{}'",
+                "Created FTS index '{}' on column '{}' (direct flush)",
                 fts_cfg.name, fts_cfg.column
             );
         }
+
+        Ok(())
+    }
+
+    /// Write FTS index metadata file.
+    async fn write_fts_metadata(
+        &self,
+        index_store: &lance_index::scalar::lance_format::LanceIndexStore,
+        partition_id: u64,
+        config: &super::super::index::FtsIndexConfig,
+    ) -> Result<()> {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        use lance_index::scalar::inverted::TokenSetFormat;
+
+        // Create metadata with params and partitions in schema metadata (this is what InvertedIndex expects)
+        let params_json = serde_json::to_string(&config.params)?;
+        let partitions_json = serde_json::to_string(&[partition_id])?;
+        let token_set_format = TokenSetFormat::default().to_string();
+
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("_placeholder", DataType::Utf8, true)]).with_metadata(
+                [
+                    ("params".to_string(), params_json),
+                    ("partitions".to_string(), partitions_json),
+                    ("token_set_format".to_string(), token_set_format),
+                ]
+                .into(),
+            ),
+        );
+
+        // Create a minimal batch (schema metadata is what matters)
+        let placeholder_array = Arc::new(StringArray::from(vec![None::<&str>]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![placeholder_array])?;
+
+        let mut writer = index_store.new_index_file("metadata.lance", schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish().await?;
 
         Ok(())
     }

@@ -410,6 +410,21 @@ impl InnerBuilder {
         self.id
     }
 
+    /// Set the token set for this builder.
+    pub fn set_tokens(&mut self, tokens: TokenSet) {
+        self.tokens = tokens;
+    }
+
+    /// Set the document set for this builder.
+    pub fn set_docs(&mut self, docs: DocSet) {
+        self.docs = docs;
+    }
+
+    /// Set the posting lists for this builder.
+    pub fn set_posting_lists(&mut self, posting_lists: Vec<PostingListBuilder>) {
+        self.posting_lists = posting_lists;
+    }
+
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // for the docs, we need to remove the rows that are removed from the doc set,
         // and update the row ids of the rows that are updated
