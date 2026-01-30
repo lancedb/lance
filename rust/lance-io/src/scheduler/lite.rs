@@ -146,9 +146,9 @@ impl IoTask {
         Ok(())
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.state {
-            TaskState::Broken => Poll::Ready(false),
+            TaskState::Broken => Poll::Ready(()),
             TaskState::Initial { idle_waker, .. } | TaskState::Reserved { idle_waker, .. } => {
                 idle_waker.replace(cx.waker().clone());
                 Poll::Pending
@@ -162,11 +162,11 @@ impl IoTask {
                         data,
                         backpressure_reservation: *backpressure_reservation,
                     };
-                    Poll::Ready(true)
+                    Poll::Ready(())
                 }
                 Poll::Pending => Poll::Pending,
             },
-            TaskState::Finished { .. } => Poll::Ready(false),
+            TaskState::Finished { .. } => Poll::Ready(()),
         }
     }
 
@@ -182,64 +182,6 @@ impl IoTask {
             });
         };
         Ok((data, backpressure_reservation))
-    }
-}
-
-// TODO: Re-enable this before merging.  If enabled as-is there is a potential deadlock.
-// This is because when scheduler X finishes a task it might need to notify scheduler Y
-// that the process limit has been lifted enough to run.  However, there is no mechanism
-// to do so.
-
-// static PROCESS_CONCURRENCY_LIMIT: LazyLock<Mutex<u64>> = LazyLock::new(|| {
-//     let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
-//         .map(|s| {
-//             s.parse::<u64>().unwrap_or_else(|_| {
-//                 log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
-//                 DEFAULT_PROCESS_IOPS_LIMIT as u64
-//             })
-//         })
-//         .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT as u64);
-//     Mutex::new(initial_capacity)
-// });
-
-/// A throttle to control how many IOPS can be issued concurrently
-trait ConcurrencyThrottle: Send {
-    fn try_acquire(&mut self) -> bool;
-    fn release(&mut self);
-}
-
-/// The default concurrency throttle combines a per-scan limit with a per-process limit
-struct SimpleConcurrencyThrottle {
-    concurrency_available: u64,
-}
-
-impl SimpleConcurrencyThrottle {
-    fn new(max_concurrency: u64) -> Self {
-        Self {
-            concurrency_available: max_concurrency,
-        }
-    }
-}
-
-impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
-    fn try_acquire(&mut self) -> bool {
-        if self.concurrency_available > 0 {
-            // let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
-            // if *process_concurrency_limit == 0 {
-            //     return false;
-            // }
-            // *process_concurrency_limit -= 1;
-            // self.concurrency_available -= 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn release(&mut self) {
-        // let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
-        // *process_concurrency_limit += 1;
-        // self.concurrency_available += 1;
     }
 }
 
@@ -301,19 +243,17 @@ struct SimpleBackpressureThrottle {
 }
 
 impl SimpleBackpressureThrottle {
-    fn try_new(max_bytes: u64, max_concurrency: u64) -> Result<Self> {
+    fn new(max_bytes: u64, max_concurrency: u64) -> Self {
         if max_bytes > i64::MAX as u64 {
-            return Err(Error::Internal {
-                message: format!("Max bytes must be less than {}", i64::MAX),
-                location: location!(),
-            });
+            // This is unlikely to ever be an issue
+            panic!("Max bytes must be less than {}", i64::MAX);
         }
-        Ok(Self {
+        Self {
             start: Instant::now(),
             last_warn: AtomicU64::new(0),
             bytes_available: max_bytes as i64,
             priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
-        })
+        }
     }
 
     fn warn_if_needed(&self) {
@@ -390,7 +330,6 @@ impl PartialEq for TaskEntry {
 impl Eq for TaskEntry {}
 
 struct IoQueueState {
-    concurrency_throttle: Box<dyn ConcurrencyThrottle>,
     backpressure_throttle: Box<dyn BackpressureThrottle>,
     pending_tasks: BinaryHeap<TaskEntry>,
     tasks: HashMap<u64, IoTask>,
@@ -398,30 +337,26 @@ struct IoQueueState {
 }
 
 impl IoQueueState {
-    fn try_new(max_concurrency: u64, max_bytes: u64) -> Result<Self> {
-        Ok(Self {
-            concurrency_throttle: Box::new(SimpleConcurrencyThrottle::new(max_concurrency)),
-            backpressure_throttle: Box::new(SimpleBackpressureThrottle::try_new(
+    fn new(max_concurrency: u64, max_bytes: u64) -> Self {
+        Self {
+            backpressure_throttle: Box::new(SimpleBackpressureThrottle::new(
                 max_bytes,
                 max_concurrency,
-            )?),
+            )),
             pending_tasks: BinaryHeap::new(),
             tasks: HashMap::new(),
             next_task_id: 0,
-        })
+        }
     }
 
     // If a task is in an unexpected state then we need to release any reservations that were made
     // before we return an error.
     //
     // Note: this is perhaps a bit paranoid as a task should never be in an unexpected state.
-    fn handle_result(&mut self, result: TaskResult, started: bool) -> Result<()> {
+    fn handle_result(&mut self, result: TaskResult) -> Result<()> {
         if let Err(error) = result {
             if let Some(reservation) = error.backpressure_reservation {
                 self.backpressure_throttle.release(reservation);
-            }
-            if started {
-                self.concurrency_throttle.release();
             }
             Err(Error::Internal {
                 message: error.message,
@@ -456,13 +391,10 @@ pub(super) struct IoQueue {
 }
 
 impl IoQueue {
-    pub fn try_new(max_concurrency: u64, max_bytes: u64) -> Result<Self> {
-        Ok(Self {
-            state: Arc::new(Mutex::new(IoQueueState::try_new(
-                max_concurrency,
-                max_bytes,
-            )?)),
-        })
+    pub fn new(max_concurrency: u64, max_bytes: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(IoQueueState::new(max_concurrency, max_bytes))),
+        }
     }
 
     fn push(&self, mut task: IoTask, mut state: MutexGuard<IoQueueState>) -> Result<()> {
@@ -471,12 +403,10 @@ impl IoQueue {
             .backpressure_throttle
             .try_acquire(task.num_bytes, task.priority)
         {
-            state.handle_result(task.reserve(reservation), false)?;
-            if state.concurrency_throttle.try_acquire() {
-                state.handle_result(task.start(), true)?;
-                state.tasks.insert(task_id, task);
-                return Ok(());
-            }
+            state.handle_result(task.reserve(reservation))?;
+            state.handle_result(task.start())?;
+            state.tasks.insert(task_id, task);
+            return Ok(());
         }
 
         state.pending_tasks.push(TaskEntry {
@@ -522,7 +452,7 @@ impl IoQueue {
     // When a task completes we should check to see if any other tasks are now runnable
     fn on_task_complete(&self, mut state: MutexGuard<IoQueueState>) -> Result<()> {
         let state_ref = &mut *state;
-        let mut task_result = (TaskResult::Ok(()), false);
+        let mut task_result = TaskResult::Ok(());
         while !state_ref.pending_tasks.is_empty() {
             // Unwrap safe here since we just checked the queue is not empty
             let next_task = state_ref.pending_tasks.peek().unwrap();
@@ -538,20 +468,17 @@ impl IoQueue {
                     break;
                 };
                 if let Err(e) = task.reserve(reservation) {
-                    task_result = (Err(e), false);
+                    task_result = Err(e);
                     break;
                 }
             }
-            if !state_ref.concurrency_throttle.try_acquire() {
-                break;
-            };
             state_ref.pending_tasks.pop();
             if let Err(e) = task.start() {
-                task_result = (Err(e), true);
+                task_result = Err(e);
                 break;
             }
         }
-        state_ref.handle_result(task_result.0, task_result.1)
+        state_ref.handle_result(task_result)
     }
 
     fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Bytes>> {
@@ -564,11 +491,7 @@ impl IoQueue {
             }));
         };
         match task.poll(cx) {
-            Poll::Ready(newly_finished) => {
-                if newly_finished {
-                    // Only release the concurrency throttle if we just finished the task
-                    state.concurrency_throttle.release();
-                }
+            Poll::Ready(_) => {
                 let task = state.tasks.remove(&task_id).unwrap();
                 let (bytes, reservation) = task.consume()?;
                 state.backpressure_throttle.release(reservation);
@@ -585,11 +508,7 @@ impl IoQueue {
     pub(super) fn close(&self) {
         let mut state = self.state.lock().unwrap();
         for task in std::mem::take(&mut state.tasks).values_mut() {
-            if task.cancel() {
-                state.concurrency_throttle.release();
-                // At the moment we don't need to worry about any potential backpressure reservations
-                // because the backpressure queue is local.  In the future this may change.
-            }
+            task.cancel();
         }
     }
 }

@@ -627,20 +627,31 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    pub fn new(io_buffer_size_bytes: u64) -> Self {
+        Self {
+            io_buffer_size_bytes,
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
+        }
+    }
+
     /// Big enough for unit testing
-    pub fn default_for_testing(use_lite_scheduler: bool) -> Self {
+    pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler,
+            use_lite_scheduler: false,
         }
     }
 
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
+        Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+    }
+
+    pub fn with_lite_scheduler(self) -> Self {
         Self {
-            io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
-            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
+            use_lite_scheduler: true,
+            ..self
         }
     }
 }
@@ -652,13 +663,13 @@ impl ScanScheduler {
     ///
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
-    pub fn try_new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Result<Arc<Self>> {
+    pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
         let io_queue = if config.use_lite_scheduler {
-            let io_queue = Arc::new(lite::IoQueue::try_new(
+            let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
-            )?);
+            ));
             IoQueueType::Lite(io_queue)
         } else {
             let io_queue = Arc::new(IoQueue::new(
@@ -672,11 +683,11 @@ impl ScanScheduler {
             tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
         };
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             object_store,
             io_queue,
             stats: Arc::new(StatsCollector::new()),
-        }))
+        })
     }
 
     /// Open a file for reading
@@ -1069,9 +1080,9 @@ mod tests {
         rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-        let config = SchedulerConfig::default_for_testing(false);
+        let config = SchedulerConfig::default_for_testing();
 
-        let scheduler = ScanScheduler::try_new(obj_store, config).unwrap();
+        let scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scheduler
             .open_file(&tmp_file, &CachedFileSize::unknown())
@@ -1116,9 +1127,9 @@ mod tests {
         rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-        let config = SchedulerConfig::default_for_testing(false);
+        let config = SchedulerConfig::default_for_testing();
 
-        let scheduler = ScanScheduler::try_new(obj_store, config).unwrap();
+        let scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scheduler
             .open_file(&tmp_file, &CachedFileSize::unknown())
@@ -1229,7 +1240,7 @@ mod tests {
             use_lite_scheduler: false,
         };
 
-        let scan_scheduler = ScanScheduler::try_new(obj_store, config).unwrap();
+        let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
             .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(1000))
@@ -1320,7 +1331,7 @@ mod tests {
             use_lite_scheduler: false,
         };
 
-        let scan_scheduler = ScanScheduler::try_new(obj_store.clone(), config).unwrap();
+        let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
 
         let file_scheduler = scan_scheduler
             .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
@@ -1395,7 +1406,7 @@ mod tests {
             use_lite_scheduler: false,
         };
 
-        let scan_scheduler = ScanScheduler::try_new(obj_store, config).unwrap();
+        let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
             .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
             .await
@@ -1426,7 +1437,7 @@ mod tests {
             io_buffer_size_bytes: 1,
             use_lite_scheduler: false,
         };
-        let scan_scheduler = ScanScheduler::try_new(obj_store.clone(), config).unwrap();
+        let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler
             .open_file(&some_path, &CachedFileSize::unknown())
             .await

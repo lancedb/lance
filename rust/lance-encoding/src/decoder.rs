@@ -1842,8 +1842,6 @@ pub struct DecoderConfig {
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
-    /// If true then scheduling will happen on the same thread as the decoder.
-    pub serialized_scheduling: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1962,9 +1960,7 @@ fn create_scheduler_decoder(
         rx,
     )?;
 
-    let serialized_scheduling = config.decoder_config.serialized_scheduling;
-
-    let do_schedule = async move {
+    let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -1994,23 +1990,9 @@ fn create_scheduler_decoder(
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
-    };
+    });
 
-    let serialized_scheduling = serialized_scheduling
-        .unwrap_or_else(|| std::env::var("LANCE_USE_SERIALIZED_SCHEDULING").is_ok());
-
-    if serialized_scheduling {
-        // Schedule then decode
-        let schedule_first = async move {
-            do_schedule.await;
-            decode_stream
-        };
-        Ok(futures::stream::once(schedule_first).flatten().boxed())
-    } else {
-        // Schedule and decode in parallel
-        let scheduler_handle = tokio::task::spawn(do_schedule);
-        Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
-    }
+    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to

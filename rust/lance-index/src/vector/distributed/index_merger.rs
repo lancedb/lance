@@ -521,10 +521,10 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut v2w_opt: Option<V2Writer> = None;
 
     // We'll also need a scheduler to open readers efficiently
-    let sched = ScanScheduler::try_new(
+    let sched = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
-    )?;
+    );
 
     // Compute content-derived sort keys for each shard once while opening the
     // auxiliary readers. These keys will be reused both for ordering the
@@ -1394,11 +1394,10 @@ mod tests {
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Use ScanScheduler to obtain a FileScheduler (required by V2Reader::try_open)
-        let sched = ScanScheduler::try_new(
+        let sched = ScanScheduler::new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
-        )
-        .unwrap();
+        );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
             .await
@@ -1669,11 +1668,10 @@ mod tests {
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file.
-        let sched = ScanScheduler::try_new(
+        let sched = ScanScheduler::new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
-        )
-        .unwrap();
+        );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
             .await
@@ -1875,11 +1873,10 @@ mod tests {
         // order follows the lexicographic parent-dir tiebreaker: rows from
         // `partial_1_10` (row ids starting at 0) should precede rows from
         // `partial_1_10b` (row ids starting at 1_000) for the first partition.
-        let sched = ScanScheduler::try_new(
+        let sched = ScanScheduler::new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
-        )
-        .unwrap();
+        );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
             .await
@@ -1992,11 +1989,10 @@ mod tests {
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file and inspect row id layout.
-        let sched = ScanScheduler::try_new(
+        let sched = ScanScheduler::new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
-        )
-        .unwrap();
+        );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
             .await

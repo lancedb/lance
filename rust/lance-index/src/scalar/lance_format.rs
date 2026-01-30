@@ -54,12 +54,10 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
-        let scheduler = ScanScheduler::try_new(
+        let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
-        )
-        // Should be safe since SchedulerConfig::max_bandwidth is always valid
-        .unwrap();
+        );
         Self {
             object_store,
             index_dir,

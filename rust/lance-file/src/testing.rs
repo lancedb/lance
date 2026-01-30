@@ -28,11 +28,8 @@ impl Default for FsFixture {
     fn default() -> Self {
         let tmp_path = TempObjFile::default();
         let object_store = Arc::new(ObjectStore::local());
-        let scheduler = ScanScheduler::try_new(
-            object_store.clone(),
-            SchedulerConfig::default_for_testing(false),
-        )
-        .unwrap();
+        let scheduler =
+            ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
         Self {
             object_store,
             tmp_path,
