@@ -327,7 +327,7 @@ pub mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::utils::mask::RowAddrTreeMap;
+    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};

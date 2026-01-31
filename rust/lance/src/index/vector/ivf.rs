@@ -1867,7 +1867,7 @@ async fn write_ivf_hnsw_file(
 pub async fn finalize_distributed_merge(
     object_store: &ObjectStore,
     index_dir: &object_store::path::Path,
-    requested_index_type: Option<&str>,
+    requested_index_type: Option<IndexType>,
 ) -> Result<()> {
     // Merge per-shard auxiliary files into a unified auxiliary.idx.
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
@@ -1889,7 +1889,7 @@ pub async fn finalize_distributed_merge(
         fh,
         None,
         Arc::default(),
-        &lance_core::cache::LanceCache::no_cache(),
+        &LanceCache::no_cache(),
         V2ReaderOptions::default(),
     )
     .await?;

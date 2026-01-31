@@ -153,7 +153,7 @@ impl LanceBuffer {
     pub fn borrow_to_typed_slice<T: ArrowNativeType>(&self) -> ScalarBuffer<T> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
-        if self.len() % std::mem::size_of::<T>() != 0 {
+        if !self.len().is_multiple_of(std::mem::size_of::<T>()) {
             panic!("attempt to borrow_to_typed_slice to data type of size {} but we have {} bytes which isn't evenly divisible", std::mem::size_of::<T>(), self.len());
         }
 
@@ -184,7 +184,7 @@ impl LanceBuffer {
     /// carefully reviewed.
     pub fn borrow_to_typed_view<T: ArrowNativeType + bytemuck::Pod>(&self) -> Cow<'_, [T]> {
         let align = std::mem::align_of::<T>();
-        if self.len() % std::mem::size_of::<T>() != 0 {
+        if !self.len().is_multiple_of(std::mem::size_of::<T>()) {
             panic!("attempt to view data type of size {} but we have {} bytes which isn't evenly divisible", std::mem::size_of::<T>(), self.len());
         }
 

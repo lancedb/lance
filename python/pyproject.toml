@@ -64,7 +64,7 @@ tests = [
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
-torch = ["torch"]
+torch = ["torch>=2.0"]
 geo = [
     "geoarrow-rust-core",
     "geoarrow-rust-io",
@@ -115,9 +115,13 @@ filterwarnings = [
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
-    # Pytorch 2.2 on Python 2.12
+    # Pytorch 2.2 on Python 3.12
     'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
     'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
+    # Pytorch inductor uses deprecated load_module() in its code cache
+    'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
+    # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
+    'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
     # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
     # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
     'ignore:.*np\.object.*:FutureWarning',

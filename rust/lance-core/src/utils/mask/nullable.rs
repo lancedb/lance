@@ -3,7 +3,7 @@
 
 use deepsize::DeepSizeOf;
 
-use super::{RowAddrMask, RowAddrTreeMap};
+use super::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 
 /// A set of row ids, with optional set of nulls.
 ///

@@ -6,8 +6,9 @@ use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
+use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{
-    BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -33,7 +34,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
+use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
 use crate::session::Session;
 use crate::Dataset;
 
@@ -42,14 +43,6 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
-
-pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
-    if storage_version >= LanceFileVersion::V2_2 {
-        BlobVersion::V2
-    } else {
-        BlobVersion::V1
-    }
-}
 
 mod commit;
 pub mod delete;
@@ -376,6 +369,7 @@ pub async fn write_fragments(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_write_fragments(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
@@ -571,9 +565,10 @@ pub async fn write_fragments_internal(
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
-    mut params: WriteParams,
+    params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    let mut params = params;
     let adapter = SchemaAdapter::new(data.schema());
 
     let (data, converted_schema) = if adapter.requires_physical_conversion() {
@@ -637,19 +632,30 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    let target_blob_version = blob_version_for(storage_version);
-    if let Some(dataset) = dataset {
-        let existing_version = dataset.blob_version();
-        if existing_version != target_blob_version {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "Blob column version mismatch. Existing dataset uses {:?} but requested write requires {:?}. Changing blob version is not allowed",
-                    existing_version, target_blob_version
-                )
-                .into(),
-                location: location!(),
-            });
-        }
+    if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "Blob v2 requires file version >= 2.2 (got {:?})",
+                storage_version
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
+    if storage_version >= LanceFileVersion::V2_2
+        && schema
+            .fields
+            .iter()
+            .any(|f| f.metadata.contains_key(BLOB_META_KEY))
+    {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
+            )
+            .into(),
+            location: location!(),
+        });
     }
 
     let fragments = do_write_fragments(
@@ -811,6 +817,7 @@ pub async fn open_writer_with_options(
         })
     } else {
         let writer = object_store.create(&full_path).await?;
+        let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
         let file_writer = current_writer::FileWriter::try_new(
             writer,
             schema.clone(),
@@ -819,11 +826,12 @@ pub async fn open_writer_with_options(
                 ..Default::default()
             },
         )?;
-        let preprocessor = if schema_has_blob_v2(schema) {
+        let preprocessor = if enable_blob_v2 {
             Some(BlobPreprocessor::new(
                 object_store.clone(),
                 data_dir.clone(),
                 data_file_key.clone(),
+                schema,
             ))
         } else {
             None

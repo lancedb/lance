@@ -8,7 +8,10 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use arrow_array::cast::AsArray;
-use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch,
+    StringArray, StructArray,
+};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
@@ -27,6 +30,8 @@ pub enum KeyValue {
     Int64(i64),
     UInt64(u64),
     Binary(Vec<u8>),
+    List(Vec<Self>),
+    Struct(Vec<Self>),
     Composite(Vec<Self>),
 }
 
@@ -37,7 +42,7 @@ impl KeyValue {
             Self::Int64(i) => i.to_le_bytes().to_vec(),
             Self::UInt64(u) => u.to_le_bytes().to_vec(),
             Self::Binary(b) => b.clone(),
-            Self::Composite(values) => {
+            Self::List(values) | Self::Struct(values) | Self::Composite(values) => {
                 let mut result = Vec::new();
                 for value in values {
                     result.extend_from_slice(&value.to_bytes());
@@ -289,41 +294,7 @@ pub fn extract_key_value_from_batch(
             return None;
         }
 
-        let key_part = match column.data_type() {
-            DataType::Utf8 => {
-                let arr = column.as_any().downcast_ref::<StringArray>()?;
-                KeyValue::String(arr.value(row_idx).to_string())
-            }
-            DataType::LargeUtf8 => {
-                let arr = column.as_any().downcast_ref::<LargeStringArray>()?;
-                KeyValue::String(arr.value(row_idx).to_string())
-            }
-            DataType::UInt64 => {
-                let arr = column.as_primitive::<arrow_array::types::UInt64Type>();
-                KeyValue::UInt64(arr.value(row_idx))
-            }
-            DataType::Int64 => {
-                let arr = column.as_primitive::<arrow_array::types::Int64Type>();
-                KeyValue::Int64(arr.value(row_idx))
-            }
-            DataType::UInt32 => {
-                let arr = column.as_primitive::<arrow_array::types::UInt32Type>();
-                KeyValue::UInt64(arr.value(row_idx) as u64)
-            }
-            DataType::Int32 => {
-                let arr = column.as_primitive::<arrow_array::types::Int32Type>();
-                KeyValue::Int64(arr.value(row_idx) as i64)
-            }
-            DataType::Binary => {
-                let arr = column.as_any().downcast_ref::<BinaryArray>()?;
-                KeyValue::Binary(arr.value(row_idx).to_vec())
-            }
-            DataType::LargeBinary => {
-                let arr = column.as_any().downcast_ref::<LargeBinaryArray>()?;
-                KeyValue::Binary(arr.value(row_idx).to_vec())
-            }
-            _ => return None,
-        };
+        let key_part = extract_key_value(column, row_idx)?;
         parts.push(key_part);
     }
 
@@ -333,5 +304,414 @@ pub fn extract_key_value_from_batch(
         Some(parts.into_iter().next().unwrap())
     } else {
         Some(KeyValue::Composite(parts))
+    }
+}
+
+fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
+    let v = match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>()?;
+            KeyValue::String(arr.value(row_idx).to_string())
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>()?;
+            KeyValue::String(arr.value(row_idx).to_string())
+        }
+        DataType::UInt64 => {
+            let arr = array.as_primitive::<arrow_array::types::UInt64Type>();
+            KeyValue::UInt64(arr.value(row_idx))
+        }
+        DataType::Int64 => {
+            let arr = array.as_primitive::<arrow_array::types::Int64Type>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::UInt32 => {
+            let arr = array.as_primitive::<arrow_array::types::UInt32Type>();
+            KeyValue::UInt64(arr.value(row_idx) as u64)
+        }
+        DataType::Int32 => {
+            let arr = array.as_primitive::<arrow_array::types::Int32Type>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>()?;
+            KeyValue::Binary(arr.value(row_idx).to_vec())
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>()?;
+            KeyValue::Binary(arr.value(row_idx).to_vec())
+        }
+        DataType::List(_) => {
+            let list_array = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = list_array.value(row_idx);
+
+            let mut elements = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    return None;
+                }
+                let element = extract_key_value(&values, i)?;
+                elements.push(element);
+            }
+            KeyValue::List(elements)
+        }
+        DataType::LargeList(_) => {
+            let list_array = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+            let values = list_array.value(row_idx);
+
+            let mut elements = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    return None;
+                }
+                let element = extract_key_value(&values, i)?;
+                elements.push(element);
+            }
+            KeyValue::List(elements)
+        }
+        DataType::Struct(_) => {
+            let struct_array = array.as_any().downcast_ref::<StructArray>()?;
+            let mut elements = Vec::with_capacity(struct_array.num_columns());
+            for i in 0..struct_array.num_columns() {
+                let child = struct_array.column(i);
+                if child.is_null(row_idx) {
+                    return None;
+                }
+                let field_value = extract_key_value(child.as_ref(), row_idx)?;
+                elements.push(field_value);
+            }
+            KeyValue::Struct(elements)
+        }
+        _ => return None,
+    };
+    Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::builder::{Int32Builder, ListBuilder, StringBuilder};
+    use arrow_array::{Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{Field, Schema};
+
+    #[test]
+    fn test_extract_key_value_from_batch_list_int() {
+        let values_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(values_builder);
+
+        list_builder.append_value([Some(1), Some(2)]);
+        list_builder.append_value([Some(3), Some(4), Some(5)]);
+
+        let list_array = list_builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            list_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")])
+            .expect("second row should produce a key");
+
+        match &key0 {
+            KeyValue::List(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::Int64(1));
+                assert_eq!(values[1], KeyValue::Int64(2));
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+
+        match &key1 {
+            KeyValue::List(values) => {
+                assert_eq!(values.len(), 3);
+                assert_eq!(values[0], KeyValue::Int64(3));
+                assert_eq!(values[1], KeyValue::Int64(4));
+                assert_eq!(values[2], KeyValue::Int64(5));
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+
+        assert_ne!(
+            key0.hash_value(),
+            key1.hash_value(),
+            "different list values should hash differently",
+        );
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_empty_list() {
+        let values_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(values_builder);
+
+        list_builder.append_value(std::iter::empty::<Option<i32>>());
+
+        let list_array = list_builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            list_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list_array)])
+            .expect("batch should be valid");
+
+        let key = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("empty list should still produce a key");
+
+        match key {
+            KeyValue::List(values) => {
+                assert!(values.is_empty(), "expected empty list");
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_list_utf8() {
+        let values_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(values_builder);
+
+        list_builder.append_value([Some("a"), Some("bc")]);
+        list_builder.append_value([Some("de")]);
+
+        let list_array = list_builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            list_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")])
+            .expect("second row should produce a key");
+
+        match &key0 {
+            KeyValue::List(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::String("a".to_string()));
+                assert_eq!(values[1], KeyValue::String("bc".to_string()));
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+
+        match &key1 {
+            KeyValue::List(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0], KeyValue::String("de".to_string()));
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+
+        assert_ne!(
+            key0.hash_value(),
+            key1.hash_value(),
+            "different list values should hash differently",
+        );
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_list_with_null_child() {
+        let values_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(values_builder);
+
+        list_builder.append_value([Some(1), Some(2)]);
+        list_builder.append_value([Some(3), None]);
+
+        let list_array = list_builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            list_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")]);
+
+        match &key0 {
+            KeyValue::List(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::Int64(1));
+                assert_eq!(values[1], KeyValue::Int64(2));
+            }
+            other => panic!("expected list key, got {:?}", other),
+        }
+
+        assert!(
+            key1.is_none(),
+            "list row with a null child should not produce a key",
+        );
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_struct_int() {
+        let a_values = Int32Array::from(vec![1, 3]);
+        let b_values = Int32Array::from(vec![2, 4]);
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", arrow_schema::DataType::Int32, false)),
+                Arc::new(a_values) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("b", arrow_schema::DataType::Int32, false)),
+                Arc::new(b_values) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            struct_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(struct_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")])
+            .expect("second row should produce a key");
+
+        match &key0 {
+            KeyValue::Struct(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::Int64(1));
+                assert_eq!(values[1], KeyValue::Int64(2));
+            }
+            other => panic!("expected struct key, got {:?}", other),
+        }
+
+        match &key1 {
+            KeyValue::Struct(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::Int64(3));
+                assert_eq!(values[1], KeyValue::Int64(4));
+            }
+            other => panic!("expected struct key, got {:?}", other),
+        }
+
+        assert_ne!(
+            key0.hash_value(),
+            key1.hash_value(),
+            "different struct values should hash differently",
+        );
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_struct_utf8() {
+        let first_names = StringArray::from(vec!["alice", "bob"]);
+        let last_names = StringArray::from(vec!["smith", "jones"]);
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("first", arrow_schema::DataType::Utf8, false)),
+                Arc::new(first_names) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("last", arrow_schema::DataType::Utf8, false)),
+                Arc::new(last_names) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            struct_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(struct_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")])
+            .expect("second row should produce a key");
+
+        match &key0 {
+            KeyValue::Struct(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::String("alice".to_string()));
+                assert_eq!(values[1], KeyValue::String("smith".to_string()));
+            }
+            other => panic!("expected struct key, got {:?}", other),
+        }
+
+        match &key1 {
+            KeyValue::Struct(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::String("bob".to_string()));
+                assert_eq!(values[1], KeyValue::String("jones".to_string()));
+            }
+            other => panic!("expected struct key, got {:?}", other),
+        }
+
+        assert_ne!(
+            key0.hash_value(),
+            key1.hash_value(),
+            "different struct values should hash differently",
+        );
+    }
+
+    #[test]
+    fn test_extract_key_value_from_batch_struct_with_null_child() {
+        let a_values = Int32Array::from(vec![Some(1), None]);
+        let b_values = Int32Array::from(vec![Some(2), Some(3)]);
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", arrow_schema::DataType::Int32, true)),
+                Arc::new(a_values) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("b", arrow_schema::DataType::Int32, true)),
+                Arc::new(b_values) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            struct_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(struct_array)])
+            .expect("batch should be valid");
+
+        let key0 = extract_key_value_from_batch(&batch, 0, &[String::from("id")])
+            .expect("first row should produce a key");
+        let key1 = extract_key_value_from_batch(&batch, 1, &[String::from("id")]);
+
+        match &key0 {
+            KeyValue::Struct(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], KeyValue::Int64(1));
+                assert_eq!(values[1], KeyValue::Int64(2));
+            }
+            other => panic!("expected struct key, got {:?}", other),
+        }
+
+        assert!(
+            key1.is_none(),
+            "struct row with a null child should not produce a key",
+        );
     }
 }

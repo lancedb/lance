@@ -34,6 +34,7 @@ pub mod cast;
 pub mod json;
 pub mod list;
 pub mod memory;
+pub mod scalar;
 pub mod r#struct;
 
 /// Arrow extension metadata key for extension name
@@ -47,6 +48,9 @@ pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 /// Arrow extension type name for Lance blob v2 columns
 pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
+/// Metadata key for overriding the dedicated blob size threshold (in bytes)
+pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
+    "lance-encoding:blob-dedicated-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 

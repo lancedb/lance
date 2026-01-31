@@ -15,7 +15,7 @@ use datafusion_physical_expr::create_physical_expr;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::Result;
 use roaring::RoaringBitmap;
 use tracing::instrument;

@@ -513,6 +513,9 @@ please provide PQBuildParams.codebook for distributed indexing"
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(global_pq)
+                    // For distributed shards, keep PQ codes in their original layout
+                    // and transpose only after all shards are merged.
+                    .with_transpose(false)
                     .with_fragment_filter(fragment_filter)
                     .build()
                     .await?;
@@ -615,6 +618,9 @@ please provide PQBuildParams.codebook for distributed indexing"
             )?
             .with_ivf(ivf_model)
             .with_quantizer(global_pq)
+            // For distributed shards, keep PQ codes in their original layout
+            // and transpose only after all shards are merged.
+            .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .build()
             .await?;

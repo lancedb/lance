@@ -40,6 +40,11 @@ jobs:
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
       - name: Checkout lance-namespace-impls
         uses: actions/checkout@v4
         with:
@@ -72,6 +77,12 @@ jobs:
           # Copy .pages from lance-namespace-impls and append template entry
           cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
           echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
+      - name: Copy lance-huggingface docs
+        run: |
+          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Huggingface: huggingface
+          EOF
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark

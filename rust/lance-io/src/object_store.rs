@@ -706,7 +706,7 @@ impl ObjectStore {
         let path = Path::parse(&path)?;
 
         if self.is_local() {
-            // Local file system needs to delete directories as well.
+            // The local file system provider needs to delete both files and directories.
             return super::local::remove_dir_all(&path);
         }
         let sub_entries = self
@@ -718,6 +718,11 @@ impl ObjectStore {
             .delete_stream(sub_entries)
             .try_collect::<Vec<_>>()
             .await?;
+        if self.scheme == "file-object-store" {
+            // file-object-store tries to do everything as similarly as possible to the remote
+            // object stores. But we still have to delete the directory entries afterwards.
+            return super::local::remove_dir_all(&path);
+        }
         Ok(())
     }
 
@@ -1099,7 +1104,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_directory() {
+    async fn test_delete_directory_local_store() {
+        test_delete_directory("").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_file_object_store() {
+        test_delete_directory("file-object-store").await;
+    }
+
+    async fn test_delete_directory(scheme: &str) {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
@@ -1113,8 +1127,16 @@ mod tests {
             "delete",
         )
         .unwrap();
-        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
-        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let url = if scheme.is_empty() {
+            file_url
+        } else {
+            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+            // Use the file:// URL's normalized path so this works on Windows too.
+            url.set_path(file_url.path());
+            url
+        };
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());

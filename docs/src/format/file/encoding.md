@@ -328,11 +328,13 @@ The protobuf for the full zip layout describes the compression of the data buffe
 size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
 have per offset (for variable-width data).
 
-### All Null Page Layout
+### Constant Page Layout
 
-This layout is used when all the values are null. Surprisingly, this does not mean there is no data. If there
-are any levels of struct or list then we need to store the rep/def levels so that we can distinguish between
-null structs, null lists, empty lists, and null values.
+This layout is used when all (visible) values in the page are the same scalar value.
+
+The all-null case is represented by a constant page without an inline scalar value. Surprisingly, this does not
+mean there is no data. If there are any levels of struct or list then we need to store the rep/def levels so that
+we can distinguish between null structs, null lists, empty lists, and null values.
 
 #### Repetition and Definition Levels (Buffers 0 and 1)
 
@@ -342,10 +344,10 @@ in the second buffer with a flat layout of 16-bit values. This will likely chang
 #### Protobuf
 
 ```protobuf
-%%% proto.message.AllNullLayout %%%
+%%% proto.message.ConstantLayout %%%
 ```
 
-All we need to know is the meaning of each rep/def level.
+All we need to know is the meaning of each rep/def level and (when present) the inline scalar value bytes.
 
 ### Blob Page Layout
 

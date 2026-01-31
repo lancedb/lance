@@ -22,8 +22,8 @@ use arrow_array::RecordBatchReader;
 use arrow_array::{
     cast::as_string_array,
     types::{Float32Type, Int32Type},
-    ArrayRef, Int32Array, Int64Array, Int8Array, Int8DictionaryArray, RecordBatchIterator,
-    StringArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+    RecordBatchIterator, StringArray,
 };
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_ord::sort::sort_to_indices;
@@ -176,6 +176,58 @@ async fn test_create_and_fill_empty_dataset(
     let sorted_arr = arrow_select::take::take(&struct_arr, &sorted_indices, None).unwrap();
     let expected_struct_arr: StructArray = expected_batch.into();
     assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+}
+
+#[tokio::test]
+async fn test_scan_constant_boolean_inline_value_v2_2() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "flag",
+        DataType::Boolean,
+        false,
+    )]));
+
+    let rows = 1024usize;
+    let flags: ArrayRef = Arc::new(BooleanArray::from_iter(std::iter::repeat_n(true, rows)));
+    let batch = RecordBatch::try_new(schema.clone(), vec![flags]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let ds = Dataset::open(&test_uri).await.unwrap();
+    let batches = ds
+        .scan()
+        .project(&["flag"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, rows);
+    for batch in batches {
+        let flags = batch
+            .column_by_name("flag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        for i in 0..flags.len() {
+            assert!(flags.value(i));
+        }
+    }
 }
 
 #[rstest]

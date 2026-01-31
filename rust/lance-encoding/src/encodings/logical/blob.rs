@@ -281,27 +281,45 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
         let kind_col = struct_arr
             .column_by_name("kind")
-            .expect("kind column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `kind` field".into(),
+                location: location!(),
+            })?
             .as_primitive::<UInt8Type>();
         let data_col = struct_arr
             .column_by_name("data")
-            .expect("data column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `data` field".into(),
+                location: location!(),
+            })?
             .as_binary::<i64>();
         let uri_col = struct_arr
             .column_by_name("uri")
-            .expect("uri column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `uri` field".into(),
+                location: location!(),
+            })?
             .as_string::<i32>();
         let blob_id_col = struct_arr
             .column_by_name("blob_id")
-            .expect("blob_id column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `blob_id` field".into(),
+                location: location!(),
+            })?
             .as_primitive::<UInt32Type>();
         let blob_size_col = struct_arr
             .column_by_name("blob_size")
-            .expect("blob_size column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `blob_size` field".into(),
+                location: location!(),
+            })?
             .as_primitive::<UInt64Type>();
         let packed_position_col = struct_arr
             .column_by_name("position")
-            .expect("position column must exist")
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Blob v2 struct missing `position` field".into(),
+                location: location!(),
+            })?
             .as_primitive::<UInt64Type>();
 
         let row_count = struct_arr.len();
@@ -498,13 +516,20 @@ mod tests {
         ]));
 
         // Use the standard test harness
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_blob_v2_external_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -579,8 +604,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -642,8 +669,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_packed_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));

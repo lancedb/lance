@@ -78,6 +78,8 @@ mod x86 {
         // EAX=7, ECX=0: Extended Features (includes AVX512)
         // More info on calling CPUID can be found here (section 1.4)
         // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
+        // __cpuid is safe in nightly but unsafe in stable, allow both
+        #[allow(unused_unsafe)]
         let ext_cpuid_result = unsafe { __cpuid(7) };
         check_flag(ext_cpuid_result.edx as usize, 23)
     }

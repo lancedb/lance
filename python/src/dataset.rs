@@ -34,7 +34,6 @@ use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
 use lance::dataset::cleanup::CleanupPolicyBuilder;
-use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -59,6 +58,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_core::datatypes::BlobHandling;
 use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
@@ -66,7 +66,6 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
@@ -765,7 +764,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -788,6 +787,7 @@ impl Dataset {
         fast_search: Option<bool>,
         full_text_query: Option<&Bound<'_, PyAny>>,
         late_materialization: Option<Bound<PyAny>>,
+        blob_handling: Option<Bound<PyAny>>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
@@ -971,6 +971,25 @@ impl Dataset {
                     "late_materialization must be a bool or a list of strings",
                 ));
             }
+        }
+
+        if let Some(blob_handling) = blob_handling {
+            let handling = if let Ok(handling) = blob_handling.extract::<String>() {
+                match handling.as_str() {
+                    "all_binary" => BlobHandling::AllBinary,
+                    "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+                    "all_descriptions" => BlobHandling::AllDescriptions,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                        )))
+                    }
+                }
+            } else {
+                return Err(PyTypeError::new_err("blob_handling must be a str"));
+            };
+
+            scanner.blob_handling(handling);
         }
 
         if let Some(use_scalar_index) = use_scalar_index {
@@ -1280,7 +1299,7 @@ impl Dataset {
             Arc::new(
                 self.ds
                     .schema()
-                    .project(&columns)
+                    .project_preserve_system_columns(&columns)
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
@@ -2080,53 +2099,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
     ) -> PyResult<()> {
         rt().block_on(None, async {
-            let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
-            let index_dir = self.ds.indices_dir().child(index_uuid);
-            let index_type_up = index_type.to_uppercase();
-            log::info!(
-                "merge_index_metadata called with index_type={} (upper={})",
-                index_type,
-                index_type_up
-            );
-            match index_type_up.as_str() {
-                "INVERTED" | "FTS" => {
-                    // Call merge_index_files function for inverted index
-                    lance_index::scalar::inverted::builder::merge_index_files(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Arc::new(store),
-                    )
-                    .await
-                }
-                "BTREE" => {
-                    // Call merge_index_files function for btree index
-                    lance_index::scalar::btree::merge_index_files(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Arc::new(store),
-                        batch_readhead,
-                    )
-                    .await
-                }
-                // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
-                "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "VECTOR" => {
-                    // Merge distributed vector index partials and finalize root index via Lance IVF helper
-                    lance::index::vector::ivf::finalize_distributed_merge(
-                        self.ds.object_store(),
-                        &index_dir,
-                        Some(&index_type_up),
-                    )
-                    .await?;
-                    Ok(())
-                }
-                _ => Err(lance::Error::InvalidInput {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Unsupported index type (patched): {}", index_type_up),
-                    )),
-                    location: location!(),
-                }),
-            }
+            self.ds
+                .merge_index_metadata(index_uuid, IndexType::try_from(index_type)?, batch_readhead)
+                .await
         })?
         .map_err(|err| PyValueError::new_err(err.to_string()))
     }

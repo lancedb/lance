@@ -1554,6 +1554,35 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_btree_remap_big_deletions(tmp_path: Path):
+    # Write 15K rows in 3 fragments
+    ds = lance.write_dataset(pa.table({"a": range(5000)}), tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"a": range(5000, 10000)}), tmp_path, mode="append"
+    )
+    ds = lance.write_dataset(
+        pa.table({"a": range(10000, 15000)}), tmp_path, mode="append"
+    )
+
+    # Create index (will have 4 pages)
+    ds.create_scalar_index("a", index_type="BTREE")
+
+    # Delete a lot of data (now there will only be two pages worth)
+    ds.delete("a > 1000 AND a < 10000")
+
+    # Run compaction (deletions will be materialized)
+    ds.optimize.compact_files()
+
+    # Reload dataset and ensure index still works
+    ds = lance.dataset(tmp_path)
+
+    for idx in [0, 500, 1000, 10000, 13000, 14000, 14999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 1
+
+    for idx in [1001, 5000, 8000, 9999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 0
+
+
 def test_bitmap_remap(tmp_path: Path):
     # Make one full fragment
     tbl = pa.Table.from_arrays(
@@ -2403,10 +2432,23 @@ def compare_fts_results(
     single_df = single_machine_results.to_pandas()
     distributed_df = distributed_results.to_pandas()
 
-    # Sort both by row_id to ensure consistent ordering
-    if "_rowid" in single_df.columns:
-        single_df = single_df.sort_values("_rowid").reset_index(drop=True)
-        distributed_df = distributed_df.sort_values("_rowid").reset_index(drop=True)
+    # Normalize row ordering for comparisons.
+    #
+    # FTS search results do not guarantee a stable order for tied scores and
+    # different execution modes (single-machine vs distributed) may return rows
+    # in different (but equivalent) orders.
+    sort_cols = (
+        ["_rowid"]
+        if "_rowid" in single_df.columns
+        else [c for c in single_df.columns if c != "_score"]
+    )
+    if sort_cols:
+        single_df = single_df.sort_values(sort_cols, kind="mergesort").reset_index(
+            drop=True
+        )
+        distributed_df = distributed_df.sort_values(
+            sort_cols, kind="mergesort"
+        ).reset_index(drop=True)
 
     # Compare row IDs (most important)
     if "_rowid" in single_df.columns:
@@ -2418,8 +2460,8 @@ def compare_fts_results(
 
     # Compare scores with tolerance
     if "_score" in single_df.columns:
-        single_scores = single_df["_score"].values
-        distributed_scores = distributed_df["_score"].values
+        single_scores = single_df["_score"].to_numpy(dtype=float)
+        distributed_scores = distributed_df["_score"].to_numpy(dtype=float)
         score_diff = np.abs(single_scores - distributed_scores)
         max_diff = np.max(score_diff)
         assert max_diff <= tolerance, (
@@ -2430,27 +2472,11 @@ def compare_fts_results(
     # Compare other columns (exact match for non-score columns)
     for col in single_df.columns:
         if col not in ["_score"]:  # Skip score column (already compared with tolerance)
-            single_values = (
-                set(single_df[col])
-                if single_df[col].dtype == "object"
-                else single_df[col].values
+            np.testing.assert_array_equal(
+                single_df[col].to_numpy(dtype=object),
+                distributed_df[col].to_numpy(dtype=object),
+                err_msg=f"Column {col} values don't match",
             )
-            distributed_values = (
-                set(distributed_df[col])
-                if distributed_df[col].dtype == "object"
-                else distributed_df[col].values
-            )
-
-            if isinstance(single_values, set):
-                assert single_values == distributed_values, (
-                    f"Column {col} content mismatch"
-                )
-            else:
-                np.testing.assert_array_equal(
-                    single_values,
-                    distributed_values,
-                    err_msg=f"Column {col} values don't match",
-                )
 
     return True
 

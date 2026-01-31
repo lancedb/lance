@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -9,19 +10,28 @@ use lance_arrow::json::{is_arrow_json_field, json_field, JsonArray};
 use lance_arrow::FixedSizeListArrayExt;
 
 use arrow::compute::concat_batches;
+use arrow_array::UInt64Array;
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
+use lance_core::cache::LanceCache;
+use lance_encoding::decoder::DecoderPlugins;
+use lance_file::reader::{describe_encoding, FileReader, FileReaderOptions};
+use lance_file::version::LanceFileVersion;
 use lance_index::scalar::inverted::{
     query::PhraseQuery, tokenizer::InvertedIndexParams, SCORE_FIELD,
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
+use uuid::Uuid;
 
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::write::WriteParams;
 use crate::Dataset;
 use lance_index::scalar::inverted::query::FtsQuery;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -364,6 +374,93 @@ async fn test_scan_limit_offset_preserves_json_extension_metadata() {
         batch_with_offset.schema().field_with_name("meta").unwrap()
     ));
     assert_eq!(batch_no_offset.schema(), batch_with_offset.schema());
+}
+
+#[tokio::test]
+async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() {
+    let rows: usize = 10_000;
+    let unique_values: usize = 2_000;
+    let batch_size: usize = 8_192;
+
+    let mut field_meta = HashMap::new();
+    field_meta.insert(
+        "lance-encoding:structural-encoding".to_string(),
+        "miniblock".to_string(),
+    );
+    field_meta.insert(
+        "lance-encoding:dict-size-ratio".to_string(),
+        "0.99".to_string(),
+    );
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::UInt64,
+        false,
+    )
+    .with_metadata(field_meta)]));
+
+    let values = (0..rows)
+        .map(|i| (i % unique_values) as u64)
+        .collect::<Vec<_>>();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(values))]).unwrap();
+
+    let uri = format!("memory://{}", Uuid::new_v4());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..WriteParams::default()
+    };
+    let dataset = Dataset::write(reader, &uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let field_id = dataset.schema().field("d").unwrap().id as u32;
+    let fragment = dataset.get_fragment(0).unwrap();
+    let data_file = fragment.data_file_for_field(field_id).unwrap();
+    let field_pos = data_file
+        .fields
+        .iter()
+        .position(|id| *id == field_id as i32)
+        .unwrap();
+    let column_idx = data_file.column_indices[field_pos] as usize;
+
+    let file_path = dataset.data_dir().child(data_file.path.as_str());
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let file_scheduler = scheduler
+        .open_file(&file_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+
+    let cache = LanceCache::with_capacity(8 * 1024 * 1024);
+    let file_reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        &cache,
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let col_meta = &file_reader.metadata().column_metadatas[column_idx];
+    let encoding = describe_encoding(col_meta.pages.first().unwrap());
+    assert!(
+        encoding.contains("OutOfLineBitpacking") && encoding.contains("dictionary"),
+        "Expected a mini-block dictionary page with out-of-line bitpacking, got: {encoding}"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(batch_size);
+    scanner.project(&["d"]).unwrap();
+
+    let mut stream = scanner.try_into_stream().await.unwrap();
+    let batch = stream.try_next().await.unwrap().unwrap();
+    assert_eq!(batch.num_columns(), 1);
 }
 
 async fn prepare_query_filter_dataset() -> Dataset {

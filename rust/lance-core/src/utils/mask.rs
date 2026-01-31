@@ -243,6 +243,39 @@ impl std::ops::BitOr for RowAddrMask {
     }
 }
 
+/// Common operations over a set of rows (either row ids or row addresses).
+///
+/// The concrete representation can be address-based (`RowAddrTreeMap`) or
+/// id-based (for example a future `RowIdSet`), but the semantics are the same:
+/// a set of unique rows.
+pub trait RowSetOps: Clone + Sized {
+    /// Logical row handle (`u64` for both row ids and row addresses).
+    type Row;
+
+    /// Returns true if the set is empty.
+    fn is_empty(&self) -> bool;
+
+    /// Returns the number of rows in the set, if it is known.
+    ///
+    /// Implementations that cannot always compute an exact size (for example
+    /// because of "full fragment" markers) should return `None`.
+    fn len(&self) -> Option<u64>;
+
+    /// Remove a value from the row set.
+    fn remove(&mut self, row: Self::Row) -> bool;
+
+    /// Returns whether this set contains the given row.
+    fn contains(&self, row: Self::Row) -> bool;
+
+    /// Returns the union of `other` and init self.
+    fn union_all(other: &[&Self]) -> Self;
+
+    /// Builds a row set from an iterator of rows.
+    fn from_sorted_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Self::Row>;
+}
+
 /// A collection of row addresses.
 ///
 /// Note: For stable row id mode, this may be split into a separate structure in the future.
@@ -263,7 +296,7 @@ pub struct RowAddrTreeMap {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum RowAddrSelection {
+pub enum RowAddrSelection {
     Full,
     Partial(RoaringBitmap),
 }
@@ -302,20 +335,14 @@ impl RowAddrSelection {
     }
 }
 
-impl RowAddrTreeMap {
-    /// Create an empty set
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl RowSetOps for RowAddrTreeMap {
+    type Row = u64;
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    /// The number of rows in the map
-    ///
-    /// If there are any "full fragment" items then this is unknown and None is returned
-    pub fn len(&self) -> Option<u64> {
+    fn len(&self) -> Option<u64> {
         self.inner
             .values()
             .map(|row_addr_selection| match row_addr_selection {
@@ -323,6 +350,92 @@ impl RowAddrTreeMap {
                 RowAddrSelection::Partial(indices) => Some(indices.len()),
             })
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
+    }
+
+    fn remove(&mut self, row: Self::Row) -> bool {
+        let upper = (row >> 32) as u32;
+        let lower = row as u32;
+        match self.inner.get_mut(&upper) {
+            None => false,
+            Some(RowAddrSelection::Full) => {
+                let mut set = RoaringBitmap::full();
+                set.remove(lower);
+                self.inner.insert(upper, RowAddrSelection::Partial(set));
+                true
+            }
+            Some(RowAddrSelection::Partial(lower_set)) => {
+                let removed = lower_set.remove(lower);
+                if lower_set.is_empty() {
+                    self.inner.remove(&upper);
+                }
+                removed
+            }
+        }
+    }
+
+    fn contains(&self, row: Self::Row) -> bool {
+        let upper = (row >> 32) as u32;
+        let lower = row as u32;
+        match self.inner.get(&upper) {
+            None => false,
+            Some(RowAddrSelection::Full) => true,
+            Some(RowAddrSelection::Partial(fragment_set)) => fragment_set.contains(lower),
+        }
+    }
+
+    fn union_all(other: &[&Self]) -> Self {
+        let mut new_map = BTreeMap::new();
+
+        for map in other {
+            for (fragment, selection) in &map.inner {
+                new_map
+                    .entry(fragment)
+                    // I hate this allocation, but I can't think of a better way
+                    .or_insert_with(|| Vec::with_capacity(other.len()))
+                    .push(selection);
+            }
+        }
+
+        let new_map = new_map
+            .into_iter()
+            .map(|(&fragment, selections)| (fragment, RowAddrSelection::union_all(&selections)))
+            .collect();
+
+        Self { inner: new_map }
+    }
+
+    #[track_caller]
+    fn from_sorted_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Self::Row>,
+    {
+        let mut iter = iter.into_iter().peekable();
+        let mut inner = BTreeMap::new();
+
+        while let Some(row_id) = iter.peek() {
+            let fragment_id = (row_id >> 32) as u32;
+            let next_bitmap_iter = iter
+                .peeking_take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
+                .map(|row_id| row_id as u32);
+            let Ok(bitmap) = RoaringBitmap::from_sorted_iter(next_bitmap_iter) else {
+                return Err(Error::Internal {
+                    message: "RowAddrTreeMap::from_sorted_iter called with non-sorted input"
+                        .to_string(),
+                    // Use the caller location since we aren't the one that got it out of order
+                    location: std::panic::Location::caller().to_snafu_location(),
+                });
+            };
+            inner.insert(fragment_id, RowAddrSelection::Partial(bitmap));
+        }
+
+        Ok(Self { inner })
+    }
+}
+
+impl RowAddrTreeMap {
+    /// Create an empty set
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// An iterator of row addrs
@@ -354,7 +467,7 @@ impl RowAddrTreeMap {
     /// Returns true if the value was not already in the set.
     ///
     /// ```rust
-    /// use lance_core::utils::mask::RowAddrTreeMap;
+    /// use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     ///
     /// let mut set = RowAddrTreeMap::new();
     /// assert_eq!(set.insert(10), true);
@@ -444,36 +557,14 @@ impl RowAddrTreeMap {
         }
     }
 
-    /// Returns whether the set contains the given value
-    pub fn contains(&self, value: u64) -> bool {
-        let upper = (value >> 32) as u32;
-        let lower = value as u32;
-        match self.inner.get(&upper) {
-            None => false,
-            Some(RowAddrSelection::Full) => true,
-            Some(RowAddrSelection::Partial(fragment_set)) => fragment_set.contains(lower),
-        }
+    /// Get the selection for a fragment
+    pub fn get(&self, fragment_id: &u32) -> Option<&RowAddrSelection> {
+        self.inner.get(fragment_id)
     }
 
-    pub fn remove(&mut self, value: u64) -> bool {
-        let upper = (value >> 32) as u32;
-        let lower = value as u32;
-        match self.inner.get_mut(&upper) {
-            None => false,
-            Some(RowAddrSelection::Full) => {
-                let mut set = RoaringBitmap::full();
-                set.remove(lower);
-                self.inner.insert(upper, RowAddrSelection::Partial(set));
-                true
-            }
-            Some(RowAddrSelection::Partial(lower_set)) => {
-                let removed = lower_set.remove(lower);
-                if lower_set.is_empty() {
-                    self.inner.remove(&upper);
-                }
-                removed
-            }
-        }
+    /// Iterate over (fragment_id, selection) pairs
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &RowAddrSelection)> {
+        self.inner.iter()
     }
 
     pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
@@ -542,27 +633,6 @@ impl RowAddrTreeMap {
         Ok(Self { inner })
     }
 
-    pub fn union_all(maps: &[&Self]) -> Self {
-        let mut new_map = BTreeMap::new();
-
-        for map in maps {
-            for (fragment, selection) in &map.inner {
-                new_map
-                    .entry(fragment)
-                    // I hate this allocation, but I can't think of a better way
-                    .or_insert_with(|| Vec::with_capacity(maps.len()))
-                    .push(selection);
-            }
-        }
-
-        let new_map = new_map
-            .into_iter()
-            .map(|(&fragment, selections)| (fragment, RowAddrSelection::union_all(&selections)))
-            .collect();
-
-        Self { inner: new_map }
-    }
-
     /// Apply a mask to the row addrs
     ///
     /// For AllowList: only keep rows that are in the selection and not null
@@ -596,30 +666,6 @@ impl RowAddrTreeMap {
                     (fragment << 32) | row_offset
                 }),
             })
-    }
-
-    #[track_caller]
-    pub fn from_sorted_iter(iter: impl IntoIterator<Item = u64>) -> Result<Self> {
-        let mut iter = iter.into_iter().peekable();
-        let mut inner = BTreeMap::new();
-
-        while let Some(row_id) = iter.peek() {
-            let fragment_id = (row_id >> 32) as u32;
-            let next_bitmap_iter = iter
-                .peeking_take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
-                .map(|row_id| row_id as u32);
-            let Ok(bitmap) = RoaringBitmap::from_sorted_iter(next_bitmap_iter) else {
-                return Err(Error::Internal {
-                    message: "RowAddrTreeMap::from_sorted_iter called with non-sorted input"
-                        .to_string(),
-                    // Use the caller location since we aren't the one that got it out of order
-                    location: std::panic::Location::caller().to_snafu_location(),
-                });
-            };
-            inner.insert(fragment_id, RowAddrSelection::Partial(bitmap));
-        }
-
-        Ok(Self { inner })
     }
 }
 
@@ -886,6 +932,34 @@ impl Extend<Self> for RowAddrTreeMap {
             }
         }
     }
+}
+
+/// Convert a RoaringBitmap to a vector of contiguous ranges.
+///
+/// This is more efficient than iterating over individual bits and coalescing,
+/// as it builds ranges directly in a single pass.
+pub fn bitmap_to_ranges(bitmap: &RoaringBitmap) -> Vec<Range<u64>> {
+    if bitmap.is_empty() {
+        return vec![];
+    }
+
+    let mut ranges = Vec::new();
+    let mut iter = bitmap.iter();
+    let first = iter.next().unwrap();
+    let mut start = first;
+    let mut end = first;
+
+    for val in iter {
+        if val == end + 1 {
+            end = val;
+        } else {
+            ranges.push(start as u64..(end + 1) as u64);
+            start = val;
+            end = val;
+        }
+    }
+    ranges.push(start as u64..(end + 1) as u64);
+    ranges
 }
 
 #[cfg(test)]

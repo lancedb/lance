@@ -99,25 +99,6 @@ pub enum BlobVersion {
     /// Blob v2 struct format.
     V2,
 }
-
-impl BlobVersion {
-    /// Convert a persisted string value (e.g. table config) into a blob version
-    pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
-            "1" => Some(Self::V1),
-            "2" => Some(Self::V2),
-            _ => None,
-        }
-    }
-
-    /// Persistable string representation for table config.
-    pub fn config_value(self) -> &'static str {
-        match self {
-            Self::V1 => "1",
-            Self::V2 => "2",
-        }
-    }
-}
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum Encoding {
@@ -302,11 +283,7 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(
-                projection
-                    .blob_handling
-                    .unload_if_needed(new_field, projection.blob_version),
-            )
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -560,28 +537,6 @@ impl Field {
             self.children = BLOB_DESC_LANCE_FIELD.children.clone();
             self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
         }
-    }
-
-    /// If the field is a blob, return a new field with the same name and id
-    /// but with the data type set to a struct of the blob description fields.
-    ///
-    /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
-        if self.is_blob() {
-            match version {
-                BlobVersion::V2 => {
-                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
-                }
-                BlobVersion::V1 => {
-                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
-                }
-            }
-        }
-        self
     }
 
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
@@ -1806,14 +1761,34 @@ mod tests {
     }
 
     #[test]
-    fn blob_into_unloaded_selects_v2_layout() {
+    fn blob_unloaded_mut_selects_layout_from_metadata() {
         let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
-        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+        let mut field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
             .unwrap();
-        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
-        assert_eq!(unloaded.children.len(), 5);
-        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 2);
+        assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let mut field: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 5);
+        assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }
 }

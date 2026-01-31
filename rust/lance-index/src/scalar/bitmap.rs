@@ -9,7 +9,6 @@ use std::{
     sync::Arc,
 };
 
-use crate::pbold;
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -18,6 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
@@ -36,6 +36,7 @@ use super::{
     btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
 };
 use super::{AnyQuery, IndexStore, ScalarIndex};
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -844,6 +845,7 @@ pub mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;

@@ -101,6 +101,7 @@ target
 
 python/venv
 test_data/venv
+.venv
 
 **/*.profraw
 *.lance

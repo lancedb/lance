@@ -9,7 +9,7 @@ use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
-use lance_arrow::FieldExt;
+use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
@@ -23,15 +23,6 @@ use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
-
-pub const BLOB_VERSION_CONFIG_KEY: &str = "lance.blob.version";
-
-pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion {
-    config
-        .get(BLOB_VERSION_CONFIG_KEY)
-        .and_then(|value| BlobVersion::from_config_value(value))
-        .unwrap_or(BlobVersion::V1)
-}
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -130,15 +121,34 @@ pub struct BlobPreprocessor {
     data_file_key: String,
     local_counter: u32,
     pack_writer: PackWriter,
+    blob_v2_cols: Vec<bool>,
+    dedicated_thresholds: Vec<usize>,
+    writer_metadata: Vec<HashMap<String, String>>,
 }
 
 impl BlobPreprocessor {
-    pub(crate) fn new(object_store: ObjectStore, data_dir: Path, data_file_key: String) -> Self {
+    pub(crate) fn new(
+        object_store: ObjectStore,
+        data_dir: Path,
+        data_file_key: String,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Self {
         let pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
+        let arrow_schema = arrow_schema::Schema::from(schema);
+        let fields = arrow_schema.fields();
+        let blob_v2_cols = fields.iter().map(|field| field.is_blob_v2()).collect();
+        let dedicated_thresholds = fields
+            .iter()
+            .map(|field| dedicated_threshold_from_metadata(field.as_ref()))
+            .collect();
+        let writer_metadata = fields
+            .iter()
+            .map(|field| field.metadata().clone())
+            .collect();
         Self {
             object_store,
             data_dir,
@@ -146,6 +156,9 @@ impl BlobPreprocessor {
             // Start at 1 to avoid a potential all-zero blob_id value.
             local_counter: 1,
             pack_writer,
+            blob_v2_cols,
+            dedicated_thresholds,
+            writer_metadata,
         }
     }
 
@@ -177,11 +190,28 @@ impl BlobPreprocessor {
             .await
     }
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let expected_columns = self.blob_v2_cols.len();
+        if batch.num_columns() != expected_columns {
+            return Err(Error::invalid_input(
+                format!(
+                    "Unexpected number of columns: expected {}, got {}",
+                    expected_columns,
+                    batch.num_columns()
+                ),
+                location!(),
+            ));
+        }
+
+        let batch_schema = batch.schema();
+        let batch_fields = batch_schema.fields();
+
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
-        for (array, field) in batch.columns().iter().zip(batch.schema().fields()) {
-            if !field.is_blob_v2() {
+        for idx in 0..batch.num_columns() {
+            let array = batch.column(idx);
+            let field = &batch_fields[idx];
+            if !self.blob_v2_cols[idx] {
                 new_columns.push(array.clone());
                 new_fields.push(field.clone());
                 continue;
@@ -234,7 +264,8 @@ impl BlobPreprocessor {
                 let has_uri = !uri_col.is_null(i);
                 let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
-                if has_data && data_len > DEDICATED_THRESHOLD {
+                let dedicated_threshold = self.dedicated_thresholds[idx];
+                if has_data && data_len > dedicated_threshold {
                     let blob_id = self.next_blob_id();
                     self.write_dedicated(blob_id, data_col.value(i)).await?;
 
@@ -317,7 +348,7 @@ impl BlobPreprocessor {
                     ArrowDataType::Struct(child_fields.into()),
                     field.is_nullable(),
                 )
-                .with_metadata(field.metadata().clone()),
+                .with_metadata(self.writer_metadata[idx].clone()),
             ));
         }
 
@@ -326,7 +357,7 @@ impl BlobPreprocessor {
                 .iter()
                 .map(|f| f.as_ref().clone())
                 .collect::<Vec<_>>(),
-            batch.schema().metadata().clone(),
+            batch_schema.metadata().clone(),
         ));
 
         RecordBatch::try_new(new_schema, new_columns)
@@ -338,8 +369,14 @@ impl BlobPreprocessor {
     }
 }
 
-pub fn schema_has_blob_v2(schema: &lance_core::datatypes::Schema) -> bool {
-    schema.fields.iter().any(|f| f.is_blob_v2())
+fn dedicated_threshold_from_metadata(field: &arrow_schema::Field) -> usize {
+    field
+        .metadata()
+        .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEDICATED_THRESHOLD)
 }
 
 pub async fn preprocess_blob_batches(
@@ -598,7 +635,7 @@ pub(super) async fn take_blobs(
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
     let blob_field_id = blob_field_id as u32;
 
-    match dataset.blob_version() {
+    match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
         BlobVersion::V2 => {
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
@@ -645,7 +682,7 @@ pub async fn take_blobs_by_addresses(
     let row_addrs_result = description_and_addr.column(1).as_primitive::<UInt64Type>();
     let blob_field_id = blob_field_id as u32;
 
-    match dataset.blob_version() {
+    match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => {
             collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs_result)
         }
@@ -653,6 +690,30 @@ pub async fn take_blobs_by_addresses(
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result).await
         }
     }
+}
+
+fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {
+    let fields = descriptions.fields();
+    if fields.len() == 2 && fields[0].name() == "position" && fields[1].name() == "size" {
+        return Ok(BlobVersion::V1);
+    }
+    if fields.len() == 5
+        && fields[0].name() == "kind"
+        && fields[1].name() == "position"
+        && fields[2].name() == "size"
+        && fields[3].name() == "blob_id"
+        && fields[4].name() == "blob_uri"
+    {
+        return Ok(BlobVersion::V2);
+    }
+    Err(Error::InvalidInput {
+        source: format!(
+            "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
+            fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        )
+        .into(),
+        location: location!(),
+    })
 }
 
 fn collect_blob_files_v1(
@@ -788,7 +849,8 @@ mod tests {
     use arrow_array::{RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
-    use lance_arrow::DataTypeExt;
+    use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
 
     use lance_core::{utils::tempfile::TempStrDir, Error, Result};
@@ -1081,7 +1143,10 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
-        let params = WriteParams::with_storage_version(LanceFileVersion::V2_2);
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
         let dataset = Arc::new(
             Dataset::write(reader, &test_dir, Some(params))
                 .await
@@ -1098,5 +1163,76 @@ mod tests {
         let second = blobs[1].read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
+    }
+
+    async fn preprocess_kind_with_schema_metadata(metadata_value: &str, data_len: usize) -> u8 {
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://blob_preprocessor",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let object_store = object_store.as_ref().clone();
+        let data_dir = base_path.child("data");
+
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            metadata_value.to_string(),
+        );
+        field = field.with_metadata(metadata);
+
+        let writer_arrow_schema = Schema::new(vec![field.clone()]);
+        let writer_schema = lance_core::datatypes::Schema::try_from(&writer_arrow_schema).unwrap();
+
+        let mut preprocessor = super::BlobPreprocessor::new(
+            object_store.clone(),
+            data_dir,
+            "data_file_key".to_string(),
+            &writer_schema,
+        );
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(vec![0u8; data_len]).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+
+        let field_without_metadata =
+            Field::new("blob", field.data_type().clone(), field.is_nullable());
+        let batch_schema = Arc::new(Schema::new(vec![field_without_metadata]));
+        let batch = RecordBatch::try_new(batch_schema, vec![blob_array]).unwrap();
+
+        let out = preprocessor.preprocess_batch(&batch).await.unwrap();
+        let struct_arr = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        struct_arr
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::UInt8Type>()
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_dedicated_threshold_ignores_non_positive_metadata() {
+        let kind = preprocess_kind_with_schema_metadata("0", 256 * 1024).await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Packed as u8);
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_dedicated_threshold_respects_smaller_metadata() {
+        let kind = preprocess_kind_with_schema_metadata("131072", 256 * 1024).await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Dedicated as u8);
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_dedicated_threshold_respects_larger_metadata() {
+        let kind =
+            preprocess_kind_with_schema_metadata("8388608", super::DEDICATED_THRESHOLD + 1024)
+                .await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Packed as u8);
     }
 }

@@ -48,6 +48,7 @@ pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
+mod index;
 mod merge_insert;
 mod namespace;
 mod optimize;
@@ -57,6 +58,7 @@ mod storage_options;
 pub mod traits;
 mod transaction;
 pub mod utils;
+mod vector_trainer;
 
 pub use error::Error;
 pub use error::Result;

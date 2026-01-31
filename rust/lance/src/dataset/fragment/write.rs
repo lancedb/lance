@@ -18,7 +18,6 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
-use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
@@ -139,7 +138,6 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let has_blob_v2 = schema_has_blob_v2(&schema);
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -149,16 +147,6 @@ impl<'a> FragmentCreateBuilder<'a> {
                 ..Default::default()
             },
         )?;
-
-        let mut preprocessor = if has_blob_v2 {
-            Some(BlobPreprocessor::new(
-                object_store.as_ref().clone(),
-                base_path.child(DATA_DIR),
-                data_file_key.clone(),
-            ))
-        } else {
-            None
-        };
 
         let (major, minor) = writer.version().to_numbers();
 
@@ -173,10 +161,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
-            let mut batch_chunk = batched_chunk?;
-            if let Some(pre) = preprocessor.as_mut() {
-                batch_chunk = preprocess_blob_batches(&batch_chunk, pre).await?;
-            }
+            let batch_chunk = batched_chunk?;
             writer.write_batches(batch_chunk.iter()).await?;
         }
 

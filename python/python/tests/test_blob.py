@@ -50,6 +50,49 @@ def test_blob_descriptions(tmp_path):
     assert descriptions.field(1) == expected_sizes
 
 
+def test_scan_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+
+def test_fragment_scan_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    fragment = ds.get_fragments()[0]
+
+    tbl = fragment.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+    tbl = fragment.to_table(columns=["blobs"], blob_handling="all_binary")
+    assert tbl.column("blobs").to_pylist() == values
+
+
 @pytest.fixture
 def dataset_with_blobs(tmp_path):
     values = pa.array([b"foo", b"bar", b"baz"], pa.large_binary())
@@ -259,7 +302,11 @@ def test_scan_blob(tmp_path, dataset_with_blobs):
 
 def test_blob_extension_write_inline(tmp_path):
     table = pa.table({"blob": lance.blob_array([b"foo", b"bar"])})
-    ds = lance.write_dataset(table, tmp_path / "test_ds_v2", data_storage_version="2.2")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2",
+        data_storage_version="2.2",
+    )
 
     desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
     assert pa.types.is_struct(desc.type)
@@ -276,7 +323,9 @@ def test_blob_extension_write_external(tmp_path):
 
     table = pa.table({"blob": lance.blob_array([uri])})
     ds = lance.write_dataset(
-        table, tmp_path / "test_ds_v2_external", data_storage_version="2.2"
+        table,
+        tmp_path / "test_ds_v2_external",
+        data_storage_version="2.2",
     )
 
     blob = ds.take_blobs("blob", indices=[0])[0]

@@ -13,27 +13,24 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
-use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{
-    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
-};
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -71,6 +68,7 @@ pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
+pub mod mem_wal;
 mod metadata;
 pub mod optimize;
 pub mod progress;
@@ -111,6 +109,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
 };
@@ -125,6 +124,7 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
+use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -335,47 +335,9 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // Separate data columns from system columns
-        // System columns need to be added to the schema manually since Schema::project
-        // doesn't include them (they're virtual columns)
-        let mut data_columns = Vec::new();
-        let mut system_fields = Vec::new();
-
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // For now we only support _rowid and _rowaddr in projections
-                if col == ROW_ID {
-                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
-                } else if col == ROW_ADDR {
-                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
-                }
-                // Note: Other system columns like _rowoffset are handled differently
-            } else {
-                data_columns.push(col.as_str());
-            }
-        }
-
-        // Project only the data columns
-        let mut schema = dataset_schema.project(&data_columns).unwrap();
-
-        // Add system fields in the order they appeared in the original columns list
-        // We need to reconstruct the proper order
-        let mut final_fields = Vec::new();
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // Find and add the system field
-                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            } else {
-                // Find and add the data field
-                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            }
-        }
-
-        schema.fields = final_fields;
+        let schema = dataset_schema
+            .project_preserve_system_columns(&columns)
+            .unwrap();
         Self::Schema(Arc::new(schema))
     }
 
@@ -400,7 +362,6 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
-        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -413,7 +374,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
+                    ProjectionPlan::from_schema(dataset, schema.as_ref())
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -421,10 +382,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
+                    ProjectionPlan::from_schema(dataset, &projection)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
     }
 }
@@ -1857,12 +1818,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone()).with_blob_version(self.blob_version())
+        Projection::empty(self.clone())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone()).with_blob_version(self.blob_version())
+        Projection::full(self.clone())
     }
 
     /// Get fragments.
@@ -2748,6 +2709,55 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
+
+    pub async fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: IndexType,
+        batch_readhead: Option<usize>,
+    ) -> Result<()> {
+        let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
+        let index_dir = self.indices_dir().child(index_uuid);
+        match index_type {
+            IndexType::Inverted => {
+                // Call merge_index_files function for inverted index
+                lance_index::scalar::inverted::builder::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                )
+                .await
+            }
+            IndexType::BTree => {
+                // Call merge_index_files function for btree index
+                lance_index::scalar::btree::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    batch_readhead,
+                )
+                .await
+            }
+            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
+            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
+                // Merge distributed vector index partials and finalize root index via Lance IVF helper
+                crate::index::vector::ivf::finalize_distributed_merge(
+                    self.object_store(),
+                    &index_dir,
+                    Some(index_type),
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidInput {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported index type (patched): {}", index_type),
+                )),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 /// # Dataset metadata APIs
@@ -2771,10 +2781,6 @@ impl Dataset {
     /// Get the dataset config from manifest
     pub fn config(&self) -> &HashMap<String, String> {
         &self.manifest.config
-    }
-
-    pub(crate) fn blob_version(&self) -> BlobVersion {
-        blob_version_from_config(&self.manifest.config)
     }
 
     /// Delete keys from the config.

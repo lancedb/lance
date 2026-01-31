@@ -220,6 +220,12 @@ impl IntoJava for &JLance<i64> {
     }
 }
 
+impl IntoJava for &JLance<i32> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(self.0)])?)
+    }
+}
+
 impl IntoJava for &String {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_string(self)?.into())

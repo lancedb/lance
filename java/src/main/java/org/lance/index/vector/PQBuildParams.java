@@ -29,6 +29,7 @@ public class PQBuildParams {
   private final int maxIters;
   private final int kmeansRedos;
   private final int sampleRate;
+  private final float[] codebook;
 
   private PQBuildParams(Builder builder) {
     this.numSubVectors = builder.numSubVectors;
@@ -36,6 +37,7 @@ public class PQBuildParams {
     this.maxIters = builder.maxIters;
     this.kmeansRedos = builder.kmeansRedos;
     this.sampleRate = builder.sampleRate;
+    this.codebook = builder.codebook;
   }
 
   public static class Builder {
@@ -44,6 +46,7 @@ public class PQBuildParams {
     private int maxIters = 50;
     private int kmeansRedos = 1;
     private int sampleRate = 256;
+    private float[] codebook = null;
 
     /** Create a new builder for training a PQ model. */
     public Builder() {}
@@ -96,6 +99,19 @@ public class PQBuildParams {
       return this;
     }
 
+    /**
+     * Set pre-trained PQ codebook.
+     *
+     * <p>The codebook is flattened as [num_centroids][dimension].
+     *
+     * @param codebook pre-trained PQ codebook
+     * @return Builder
+     */
+    public Builder setCodebook(float[] codebook) {
+      this.codebook = codebook;
+      return this;
+    }
+
     public PQBuildParams build() {
       return new PQBuildParams(this);
     }
@@ -121,6 +137,10 @@ public class PQBuildParams {
     return sampleRate;
   }
 
+  public float[] getCodebook() {
+    return codebook;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -129,6 +149,7 @@ public class PQBuildParams {
         .add("maxIters", maxIters)
         .add("kmeansRedos", kmeansRedos)
         .add("sampleRate", sampleRate)
+        .add("hasCodebook", codebook != null)
         .toString();
   }
 }

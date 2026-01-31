@@ -159,7 +159,15 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(
     last_offset_idx: usize,
     minichunk_size: i64,
 ) -> usize {
-    let mut num_values = 1;
+    // MiniBlockChunk uses `log_num_values == 0` as a sentinel for the final chunk. This means we
+    // must avoid creating 1-value chunks except for the final chunk, even if the configured
+    // `minichunk_size` is too small to fit more than one value.
+    let remaining_values = offsets.len().saturating_sub(last_offset_idx + 1);
+    if remaining_values <= 1 {
+        return offsets.len() - 1;
+    }
+
+    let mut num_values = 2;
     let mut new_num_values = num_values * 2;
     loop {
         if last_offset_idx + new_num_values >= offsets.len() {
