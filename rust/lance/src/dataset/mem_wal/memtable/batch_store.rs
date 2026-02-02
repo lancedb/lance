@@ -525,7 +525,7 @@ impl BatchStore {
     /// The batches are iterated in reverse order, and the rows within each
     /// batch are also reversed, so the final result has all rows in reverse
     /// order from newest to oldest.
-    pub fn to_vec_reversed(&self) -> Vec<RecordBatch> {
+    pub fn to_vec_reversed(&self) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
         use arrow::compute::kernels::take::take;
         use arrow_array::UInt32Array;
 
@@ -534,7 +534,7 @@ impl BatchStore {
                 // Reverse the rows within each batch
                 let num_rows = b.data.num_rows();
                 if num_rows == 0 {
-                    return b.data.clone();
+                    return Ok(b.data.clone());
                 }
 
                 // Create indices for reversed order: [n-1, n-2, ..., 1, 0]
@@ -542,14 +542,14 @@ impl BatchStore {
                 let indices_array = UInt32Array::from(indices);
 
                 // Take rows in reversed order
-                let columns: Vec<_> = b
+                let columns: Result<Vec<_>, _> = b
                     .data
                     .columns()
                     .iter()
-                    .map(|col| take(col.as_ref(), &indices_array, None).unwrap())
+                    .map(|col| take(col.as_ref(), &indices_array, None))
                     .collect();
 
-                RecordBatch::try_new(b.data.schema(), columns).unwrap()
+                RecordBatch::try_new(b.data.schema(), columns?)
             })
             .collect()
     }
@@ -934,7 +934,7 @@ mod tests {
         assert_eq!(ids.value(9), 9);
 
         // Reversed order: batches in reverse order, rows within each batch also reversed
-        let reversed = store.to_vec_reversed();
+        let reversed = store.to_vec_reversed().unwrap();
         assert_eq!(reversed.len(), 2);
         assert_eq!(reversed[0].num_rows(), 5); // batch2 comes first
         assert_eq!(reversed[1].num_rows(), 10); // batch1 comes second

@@ -673,7 +673,7 @@ impl MemTable {
     /// callers to compute reversed row positions for indexes.
     pub async fn scan_batches_reversed(&self) -> Result<(Vec<RecordBatch>, usize)> {
         let total_rows = self.batch_store.total_rows();
-        let batches = self.batch_store.to_vec_reversed();
+        let batches = self.batch_store.to_vec_reversed()?;
         Ok((batches, total_rows))
     }
 
