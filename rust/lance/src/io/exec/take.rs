@@ -191,13 +191,16 @@ impl TakeStream {
             "{} nulls in row addresses",
             row_addrs.null_count()
         );
-        // Check if the row addresses are already sorted to avoid unnecessary reorders
-        let is_sorted = row_addrs.values().is_sorted();
+
+        // Fast path: check if addresses are already sorted with no duplicates (common case).
+        // This avoids all sorting, dedup, and permutation overhead.
+        let is_sorted_and_unique = row_addrs.values().windows(2).all(|w| w[0] < w[1]);
 
         let sorted_addrs: Arc<dyn Array>;
-        let (sorted_addrs, permutation) = if is_sorted {
-            (row_addrs, None)
+        let (unique_addrs, permutation, sorted_to_unique) = if is_sorted_and_unique {
+            (Cow::Borrowed(row_addrs.values().as_ref()), None, None)
         } else {
+            // Sort and compute inverse permutation to restore original order later
             let permutation = arrow::compute::sort_to_indices(&row_addrs_arr, None, None).unwrap();
             sorted_addrs = arrow::compute::take(
                 &row_addrs_arr,
@@ -207,36 +210,45 @@ impl TakeStream {
                 }),
             )
             .unwrap();
-            // Calculate the inverse permutation to restore the original order
             let mut inverse_permutation = vec![0; permutation.len()];
             for (i, p) in permutation.values().iter().enumerate() {
                 inverse_permutation[*p as usize] = i as u32;
             }
-            (
-                sorted_addrs.as_primitive::<UInt64Type>(),
-                Some(UInt32Array::from(inverse_permutation)),
-            )
-        };
+            let sorted_values = sorted_addrs.as_primitive::<UInt64Type>().values();
 
-        // Deduplicate sorted addresses. FTS on List<Utf8> can produce duplicate
-        // row addresses when multiple list elements in the same row match. The
-        // encoding layer requires strictly increasing indices, so we dedup here
-        // and expand the results back afterwards.
-        let sorted_values = sorted_addrs.values();
-        let mut unique_addrs: Vec<u64> = Vec::with_capacity(sorted_values.len());
-        let mut sorted_to_unique: Vec<usize> = Vec::with_capacity(sorted_values.len());
-        for &addr in sorted_values.iter() {
-            if unique_addrs.last() != Some(&addr) {
-                unique_addrs.push(addr);
+            // Deduplicate sorted addresses. FTS on List<Utf8> can produce duplicate
+            // row addresses when multiple list elements in the same row match. The
+            // encoding layer requires strictly increasing indices, so we dedup here
+            // and expand the results back afterwards.
+            let has_duplicates = sorted_values.windows(2).any(|w| w[0] == w[1]);
+            if has_duplicates {
+                let mut deduped: Vec<u64> = Vec::with_capacity(sorted_values.len());
+                let mut mapping: Vec<usize> = Vec::with_capacity(sorted_values.len());
+                for &addr in sorted_values.iter() {
+                    if deduped.last() != Some(&addr) {
+                        deduped.push(addr);
+                    }
+                    mapping.push(deduped.len() - 1);
+                }
+                (
+                    Cow::Owned(deduped),
+                    Some(UInt32Array::from(inverse_permutation)),
+                    Some(mapping),
+                )
+            } else {
+                (
+                    Cow::Borrowed(sorted_values.as_ref()),
+                    Some(UInt32Array::from(inverse_permutation)),
+                    None,
+                )
             }
-            sorted_to_unique.push(unique_addrs.len() - 1);
-        }
+        };
 
         let mut futures = FuturesOrdered::new();
         let mut current_offsets = Vec::new();
         let mut current_fragment_id = None;
 
-        for row_addr in &unique_addrs {
+        for row_addr in unique_addrs.iter() {
             let addr = RowAddress::new_from_u64(*row_addr);
 
             if Some(addr.fragment_id()) != current_fragment_id {
@@ -281,20 +293,33 @@ impl TakeStream {
         let schema = batches.first().expect_ok()?.schema();
         let mut new_data = concat_batches(&schema, batches.iter())?;
 
-        // Expand deduplicated rows back to the sorted order (reinsert duplicates)
-        if unique_addrs.len() < sorted_values.len() {
-            let expand_indices = UInt32Array::from(
-                sorted_to_unique
-                    .iter()
-                    .map(|&i| i as u32)
-                    .collect::<Vec<_>>(),
-            );
-            new_data = arrow_select::take::take_record_batch(&new_data, &expand_indices).unwrap();
-        }
-
-        // Restore previous order (if addresses were out of order originally)
-        if let Some(permutation) = permutation {
-            new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
+        // Expand deduplicated rows and restore original order.
+        // When both are needed, combine into a single take to avoid two passes.
+        match (sorted_to_unique, permutation) {
+            (Some(expand_map), Some(inv_perm)) => {
+                // Compose: for each original position, look up its sorted position
+                // via the inverse permutation, then map through the dedup expand.
+                let combined = UInt32Array::from(
+                    inv_perm
+                        .values()
+                        .iter()
+                        .map(|&p| expand_map[p as usize] as u32)
+                        .collect::<Vec<_>>(),
+                );
+                new_data = arrow_select::take::take_record_batch(&new_data, &combined).unwrap();
+            }
+            (None, Some(inv_perm)) => {
+                new_data = arrow_select::take::take_record_batch(&new_data, &inv_perm).unwrap();
+            }
+            (Some(expand_map), None) => {
+                // Sorted and unique was false but no permutation — shouldn't happen,
+                // but handle defensively.
+                let expand_indices =
+                    UInt32Array::from(expand_map.iter().map(|&i| i as u32).collect::<Vec<_>>());
+                new_data =
+                    arrow_select::take::take_record_batch(&new_data, &expand_indices).unwrap();
+            }
+            (None, None) => {}
         }
 
         self.metrics
