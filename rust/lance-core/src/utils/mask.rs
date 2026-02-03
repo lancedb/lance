@@ -1044,7 +1044,7 @@ impl RowSetOps for RowIdSet {
 
 /// A mask over stable row ids based on an allow-list or block-list.
 ///
-/// The semantics mirror [`super::RowAddrMask`], but operate on stable
+/// The semantics mirror [`RowAddrMask`], but operate on stable
 /// row ids instead of physical row addresses.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowIdMask {
