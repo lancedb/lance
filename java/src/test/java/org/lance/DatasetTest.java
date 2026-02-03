@@ -257,6 +257,7 @@ public class DatasetTest {
 
         // checkout the dataset at version 1
         try (Dataset checkoutV1 = dataset2.checkoutVersion(1)) {
+          assertNotNull(checkoutV1.getSchema());
           assertEquals(1, checkoutV1.version());
           assertEquals(2, checkoutV1.latestVersion());
           assertEquals(0, checkoutV1.countRows());
@@ -305,6 +306,7 @@ public class DatasetTest {
 
         // checkout the dataset at version 1
         try (Dataset checkoutV1 = dataset2.checkoutTag("tag1")) {
+          assertNotNull(checkoutV1.getSchema());
           assertEquals(1, checkoutV1.version());
           assertEquals(2, checkoutV1.latestVersion());
           assertEquals(0, checkoutV1.countRows());
@@ -1696,6 +1698,7 @@ public class DatasetTest {
 
                   // Step 6. use checkout_branch to checkout branch2
                   try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2"))) {
+                    assertNotNull(branch2V4New.getSchema());
                     assertEquals(4, branch2V4New.version());
                     assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
                   }
