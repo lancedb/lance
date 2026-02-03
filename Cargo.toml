@@ -95,7 +95,7 @@ half = { "version" = "2.1", default-features = false, features = [
 ] }
 lance-bitpacking = { version = "=2.1.0-beta.0", path = "./rust/compression/bitpacking" }
 bitvec = "1"
-bytes = "1.4"
+bytes = "1.11.1"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4.41", default-features = false, features = [
