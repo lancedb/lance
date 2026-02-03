@@ -228,9 +228,7 @@ async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     // Create file reader v2.
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
-        SchedulerConfig {
-            io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
-        },
+        SchedulerConfig::new(2 * 1024 * 1024 * 1024),
     );
     let file = scheduler
         .open_file(file_path, &CachedFileSize::unknown())
