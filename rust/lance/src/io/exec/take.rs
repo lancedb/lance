@@ -218,11 +218,25 @@ impl TakeStream {
             )
         };
 
+        // Deduplicate sorted addresses. FTS on List<Utf8> can produce duplicate
+        // row addresses when multiple list elements in the same row match. The
+        // encoding layer requires strictly increasing indices, so we dedup here
+        // and expand the results back afterwards.
+        let sorted_values = sorted_addrs.values();
+        let mut unique_addrs: Vec<u64> = Vec::with_capacity(sorted_values.len());
+        let mut sorted_to_unique: Vec<usize> = Vec::with_capacity(sorted_values.len());
+        for &addr in sorted_values.iter() {
+            if unique_addrs.last() != Some(&addr) {
+                unique_addrs.push(addr);
+            }
+            sorted_to_unique.push(unique_addrs.len() - 1);
+        }
+
         let mut futures = FuturesOrdered::new();
         let mut current_offsets = Vec::new();
         let mut current_fragment_id = None;
 
-        for row_addr in sorted_addrs.values() {
+        for row_addr in &unique_addrs {
             let addr = RowAddress::new_from_u64(*row_addr);
 
             if Some(addr.fragment_id()) != current_fragment_id {
@@ -266,6 +280,17 @@ impl TakeStream {
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let schema = batches.first().expect_ok()?.schema();
         let mut new_data = concat_batches(&schema, batches.iter())?;
+
+        // Expand deduplicated rows back to the sorted order (reinsert duplicates)
+        if unique_addrs.len() < sorted_values.len() {
+            let expand_indices = UInt32Array::from(
+                sorted_to_unique
+                    .iter()
+                    .map(|&i| i as u32)
+                    .collect::<Vec<_>>(),
+            );
+            new_data = arrow_select::take::take_record_batch(&new_data, &expand_indices).unwrap();
+        }
 
         // Restore previous order (if addresses were out of order originally)
         if let Some(permutation) = permutation {
@@ -818,6 +843,105 @@ mod tests {
         let metrics = take_exec.metrics().unwrap();
         assert_eq!(metrics.output_rows(), Some(15));
         assert_eq!(metrics.find_count("batches_processed").unwrap().value(), 3);
+    }
+
+    /// Regression test: FTS on List<Utf8> can produce duplicate row addresses when
+    /// multiple list elements in the same row match. These duplicates caused
+    /// `indices_to_ranges` in the encoding layer to produce overlapping ranges,
+    /// panicking in BinaryPageScheduler with "attempt to subtract with overflow".
+    #[tokio::test]
+    async fn test_take_with_duplicate_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        // Simulate duplicate row addresses (same row matched twice),
+        // already sorted as they would be within a single fragment.
+        let row_addrs = UInt64Array::from(vec![0u64, 0, 1, 2, 2]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+
+        let row_addr_stream = futures::stream::iter(vec![Ok(batch)]);
+        let row_addr_stream = Box::pin(RecordBatchStreamAdapter::new(schema, row_addr_stream));
+        let input = Arc::new(OneShotExec::new(row_addr_stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        let all_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let s_col = all_data
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Duplicated rows should have identical values
+        assert_eq!(s_col.value(0), s_col.value(1));
+        assert_eq!(s_col.value(3), s_col.value(4));
+    }
+
+    /// Same as above but with unsorted duplicates, exercising the sort+dedup path.
+    #[tokio::test]
+    async fn test_take_with_unsorted_duplicate_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let row_addrs = UInt64Array::from(vec![2u64, 0, 1, 0, 2]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+
+        let row_addr_stream = futures::stream::iter(vec![Ok(batch)]);
+        let row_addr_stream = Box::pin(RecordBatchStreamAdapter::new(schema, row_addr_stream));
+        let input = Arc::new(OneShotExec::new(row_addr_stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        let all_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let s_col = all_data
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Original order was [2, 0, 1, 0, 2] — duplicates should match
+        assert_eq!(s_col.value(0), s_col.value(4)); // both row 2
+        assert_eq!(s_col.value(1), s_col.value(3)); // both row 0
     }
 
     #[tokio::test]
