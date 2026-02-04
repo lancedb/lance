@@ -62,6 +62,10 @@ pprof.workspace = true
 name = "scheduler"
 harness = false
 
+[[bench]]
+name = "write"
+harness = false
+
 [features]
 default = ["aws", "azure", "gcp"]
 gcs-test = []

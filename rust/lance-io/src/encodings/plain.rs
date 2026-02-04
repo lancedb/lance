@@ -756,7 +756,7 @@ mod tests {
             let mut writer = tokio::fs::File::create(&path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
             assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
-            writer.shutdown().await.unwrap();
+            AsyncWriteExt::shutdown(&mut writer).await.unwrap();
         }
 
         let reader = LocalObjectReader::open_local_path(&path, 2048, None)

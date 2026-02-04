@@ -21,6 +21,7 @@ use lance_core::{Error, Result};
 use tracing::Instrument;
 
 use crate::traits::Writer;
+use crate::utils::tracking_store::IOTracker;
 use snafu::location;
 use tokio::runtime::Handle;
 
@@ -298,21 +299,6 @@ impl ObjectWriter {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> Result<WriteResult> {
-        AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(
-                format!("failed to shutdown object writer for {}: {}", self.path, e),
-                // and wrap it in here.
-                location!(),
-            )
-        })?;
-        if let UploadState::Done(result) = &self.state {
-            Ok(result.clone())
-        } else {
-            unreachable!()
-        }
-    }
-
     pub async fn abort(&mut self) {
         let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
         if let UploadState::InProgress { mut upload, .. } = state {
@@ -498,6 +484,125 @@ impl Writer for ObjectWriter {
     async fn tell(&mut self) -> Result<usize> {
         Ok(self.cursor)
     }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        AsyncWriteExt::shutdown(self).await.map_err(|e| {
+            Error::io(
+                format!("failed to shutdown object writer for {}: {}", self.path, e),
+                location!(),
+            )
+        })?;
+        if let UploadState::Done(result) = &self.state {
+            Ok(result.clone())
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+pub struct LocalWriter {
+    inner: tokio::io::BufWriter<tokio::fs::File>,
+    cursor: usize,
+    path: Path,
+    io_tracker: Arc<IOTracker>,
+}
+
+impl LocalWriter {
+    pub fn new(file: tokio::fs::File, path: Path, io_tracker: Arc<IOTracker>) -> Self {
+        Self {
+            inner: tokio::io::BufWriter::new(file),
+            cursor: 0,
+            path,
+            io_tracker,
+        }
+    }
+}
+
+impl AsyncWrite for LocalWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            self.cursor += *n;
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl Writer for LocalWriter {
+    async fn tell(&mut self) -> Result<usize> {
+        Ok(self.cursor)
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        AsyncWriteExt::shutdown(self).await.map_err(|e| {
+            Error::io(
+                format!("failed to shutdown local writer for {}: {}", self.path, e),
+                location!(),
+            )
+        })?;
+
+        let local_path = crate::local::to_local_path(&self.path);
+        let metadata = std::fs::metadata(&local_path).map_err(|e| {
+            Error::io(
+                format!("failed to read metadata for {}: {}", self.path, e),
+                location!(),
+            )
+        })?;
+        let e_tag = get_etag(&metadata);
+
+        self.io_tracker
+            .record_write("put", self.path.clone(), self.cursor as u64);
+
+        Ok(WriteResult {
+            size: self.cursor,
+            e_tag: Some(e_tag),
+        })
+    }
+}
+
+// Based on object store's implementation.
+pub fn get_etag(metadata: &std::fs::Metadata) -> String {
+    let inode = get_inode(metadata);
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+
+    // Use an ETag scheme based on that used by many popular HTTP servers
+    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
+    format!("{inode:x}-{mtime:x}-{size:x}")
+}
+
+#[cfg(unix)]
+fn get_inode(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(metadata)
+}
+
+#[cfg(not(unix))]
+fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -525,7 +630,7 @@ mod tests {
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
         assert_eq!(object_writer.tell().await.unwrap(), 256 * 3);
 
-        let res = object_writer.shutdown().await.unwrap();
+        let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, 256 * 3);
 
         // Trigger multi part upload
@@ -540,7 +645,7 @@ mod tests {
             // Check the cursor
             assert_eq!(object_writer.tell().await.unwrap(), (i + 1) * buf.len());
         }
-        let res = object_writer.shutdown().await.unwrap();
+        let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
     }
 
@@ -552,5 +657,28 @@ mod tests {
             .await
             .unwrap();
         object_writer.abort().await;
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_shutdown() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("test_local_writer.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let io_tracker = Arc::new(IOTracker::default());
+
+        let file = tokio::fs::File::create(&file_path).await.unwrap();
+        let mut writer = LocalWriter::new(file, os_path, io_tracker.clone());
+
+        let data = b"hello local writer";
+        writer.write_all(data).await.unwrap();
+
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, data.len());
+        assert!(result.e_tag.is_some());
+        assert!(!result.e_tag.as_ref().unwrap().is_empty());
+
+        let stats = io_tracker.stats();
+        assert_eq!(stats.write_iops, 1);
+        assert_eq!(stats.written_bytes, data.len() as u64);
     }
 }

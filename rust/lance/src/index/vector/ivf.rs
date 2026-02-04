@@ -82,7 +82,6 @@ use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
-    object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
@@ -575,7 +574,7 @@ async fn optimize_ivf_pq_indices(
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-    mut writer: ObjectWriter,
+    mut writer: Box<dyn Writer>,
     dataset_version: u64,
 ) -> Result<usize> {
     let metric_type = first_idx.metric_type;
@@ -622,7 +621,13 @@ async fn optimize_ivf_pq_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    write_pq_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
+    write_pq_partitions(
+        writer.as_mut(),
+        &mut ivf_mut,
+        shuffled,
+        Some(&indices_to_merge),
+    )
+    .await?;
     let metadata = IvfPQIndexMetadata {
         name: format!("_{}_idx", vector_column),
         column: vector_column.to_string(),
@@ -639,7 +644,7 @@ async fn optimize_ivf_pq_indices(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(existing_indices.len() - start_pos)
 }
@@ -653,8 +658,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-    writer: ObjectWriter,
-    aux_writer: ObjectWriter,
+    writer: Box<dyn Writer>,
+    aux_writer: Box<dyn Writer>,
 ) -> Result<usize> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
@@ -1468,7 +1473,7 @@ impl RemapPageTask {
         Ok(self)
     }
 
-    async fn write(self, writer: &mut ObjectWriter, ivf: &mut IvfModel) -> Result<()> {
+    async fn write(self, writer: &mut dyn Writer, ivf: &mut IvfModel) -> Result<()> {
         let page = self.page.as_ref().expect("Load was not called");
         let page: &PQIndex = page
             .as_any()
@@ -1616,7 +1621,7 @@ pub(crate) async fn remap_index_file(
         loss: index.ivf.loss,
     };
     while let Some(write_task) = task_stream.try_next().await? {
-        write_task.write(&mut writer, &mut ivf).await?;
+        write_task.write(writer.as_mut(), &mut ivf).await?;
     }
 
     let pq_sub_index = index
@@ -1644,7 +1649,7 @@ pub(crate) async fn remap_index_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }
@@ -1674,7 +1679,7 @@ async fn write_ivf_pq_file(
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
     builder::build_partitions(
-        &mut writer,
+        writer.as_mut(),
         stream,
         column,
         &mut ivf,
@@ -1705,7 +1710,7 @@ async fn write_ivf_pq_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }
@@ -1725,7 +1730,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
         .child(index_id.to_string())
         .child("index.idx");
     let mut writer = obj_store.create(&path).await?;
-    write_pq_partitions(&mut writer, &mut ivf, Some(streams), None).await?;
+    write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
     let metadata = IvfPQIndexMetadata::new(
         index_name.to_string(),
@@ -1740,7 +1745,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }

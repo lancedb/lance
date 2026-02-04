@@ -22,7 +22,7 @@ use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
-use lance_io::traits::Reader;
+use lance_io::traits::{Reader, Writer};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -40,7 +40,7 @@ struct PackWriter {
     data_file_key: String,
     max_pack_size: usize,
     current_blob_id: Option<u32>,
-    writer: Option<lance_io::object_writer::ObjectWriter>,
+    writer: Option<Box<dyn lance_io::traits::Writer>>,
     current_size: usize,
 }
 
@@ -102,7 +102,7 @@ impl PackWriter {
 
     async fn finish(&mut self) -> Result<()> {
         if let Some(mut writer) = self.writer.take() {
-            writer.shutdown().await?;
+            Writer::shutdown(writer.as_mut()).await?;
         }
         self.current_blob_id = None;
         self.current_size = 0;
@@ -172,7 +172,7 @@ impl BlobPreprocessor {
         let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
-        writer.shutdown().await?;
+        Writer::shutdown(&mut writer).await?;
         Ok(path)
     }
 
