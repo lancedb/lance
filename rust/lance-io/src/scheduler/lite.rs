@@ -1,6 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! A lightweight I/O scheduler primarily intended for use with I/O uring.
+//!
+//! This scheduler attempts to avoid any kind of task switching whenever possible
+//! to minimize context switching overhead.
+//!
+//! There are a few limitations compared to the standard scheduler:
+//!
+//! * There is no concurrency limit.  The scheduler will allow as many IOPS to run
+//!   as possible as long as the backpressure throttle is not exceeded.
+//! * There is no "babysitting" of IOPS.  An I/O task will only be polled when its
+//!   future is polled.  The standard scheduler will `spawn` I/O tasks and so they
+//!   are always polled by tokio's runtime.  This is important for operations like
+//!   cloud requests where intermittent polling is required to clear out network
+//!   buffers and keep the TCP connection moving.
+
 use std::{
     collections::{BinaryHeap, HashMap},
     fmt::Debug,
@@ -23,6 +38,15 @@ use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN};
 
 type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
 
+/// The state of an I/O task
+///
+/// The state machine is as follows:
+///
+/// * `Broken` - The task is in an error state and cannot be run, should never happen
+/// * `Initial` - The task has been submitted but does not have a backpressure reservation
+/// * `Reserved` - The task has a backpressure reservation
+/// * `Running` - The task is running and has a future to poll
+/// * `Finished` - The task has finished and has a result
 enum TaskState {
     Broken,
     Initial {
@@ -44,26 +68,41 @@ enum TaskState {
     },
 }
 
-impl TaskState {
-    // Take out any reservations that were made for this task so they can be cleaned up
-    fn break_into_error(self, message: String) -> BrokenTaskError {
-        match self {
-            Self::Reserved {
+/// A custom error type that might have a backpressure reservation
+///
+/// This is used instead of Lance's standard error type so we can ensure
+/// we release the reservation before returning the error.
+struct BrokenTaskError {
+    message: String,
+    backpressure_reservation: Option<BackpressureReservation>,
+}
+
+/// The result type corresponding to BrokenTaskError
+type TaskResult = std::result::Result<(), BrokenTaskError>;
+
+impl BrokenTaskError {
+    // Create a BrokenTaskError from a task state
+    //
+    // This will capture any backpressure reservation the task has and put it into the
+    // error so we make sure to release it when returning the error.
+    fn new(task_state: TaskState, message: String) -> Self {
+        match task_state {
+            TaskState::Reserved {
                 backpressure_reservation,
                 ..
             }
-            | Self::Running {
+            | TaskState::Running {
                 backpressure_reservation,
                 ..
             }
-            | Self::Finished {
+            | TaskState::Finished {
                 backpressure_reservation,
                 ..
-            } => BrokenTaskError {
+            } => Self {
                 message,
                 backpressure_reservation: Some(backpressure_reservation),
             },
-            _ => BrokenTaskError {
+            TaskState::Broken | TaskState::Initial { .. } => Self {
                 message,
                 backpressure_reservation: None,
             },
@@ -71,17 +110,15 @@ impl TaskState {
     }
 }
 
-struct BrokenTaskError {
-    message: String,
-    backpressure_reservation: Option<BackpressureReservation>,
-}
-
-type TaskResult = std::result::Result<(), BrokenTaskError>;
-
-pub(super) struct IoTask {
+/// An I/O task represents a single read operation
+struct IoTask {
+    /// The unique identifier of the task (only used for debugging)
     id: u64,
+    /// The number of bytes to read
     num_bytes: u64,
+    /// The priority of the task, lower values are higher priority
     priority: u128,
+    /// The current state of the task
     state: TaskState,
 }
 
@@ -111,9 +148,10 @@ impl IoTask {
     fn reserve(&mut self, backpressure_reservation: BackpressureReservation) -> TaskResult {
         let state = std::mem::replace(&mut self.state, TaskState::Broken);
         let TaskState::Initial { idle_waker, run_fn } = state else {
-            return Err(
-                state.break_into_error(format!("Task with id {} not in initial state", self.id))
-            );
+            return Err(BrokenTaskError::new(
+                state,
+                format!("Task with id {} not in initial state", self.id),
+            ));
         };
         self.state = TaskState::Reserved {
             idle_waker,
@@ -131,9 +169,10 @@ impl IoTask {
             run_fn,
         } = state
         else {
-            return Err(
-                state.break_into_error(format!("Task with id {} not in reserved state", self.id))
-            );
+            return Err(BrokenTaskError::new(
+                state,
+                format!("Task with id {} not in reserved state", self.id),
+            ));
         };
         let inner = run_fn();
         self.state = TaskState::Running {
@@ -525,5 +564,93 @@ impl Future for TaskHandle {
     type Output = Result<Bytes>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.queue.poll(self.task_id, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn test_priority_ordering() {
+        // Backpressure budget of 10 bytes: only one 10-byte task runs at a time.
+        let queue = Arc::new(IoQueue::new(128, 10));
+
+        // Records the priority of each task when its run_fn is invoked (i.e. when
+        // the task transitions to Running).
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Helper: builds a RunFn that records `prio` in start_order and then
+        // waits on the oneshot receiver for its result bytes.
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        // Submit a blocker task (priority 0, 10 bytes).
+        // It starts immediately because there is enough backpressure budget.
+        let (blocker_tx, blocker_rx) = oneshot::channel();
+        let blocker = queue
+            .clone()
+            .submit(0..10, 0, make_run_fn(0, blocker_rx, start_order.clone()))
+            .unwrap();
+
+        // Submit four tasks with out-of-order priorities.
+        // All are queued because the blocker consumed the full budget.
+        let (tx_30, rx_30) = oneshot::channel();
+        let h30 = queue
+            .clone()
+            .submit(0..10, 30, make_run_fn(30, rx_30, start_order.clone()))
+            .unwrap();
+
+        let (tx_10, rx_10) = oneshot::channel();
+        let h10 = queue
+            .clone()
+            .submit(0..10, 10, make_run_fn(10, rx_10, start_order.clone()))
+            .unwrap();
+
+        let (tx_50, rx_50) = oneshot::channel();
+        let h50 = queue
+            .clone()
+            .submit(0..10, 50, make_run_fn(50, rx_50, start_order.clone()))
+            .unwrap();
+
+        let (tx_20, rx_20) = oneshot::channel();
+        let h20 = queue
+            .clone()
+            .submit(0..10, 20, make_run_fn(20, rx_20, start_order.clone()))
+            .unwrap();
+
+        // Only the blocker has started so far.
+        assert_eq!(*start_order.lock().unwrap(), vec![0]);
+
+        // Complete the blocker -> frees budget -> starts priority 10 (lowest value = highest priority).
+        blocker_tx.send(Bytes::from_static(b"x")).unwrap();
+        blocker.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 10]);
+
+        // Complete priority 10 -> starts priority 20.
+        tx_10.send(Bytes::from_static(b"x")).unwrap();
+        h10.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20]);
+
+        // Complete priority 20 -> starts priority 30.
+        tx_20.send(Bytes::from_static(b"x")).unwrap();
+        h20.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30]);
+
+        // Complete priority 30 -> starts priority 50.
+        tx_30.send(Bytes::from_static(b"x")).unwrap();
+        h30.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30, 50]);
+
+        // Complete priority 50 -> no more pending tasks.
+        tx_50.send(Bytes::from_static(b"x")).unwrap();
+        h50.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30, 50]);
     }
 }

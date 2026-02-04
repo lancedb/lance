@@ -1420,6 +1420,77 @@ mod tests {
         assert_eq!(second_fut.await.unwrap().len(), 10);
     }
 
+    /// A Reader that tracks how many times get_range has been called.
+    #[derive(Debug)]
+    struct TrackingReader {
+        get_range_count: Arc<AtomicU64>,
+        path: Path,
+    }
+
+    impl deepsize::DeepSizeOf for TrackingReader {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for TrackingReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(1_000_000) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.get_range_count.fetch_add(1, Ordering::Release);
+            let num_bytes = range.end - range.start;
+            Box::pin(async move { Ok(Bytes::from(vec![0u8; num_bytes])) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lite_scheduler_submits_eagerly() {
+        let obj_store = Arc::new(ObjectStore::memory());
+        let config = SchedulerConfig::default_for_testing().with_lite_scheduler();
+        let scheduler = ScanScheduler::new(obj_store, config);
+
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        // Submit several requests. The lite scheduler should call get_range
+        // eagerly during submit (before the returned future is polled).
+        let fut1 = scheduler.submit_request(reader.clone(), vec![0..100], 0);
+        let fut2 = scheduler.submit_request(reader.clone(), vec![100..200], 10);
+        let fut3 = scheduler.submit_request(reader.clone(), vec![200..300], 20);
+
+        // get_range must have been called for all 3 requests already.
+        assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+
+        // The futures should still resolve with the correct data.
+        assert_eq!(fut1.await.unwrap()[0].len(), 100);
+        assert_eq!(fut2.await.unwrap()[0].len(), 100);
+        assert_eq!(fut3.await.unwrap()[0].len(), 100);
+    }
+
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn stress_backpressure() {
         // This test ensures that the backpressure mechanism works correctly with
