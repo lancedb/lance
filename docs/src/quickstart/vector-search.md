@@ -280,4 +280,4 @@ print(result.to_pandas())
 
 ## Next Steps
 
-Check out **[Full-text Search](../quickstart/versioning.md)**, where we show how to create and query a BM25 index for keyword-based search in Lance.
+Check out **[Full-text Search](../quickstart/full-text-search.md)**, where we show how to create and query a BM25 index for keyword-based search in Lance.
