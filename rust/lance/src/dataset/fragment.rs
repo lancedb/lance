@@ -2616,18 +2616,43 @@ impl FragmentReader {
 
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
     /// batches.  May return an error if the taken rows do not fit into a single batch.
+    ///
+    /// Duplicate indices are allowed and will produce duplicate rows in the output.
     pub async fn take_as_batch(
         &self,
         indices: &[u32],
         take_priority: Option<u32>,
     ) -> Result<RecordBatch> {
+        // The v2 encoding layer requires strictly increasing indices. Deduplicate
+        // here so callers (e.g. FTS with duplicate row matches) don't need to.
+        let has_duplicates = indices.windows(2).any(|w| w[0] == w[1]);
+        let (unique_indices, expand_map) = if has_duplicates {
+            let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
+            let mut mapping: Vec<u32> = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                if unique.last() != Some(&idx) {
+                    unique.push(idx);
+                }
+                mapping.push((unique.len() - 1) as u32);
+            }
+            (Cow::Owned(unique), Some(UInt32Array::from(mapping)))
+        } else {
+            (Cow::Borrowed(indices), None)
+        };
+
         let batches = self
-            .take(indices, u32::MAX, take_priority)
+            .take(&unique_indices, u32::MAX, take_priority)
             .await?
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
+        let mut batch = concat_batches(&Arc::new(self.output_schema.clone()), batches.iter())?;
+
+        if let Some(expand_map) = expand_map {
+            batch = arrow_select::take::take_record_batch(&batch, &expand_map)?;
+        }
+
+        Ok(batch)
     }
 }
 
