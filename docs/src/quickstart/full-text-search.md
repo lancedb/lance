@@ -14,7 +14,7 @@ By the end of this tutorial, you'll be able to build and use an FTS index, under
 First, install the required dependencies:
 
 ```bash
-pip install pylance pandas
+pip install pylance pyarrow
 ```
 
 ## Set Up Your Environment
@@ -22,8 +22,8 @@ pip install pylance pandas
 Import the necessary libraries for working with Lance datasets:
 
 ```python
-import pandas as pd
 import lance
+import pyarrow as pa
 ```
 
 ## Prepare Your Text Data
@@ -31,17 +31,19 @@ import lance
 For this quickstart page, we'll create a simple dataset with text documents:
 
 ```python
-df = pd.DataFrame({
-    "id": [1, 2, 3],
-    "text": [
-        "I left my umbrella on the evening train to Boston",
-        "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-        "This train is scheduled to leave for Edinburgh at 9:30 in the morning",
-    ],
-})
+table = pa.table(
+    {
+        "id": [1, 2, 3],
+        "text": [
+            "I left my umbrella on the morning train to Boston",
+            "This ramen recipe simmers the broth for three hours with dried mushrooms.",
+            "This train is scheduled to leave for Edinburgh at 9:30 AM",
+        ],
+    }
+)
 
 # Write to a new Lance dataset
-lance.write_dataset(df, "/tmp/fts.lance", mode="overwrite")
+lance.write_dataset(table, "/tmp/fts.lance", mode="overwrite")
 ```
 
 This creates a Lance dataset with three text documents containing somewhat overlapping keywords that we'll use to demonstrate various search scenarios.
@@ -269,22 +271,22 @@ This is done by passing in the column name and its value to the `filter` paramet
 
 ```python
 import lance
-import pandas as pd
+import pyarrow as pa
 
-df = pd.DataFrame(
+table = pa.table(
     {
         "id": [1, 2, 3],
         "text": [
-            "I left my umbrella on the evening train to Boston",
+            "I left my umbrella on the morning train to Boston",
             "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-            "This train is scheduled to leave for Edinburgh at 9:30 in the morning",
+            "This train is scheduled to leave for Edinburgh at 9:30 AM",
         ],
         "category": ["travel", "food", "travel"],
     }
 )
 
 # Temp write dataset
-lance.write_dataset(df, "./fts_test_with_metadata.lance", mode="overwrite")
+lance.write_dataset(table, "./fts_test_with_metadata.lance", mode="overwrite")
 
 ds = lance.dataset("./fts_test_with_metadata.lance")
 
