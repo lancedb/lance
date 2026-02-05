@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
 from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
@@ -99,6 +99,7 @@ def dataset(
     session: Optional[Session] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    storage_options_provider: Optional[Any] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -166,6 +167,11 @@ def dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
+    storage_options_provider : optional
+        A storage options provider for automatic credential refresh. Must implement
+        `fetch_storage_options()` method that returns a dict of storage options.
+        If provided along with `namespace`, this takes precedence over the
+        namespace-created provider.
 
     Notes
     -----
@@ -191,7 +197,6 @@ def dataset(
         )
 
     # Handle namespace resolution in Python
-    storage_options_provider = None
     if namespace is not None:
         if table_id is None:
             raise ValueError(
@@ -208,9 +213,10 @@ def dataset(
         namespace_storage_options = response.storage_options
 
         if namespace_storage_options:
-            storage_options_provider = LanceNamespaceStorageOptionsProvider(
-                namespace=namespace, table_id=table_id
-            )
+            if storage_options_provider is None:
+                storage_options_provider = LanceNamespaceStorageOptionsProvider(
+                    namespace=namespace, table_id=table_id
+                )
             if storage_options is None:
                 storage_options = namespace_storage_options
             else:

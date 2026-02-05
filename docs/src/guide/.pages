@@ -1,5 +1,6 @@
 nav:
   - Read and Write: read_and_write.md
+  - Data Types: data_types.md
   - Data Evolution: data_evolution.md
   - Blob API: blob.md
   - JSON Support: json.md

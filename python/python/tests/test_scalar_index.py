@@ -1554,6 +1554,21 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_bitmap_empty_range(tmp_path: Path):
+    data = pa.table({"c0": pa.array([1, 2, 3], type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "dataset")
+    dataset.create_scalar_index("c0", index_type="BITMAP")
+    filters = [
+        "c0 BETWEEN 2 AND 1",
+        "c0 > 2 AND c0 < 2",
+        "c0 >= 2 AND c0 < 2",
+        "c0 > 2 AND c0 <= 2",
+    ]
+    for filter_expr in filters:
+        result = dataset.to_table(filter=filter_expr, use_scalar_index=True)
+        assert result.num_rows == 0
+
+
 def test_btree_remap_big_deletions(tmp_path: Path):
     # Write 15K rows in 3 fragments
     ds = lance.write_dataset(pa.table({"a": range(5000)}), tmp_path)

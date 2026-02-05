@@ -408,9 +408,7 @@ impl FilteredReadStream {
 
         let obj_store = dataset.object_store.clone();
         let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
-            SchedulerConfig {
-                io_buffer_size_bytes,
-            }
+            SchedulerConfig::new(io_buffer_size_bytes)
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };

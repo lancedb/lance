@@ -653,12 +653,8 @@ impl LanceFileReader {
         path: Path,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let scheduler = ScanScheduler::new(
-            object_store,
-            SchedulerConfig {
-                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
-            },
-        );
+        let scheduler =
+            ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
         let file = scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await

@@ -437,6 +437,7 @@ class LanceDataset(pa.dataset.Dataset):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+        self._storage_options_provider = storage_options_provider
 
         # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
@@ -526,11 +527,13 @@ class LanceDataset(pa.dataset.Dataset):
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
+        self._storage_options_provider = None
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
         ds._storage_options = self._storage_options
+        ds._storage_options_provider = self._storage_options_provider
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params.copy() if self._read_params else None
@@ -625,6 +628,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = self._storage_options
+        ds._storage_options_provider = self._storage_options_provider
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
         return ds
@@ -2283,6 +2287,27 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.storage_options_accessor()
 
+    def new_file_session(self):
+        """
+        Create a new file session for reading and writing files in this dataset.
+
+        The file session will use the dataset's storage options and provider
+        for credential management, enabling automatic credential refresh for
+        long-running operations.
+
+        Returns
+        -------
+        LanceFileSession
+            A file session configured for this dataset's storage location.
+        """
+        from lance.file import LanceFileSession
+
+        return LanceFileSession(
+            base_path=self._uri,
+            storage_options=self.latest_storage_options(),
+            storage_options_provider=self._storage_options_provider,
+        )
+
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> "LanceDataset":
@@ -3479,6 +3504,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
+        ds._storage_options_provider = storage_options_provider
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
@@ -3577,6 +3603,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = storage_options
+        ds._storage_options_provider = storage_options_provider
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(
@@ -5855,6 +5882,7 @@ def write_dataset(
 
     ds = LanceDataset.__new__(LanceDataset)
     ds._storage_options = storage_options
+    ds._storage_options_provider = None
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
