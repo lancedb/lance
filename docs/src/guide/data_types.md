@@ -85,93 +85,93 @@ Lance provides excellent support for array types, which are critical for storing
 
 `FixedSizeList` is the recommended type for storing fixed-dimensional vector embeddings. Each vector has the same number of dimensions, making it highly efficient for storage and computation.
 
-=== "Python"
+#### Python Example
 
-    ```python
-    import lance
-    import pyarrow as pa
-    import numpy as np
+```python
+import lance
+import pyarrow as pa
+import numpy as np
 
-    # Create a schema with a vector embedding column
-    # This defines a 128-dimensional float32 vector
-    schema = pa.schema([
-        pa.field("id", pa.int64()),
-        pa.field("text", pa.utf8()),
-        pa.field("vector", pa.list_(pa.float32(), 128)),  # FixedSizeList of 128 floats
-    ])
+# Create a schema with a vector embedding column
+# This defines a 128-dimensional float32 vector
+schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("text", pa.utf8()),
+    pa.field("vector", pa.list_(pa.float32(), 128)),  # FixedSizeList of 128 floats
+])
 
-    # Create sample data with embeddings
-    num_rows = 1000
-    vectors = np.random.rand(num_rows, 128).astype(np.float32)
+# Create sample data with embeddings
+num_rows = 1000
+vectors = np.random.rand(num_rows, 128).astype(np.float32)
 
-    table = pa.Table.from_pydict({
-        "id": list(range(num_rows)),
-        "text": [f"document_{i}" for i in range(num_rows)],
-        "vector": [v.tolist() for v in vectors],
-    }, schema=schema)
+table = pa.Table.from_pydict({
+    "id": list(range(num_rows)),
+    "text": [f"document_{i}" for i in range(num_rows)],
+    "vector": [v.tolist() for v in vectors],
+}, schema=schema)
 
-    # Write to Lance format
-    ds = lance.write_dataset(table, "./embeddings.lance")
-    print(f"Created dataset with {ds.count_rows()} rows")
-    ```
+# Write to Lance format
+ds = lance.write_dataset(table, "./embeddings.lance")
+print(f"Created dataset with {ds.count_rows()} rows")
+```
 
-=== "Rust"
+#### Rust Example
 
-    ```rust
-    use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
-    };
-    use arrow_schema::{DataType, Field, Schema};
-    use lance::dataset::WriteParams;
-    use lance::Dataset;
-    use std::sync::Arc;
+```rust
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema};
+use lance::dataset::WriteParams;
+use lance::Dataset;
+use std::sync::Arc;
 
-    #[tokio::main]
-    async fn main() -> lance::Result<()> {
-        // Define schema with a 128-dimensional vector column
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("text", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    128,
-                ),
-                false,
+#[tokio::main]
+async fn main() -> lance::Result<()> {
+    // Define schema with a 128-dimensional vector column
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                128,
             ),
-        ]));
+            false,
+        ),
+    ]));
 
-        // Create sample data
-        let ids = Int64Array::from(vec![0, 1, 2]);
-        let texts = StringArray::from(vec!["doc_0", "doc_1", "doc_2"]);
-        
-        // Create vector embeddings (128-dimensional)
-        let values: Vec<f32> = (0..384).map(|i| i as f32 / 100.0).collect();
-        let values_array = Float32Array::from(values);
-        let vectors = FixedSizeListArray::try_new_from_values(values_array, 128)?;
+    // Create sample data
+    let ids = Int64Array::from(vec![0, 1, 2]);
+    let texts = StringArray::from(vec!["doc_0", "doc_1", "doc_2"]);
+    
+    // Create vector embeddings (128-dimensional)
+    let values: Vec<f32> = (0..384).map(|i| i as f32 / 100.0).collect();
+    let values_array = Float32Array::from(values);
+    let vectors = FixedSizeListArray::try_new_from_values(values_array, 128)?;
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(ids) as ArrayRef,
-                Arc::new(texts) as ArrayRef,
-                Arc::new(vectors) as ArrayRef,
-            ],
-        )?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ids) as ArrayRef,
+            Arc::new(texts) as ArrayRef,
+            Arc::new(vectors) as ArrayRef,
+        ],
+    )?;
 
-        // Write to Lance
-        let dataset = Dataset::write(
-            vec![batch].into_iter().map(Ok),
-            "embeddings.lance",
-            WriteParams::default(),
-        )
-        .await?;
+    // Write to Lance
+    let dataset = Dataset::write(
+        vec![batch].into_iter().map(Ok),
+        "embeddings.lance",
+        WriteParams::default(),
+    )
+    .await?;
 
-        println!("Created dataset with {} rows", dataset.count_rows().await?);
-        Ok(())
-    }
-    ```
+    println!("Created dataset with {} rows", dataset.count_rows().await?);
+    Ok(())
+}
+```
 
 ### Vector Search with Embeddings
 
