@@ -15,7 +15,7 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `UInt8`, `UInt16`, `UInt32`, `UInt64` | Unsigned integers | IDs, indices |
 | `Float16`, `Float32`, `Float64` | Floating point numbers | Measurements, scores |
 | `Decimal128`, `Decimal256` | Fixed-precision decimals | Financial data |
-| `Date32`, `Date64` | Date values | Timestamps |
+| `Date32`, `Date64` | Date values | Birth dates, event dates |
 | `Time32`, `Time64` | Time values | Time of day |
 | `Timestamp` | Date and time with timezone | Event timestamps |
 | `Duration` | Time duration | Elapsed time |
@@ -272,7 +272,7 @@ When integrating Lance with other systems (like Apache Flink, Spark, or Presto),
 | `DOUBLE` | `Float64` | |
 | `DECIMAL(p,s)` | `Decimal128(p,s)` | |
 | `STRING` / `VARCHAR` | `Utf8` | |
-| `CHAR(n)` | `Utf8` | Fixed-width string |
+| `CHAR(n)` | `Utf8` | Fixed-width in source system; stored as variable-length Utf8 |
 | `DATE` | `Date32` | |
 | `TIME` | `Time64` | Microsecond precision |
 | `TIMESTAMP` | `Timestamp` | |
