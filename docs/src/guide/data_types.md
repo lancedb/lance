@@ -30,6 +30,53 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `LargeBinary` | Large binary data (64-bit offsets) | Large blobs |
 | `FixedSizeBinary(n)` | Fixed-length binary data | UUIDs, hashes |
 
+### Blob Type for Large Binary Objects
+
+Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Unlike regular binary columns, blobs are stored out-of-line and support lazy loading, which means you can read portions of the data without loading everything into memory.
+
+To create a blob column, add the `lance-encoding:blob` metadata to a `LargeBinary` field:
+
+```python
+import pyarrow as pa
+import lance
+
+# Define schema with a blob column for videos
+schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("filename", pa.utf8()),
+    pa.field("video", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
+])
+
+# Read video file
+with open("sample_video.mp4", "rb") as f:
+    video_data = f.read()
+
+# Create and write dataset
+table = pa.table({
+    "id": [1],
+    "filename": ["sample_video.mp4"],
+    "video": [video_data],
+}, schema=schema)
+
+ds = lance.write_dataset(table, "./videos.lance", schema=schema)
+```
+
+To read blob data, use `take_blobs()` which returns file-like objects for lazy reading:
+
+```python
+# Retrieve blob as a file-like object (lazy loading)
+blobs = ds.take_blobs("video", ids=[0])
+
+# Use with libraries that accept file-like objects
+import av  # pip install av
+with av.open(blobs[0]) as container:
+    for frame in container.decode(video=0):
+        # Process video frames without loading entire video into memory
+        pass
+```
+
+For more details, see the [Blob API Guide](blob.md).
+
 ## Array Types for Vector Embeddings
 
 Lance provides excellent support for array types, which are critical for storing vector embeddings in AI/ML applications.
@@ -279,6 +326,7 @@ When integrating Lance with other systems (like Apache Flink, Spark, or Presto),
 | `TIMESTAMP WITH LOCAL TIMEZONE` | `Timestamp` | With timezone info |
 | `BINARY` / `VARBINARY` | `Binary` | |
 | `BYTES` | `Binary` | |
+| `BLOB` | `LargeBinary` with `lance-encoding:blob` | Large binary objects with lazy loading |
 | `ARRAY<T>` | `List(T)` | Variable-length array |
 | `ARRAY<T>(n)` | `FixedSizeList(T, n)` | Fixed-length array (vectors) |
 | `ROW` / `STRUCT` | `Struct` | Nested structure |
@@ -337,5 +385,6 @@ This maps to Lance's `FixedSizeList(Float32, 384)` type, which is optimized for:
 ## See Also
 
 - [Vector Search Tutorial](../quickstart/vector-search.md) - Complete guide to vector search with Lance
+- [Blob API Guide](blob.md) - Storing and retrieving large binary objects (videos, images)
 - [Extension Arrays](arrays.md) - Special array types for ML (BFloat16, images)
 - [Performance Guide](performance.md) - Optimization tips for large-scale deployments
