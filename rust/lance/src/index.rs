@@ -1056,7 +1056,7 @@ async fn index_statistics_scalar(
     let field_path = ds.schema().field_path(field_id)?;
 
     let (indices_stats, index_uri, num_indices, updated_at) =
-        collect_scalar_indices_statistics(ds, metadatas, &field_path).await?;
+        collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
 
     let index_type_hint = indices_stats
         .first()
@@ -1070,7 +1070,7 @@ async fn index_statistics_scalar(
         num_unindexed_fragments,
         num_indexed_rows,
         num_unindexed_rows,
-    )) = fragment_statistics_or_migrate(ds, index_name).await?
+    )) = gather_fragment_statistics(ds, index_name).await?
     else {
         return migrate_and_recompute_index_statistics(ds, index_name).await;
     };
@@ -1091,7 +1091,7 @@ async fn index_statistics_scalar(
     serialize_index_statistics(&stats)
 }
 
-async fn collect_scalar_indices_statistics(
+async fn collect_regular_indices_statistics(
     ds: &Dataset,
     metadatas: Vec<IndexMetadata>,
     field_path: &str,
@@ -1139,7 +1139,7 @@ async fn collect_scalar_indices_statistics(
     ))
 }
 
-async fn fragment_statistics_or_migrate(
+async fn gather_fragment_statistics(
     ds: &Dataset,
     index_name: &str,
 ) -> Result<Option<(Vec<usize>, usize, usize, usize, usize)>> {
