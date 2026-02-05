@@ -4,11 +4,11 @@
 use core::panic;
 use std::cmp::{max, min};
 
+use super::{num_centroids, utils::get_sub_vector_centroids};
 use lance_core::assume_eq;
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
-use super::{num_centroids, utils::get_sub_vector_centroids};
 
 // for quantizing the distance table, we need to know the max possible distance,
 // so we perform a flat search on the first `FLAT_NUM_4BIT_PQ` rows.
@@ -45,7 +45,11 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length));
+        result.extend(l2_distance_batch(
+            sub_vec,
+            subvec_centroids,
+            sub_vector_length,
+        ));
     }
     result
 }
@@ -78,7 +82,11 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length));
+        result.extend(dot_distance_batch(
+            sub_vec,
+            subvec_centroids,
+            sub_vector_length,
+        ));
     }
     result
 }
