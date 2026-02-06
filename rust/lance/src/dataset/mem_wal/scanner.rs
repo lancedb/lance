@@ -3,7 +3,7 @@
 
 //! LSM Scanner - Unified scanner for LSM tree data
 //!
-//! This module provides a scanner that reads from multiple data sources
+//! This module provides scanners that read from multiple data sources
 //! in an LSM tree architecture:
 //! - Base table (merged data)
 //! - Flushed MemTables (persisted but not yet merged)
@@ -11,6 +11,12 @@
 //!
 //! The scanner handles deduplication by primary key, keeping the newest
 //! version based on generation number and row address.
+//!
+//! ## Supported Query Types
+//!
+//! - **Scan**: Full table scan with deduplication
+//! - **Point Lookup**: Primary key-based lookup with bloom filter optimization
+//! - **Vector Search**: KNN search with staleness detection
 //!
 //! ## Example
 //!
@@ -30,7 +36,11 @@ mod collector;
 mod data_source;
 pub mod exec;
 mod planner;
+mod point_lookup;
+mod vector_search;
 
 pub use builder::LsmScanner;
 pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, RegionSnapshot};
+pub use point_lookup::LsmPointLookupPlanner;
+pub use vector_search::{LsmVectorSearchPlanner, DISTANCE_COLUMN};

@@ -116,7 +116,7 @@ In other words, a WAL consists of an ordered list of WAL entries starting from p
 Writer must flush WAL entries in sequential order from lower to higher position.
 If WAL entry `N` is not flushed fully, WAL entry `N+1` must not exist in storage.
 
-### WAL Replay
+#### WAL Replay
 
 **Replaying** a WAL means to read data in the WAL from a lower to a higher position.
 This is commonly used to recover the latest MemTable after it is lost,
@@ -160,6 +160,9 @@ The content within the generation directory follows the [Lance table storage lay
 
 Generation numbers determine merge order of flushed MemTable into base table: 
 lower numbers represent older data and must be merged to the base table first to preserve correct upsert semantics.
+
+Within a single flushed MemTable, if there are multiple rows of the same primary key,
+the row that is last inserted wins.
 
 ### Region Manifest
 
