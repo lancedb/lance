@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::scalar::inverted::lance_tokenizer::DocType;
+use crate::scalar::inverted::scorer::BM25StatsOverride;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -20,6 +23,8 @@ pub struct FtsSearchParams {
     pub phrase_slop: Option<u32>,
     /// The number of beginning characters being unchanged for fuzzy matching.
     pub prefix_length: u32,
+    /// Optional BM25 stats override for custom corpus-level statistics.
+    pub bm25_override: Option<Arc<BM25StatsOverride>>,
 }
 
 impl FtsSearchParams {
@@ -31,6 +36,7 @@ impl FtsSearchParams {
             max_expansions: 50,
             phrase_slop: None,
             prefix_length: 0,
+            bm25_override: None,
         }
     }
 
@@ -61,6 +67,11 @@ impl FtsSearchParams {
 
     pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
         self.prefix_length = prefix_length;
+        self
+    }
+
+    pub fn with_bm25_override(mut self, bm25_override: Option<Arc<BM25StatsOverride>>) -> Self {
+        self.bm25_override = bm25_override;
         self
     }
 }

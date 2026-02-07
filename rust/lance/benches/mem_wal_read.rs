@@ -63,6 +63,9 @@ use lance::dataset::mem_wal::scanner::{
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, RegionWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::InvertedIndexParams;
+use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -1033,11 +1036,340 @@ fn bench_vector_search(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sample text snippets for FTS benchmarking.
+const FTS_SAMPLE_TEXTS: &[&str] = &[
+    "The quick brown fox jumps over the lazy dog",
+    "Machine learning models require large datasets for training",
+    "Vector databases enable semantic search capabilities",
+    "Rust provides memory safety without garbage collection",
+    "Cloud native applications scale horizontally across regions",
+    "Data lakehouse combines warehouse and lake architecture benefits",
+    "Embeddings capture semantic meaning in high dimensional vector space",
+    "Columnar storage format optimizes analytical query performance",
+    "Neural networks learn hierarchical feature representations",
+    "Distributed systems handle concurrent requests efficiently",
+    "Natural language processing transforms text into structured data",
+    "Graph databases model relationships between connected entities",
+    "Streaming analytics processes real time event data continuously",
+    "Containerized microservices deploy independently at scale",
+    "Full text search indexes enable fast keyword matching queries",
+    "Object storage provides durable scalable blob persistence",
+];
+
+/// Create FTS schema: (id: Int64, text: Utf8)
+fn create_fts_schema() -> Arc<ArrowSchema> {
+    use std::collections::HashMap;
+
+    let mut id_metadata = HashMap::new();
+    id_metadata.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    let id_field = Field::new("id", DataType::Int64, false).with_metadata(id_metadata);
+
+    Arc::new(ArrowSchema::new(vec![
+        id_field,
+        Field::new("text", DataType::Utf8, true),
+    ]))
+}
+
+/// Create a batch with sequential IDs and cycling text content.
+fn create_fts_batch(schema: &ArrowSchema, start_id: i64, num_rows: usize) -> RecordBatch {
+    let ids: Vec<i64> = (start_id..start_id + num_rows as i64).collect();
+    let texts: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            let base = FTS_SAMPLE_TEXTS[(*id as usize) % FTS_SAMPLE_TEXTS.len()];
+            format!("{} (row {})", base, id)
+        })
+        .collect();
+
+    RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Setup context for FTS benchmarks.
+struct FtsBenchContext {
+    base_dataset: Arc<Dataset>,
+    lsm_dataset: Arc<Dataset>,
+    region_snapshots: Vec<RegionSnapshot>,
+    active_memtable: Option<(Uuid, ActiveMemTableRef)>,
+    total_rows: usize,
+    pk_columns: Vec<String>,
+}
+
+/// Create benchmark context for FTS search with:
+/// - Base table with FTS index (for baseline)
+/// - LSM dataset with FTS index + MemWAL maintained FTS index
+/// - 2 flushed MemTables + 1 active MemTable with text data
+async fn setup_fts_benchmark(
+    base_rows: usize,
+    memtable_rows: usize,
+    batch_size: usize,
+    dataset_prefix: &str,
+) -> FtsBenchContext {
+    let schema = create_fts_schema();
+    let pk_columns = vec!["id".to_string()];
+
+    let short_id = &Uuid::new_v4().to_string()[..8];
+    let prefix = dataset_prefix.trim_end_matches('/');
+
+    // Create base dataset with FTS index (for baseline comparison)
+    let base_uri = format!("{}/fts_base_{}", prefix, short_id);
+    let base_batches: Vec<RecordBatch> = (0..base_rows.div_ceil(batch_size))
+        .map(|i| {
+            let start = (i * batch_size) as i64;
+            let rows = batch_size.min(base_rows - i * batch_size);
+            create_fts_batch(&schema, start, rows)
+        })
+        .collect();
+
+    let reader = RecordBatchIterator::new(base_batches.into_iter().map(Ok), schema.clone());
+    let mut base_dataset = Dataset::write(reader, &base_uri, Some(WriteParams::default()))
+        .await
+        .unwrap();
+
+    let fts_params = InvertedIndexParams::default();
+    base_dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &fts_params,
+            false,
+        )
+        .await
+        .unwrap();
+    let base_dataset = Arc::new(base_dataset);
+
+    // Create LSM dataset with FTS index + MemWAL
+    let lsm_uri = format!("{}/fts_lsm_{}", prefix, short_id);
+    let lsm_base_batches: Vec<RecordBatch> = (0..base_rows.div_ceil(batch_size))
+        .map(|i| {
+            let start = (i * batch_size) as i64;
+            let rows = batch_size.min(base_rows - i * batch_size);
+            create_fts_batch(&schema, start, rows)
+        })
+        .collect();
+
+    let reader = RecordBatchIterator::new(lsm_base_batches.into_iter().map(Ok), schema.clone());
+    let mut lsm_dataset = Dataset::write(reader, &lsm_uri, Some(WriteParams::default()))
+        .await
+        .unwrap();
+
+    let fts_params = InvertedIndexParams::default();
+    lsm_dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &fts_params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    lsm_dataset
+        .initialize_mem_wal(MemWalConfig {
+            region_spec: None,
+            maintained_indexes: vec!["text_fts".to_string()],
+        })
+        .await
+        .unwrap();
+
+    let lsm_dataset = Arc::new(lsm_dataset);
+
+    // Create RegionWriter
+    let region_id = Uuid::new_v4();
+    let config = RegionWriterConfig {
+        region_id,
+        region_spec_id: 0,
+        durable_write: false,
+        sync_indexed_write: false,
+        max_memtable_size: memtable_rows * 100,
+        max_memtable_rows: memtable_rows,
+        max_wal_flush_interval: Some(Duration::from_secs(60)),
+        ..RegionWriterConfig::default()
+    };
+
+    let writer = lsm_dataset
+        .as_ref()
+        .mem_wal_writer(region_id, config)
+        .await
+        .unwrap();
+
+    let is_cloud = dataset_prefix.starts_with("s3://")
+        || dataset_prefix.starts_with("gs://")
+        || dataset_prefix.starts_with("az://");
+    let flush_wait = if is_cloud {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(500)
+    };
+
+    // Write generation 1 (will be flushed)
+    let gen1_start = base_rows as i64;
+    for i in 0..memtable_rows.div_ceil(batch_size) {
+        let start = gen1_start + (i * batch_size) as i64;
+        let rows = batch_size.min(memtable_rows - i * batch_size);
+        let batch = create_fts_batch(&schema, start, rows);
+        writer.put(vec![batch]).await.unwrap();
+    }
+    tokio::time::sleep(flush_wait).await;
+
+    // Write generation 2 (will be flushed)
+    let gen2_start = gen1_start + memtable_rows as i64;
+    for i in 0..memtable_rows.div_ceil(batch_size) {
+        let start = gen2_start + (i * batch_size) as i64;
+        let rows = batch_size.min(memtable_rows - i * batch_size);
+        let batch = create_fts_batch(&schema, start, rows);
+        writer.put(vec![batch]).await.unwrap();
+    }
+    tokio::time::sleep(flush_wait).await;
+
+    // Write generation 3 (active memtable, not flushed)
+    let gen3_start = gen2_start + memtable_rows as i64;
+    let gen3_rows = memtable_rows / 2;
+    for i in 0..gen3_rows.div_ceil(batch_size) {
+        let start = gen3_start + (i * batch_size) as i64;
+        let rows = batch_size.min(gen3_rows - i * batch_size);
+        let batch = create_fts_batch(&schema, start, rows);
+        writer.put(vec![batch]).await.unwrap();
+    }
+
+    let manifest = writer.manifest().await.unwrap();
+    let active_memtable_ref = writer.active_memtable_ref().await;
+
+    let mut region_snapshot = RegionSnapshot::new(region_id);
+    if let Some(ref m) = manifest {
+        region_snapshot = region_snapshot.with_current_generation(m.current_generation);
+        for fg in &m.flushed_generations {
+            region_snapshot =
+                region_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        }
+    }
+
+    let num_flushed = manifest
+        .as_ref()
+        .map(|m| m.flushed_generations.len())
+        .unwrap_or(0);
+
+    println!("FTS benchmark setup complete:");
+    println!("  Base table: {} rows (with FTS index)", base_rows);
+    println!("  Flushed MemTables: {} generations", num_flushed);
+    println!("  Active MemTable: {} rows", gen3_rows);
+    println!(
+        "  Total LSM rows: {}",
+        base_rows + memtable_rows * 2 + gen3_rows
+    );
+
+    std::mem::forget(writer);
+
+    FtsBenchContext {
+        base_dataset,
+        lsm_dataset,
+        region_snapshots: vec![region_snapshot],
+        active_memtable: Some((region_id, active_memtable_ref)),
+        total_rows: base_rows + memtable_rows * 2 + gen3_rows,
+        pk_columns,
+    }
+}
+
+/// Benchmark FTS search operations.
+fn bench_fts_search(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let base_rows = get_base_rows();
+    let memtable_rows = get_memtable_rows();
+    let batch_size = get_batch_size();
+    let sample_size = get_sample_size();
+    let dataset_prefix = get_dataset_prefix();
+
+    let ctx = rt.block_on(setup_fts_benchmark(
+        base_rows,
+        memtable_rows,
+        batch_size,
+        &dataset_prefix,
+    ));
+
+    let mut group = c.benchmark_group("LSM FTS Search");
+    group.throughput(Throughput::Elements(10));
+    group.sample_size(sample_size);
+
+    let label = format!("{}_total_rows", ctx.total_rows);
+    let k = 10;
+    let query_text = "machine learning";
+
+    // Baseline: FTS on base table only (persistent inverted index)
+    group.bench_with_input(BenchmarkId::new("BaseTable_FTS", &label), &(), |b, _| {
+        let dataset = ctx.base_dataset.clone();
+        b.to_async(&rt).iter(|| {
+            let dataset = dataset.clone();
+            async move {
+                let batches: Vec<RecordBatch> = dataset
+                    .scan()
+                    .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
+                    .unwrap()
+                    .limit(Some(k as i64), None)
+                    .unwrap()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert!(total <= k);
+            }
+        });
+    });
+
+    // LSM FTS search: base table + flushed memtables + active memtable
+    if let Some((region_id, ref active_memtable)) = ctx.active_memtable {
+        group.bench_with_input(BenchmarkId::new("LSM_FTS", &label), &(), |b, _| {
+            let dataset = ctx.lsm_dataset.clone();
+            let region_snapshots = ctx.region_snapshots.clone();
+            let pk_columns = ctx.pk_columns.clone();
+            let active = active_memtable.clone();
+            b.to_async(&rt).iter(|| {
+                let dataset = dataset.clone();
+                let region_snapshots = region_snapshots.clone();
+                let pk_columns = pk_columns.clone();
+                let active = active.clone();
+                async move {
+                    let scanner = LsmScanner::new(dataset, region_snapshots, pk_columns)
+                        .with_active_memtable(region_id, active)
+                        .full_text_search("text", query_text)
+                        .limit(k, None);
+                    let batches: Vec<RecordBatch> = scanner
+                        .try_into_stream()
+                        .await
+                        .unwrap()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    assert!(total <= k);
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn all_benchmarks(c: &mut Criterion) {
     bench_scan(c);
     bench_scan_with_projection(c);
     bench_point_lookup(c);
     bench_vector_search(c);
+    bench_fts_search(c);
 }
 
 #[cfg(target_os = "linux")]

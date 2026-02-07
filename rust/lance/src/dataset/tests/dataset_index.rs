@@ -1835,6 +1835,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1851,6 +1852,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1869,6 +1871,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1887,6 +1890,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1905,6 +1909,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1923,6 +1928,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1964,6 +1970,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1981,6 +1988,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -1998,6 +2006,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2015,6 +2024,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2080,6 +2090,7 @@ async fn test_json_inverted_flat_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2119,6 +2130,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2136,6 +2148,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2178,6 +2191,7 @@ async fn test_json_inverted_multimatch_query() {
         }),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2226,6 +2240,7 @@ async fn test_json_inverted_boolean_query() {
         }),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()
@@ -2498,6 +2513,7 @@ async fn test_auto_infer_lance_tokenizer() {
         ),
         limit: None,
         wand_factor: None,
+        bm25_override: None,
     };
     let batch = dataset
         .scan()

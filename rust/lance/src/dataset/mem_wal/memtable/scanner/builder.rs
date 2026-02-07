@@ -19,6 +19,7 @@ use lance_linalg::distance::DistanceType;
 use snafu::location;
 
 use super::exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+use crate::dataset::mem_wal::scanner::bm25_stats::DeferredBM25Stats;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Vector search query parameters.
@@ -94,6 +95,8 @@ pub struct FtsQuery {
     /// WAND factor for early termination (0.0 to 1.0).
     /// 1.0 = full recall (default), <1.0 = faster but may miss low-scoring results.
     pub wand_factor: f32,
+    /// Maximum number of results to return. None means unlimited.
+    pub limit: Option<usize>,
 }
 
 /// Default maximum number of fuzzy expansions.
@@ -111,6 +114,7 @@ impl FtsQuery {
                 query: query.into(),
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -123,6 +127,7 @@ impl FtsQuery {
                 slop,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -141,6 +146,7 @@ impl FtsQuery {
                 must_not,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -159,6 +165,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -194,6 +202,7 @@ impl FtsQuery {
                 max_expansions,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
         }
     }
 
@@ -204,6 +213,12 @@ impl FtsQuery {
     /// - 0.0 = only return the absolute best match
     pub fn with_wand_factor(mut self, wand_factor: f32) -> Self {
         self.wand_factor = wand_factor.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the maximum number of results to return.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
         self
     }
 }
@@ -279,6 +294,8 @@ pub struct MemTableScanner {
     /// Whether to include _rowaddr column in output.
     /// Same value as _rowid but named for compatibility with LSM scanner.
     with_row_address: bool,
+    /// Deferred global BM25 stats for cross-generation FTS scoring.
+    deferred_bm25_stats: Option<DeferredBM25Stats>,
 }
 
 impl MemTableScanner {
@@ -311,6 +328,7 @@ impl MemTableScanner {
             batch_size: None,
             with_row_id: false,
             with_row_address: false,
+            deferred_bm25_stats: None,
         }
     }
 
@@ -350,6 +368,13 @@ impl MemTableScanner {
     pub fn with_row_address(&mut self) -> &mut Self {
         self.with_row_address = true;
         self
+    }
+
+    /// Set deferred global BM25 stats for cross-generation FTS scoring.
+    ///
+    /// The stats are resolved lazily at execution time via the `OnceCell`.
+    pub fn set_deferred_bm25_stats(&mut self, stats: Option<DeferredBM25Stats>) {
+        self.deferred_bm25_stats = stats;
     }
 
     /// Set a filter expression using SQL-like syntax.
@@ -612,6 +637,18 @@ impl MemTableScanner {
         self
     }
 
+    /// Set the maximum number of FTS results per source.
+    ///
+    /// Must be called after one of the `full_text_*` methods.
+    pub fn fts_limit(&mut self, limit: usize) -> &mut Self {
+        if let Some(ref mut q) = self.full_text_query {
+            q.limit = Some(limit);
+        } else {
+            log::warn!("fts_limit is not set because full_text_query has not been called yet");
+        }
+        self
+    }
+
     /// Enable or disable index usage.
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         self.use_index = use_index;
@@ -849,7 +886,8 @@ impl MemTableScanner {
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
-        )?;
+        )?
+        .with_deferred_bm25_stats(self.deferred_bm25_stats.clone());
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 

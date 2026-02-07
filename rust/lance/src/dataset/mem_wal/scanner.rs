@@ -31,16 +31,20 @@
 //! let stream = scanner.try_into_stream().await?;
 //! ```
 
+pub mod bm25_stats;
 mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
+mod fts_search;
 mod planner;
 mod point_lookup;
 mod vector_search;
 
+pub use bm25_stats::GlobalBM25Stats;
 pub use builder::LsmScanner;
 pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, RegionSnapshot};
+pub use fts_search::LsmFtsSearchPlanner;
 pub use point_lookup::LsmPointLookupPlanner;
 pub use vector_search::{LsmVectorSearchPlanner, DISTANCE_COLUMN};

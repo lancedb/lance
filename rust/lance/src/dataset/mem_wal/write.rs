@@ -1052,8 +1052,13 @@ impl RegionWriter {
         )?;
 
         // Start background MemTable flush handler
-        let memtable_handler =
-            MemTableFlushHandler::new(state.clone(), flusher, epoch, stats.clone());
+        let memtable_handler = MemTableFlushHandler::new(
+            state.clone(),
+            flusher,
+            epoch,
+            stats.clone(),
+            index_configs.clone(),
+        );
         task_executor.add_handler(
             "memtable_flusher".to_string(),
             Box::new(memtable_handler),
@@ -1456,6 +1461,7 @@ struct MemTableFlushHandler {
     flusher: Arc<MemTableFlusher>,
     epoch: u64,
     stats: SharedWriteStats,
+    index_configs: Vec<MemIndexConfig>,
 }
 
 impl MemTableFlushHandler {
@@ -1464,12 +1470,14 @@ impl MemTableFlushHandler {
         flusher: Arc<MemTableFlusher>,
         epoch: u64,
         stats: SharedWriteStats,
+        index_configs: Vec<MemIndexConfig>,
     ) -> Self {
         Self {
             state,
             flusher,
             epoch,
             stats,
+            index_configs,
         }
     }
 }
@@ -1514,8 +1522,14 @@ impl MemTableFlushHandler {
                 .map_err(|e| Error::io(format!("WAL flush failed: {}", e), snafu::location!()))?;
         }
 
-        // Step 2: Flush the memtable to Lance storage
-        let result = self.flusher.flush(&memtable, self.epoch).await?;
+        // Step 2: Flush the memtable to Lance storage (with indexes if configured)
+        let result = if self.index_configs.is_empty() {
+            self.flusher.flush(&memtable, self.epoch).await?
+        } else {
+            self.flusher
+                .flush_with_indexes(&memtable, self.epoch, &self.index_configs)
+                .await?
+        };
 
         // Step 3: Signal completion and update backpressure tracking
         // Signal memtable flush completion for backpressure watchers

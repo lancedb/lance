@@ -24,8 +24,9 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use snafu::location;
 
-use super::super::builder::{FtsQuery, FtsQueryType, DEFAULT_WAND_FACTOR};
+use super::super::builder::{FtsQuery, FtsQueryType};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::scanner::bm25_stats::{DeferredBM25Stats, GlobalBM25Stats};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Score column name in output.
@@ -55,6 +56,9 @@ pub struct FtsIndexExec {
     max_visible_row: Option<u64>,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
+    /// Deferred global BM25 stats for cross-generation scoring.
+    /// Resolved lazily at execution time to avoid blocking plan construction.
+    deferred_bm25_stats: Option<DeferredBM25Stats>,
 }
 
 impl Debug for FtsIndexExec {
@@ -158,235 +162,200 @@ impl FtsIndexExec {
             batch_ranges,
             max_visible_row,
             with_row_id,
+            deferred_bm25_stats: None,
         })
     }
 
-    /// Find batch for a row position using binary search. O(log n).
-    #[inline]
-    fn find_batch(&self, row_pos: usize) -> Option<&BatchRange> {
-        // Binary search: find the batch where start <= row_pos < end
-        let idx = self.batch_ranges.partition_point(|b| b.end <= row_pos);
-        self.batch_ranges
-            .get(idx)
-            .filter(|b| row_pos >= b.start && row_pos < b.end)
+    /// Set deferred global BM25 stats for cross-generation scoring.
+    ///
+    /// The stats are resolved lazily at execution time. If the stats task
+    /// hasn't completed yet, the execution stream will await its result.
+    pub fn with_deferred_bm25_stats(mut self, stats: Option<DeferredBM25Stats>) -> Self {
+        self.deferred_bm25_stats = stats;
+        self
     }
+}
 
-    /// Query the index and return matching rows with BM25 scores.
-    fn query_index(&self) -> Vec<(u64, f32)> {
-        let Some(index) = self.indexes.get_fts_by_column(&self.query.column) else {
-            return vec![];
-        };
+/// Standalone query + materialization logic used by both sync and async execute paths.
+///
+/// Extracted from `FtsIndexExec` methods so it can be called from an async block
+/// (which cannot borrow `&self` across an `.await`).
+#[allow(clippy::too_many_arguments)]
+fn execute_fts_query(
+    batch_store: &Arc<BatchStore>,
+    indexes: &Arc<IndexStore>,
+    query: &FtsQuery,
+    max_visible_row: Option<u64>,
+    projection: Option<&[usize]>,
+    output_schema: &SchemaRef,
+    batch_ranges: &[BatchRange],
+    with_row_id: bool,
+    resolved_stats: Option<&GlobalBM25Stats>,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    // Query the index
+    let results = query_fts_index(indexes, query, resolved_stats);
 
-        // Convert FtsQueryType to FtsQueryExpr
-        let query_expr = match &self.query.query_type {
-            FtsQueryType::Match { query } => FtsQueryExpr::match_query(query),
-            FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
-            FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            } => {
-                let mut builder = FtsQueryExpr::boolean();
-                for term in must {
-                    builder = builder.must(FtsQueryExpr::match_query(term));
-                }
-                for term in should {
-                    builder = builder.should(FtsQueryExpr::match_query(term));
-                }
-                for term in must_not {
-                    builder = builder.must_not(FtsQueryExpr::match_query(term));
-                }
-                builder.build()
-            }
-            FtsQueryType::Fuzzy {
-                query,
-                fuzziness,
-                max_expansions,
-            } => FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *max_expansions),
-        };
-
-        // Search the index using the query expression
-        // Use search_with_options if wand_factor is set (< 1.0)
-        let entries = if self.query.wand_factor < DEFAULT_WAND_FACTOR {
-            let options = SearchOptions::new().with_wand_factor(self.query.wand_factor);
-            index.search_with_options(&query_expr, options)
-        } else {
-            index.search_query(&query_expr)
-        };
-
-        // Convert to (row_position, score) pairs
-        entries
-            .into_iter()
-            .map(|entry| (entry.row_position, entry.score))
-            .collect()
-    }
-
-    /// Filter results by MVCC visibility using max_row_position. O(n).
-    fn filter_by_visibility(&self, results: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
-        let Some(max_visible) = self.max_visible_row else {
-            return vec![];
-        };
-        results
+    // Filter by visibility
+    let mut visible_results = match max_visible_row {
+        Some(max_visible) => results
             .into_iter()
             .filter(|&(pos, _)| pos <= max_visible)
-            .collect()
+            .collect(),
+        None => vec![],
+    };
+
+    // Sort by score descending
+    visible_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Materialize rows
+    materialize_rows_sorted(
+        &visible_results,
+        batch_store,
+        batch_ranges,
+        projection,
+        output_schema,
+        with_row_id,
+    )
+}
+
+/// Query the FTS index and return (row_position, score) pairs.
+fn query_fts_index(
+    indexes: &Arc<IndexStore>,
+    query: &FtsQuery,
+    resolved_stats: Option<&GlobalBM25Stats>,
+) -> Vec<(u64, f32)> {
+    let Some(index) = indexes.get_fts_by_column(&query.column) else {
+        return vec![];
+    };
+
+    let query_expr = match &query.query_type {
+        FtsQueryType::Match { query } => FtsQueryExpr::match_query(query),
+        FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
+        FtsQueryType::Boolean {
+            must,
+            should,
+            must_not,
+        } => {
+            let mut builder = FtsQueryExpr::boolean();
+            for term in must {
+                builder = builder.must(FtsQueryExpr::match_query(term));
+            }
+            for term in should {
+                builder = builder.should(FtsQueryExpr::match_query(term));
+            }
+            for term in must_not {
+                builder = builder.must_not(FtsQueryExpr::match_query(term));
+            }
+            builder.build()
+        }
+        FtsQueryType::Fuzzy {
+            query,
+            fuzziness,
+            max_expansions,
+        } => FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *max_expansions),
+    };
+
+    let mut options = SearchOptions::new().with_wand_factor(query.wand_factor);
+    if let Some(limit) = query.limit {
+        options = options.with_limit(limit);
+    }
+    if let Some(stats) = resolved_stats {
+        options = options.with_bm25_override(Arc::new(stats.clone()));
+    }
+    let entries = index.search_with_options(&query_expr, options);
+
+    entries
+        .into_iter()
+        .map(|entry| (entry.row_position, entry.score))
+        .collect()
+}
+
+/// Find batch for a row position using binary search. O(log n).
+#[inline]
+fn find_batch(batch_ranges: &[BatchRange], row_pos: usize) -> Option<&BatchRange> {
+    let idx = batch_ranges.partition_point(|b| b.end <= row_pos);
+    batch_ranges
+        .get(idx)
+        .filter(|b| row_pos >= b.start && row_pos < b.end)
+}
+
+/// Materialize rows from batch store preserving input order (for sorted results).
+fn materialize_rows_sorted(
+    results: &[(u64, f32)],
+    batch_store: &Arc<BatchStore>,
+    batch_ranges: &[BatchRange],
+    projection: Option<&[usize]>,
+    output_schema: &SchemaRef,
+    with_row_id: bool,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    if results.is_empty() {
+        return Ok(vec![]);
     }
 
-    /// Materialize rows from batch store with score column (for unsorted results).
-    #[allow(dead_code)]
-    fn materialize_rows(&self, results: &[(u64, f32)]) -> DataFusionResult<Vec<RecordBatch>> {
-        if results.is_empty() {
-            return Ok(vec![]);
+    let mut all_scores: Vec<f32> = Vec::with_capacity(results.len());
+    let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
+    let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
+
+    if let Some(stored) = batch_store.get(0) {
+        for _ in 0..stored.data.num_columns() {
+            all_columns.push(Vec::with_capacity(results.len()));
         }
-
-        // Group rows by batch using binary search on pre-computed ranges
-        // Track (row_in_batch, score, original_row_position)
-        let mut batches_data: std::collections::HashMap<usize, Vec<(usize, f32, u64)>> =
-            std::collections::HashMap::new();
-
-        for &(pos, score) in results {
-            if let Some(batch) = self.find_batch(pos as usize) {
-                batches_data.entry(batch.batch_id).or_default().push((
-                    pos as usize - batch.start,
-                    score,
-                    pos,
-                ));
-            }
-        }
-
-        let mut all_batches = Vec::new();
-
-        for (batch_id, rows_with_score) in batches_data {
-            if let Some(stored) = self.batch_store.get(batch_id) {
-                let rows: Vec<u32> = rows_with_score.iter().map(|&(r, _, _)| r as u32).collect();
-                let scores: Vec<f32> = rows_with_score.iter().map(|&(_, s, _)| s).collect();
-                let row_positions: Vec<u64> =
-                    rows_with_score.iter().map(|&(_, _, pos)| pos).collect();
-
-                let indices = UInt32Array::from(rows);
-
-                let mut columns: Vec<Arc<dyn arrow_array::Array>> = stored
-                    .data
-                    .columns()
-                    .iter()
-                    .map(|col| arrow_select::take::take(col.as_ref(), &indices, None).unwrap())
-                    .collect();
-
-                // Add score column
-                columns.push(Arc::new(Float32Array::from(scores)));
-
-                // Apply projection if needed (excluding score column which is always included)
-                let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
-                    // Always include score as last column
-                    projected.push(columns.last().unwrap().clone());
-                    projected
-                } else {
-                    columns
-                };
-
-                // Add _rowid column if requested
-                if self.with_row_id {
-                    final_columns.push(Arc::new(UInt64Array::from(row_positions)));
-                }
-
-                let batch = RecordBatch::try_new(self.output_schema.clone(), final_columns)?;
-                all_batches.push(batch);
-            }
-        }
-
-        Ok(all_batches)
     }
 
-    /// Materialize rows from batch store preserving input order (for sorted results).
-    ///
-    /// This method processes results one at a time to preserve the score-sorted order,
-    /// then combines them into a single batch.
-    fn materialize_rows_sorted(
-        &self,
-        results: &[(u64, f32)],
-    ) -> DataFusionResult<Vec<RecordBatch>> {
-        if results.is_empty() {
-            return Ok(vec![]);
-        }
+    for &(pos, score) in results {
+        if let Some(batch_range) = find_batch(batch_ranges, pos as usize) {
+            if let Some(stored) = batch_store.get(batch_range.batch_id) {
+                let row_in_batch = (pos as usize - batch_range.start) as u32;
+                let indices = UInt32Array::from(vec![row_in_batch]);
 
-        // Process each result in order to preserve sorting
-        let mut all_rows: Vec<u32> = Vec::with_capacity(results.len());
-        let mut all_scores: Vec<f32> = Vec::with_capacity(results.len());
-        let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
-        let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
-
-        // Initialize column vectors based on first batch's schema
-        let first_batch = self.batch_store.get(0);
-        if let Some(stored) = first_batch {
-            for _ in 0..stored.data.num_columns() {
-                all_columns.push(Vec::with_capacity(results.len()));
-            }
-        }
-
-        for &(pos, score) in results {
-            if let Some(batch_range) = self.find_batch(pos as usize) {
-                if let Some(stored) = self.batch_store.get(batch_range.batch_id) {
-                    let row_in_batch = (pos as usize - batch_range.start) as u32;
-                    let indices = UInt32Array::from(vec![row_in_batch]);
-
-                    // Take each column value
-                    for (col_idx, col) in stored.data.columns().iter().enumerate() {
-                        let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
-                        if all_columns.len() <= col_idx {
-                            all_columns.push(Vec::new());
-                        }
-                        all_columns[col_idx].push(taken);
+                for (col_idx, col) in stored.data.columns().iter().enumerate() {
+                    let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
+                    if all_columns.len() <= col_idx {
+                        all_columns.push(Vec::new());
                     }
-
-                    all_rows.push(row_in_batch);
-                    all_scores.push(score);
-                    all_row_positions.push(pos);
+                    all_columns[col_idx].push(taken);
                 }
+
+                all_scores.push(score);
+                all_row_positions.push(pos);
             }
         }
-
-        if all_scores.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Concatenate all column arrays
-        let mut final_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
-
-        for col_arrays in &all_columns {
-            if !col_arrays.is_empty() {
-                let refs: Vec<&dyn arrow_array::Array> =
-                    col_arrays.iter().map(|a| a.as_ref()).collect();
-                let concatenated = arrow_select::concat::concat(&refs)?;
-                final_columns.push(concatenated);
-            }
-        }
-
-        // Add score column
-        final_columns.push(Arc::new(Float32Array::from(all_scores)));
-
-        // Apply projection if needed
-        let mut projected_columns = if let Some(ref proj_indices) = self.projection {
-            let mut projected: Vec<_> = proj_indices
-                .iter()
-                .map(|&i| final_columns[i].clone())
-                .collect();
-            // Always include score as last column
-            projected.push(final_columns.last().unwrap().clone());
-            projected
-        } else {
-            final_columns
-        };
-
-        // Add _rowid column if requested
-        if self.with_row_id {
-            projected_columns.push(Arc::new(UInt64Array::from(all_row_positions)));
-        }
-
-        let batch = RecordBatch::try_new(self.output_schema.clone(), projected_columns)?;
-        Ok(vec![batch])
     }
+
+    if all_scores.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut final_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
+
+    for col_arrays in &all_columns {
+        if !col_arrays.is_empty() {
+            let refs: Vec<&dyn arrow_array::Array> =
+                col_arrays.iter().map(|a| a.as_ref()).collect();
+            let concatenated = arrow_select::concat::concat(&refs)?;
+            final_columns.push(concatenated);
+        }
+    }
+
+    final_columns.push(Arc::new(Float32Array::from(all_scores)));
+
+    let mut projected_columns = if let Some(proj_indices) = projection {
+        let mut projected: Vec<_> = proj_indices
+            .iter()
+            .map(|&i| final_columns[i].clone())
+            .collect();
+        projected.push(final_columns.last().unwrap().clone());
+        projected
+    } else {
+        final_columns
+    };
+
+    if with_row_id {
+        projected_columns.push(Arc::new(UInt64Array::from(all_row_positions)));
+    }
+
+    let batch = RecordBatch::try_new(output_schema.clone(), projected_columns)?;
+    Ok(vec![batch])
 }
 
 impl DisplayAs for FtsIndexExec {
@@ -444,22 +413,64 @@ impl ExecutionPlan for FtsIndexExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        // Query the index
-        let results = self.query_index();
+        if self.deferred_bm25_stats.is_none() {
+            // Fast path: no deferred stats, execute synchronously
+            let batches = execute_fts_query(
+                &self.batch_store,
+                &self.indexes,
+                &self.query,
+                self.max_visible_row,
+                self.projection.as_deref(),
+                &self.output_schema,
+                &self.batch_ranges,
+                self.with_row_id,
+                None,
+            )?;
+            let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.output_schema.clone(),
+                stream,
+            )));
+        }
 
-        // Filter by visibility
-        let mut visible_results = self.filter_by_visibility(results);
+        // Deferred path: clone fields needed by the async block
+        let deferred_stats = self.deferred_bm25_stats.clone().unwrap();
+        let batch_store = self.batch_store.clone();
+        let indexes = self.indexes.clone();
+        let query = self.query.clone();
+        let max_visible_row = self.max_visible_row;
+        let projection = self.projection.clone();
+        let output_schema = self.output_schema.clone();
+        let batch_ranges = self.batch_ranges.clone();
+        let with_row_id = self.with_row_id;
 
-        // Sort by score descending (best matches first)
-        visible_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let output_schema_for_stream = output_schema.clone();
+        let fut = async move {
+            // Resolve deferred BM25 stats (may already be available)
+            let resolved = deferred_stats.await;
+            // Run the sync query/materialization logic
+            execute_fts_query(
+                &batch_store,
+                &indexes,
+                &query,
+                max_visible_row,
+                projection.as_deref(),
+                &output_schema,
+                &batch_ranges,
+                with_row_id,
+                Some(&resolved),
+            )
+        };
 
-        // Materialize the rows (preserving sort order)
-        let batches = self.materialize_rows_sorted(&visible_results)?;
-
-        let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
+        let stream = futures::stream::once(fut)
+            .flat_map(|result| match result {
+                Ok(batches) => stream::iter(batches.into_iter().map(Ok)).boxed(),
+                Err(e) => stream::once(async move { Err(e) }).boxed(),
+            })
+            .boxed();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
+            output_schema_for_stream,
             stream,
         )))
     }

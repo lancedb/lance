@@ -1003,6 +1003,19 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Set a BM25 stats override on the full-text search query.
+    ///
+    /// This is used by the LSM FTS planner to inject global BM25 statistics
+    /// so that scores are comparable across LSM generations.
+    pub fn set_fts_bm25_override(
+        &mut self,
+        bm25_override: Option<Arc<lance_index::scalar::inverted::scorer::BM25StatsOverride>>,
+    ) {
+        if let Some(ref mut query) = self.full_text_query {
+            query.bm25_override = bm25_override;
+        }
+    }
+
     /// Set a filter using a Substrait ExtendedExpression message
     ///
     /// The message must contain exactly one expression and that expression

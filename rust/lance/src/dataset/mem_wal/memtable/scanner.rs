@@ -36,5 +36,5 @@
 mod builder;
 mod exec;
 
-pub use builder::MemTableScanner;
-pub use exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+pub use builder::{FtsQuery, FtsQueryType, MemTableScanner};
+pub use exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec, SCORE_COLUMN};

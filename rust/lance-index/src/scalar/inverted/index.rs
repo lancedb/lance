@@ -55,7 +55,7 @@ use super::{
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    scorer::{idf, BM25StatsOverride, IndexBM25Scorer, OverrideBM25Scorer, Scorer, B, K1},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -238,6 +238,21 @@ impl InvertedIndex {
         self.partitions.len()
     }
 
+    /// Read BM25 collection-level stats from this index without running a query.
+    ///
+    /// Returns `(num_docs, total_tokens, term_doc_freqs)` aggregated across
+    /// all partitions, using the same `IndexBM25Scorer` that `bm25_search` uses.
+    pub fn collection_stats(&self, terms: &[String]) -> (usize, u64, HashMap<String, usize>) {
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|p| p.as_ref()));
+        let num_docs = scorer.num_docs();
+        let total_tokens = scorer.total_tokens();
+        let term_doc_freqs: HashMap<String, usize> = terms
+            .iter()
+            .map(|t| (t.clone(), scorer.num_docs_containing_token(t)))
+            .collect();
+        (num_docs, total_tokens, term_doc_freqs)
+    }
+
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
@@ -251,6 +266,35 @@ impl InvertedIndex {
         operator: Operator,
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        self.bm25_search_internal(tokens, params, operator, prefilter, metrics, scorer)
+            .await
+    }
+
+    /// BM25 search using externally-provided global statistics.
+    pub async fn bm25_search_with_override(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        override_stats: &BM25StatsOverride,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let scorer = OverrideBM25Scorer::new(override_stats);
+        self.bm25_search_internal(tokens, params, operator, prefilter, metrics, scorer)
+            .await
+    }
+
+    async fn bm25_search_internal<S: Scorer>(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        scorer: S,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
@@ -301,7 +345,6 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {

@@ -284,16 +284,32 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
-            let (doc_ids, mut scores) = inverted_idx
-                .bm25_search(
-                    Arc::new(tokens),
-                    params.into(),
-                    query.operator,
-                    pre_filter,
-                    metrics.clone(),
-                )
-                .boxed()
-                .await?;
+            let params: Arc<FtsSearchParams> = params.into();
+            let bm25_override = params.bm25_override.clone();
+            let (doc_ids, mut scores) = if let Some(ref override_stats) = bm25_override {
+                inverted_idx
+                    .bm25_search_with_override(
+                        Arc::new(tokens),
+                        params,
+                        query.operator,
+                        pre_filter,
+                        metrics.clone(),
+                        override_stats,
+                    )
+                    .boxed()
+                    .await?
+            } else {
+                inverted_idx
+                    .bm25_search(
+                        Arc::new(tokens),
+                        params,
+                        query.operator,
+                        pre_filter,
+                        metrics.clone(),
+                    )
+                    .boxed()
+                    .await?
+            };
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });

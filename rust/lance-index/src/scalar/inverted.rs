@@ -9,7 +9,7 @@ pub mod json;
 mod merger;
 pub mod parser;
 pub mod query;
-mod scorer;
+pub mod scorer;
 pub mod tokenizer;
 mod wand;
 

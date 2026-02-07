@@ -131,6 +131,60 @@ impl Scorer for IndexBM25Scorer<'_> {
     }
 }
 
+/// Override BM25 stats for cross-generation scoring.
+///
+/// Contains the aggregated stats from all LSM generations so that
+/// a persistent index partition can produce globally-comparable scores.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BM25StatsOverride {
+    pub num_docs: usize,
+    pub total_tokens: u64,
+    /// term -> number of documents containing the term across all generations.
+    pub term_doc_freqs: HashMap<String, usize>,
+}
+
+/// BM25 scorer using externally-provided (global) statistics.
+///
+/// Same math as `IndexBM25Scorer`, but num_docs and term_doc_freqs
+/// come from the override rather than the local index partitions.
+pub struct OverrideBM25Scorer {
+    num_docs: usize,
+    avg_doc_length: f32,
+    term_doc_freqs: HashMap<String, usize>,
+}
+
+impl OverrideBM25Scorer {
+    pub fn new(override_stats: &BM25StatsOverride) -> Self {
+        let avg_doc_length = if override_stats.num_docs > 0 {
+            override_stats.total_tokens as f32 / override_stats.num_docs as f32
+        } else {
+            1.0
+        };
+        Self {
+            num_docs: override_stats.num_docs,
+            avg_doc_length,
+            term_doc_freqs: override_stats.term_doc_freqs.clone(),
+        }
+    }
+}
+
+impl Scorer for OverrideBM25Scorer {
+    fn query_weight(&self, token: &str) -> f32 {
+        let token_docs = self.term_doc_freqs.get(token).copied().unwrap_or(0);
+        if token_docs == 0 {
+            return 0.0;
+        }
+        idf(token_docs, self.num_docs)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        let freq = freq as f32;
+        let doc_tokens = doc_tokens as f32;
+        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
+        (K1 + 1.0) * freq / (freq + doc_norm)
+    }
+}
+
 #[inline]
 pub fn idf(token_docs: usize, num_docs: usize) -> f32 {
     let num_docs = num_docs as f32;

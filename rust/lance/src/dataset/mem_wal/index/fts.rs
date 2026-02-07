@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
@@ -38,6 +38,7 @@ use snafu::location;
 use tantivy::tokenizer::TokenStream;
 
 use super::RowPosition;
+use crate::dataset::mem_wal::scanner::bm25_stats::GlobalBM25Stats;
 
 /// Composite key for FTS index.
 ///
@@ -146,6 +147,9 @@ pub struct SearchOptions {
     pub wand_factor: f32,
     /// Maximum number of results to return. None means unlimited.
     pub limit: Option<usize>,
+    /// Optional BM25 stats override for custom corpus-level statistics.
+    /// When set, scoring uses these stats instead of the index's local stats.
+    pub bm25_override: Option<Arc<GlobalBM25Stats>>,
 }
 
 impl Default for SearchOptions {
@@ -153,6 +157,7 @@ impl Default for SearchOptions {
         Self {
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
+            bm25_override: None,
         }
     }
 }
@@ -176,6 +181,12 @@ impl SearchOptions {
     /// Set the maximum number of results to return.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Set BM25 stats override for custom corpus-level statistics.
+    pub fn with_bm25_override(mut self, stats: Arc<GlobalBM25Stats>) -> Self {
+        self.bm25_override = Some(stats);
         self
     }
 }
@@ -842,9 +853,36 @@ impl FtsMemIndex {
         self.doc_count.load(Ordering::Relaxed) == 0
     }
 
+    /// Get total token count across all documents.
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Get document frequencies for the given terms.
+    pub fn term_doc_frequencies(&self, terms: &[String]) -> HashMap<String, usize> {
+        let mut result = HashMap::new();
+        for term in terms {
+            if let Some(entry) = self.doc_freq.get(term) {
+                result.insert(term.clone(), entry.value().load(Ordering::Relaxed));
+            }
+        }
+        result
+    }
+
     /// Get the column name.
     pub fn column_name(&self) -> &str {
         &self.column_name
+    }
+
+    /// Tokenize a query string using the index's tokenizer.
+    pub fn tokenize_query(&self, query: &str) -> Vec<String> {
+        let mut tokenizer = self.tokenizer.lock().unwrap();
+        let mut token_stream = tokenizer.token_stream_for_search(query);
+        let mut tokens = Vec::new();
+        while let Some(token) = token_stream.next() {
+            tokens.push(token.text.clone());
+        }
+        tokens
     }
 
     /// Expand a term to fuzzy matches within the specified edit distance.
@@ -1070,8 +1108,12 @@ impl FtsMemIndex {
         query: &FtsQueryExpr,
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
-        // Execute the query to get all results
-        let mut results = self.search_query(query);
+        // Execute the query, using BM25 override stats if provided
+        let mut results = if let Some(ref stats) = options.bm25_override {
+            self.search_query_with_scorer(query, stats)
+        } else {
+            self.search_query(query)
+        };
 
         // Sort by score descending
         results.sort_by(|a, b| {
@@ -1106,6 +1148,365 @@ impl FtsMemIndex {
             results.truncate(limit);
         }
 
+        results
+    }
+
+    /// Execute a query using external BM25 statistics for scoring.
+    fn search_query_with_scorer(
+        &self,
+        query: &FtsQueryExpr,
+        stats: &GlobalBM25Stats,
+    ) -> Vec<FtsEntry> {
+        match query {
+            FtsQueryExpr::Match { query, boost } => {
+                let mut results = self.search_with_scorer(query, stats);
+                if *boost != 1.0 {
+                    for entry in &mut results {
+                        entry.score *= boost;
+                    }
+                }
+                results
+            }
+            FtsQueryExpr::Phrase { query, slop, boost } => {
+                let mut results = self.search_phrase_with_scorer(query, *slop, stats);
+                if *boost != 1.0 {
+                    for entry in &mut results {
+                        entry.score *= boost;
+                    }
+                }
+                results
+            }
+            FtsQueryExpr::Fuzzy {
+                query,
+                fuzziness,
+                max_expansions,
+                boost,
+            } => {
+                let mut results =
+                    self.search_fuzzy_with_scorer(query, *fuzziness, *max_expansions, stats);
+                if *boost != 1.0 {
+                    for entry in &mut results {
+                        entry.score *= boost;
+                    }
+                }
+                results
+            }
+            FtsQueryExpr::Boolean {
+                must,
+                should,
+                must_not,
+            } => self.search_boolean_with_scorer(must, should, must_not, stats),
+            FtsQueryExpr::Boost {
+                positive,
+                negative,
+                negative_boost,
+            } => {
+                self.search_boost_with_scorer(positive, negative.as_deref(), *negative_boost, stats)
+            }
+        }
+    }
+
+    /// Term search using external scorer for BM25 computation.
+    fn search_with_scorer(&self, term: &str, stats: &GlobalBM25Stats) -> Vec<FtsEntry> {
+        let tokens: Vec<String> = {
+            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let mut token_stream = tokenizer.token_stream_for_search(term);
+            let mut tokens = Vec::new();
+            while let Some(token) = token_stream.next() {
+                tokens.push(token.text.clone());
+            }
+            tokens
+        };
+
+        let mut doc_term_info: HashMap<RowPosition, Vec<(u32, String)>> = HashMap::new();
+        for token in &tokens {
+            let df = self
+                .doc_freq
+                .get(token)
+                .map(|e| e.value().load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if df == 0 {
+                continue;
+            }
+
+            let start = FtsKey {
+                token: token.clone(),
+                row_position: 0,
+            };
+            let end = FtsKey {
+                token: token.clone(),
+                row_position: u64::MAX,
+            };
+
+            for entry in self.postings.range(start..=end) {
+                doc_term_info
+                    .entry(entry.key().row_position)
+                    .or_default()
+                    .push((entry.value().frequency, token.clone()));
+            }
+        }
+
+        doc_term_info
+            .into_iter()
+            .map(|(row_position, term_infos)| {
+                let dl = self
+                    .doc_lengths
+                    .get(&row_position)
+                    .map(|e| *e.value())
+                    .unwrap_or(1);
+
+                let mut score: f32 = 0.0;
+                for (tf, token) in &term_infos {
+                    score += stats.score(token, *tf, dl);
+                }
+
+                FtsEntry {
+                    row_position,
+                    score,
+                }
+            })
+            .collect()
+    }
+
+    /// Phrase search using external scorer.
+    fn search_phrase_with_scorer(
+        &self,
+        phrase: &str,
+        slop: u32,
+        stats: &GlobalBM25Stats,
+    ) -> Vec<FtsEntry> {
+        let tokens: Vec<String> = {
+            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let mut token_stream = tokenizer.token_stream_for_search(phrase);
+            let mut tokens = Vec::new();
+            while let Some(token) = token_stream.next() {
+                tokens.push(token.text.clone());
+            }
+            tokens
+        };
+
+        if tokens.is_empty() {
+            return vec![];
+        }
+        if tokens.len() == 1 {
+            return self.search_with_scorer(phrase, stats);
+        }
+
+        let mut token_postings: Vec<HashMap<RowPosition, PostingValue>> = Vec::new();
+        for token in &tokens {
+            let start = FtsKey {
+                token: token.clone(),
+                row_position: 0,
+            };
+            let end = FtsKey {
+                token: token.clone(),
+                row_position: u64::MAX,
+            };
+            let mut postings_for_token: HashMap<RowPosition, PostingValue> = HashMap::new();
+            for entry in self.postings.range(start..=end) {
+                postings_for_token.insert(entry.key().row_position, entry.value().clone());
+            }
+            token_postings.push(postings_for_token);
+        }
+
+        let first_token_docs: Vec<RowPosition> = token_postings[0].keys().copied().collect();
+        let mut matching_docs: Vec<FtsEntry> = Vec::new();
+
+        for row_position in first_token_docs {
+            let all_tokens_present = token_postings
+                .iter()
+                .all(|tp| tp.contains_key(&row_position));
+            if !all_tokens_present {
+                continue;
+            }
+
+            if self.check_phrase_positions(&token_postings, row_position, slop) {
+                let dl = self
+                    .doc_lengths
+                    .get(&row_position)
+                    .map(|e| *e.value())
+                    .unwrap_or(1);
+
+                let mut score: f32 = 0.0;
+                for (token_idx, token) in tokens.iter().enumerate() {
+                    let tf = token_postings[token_idx]
+                        .get(&row_position)
+                        .map(|p| p.frequency)
+                        .unwrap_or(1);
+                    score += stats.score(token, tf, dl);
+                }
+
+                matching_docs.push(FtsEntry {
+                    row_position,
+                    score,
+                });
+            }
+        }
+
+        matching_docs
+    }
+
+    /// Fuzzy search using external scorer.
+    fn search_fuzzy_with_scorer(
+        &self,
+        query: &str,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
+        stats: &GlobalBM25Stats,
+    ) -> Vec<FtsEntry> {
+        let tokens: Vec<String> = {
+            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let mut token_stream = tokenizer.token_stream_for_search(query);
+            let mut tokens = Vec::new();
+            while let Some(token) = token_stream.next() {
+                tokens.push(token.text.clone());
+            }
+            tokens
+        };
+
+        if tokens.is_empty() {
+            return vec![];
+        }
+
+        let mut doc_term_info: HashMap<RowPosition, Vec<(u32, String)>> = HashMap::new();
+        for token in &tokens {
+            let max_distance = fuzziness.unwrap_or_else(|| auto_fuzziness(token));
+            let expanded = self.expand_fuzzy(token, max_distance, max_expansions);
+
+            for (matched_term, _distance) in expanded {
+                let df = self
+                    .doc_freq
+                    .get(&matched_term)
+                    .map(|e| e.value().load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if df == 0 {
+                    continue;
+                }
+
+                let start = FtsKey {
+                    token: matched_term.clone(),
+                    row_position: 0,
+                };
+                let end = FtsKey {
+                    token: matched_term.clone(),
+                    row_position: u64::MAX,
+                };
+
+                for entry in self.postings.range(start..=end) {
+                    doc_term_info
+                        .entry(entry.key().row_position)
+                        .or_default()
+                        .push((entry.value().frequency, matched_term.clone()));
+                }
+            }
+        }
+
+        doc_term_info
+            .into_iter()
+            .map(|(row_position, term_infos)| {
+                let dl = self
+                    .doc_lengths
+                    .get(&row_position)
+                    .map(|e| *e.value())
+                    .unwrap_or(1);
+
+                let mut score: f32 = 0.0;
+                for (tf, token) in &term_infos {
+                    score += stats.score(token, *tf, dl);
+                }
+
+                FtsEntry {
+                    row_position,
+                    score,
+                }
+            })
+            .collect()
+    }
+
+    /// Boolean search using external scorer.
+    fn search_boolean_with_scorer(
+        &self,
+        must: &[FtsQueryExpr],
+        should: &[FtsQueryExpr],
+        must_not: &[FtsQueryExpr],
+        stats: &GlobalBM25Stats,
+    ) -> Vec<FtsEntry> {
+        let excluded: std::collections::HashSet<RowPosition> = must_not
+            .iter()
+            .flat_map(|q| self.search_query_with_scorer(q, stats))
+            .map(|e| e.row_position)
+            .collect();
+
+        let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
+            let mut map = HashMap::new();
+            for q in should {
+                for entry in self.search_query_with_scorer(q, stats) {
+                    *map.entry(entry.row_position).or_default() += entry.score;
+                }
+            }
+            map
+        } else {
+            let first_results = self.search_query_with_scorer(&must[0], stats);
+            let mut map: HashMap<RowPosition, f32> = first_results
+                .into_iter()
+                .map(|e| (e.row_position, e.score))
+                .collect();
+
+            for q in must.iter().skip(1) {
+                let results = self.search_query_with_scorer(q, stats);
+                let result_set: HashMap<RowPosition, f32> = results
+                    .into_iter()
+                    .map(|e| (e.row_position, e.score))
+                    .collect();
+                map = map
+                    .into_iter()
+                    .filter_map(|(pos, score)| result_set.get(&pos).map(|s| (pos, score + s)))
+                    .collect();
+            }
+
+            if !should.is_empty() {
+                for q in should {
+                    for entry in self.search_query_with_scorer(q, stats) {
+                        if let Some(score) = map.get_mut(&entry.row_position) {
+                            *score += entry.score;
+                        }
+                    }
+                }
+            }
+            map
+        };
+
+        result_map.retain(|pos, _| !excluded.contains(pos));
+
+        result_map
+            .into_iter()
+            .map(|(row_position, score)| FtsEntry {
+                row_position,
+                score,
+            })
+            .collect()
+    }
+
+    /// Boost search using external scorer.
+    fn search_boost_with_scorer(
+        &self,
+        positive: &FtsQueryExpr,
+        negative: Option<&FtsQueryExpr>,
+        negative_boost: f32,
+        stats: &GlobalBM25Stats,
+    ) -> Vec<FtsEntry> {
+        let mut results = self.search_query_with_scorer(positive, stats);
+        let Some(neg_query) = negative else {
+            return results;
+        };
+        let negative_results = self.search_query_with_scorer(neg_query, stats);
+        let negative_positions: std::collections::HashSet<RowPosition> =
+            negative_results.iter().map(|e| e.row_position).collect();
+        for entry in &mut results {
+            if negative_positions.contains(&entry.row_position) {
+                entry.score *= negative_boost;
+            }
+        }
         results
     }
 

@@ -323,6 +323,9 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    /// Optional BM25 stats override for custom corpus-level statistics.
+    pub bm25_override: Option<Arc<inverted::scorer::BM25StatsOverride>>,
 }
 
 impl FullTextSearchQuery {
@@ -333,6 +336,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            bm25_override: None,
         }
     }
 
@@ -343,6 +347,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            bm25_override: None,
         }
     }
 
@@ -352,6 +357,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            bm25_override: None,
         }
     }
 
@@ -389,6 +395,7 @@ impl FullTextSearchQuery {
         FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
             .with_wand_factor(self.wand_factor.unwrap_or(1.0))
+            .with_bm25_override(self.bm25_override.clone())
     }
 }
 

@@ -16,9 +16,12 @@ use lance_core::{Error, Result};
 use snafu::location;
 use uuid::Uuid;
 
+use super::bm25_stats::GlobalBM25Stats;
 use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
 use super::data_source::RegionSnapshot;
+use super::fts_search::LsmFtsSearchPlanner;
 use super::planner::LsmScanPlanner;
+use crate::dataset::mem_wal::memtable::scanner::FtsQuery;
 use crate::dataset::Dataset;
 
 /// Scanner for LSM tree data spanning base table, flushed MemTables, and active MemTable.
@@ -60,6 +63,10 @@ pub struct LsmScanner {
 
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
+
+    // Full-text search
+    fts_query: Option<FtsQuery>,
+    fts_global_stats: Option<GlobalBM25Stats>,
 }
 
 impl LsmScanner {
@@ -86,6 +93,8 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            fts_query: None,
+            fts_global_stats: None,
         }
     }
 
@@ -159,6 +168,27 @@ impl LsmScanner {
         self
     }
 
+    /// Enable full-text search with global BM25 scoring.
+    ///
+    /// Stats are aggregated across all LSM levels at plan time so that
+    /// BM25 scores are comparable across generations.
+    pub fn full_text_search(mut self, column: impl Into<String>, query: impl Into<String>) -> Self {
+        self.fts_query = Some(FtsQuery::match_query(column, query));
+        self
+    }
+
+    /// Enable full-text search with pre-computed global BM25 stats.
+    pub fn fts_with_global_stats(
+        mut self,
+        column: impl Into<String>,
+        query: impl Into<String>,
+        stats: GlobalBM25Stats,
+    ) -> Self {
+        self.fts_query = Some(FtsQuery::match_query(column, query));
+        self.fts_global_stats = Some(stats);
+        self
+    }
+
     /// Get the output schema.
     pub fn schema(&self) -> SchemaRef {
         // For now, return base schema. Full implementation would compute
@@ -172,8 +202,26 @@ impl LsmScanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        let planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
 
+        if let Some(ref fts_query) = self.fts_query {
+            let k = self.limit.unwrap_or(10);
+            let mut planner = LsmFtsSearchPlanner::new(
+                collector,
+                self.pk_columns.clone(),
+                base_schema,
+                fts_query.clone(),
+            );
+            if let Some(ref stats) = self.fts_global_stats {
+                planner = planner.with_global_stats(stats.clone());
+            }
+            let projection = self
+                .projection
+                .as_ref()
+                .map(|p| p.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>());
+            return planner.plan_search(k, projection.as_deref()).await;
+        }
+
+        let planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
         planner
             .plan_scan(
                 self.projection.as_deref(),
@@ -247,6 +295,7 @@ impl std::fmt::Debug for LsmScanner {
             .field("limit", &self.limit)
             .field("offset", &self.offset)
             .field("pk_columns", &self.pk_columns)
+            .field("fts_query", &self.fts_query.is_some())
             .finish()
     }
 }
