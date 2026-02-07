@@ -26,6 +26,7 @@ pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
+pub mod progress;
 pub mod registry;
 pub mod scalar;
 pub mod traits;

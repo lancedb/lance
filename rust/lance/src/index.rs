@@ -28,6 +28,7 @@ use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
+pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::expression::{
     IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
