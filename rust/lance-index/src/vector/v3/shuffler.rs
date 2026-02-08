@@ -162,8 +162,7 @@ impl Shuffler for IvfShuffler {
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
                 if !batches.is_empty() {
-                    partition_sizes[part_id] +=
-                        batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                    partition_sizes[part_id] += batches.iter().map(|b| b.num_rows()).sum::<usize>();
                     writers[part_id].write_batches(batches.iter()).await?;
                 }
             }
