@@ -110,15 +110,18 @@ impl Shuffler for IvfShuffler {
         let mut writers = stream::iter(0..num_partitions)
             .map(|partition_id| {
                 let part_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
+                let spill_path = self.output_dir.child(format!("ivf_{}.spill", partition_id));
                 let object_store = self.object_store.clone();
                 let schema = schema.clone();
                 async move {
                     let writer = object_store.create(&part_path).await?;
-                    FileWriter::try_new(
+                    let file_writer = FileWriter::try_new(
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
                         Default::default(),
-                    )
+                    )?
+                    .with_page_metadata_spill(object_store.clone(), spill_path);
+                    Result::Ok(file_writer)
                 }
             })
             .buffered(self.object_store.io_parallelism())
