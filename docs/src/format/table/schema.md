@@ -6,6 +6,13 @@ The schema describes the structure of a Lance table, including all fields, their
 Schemas use a logical type system where data types are represented as strings that map to Apache Arrow data types.
 Each field in the schema has a unique identifier (field ID) that enables robust schema evolution and version tracking.
 
+!!! note
+
+    Logical types are currently being simplified through discussion [#5864](https://github.com/lance-format/lance/discussions/5864).
+    Proposed changes include consolidating encoding-specific variants (e.g., `large_string` and `string`, `large_binary` and `binary`)
+    into single logical types with runtime optimization. Additionally, [#5817](https://github.com/lance-format/lance/discussions/5817) proposes adding
+    `string_view` and `binary_view` types. This document describes the current implementation.
+
 ## Data Types
 
 Lance supports a comprehensive set of data types that map to Apache Arrow types.
@@ -15,33 +22,33 @@ Data types are represented as strings in the schema and can be grouped into seve
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `null` | Null | Null type (no values) |
-| `bool` | Boolean | Boolean (true/false) |
-| `int8` | Int8 | Signed 8-bit integer |
-| `uint8` | UInt8 | Unsigned 8-bit integer |
-| `int16` | Int16 | Signed 16-bit integer |
-| `uint16` | UInt16 | Unsigned 16-bit integer |
-| `int32` | Int32 | Signed 32-bit integer |
-| `uint32` | UInt32 | Unsigned 32-bit integer |
-| `int64` | Int64 | Signed 64-bit integer |
-| `uint64` | UInt64 | Unsigned 64-bit integer |
+| `null` | `Null` | Null type (no values) |
+| `bool` | `Boolean` | Boolean (true/false) |
+| `int8` | `Int8` | Signed 8-bit integer |
+| `uint8` | `UInt8` | Unsigned 8-bit integer |
+| `int16` | `Int16` | Signed 16-bit integer |
+| `uint16` | `UInt16` | Unsigned 16-bit integer |
+| `int32` | `Int32` | Signed 32-bit integer |
+| `uint32` | `UInt32` | Unsigned 32-bit integer |
+| `int64` | `Int64` | Signed 64-bit integer |
+| `uint64` | `UInt64` | Unsigned 64-bit integer |
 
 ### Floating Point Types
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `halffloat` | Float16 | IEEE 754 half-precision floating point (16-bit) |
-| `float` | Float32 | IEEE 754 single-precision floating point (32-bit) |
-| `double` | Float64 | IEEE 754 double-precision floating point (64-bit) |
+| `halffloat` | `Float16` | IEEE 754 half-precision floating point (16-bit) |
+| `float` | `Float32` | IEEE 754 single-precision floating point (32-bit) |
+| `double` | `Float64` | IEEE 754 double-precision floating point (64-bit) |
 
 ### String and Binary Types
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `string` | Utf8 | Variable-length UTF-8 encoded string |
-| `binary` | Binary | Variable-length binary data |
-| `large_string` | LargeUtf8 | Variable-length UTF-8 string (supports large offsets) |
-| `large_binary` | LargeBinary | Variable-length binary data (supports large offsets) |
+| `string` | `Utf8` | Variable-length UTF-8 encoded string |
+| `binary` | `Binary` | Variable-length binary data |
+| `large_string` | `LargeUtf8` | Variable-length UTF-8 string (supports large offsets) |
+| `large_binary` | `LargeBinary` | Variable-length binary data (supports large offsets) |
 
 ### Decimal Types
 
@@ -49,8 +56,8 @@ Decimal types support arbitrary-precision numeric values. The format is: `decima
 
 | Logical Type | Arrow Type | Precision | Example |
 |---|---|---|---|
-| `decimal:128:P:S` | Decimal128 | Up to 38 digits | `decimal:128:10:2` (10 total digits, 2 after decimal) |
-| `decimal:256:P:S` | Decimal256 | Up to 76 digits | `decimal:256:20:5` |
+| `decimal:128:P:S` | `Decimal128` | Up to 38 digits | `decimal:128:10:2` (10 total digits, 2 after decimal) |
+| `decimal:256:P:S` | `Decimal256` | Up to 76 digits | `decimal:256:20:5` |
 
 - **Precision (P)**: Total number of digits (1-38 for Decimal128, up to 76 for Decimal256)
 - **Scale (S)**: Number of digits after the decimal point (0 ≤ S ≤ P)
@@ -59,16 +66,16 @@ Decimal types support arbitrary-precision numeric values. The format is: `decima
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `date32:day` | Date32 | Date (days since epoch) |
-| `date64:ms` | Date64 | Date (milliseconds since epoch) |
-| `time32:s` | Time32 | Time (seconds since midnight) |
-| `time32:ms` | Time32 | Time (milliseconds since midnight) |
-| `time64:us` | Time64 | Time (microseconds since midnight) |
-| `time64:ns` | Time64 | Time (nanoseconds since midnight) |
-| `duration:s` | Duration | Duration (seconds) |
-| `duration:ms` | Duration | Duration (milliseconds) |
-| `duration:us` | Duration | Duration (microseconds) |
-| `duration:ns` | Duration | Duration (nanoseconds) |
+| `date32:day` | `Date32` | Date (days since epoch) |
+| `date64:ms` | `Date64` | Date (milliseconds since epoch) |
+| `time32:s` | `Time32` | Time (seconds since midnight) |
+| `time32:ms` | `Time32` | Time (milliseconds since midnight) |
+| `time64:us` | `Time64` | Time (microseconds since midnight) |
+| `time64:ns` | `Time64` | Time (nanoseconds since midnight) |
+| `duration:s` | `Duration` | Duration (seconds) |
+| `duration:ms` | `Duration` | Duration (milliseconds) |
+| `duration:us` | `Duration` | Duration (microseconds) |
+| `duration:ns` | `Duration` | Duration (nanoseconds) |
 
 ### Timestamp Types
 
@@ -91,7 +98,7 @@ A struct is a container for named fields with heterogeneous types.
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `struct` | Struct | Composite type containing multiple named fields |
+| `struct` | `Struct` | Composite type containing multiple named fields |
 
 Struct fields are represented as child fields in the schema.
 
@@ -114,10 +121,10 @@ Lists represent variable-length arrays of a single type.
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `list` | List | Variable-length list of values |
-| `list.struct` | List(Struct) | Variable-length list of struct values |
-| `large_list` | LargeList | Variable-length list (supports large offsets) |
-| `large_list.struct` | LargeList(Struct) | Variable-length list of struct values (large offsets) |
+| `list` | `List` | Variable-length list of values |
+| `list.struct` | `List(Struct)` | Variable-length list of struct values |
+| `large_list` | `LargeList` | Variable-length list (supports large offsets) |
+| `large_list.struct` | `LargeList(Struct)` | Variable-length list of struct values (large offsets) |
 
 The element type is specified as a child field.
 
@@ -161,7 +168,7 @@ Key-value pairs stored in a structured format.
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `map` | Map | Key-value pairs (currently supports unordered keys only) |
+| `map` | `Map` | Key-value pairs (currently supports unordered keys only) |
 
 Maps have key and value types specified as child fields.
 
@@ -235,23 +242,7 @@ Fields can carry additional metadata as key-value pairs to configure encoding, p
 
 ### Primary Key Metadata
 
-Metadata for marking fields as part of the unenforced primary key:
-
-| Metadata Key | Values | Description |
-|---|---|---|
-| `lance-schema:unenforced-primary-key` | `true`, `1`, `yes` (case-insensitive) | Marks field as part of primary key |
-| `lance-schema:unenforced-primary-key:position` | Positive integer (1-based) | Position in composite primary key (optional) |
-
-**Primary Key Constraints:**
-- The field must be a leaf field (no children)
-- The field must not be nullable
-- All ancestor fields (parents) must not be nullable
-- The field cannot be within a list or map type
-
-**Composite Primary Key Ordering:**
-- When position metadata is specified, fields are ordered by position (1, 2, 3, ...)
-- When position is not specified, fields are ordered by field ID
-- Fields with explicit positions come before fields without
+For details on primary key configuration, see [Unenforced Primary Key](index.md#unenforced-primary-key) in the table format overview.
 
 ### Encoding Metadata
 
@@ -399,29 +390,29 @@ When converting between logical types and Arrow types, Lance uses the following 
 
 | Arrow Type | Logical Type Format |
 |---|---|
-| Arrow::Null | `null` |
-| Arrow::Boolean | `bool` |
-| Arrow::Int8 to Int64 | `int8`, `int16`, `int32`, `int64` |
-| Arrow::UInt8 to UInt64 | `uint8`, `uint16`, `uint32`, `uint64` |
-| Arrow::Float16 | `halffloat` |
-| Arrow::Float32 | `float` |
-| Arrow::Float64 | `double` |
-| Arrow::Utf8 | `string` |
-| Arrow::LargeUtf8 | `large_string` |
-| Arrow::Binary | `binary` |
-| Arrow::LargeBinary | `large_binary` |
-| Arrow::Decimal128(p, s) | `decimal:128:p:s` |
-| Arrow::Decimal256(p, s) | `decimal:256:p:s` |
-| Arrow::Date32 | `date32:day` |
-| Arrow::Date64 | `date64:ms` |
-| Arrow::Time32(TimeUnit) | `time32:s`, `time32:ms` |
-| Arrow::Time64(TimeUnit) | `time64:us`, `time64:ns` |
-| Arrow::Timestamp(unit, tz) | `timestamp:unit:tz` |
-| Arrow::Duration(unit) | `duration:s`, `duration:ms`, `duration:us`, `duration:ns` |
-| Arrow::Struct | `struct` |
-| Arrow::List(Element) | `list` or `list.struct` if element is Struct |
-| Arrow::LargeList(Element) | `large_list` or `large_list.struct` |
-| Arrow::FixedSizeList(Element, Size) | `fixed_size_list:type:size` |
-| Arrow::FixedSizeBinary(Size) | `fixed_size_binary:size` |
-| Arrow::Dictionary(KeyType, ValueType) | `dict:value_type:key_type:false` |
-| Arrow::Map | `map` |
+| `Arrow::Null` | `null` |
+| `Arrow::Boolean` | `bool` |
+| `Arrow::Int8` to `Int64` | `int8`, `int16`, `int32`, `int64` |
+| `Arrow::UInt8` to `UInt64` | `uint8`, `uint16`, `uint32`, `uint64` |
+| `Arrow::Float16` | `halffloat` |
+| `Arrow::Float32` | `float` |
+| `Arrow::Float64` | `double` |
+| `Arrow::Utf8` | `string` |
+| `Arrow::LargeUtf8` | `large_string` |
+| `Arrow::Binary` | `binary` |
+| `Arrow::LargeBinary` | `large_binary` |
+| `Arrow::Decimal128(p, s)` | `decimal:128:p:s` |
+| `Arrow::Decimal256(p, s)` | `decimal:256:p:s` |
+| `Arrow::Date32` | `date32:day` |
+| `Arrow::Date64` | `date64:ms` |
+| `Arrow::Time32(TimeUnit)` | `time32:s`, `time32:ms` |
+| `Arrow::Time64(TimeUnit)` | `time64:us`, `time64:ns` |
+| `Arrow::Timestamp(unit, tz)` | `timestamp:unit:tz` |
+| `Arrow::Duration(unit)` | `duration:s`, `duration:ms`, `duration:us`, `duration:ns` |
+| `Arrow::Struct` | `struct` |
+| `Arrow::List(Element)` | `list` or `list.struct` if element is Struct |
+| `Arrow::LargeList(Element)` | `large_list` or `large_list.struct` |
+| `Arrow::FixedSizeList(Element, Size)` | `fixed_size_list:type:size` |
+| `Arrow::FixedSizeBinary(Size)` | `fixed_size_binary:size` |
+| `Arrow::Dictionary(KeyType, ValueType)` | `dict:value_type:key_type:false` |
+| `Arrow::Map` | `map` |
