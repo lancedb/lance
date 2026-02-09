@@ -1508,8 +1508,8 @@ impl Dataset {
         take::take_scan(self, row_ranges, projection, batch_readahead)
     }
 
-    /// Sample `n` rows from the dataset.
-    pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+    /// Randomly sample `n` rows from the dataset.
+    pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
