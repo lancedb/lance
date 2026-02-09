@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema;
-use futures::prelude::*;
+use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::{
     cache::LanceCache,
@@ -160,12 +160,15 @@ impl Shuffler for IvfShuffler {
             let (shuffled, loss) = shuffled?;
             total_loss += loss;
 
-            for (part_id, batches) in shuffled.into_iter().enumerate() {
+            let mut futs = Vec::new();
+            for (part_id, (writer, batches)) in writers.iter_mut().zip(shuffled.iter()).enumerate()
+            {
                 if !batches.is_empty() {
                     partition_sizes[part_id] += batches.iter().map(|b| b.num_rows()).sum::<usize>();
-                    writers[part_id].write_batches(batches.iter()).await?;
+                    futs.push(writer.write_batches(batches.iter()));
                 }
             }
+            try_join_all(futs).await?;
         }
 
         // finish all writers
