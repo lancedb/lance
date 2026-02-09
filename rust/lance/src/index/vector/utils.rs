@@ -3,9 +3,12 @@
 
 use std::sync::Arc;
 
+use arrow::array::ArrayData;
+use arrow::datatypes::DataType;
 use arrow_array::{cast::AsArray, Array, ArrayRef, FixedSizeListArray, RecordBatch};
+use arrow_buffer::Buffer;
 use futures::StreamExt;
-use lance_arrow::{interleave_batches, DataTypeExt};
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
 use lance_linalg::distance::DistanceType;
 use log::{info, warn};
@@ -293,110 +296,22 @@ pub async fn maybe_sample_training_data(
         _ => sample_size_hint,
     };
 
-    let batch = if num_rows > sample_size_hint && !is_nullable {
+    let should_sample = num_rows > sample_size_hint;
+    if should_sample && !is_nullable {
         let projection = dataset.schema().project(&[column])?;
         let batch = dataset.sample(sample_size_hint, &projection).await?;
         info!(
             "Sample training data: retrieved {} rows by sampling",
             batch.num_rows()
         );
-        batch
-    } else if num_rows > sample_size_hint && is_nullable {
-        // Use min block size + vector size to determine sample granularity
-        // For example, on object storage, block size is 64 KB. A 768-dim 32-bit
-        // vector is 3 KB. So we can sample every 64 KB / 3 KB = 21 vectors.
-        let block_size = dataset.object_store().block_size();
-        // We provide a fallback in case of multi-vector, which will have
-        // a variable size. We use 4 KB as a fallback.
-        let byte_width = vector_field
-            .data_type()
-            .byte_width_opt()
-            .unwrap_or(4 * 1024);
-
-        let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
-
-        let mut collected = Vec::with_capacity(ranges.size_hint().0);
-        let mut indices = Vec::with_capacity(sample_size_hint);
-        let mut num_non_null = 0;
-
-        let mut scan = dataset.take_scan(
-            Box::pin(futures::stream::iter(ranges).map(Ok)),
-            Arc::new(dataset.schema().project(&[column])?),
-            dataset.object_store().io_parallelism(),
-        );
-
-        while let Some(batch) = scan.next().await {
-            let batch = batch?;
-
-            let array = get_column_from_batch(&batch, column)?;
-            let null_count = array.logical_null_count();
-            if null_count < array.len() {
-                num_non_null += array.len() - null_count;
-
-                let batch_i = collected.len();
-                if let Some(null_buffer) = array.nulls() {
-                    for i in null_buffer.valid_indices() {
-                        indices.push((batch_i, i));
-                    }
-                } else {
-                    indices.extend((0..array.len()).map(|i| (batch_i, i)));
-                }
-
-                collected.push(batch);
-            }
-            if num_non_null >= sample_size_hint {
-                break;
-            }
-        }
-
-        let batch = interleave_batches(&collected, &indices).map_err(|err| Error::Index {
-            message: format!("Sample training data: {}", err),
-            location: location!(),
-        })?;
-        info!(
-            "Sample training data: retrieved {} rows by sampling after filtering out nulls",
-            batch.num_rows()
-        );
-
-        // it's possible that we have more rows than sample_size_hint for this case,
-        // truncate the batch to sample_size_hint
-        if batch.num_rows() > sample_size_hint {
-            batch.slice(0, sample_size_hint)
-        } else {
-            batch
-        }
+        vector_column_to_fsl(&batch, column)
+    } else if should_sample && is_nullable {
+        sample_nullable_training_data(dataset, column, sample_size_hint, num_rows, vector_field)
+            .await
     } else {
-        let mut scanner = dataset.scan();
-        scanner.project(&[column])?;
-        if is_nullable {
-            let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
-            scanner.filter_expr(column_expr.is_not_null());
-        }
-        let batch = scanner.try_into_batch().await?;
-        info!(
-            "Sample training data: retrieved {} rows scanning full datasets",
-            batch.num_rows()
-        );
-        batch
-    };
-
-    let array = get_column_from_batch(&batch, column)?;
-
-    match array.data_type() {
-        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
-        // for multivector, flatten the vectors into a FixedSizeListArray
-        arrow::datatypes::DataType::List(_) => {
-            let list_array = array.as_list::<i32>();
-            let vectors = list_array.values().as_fixed_size_list();
-            Ok(vectors.clone())
-        }
-        _ => Err(Error::Index {
-            message: format!(
-                "Sample training data: column {} is not a FixedSizeListArray",
-                column
-            ),
-            location: location!(),
-        }),
+        // too small to require sampling
+        let batch = scan_all_training_data(dataset, column, is_nullable).await?;
+        vector_column_to_fsl(&batch, column)
     }
 }
 
@@ -418,6 +333,285 @@ impl PartitionLoadLock {
         let mtx = &self.partition_locks[partition_id];
 
         mtx.clone()
+    }
+}
+
+/// Extract a vector column from a batch as a flat [`FixedSizeListArray`].
+///
+/// Handles both regular vector columns (FixedSizeList) and multivector columns
+/// (List\<FixedSizeList\>), flattening the latter.
+fn vector_column_to_fsl(batch: &RecordBatch, column: &str) -> Result<FixedSizeListArray> {
+    let array = get_column_from_batch(batch, column)?;
+    match array.data_type() {
+        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
+        arrow::datatypes::DataType::List(_) => {
+            let list_array = array.as_list::<i32>();
+            let vectors = list_array.values().as_fixed_size_list();
+            Ok(vectors.clone())
+        }
+        _ => Err(Error::Index {
+            message: format!(
+                "Sample training data: column {} is not a vector column",
+                column
+            ),
+            location: location!(),
+        }),
+    }
+}
+
+/// Scan the entire dataset to collect training data, optionally filtering nulls.
+///
+/// Used when the dataset is small enough that random sampling is unnecessary.
+async fn scan_all_training_data(
+    dataset: &Dataset,
+    column: &str,
+    is_nullable: bool,
+) -> Result<RecordBatch> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    if is_nullable {
+        let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+        scanner.filter_expr(column_expr.is_not_null());
+    }
+    let batch = scanner.try_into_batch().await?;
+    info!(
+        "Sample training data: retrieved {} rows scanning full dataset",
+        batch.num_rows()
+    );
+    Ok(batch)
+}
+
+/// Sample training data from a nullable column, filtering out null rows.
+///
+/// For FixedSizeList columns, non-null vector bytes are accumulated directly
+/// into a flat buffer (avoiding holding all source batches in memory). For
+/// other types (e.g. multivector), falls back to [`sample_nullable_fallback`].
+async fn sample_nullable_training_data(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+    num_rows: usize,
+    vector_field: &lance_core::datatypes::Field,
+) -> Result<FixedSizeListArray> {
+    // Use min block size + vector size to determine sample granularity.
+    // For example, on object storage, block size is 64 KB. A 768-dim 32-bit
+    // vector is 3 KB. So we can sample every 64 KB / 3 KB = 21 vectors.
+    let block_size = dataset.object_store().block_size();
+    // We provide a fallback in case of multi-vector, which will have
+    // a variable size. We use 4 KB as a fallback.
+    let byte_width = vector_field
+        .data_type()
+        .byte_width_opt()
+        .unwrap_or(4 * 1024);
+
+    let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
+
+    let mut scan = dataset.take_scan(
+        Box::pin(futures::stream::iter(ranges).map(Ok)),
+        Arc::new(dataset.schema().project(&[column])?),
+        dataset.object_store().io_parallelism(),
+    );
+
+    // Peek at the first non-empty batch to determine the column type, then
+    // dispatch to the remainder of the scan, along with the first batch, to the
+    // appropriate streaming strategy.
+    loop {
+        let Some(batch) = scan.next().await else {
+            // No data at all — return an empty FSL array.
+            return fsl_values_to_array(vector_field, &[], 0);
+        };
+        let batch = batch?;
+        let array = get_column_from_batch(&batch, column)?;
+        if array.logical_null_count() >= array.len() {
+            continue;
+        }
+
+        return match array.data_type() {
+            arrow::datatypes::DataType::FixedSizeList(_, _) => {
+                sample_nullable_fsl(
+                    column,
+                    sample_size_hint,
+                    byte_width,
+                    vector_field,
+                    array,
+                    scan,
+                )
+                .await
+            }
+            _ => sample_nullable_fallback(column, sample_size_hint, array, batch, scan).await,
+        };
+    }
+}
+
+/// Build a FixedSizeListArray from raw flat value bytes.
+fn fsl_values_to_array(
+    field: &lance_core::datatypes::Field,
+    values_buf: &[u8],
+    num_rows: usize,
+) -> Result<FixedSizeListArray> {
+    let (inner_field, dim) = match field.data_type() {
+        DataType::FixedSizeList(f, d) => (f, d as usize),
+        other => {
+            return Err(Error::Index {
+                message: format!("Expected FixedSizeList, got {:?}", other),
+                location: location!(),
+            })
+        }
+    };
+
+    let elem_size = inner_field
+        .data_type()
+        .primitive_width()
+        .ok_or_else(|| Error::Index {
+            message: format!(
+                "FixedSizeList inner type {:?} has no fixed width",
+                inner_field.data_type()
+            ),
+            location: location!(),
+        })?;
+
+    let expected_bytes = num_rows * dim * elem_size;
+    let buf = Buffer::from(&values_buf[..expected_bytes]);
+    let values_array = arrow_array::make_array(ArrayData::try_new(
+        inner_field.data_type().clone(),
+        num_rows * dim,
+        None,
+        0,
+        vec![buf],
+        vec![],
+    )?);
+
+    Ok(FixedSizeListArray::try_new(
+        inner_field,
+        dim as i32,
+        values_array,
+        None,
+    )?)
+}
+
+/// Stream-and-compact nullable sampling for FixedSizeList vector columns.
+///
+/// Unlike [`sample_nullable_fallback`], which must collect all source batches in
+/// memory for interleaving, this exploits the fixed-width layout of FSL columns
+/// to accumulate non-null vector bytes directly into a flat buffer, dropping
+/// each source batch immediately. This keeps peak memory proportional to the
+/// output sample rather than the input scan.
+async fn sample_nullable_fsl(
+    column: &str,
+    sample_size_hint: usize,
+    byte_width: usize,
+    vector_field: &lance_core::datatypes::Field,
+    first_array: ArrayRef,
+    mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
+) -> Result<FixedSizeListArray> {
+    let mut values_buf: Vec<u8> = Vec::with_capacity(sample_size_hint * byte_width);
+    let mut num_non_null: usize = 0;
+
+    // Process the already-read first batch.
+    accumulate_fsl_non_nulls(&mut values_buf, &mut num_non_null, &first_array, byte_width)?;
+
+    // Continue streaming remaining batches.
+    while num_non_null < sample_size_hint {
+        let Some(batch) = scan.next().await else {
+            break;
+        };
+        let batch = batch?;
+        let array = get_column_from_batch(&batch, column)?;
+        if array.logical_null_count() >= array.len() {
+            continue;
+        }
+        accumulate_fsl_non_nulls(&mut values_buf, &mut num_non_null, &array, byte_width)?;
+    }
+
+    let num_rows_out = num_non_null.min(sample_size_hint);
+    values_buf.truncate(num_rows_out * byte_width);
+
+    info!(
+        "Sample training data: retrieved {} rows by sampling after filtering out nulls",
+        num_rows_out
+    );
+
+    fsl_values_to_array(vector_field, &values_buf, num_rows_out)
+}
+
+/// Append non-null values from a FixedSizeList array into a flat byte buffer.
+///
+/// Uses Arrow's `filter` kernel to handle null removal and offset arithmetic,
+/// then copies the resulting contiguous bytes into the output buffer.
+fn accumulate_fsl_non_nulls(
+    values_buf: &mut Vec<u8>,
+    num_non_null: &mut usize,
+    array: &ArrayRef,
+    byte_width: usize,
+) -> Result<()> {
+    // Always filter to both remove nulls and produce a zero-offset array.
+    // When there are no nulls this is just a copy, which is cheap relative
+    // to the I/O cost of reading each batch.
+    let mask = match array.nulls() {
+        Some(nulls) => arrow_array::BooleanArray::from(nulls.inner().clone()),
+        None => arrow_array::BooleanArray::from(vec![true; array.len()]),
+    };
+    let filtered = arrow::compute::filter(array, &mask)?;
+    let fsl = filtered.as_fixed_size_list();
+    let values_data = fsl.values().to_data();
+    let value_bytes = &values_data.buffers()[0].as_slice()[..fsl.len() * byte_width];
+    values_buf.extend_from_slice(value_bytes);
+    *num_non_null += fsl.len();
+    Ok(())
+}
+
+/// Fallback for nullable sampling when the column type is not FixedSizeList
+/// (e.g. multivector List columns). Filters nulls from each batch as it
+/// arrives, then concatenates the filtered batches.
+async fn sample_nullable_fallback(
+    column: &str,
+    sample_size_hint: usize,
+    first_array: ArrayRef,
+    first_batch: RecordBatch,
+    mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
+) -> Result<FixedSizeListArray> {
+    let schema = first_batch.schema();
+    let mut filtered = Vec::new();
+    let mut num_non_null: usize = 0;
+
+    // Filter and collect the already-read first batch.
+    let batch = filter_non_null_rows(first_array, first_batch)?;
+    num_non_null += batch.num_rows();
+    filtered.push(batch);
+
+    while num_non_null < sample_size_hint {
+        let Some(batch) = scan.next().await else {
+            break;
+        };
+        let batch = batch?;
+        let array = get_column_from_batch(&batch, column)?;
+        if array.logical_null_count() >= array.len() {
+            continue;
+        }
+        let batch = filter_non_null_rows(array, batch)?;
+        num_non_null += batch.num_rows();
+        filtered.push(batch);
+    }
+
+    let batch = arrow::compute::concat_batches(&schema, &filtered)?;
+    let num_rows_out = batch.num_rows().min(sample_size_hint);
+    let batch = batch.slice(0, num_rows_out);
+
+    info!(
+        "Sample training data (fallback): retrieved {} rows by sampling after filtering out nulls",
+        num_rows_out
+    );
+
+    vector_column_to_fsl(&batch, column)
+}
+
+/// Filter a batch to only include rows where `array` is non-null.
+fn filter_non_null_rows(array: ArrayRef, batch: RecordBatch) -> Result<RecordBatch> {
+    if let Some(nulls) = array.nulls() {
+        let mask = arrow_array::BooleanArray::from(nulls.inner().clone());
+        Ok(arrow::compute::filter_record_batch(&batch, &mask)?)
+    } else {
+        Ok(batch)
     }
 }
 
@@ -546,6 +740,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(training_data.len(), 1000);
+    }
+
+    #[rstest::rstest]
+    #[case::f16(arrow::datatypes::DataType::Float16, 2)]
+    #[case::f32(arrow::datatypes::DataType::Float32, 4)]
+    #[case::f64(arrow::datatypes::DataType::Float64, 8)]
+    #[test]
+    fn test_fsl_values_to_array_roundtrip(
+        #[case] elem_type: arrow::datatypes::DataType,
+        #[case] elem_size: usize,
+    ) {
+        let dim = 4;
+        let num_rows = 3;
+        // Fill with recognizable byte patterns: each element gets its index as bytes.
+        let num_elems = num_rows * dim;
+        let values_buf: Vec<u8> = (0..num_elems)
+            .flat_map(|i| {
+                let mut bytes = vec![0u8; elem_size];
+                // Write index into the first bytes (little-endian).
+                let i_bytes = (i as u32).to_le_bytes();
+                bytes[..i_bytes.len().min(elem_size)]
+                    .copy_from_slice(&i_bytes[..i_bytes.len().min(elem_size)]);
+                bytes
+            })
+            .collect();
+
+        let dt = DataType::FixedSizeList(
+            Arc::new(arrow::datatypes::Field::new("item", elem_type, true)),
+            dim as i32,
+        );
+        let field = lance_core::datatypes::Field::new_arrow("vec", dt, true).unwrap();
+
+        let fsl = fsl_values_to_array(&field, &values_buf, num_rows).unwrap();
+        assert_eq!(fsl.len(), num_rows);
+        assert_eq!(fsl.value_length(), dim as i32);
+
+        // Verify the raw bytes round-tripped correctly.
+        let out_data = fsl.values().to_data();
+        let out_bytes = out_data.buffers()[0].as_slice();
+        assert_eq!(&out_bytes[..values_buf.len()], &values_buf[..]);
+    }
+
+    #[rstest::rstest]
+    #[case::f32(array::rand_vec::<Float32Type>(Dimension::from(8)))]
+    #[case::f64(array::rand_vec::<arrow_array::types::Float64Type>(Dimension::from(8)))]
+    #[tokio::test]
+    async fn test_maybe_sample_training_data_nullable_fsl(
+        #[case] vec_gen: Box<dyn lance_datagen::ArrayGenerator>,
+    ) {
+        let nrows: usize = 2000;
+        let dims: u32 = 8;
+        let sample_size: usize = 500;
+
+        let data = gen_batch()
+            .col("vec", vec_gen.with_random_nulls(0.5))
+            .into_batch_rows(RowCount::from(nrows as u64))
+            .unwrap();
+
+        let col = data.column_by_name("vec").unwrap();
+        assert!(col.null_count() > 0, "test data should have nulls");
+
+        let dataset = InsertBuilder::new("memory://nullable_fsl_test")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let training_data = maybe_sample_training_data(&dataset, "vec", sample_size)
+            .await
+            .unwrap();
+
+        assert!(training_data.len() <= sample_size);
+        assert!(training_data.len() > 0);
+        assert_eq!(training_data.null_count(), 0);
+        assert_eq!(training_data.value_length(), dims as i32);
     }
 
     #[tokio::test]
