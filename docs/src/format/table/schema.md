@@ -202,23 +202,23 @@ They are essential for robust schema evolution, as they allow fields to be renam
 **Initial assignment (depth-first order):**
 When a table is created, field IDs are assigned to all fields in depth-first order, starting from 0.
 
-Nested fields are linked via the `parent_id` field in the protobuf message. For example, if field "c" (id: 2) is a struct containing fields "x", "y", "z", those child fields will have `parent_id: 2`.
+Nested fields are linked via the `parent_id` field in the protobuf message. For example, if field "c" (id: 2) is a struct containing fields "x", "y", "z", those child fields will have `parent_id: 2`. Top-level fields have `parent_id: -1`.
 
 Example with nested structure:
 ```
 Field order: a, b, c.x, c.y, c.z, d
 
 Assigned IDs with parent relationships:
-- a: 0 (parent_id: 0)
-- b: 1 (parent_id: 0)
-- c: 2 (parent_id: 0, struct type)
+- a: 0 (parent_id: -1)
+- b: 1 (parent_id: -1)
+- c: 2 (parent_id: -1, struct type)
 - c.x: 3 (parent_id: 2)
 - c.y: 4 (parent_id: 2)
 - c.z: 5 (parent_id: 2)
-- d: 6 (parent_id: 0)
+- d: 6 (parent_id: -1)
 ```
 
-Note: A `parent_id` of 0 or absence indicates a top-level field. Child fields reference their parent via `parent_id` rather than being stored as separate "children" arrays.
+Note: A `parent_id` of -1 indicates a top-level field. For nested fields, `parent_id` references the ID of the parent field. Child fields reference their parent via `parent_id` rather than being stored as separate "children" arrays in the protobuf message (though the Rust in-memory representation maintains a children vector for convenience).
 
 **New field assignment (incremental):**
 When fields are added later (e.g., through schema evolution), they receive the next available ID
@@ -278,7 +278,7 @@ The Field message contains:
 - **type**: Field type enum (PARENT, REPEATED, or LEAF)
 - **logical_type**: Logical type string representation (string) - e.g., "int64", "struct", "list"
 - **nullable**: Whether the field can be null (bool)
-- **parent_id**: Parent field ID for nested fields; 0 or unset for top-level fields (int32)
+- **parent_id**: Parent field ID for nested fields; -1 for top-level fields (int32)
 - **metadata**: Key-value pairs for additional configuration (map<string, bytes>)
 - **unenforced_primary_key**: Whether this field is part of the primary key (bool)
 - **unenforced_primary_key_position**: Position in primary key ordering (uint32, 0 = unordered)
@@ -311,18 +311,21 @@ Field {
     name: "id"
     logical_type: "int64"
     nullable: false
+    parent_id: -1
 }
 Field {
     id: 1
     name: "name"
     logical_type: "string"
     nullable: true
+    parent_id: -1
 }
 Field {
     id: 2
     name: "created_at"
     logical_type: "timestamp:us:UTC"
     nullable: true
+    parent_id: -1
 }
 ```
 
@@ -334,13 +337,14 @@ Field {
     name: "id"
     logical_type: "int64"
     nullable: false
+    parent_id: -1  // Top-level field
 }
 Field {
     id: 1
     name: "user"
     logical_type: "struct"
     nullable: true
-    parent_id: 0  // This is a top-level field, so parent_id is 0 or omitted
+    parent_id: -1  // Top-level field
 }
 Field {
     id: 2
@@ -361,7 +365,7 @@ Field {
     name: "tags"
     logical_type: "list"
     nullable: true
-    parent_id: 0  // This is a top-level field
+    parent_id: -1  // Top-level field
 }
 Field {
     id: 5
@@ -380,6 +384,7 @@ Field {
     name: "id"
     logical_type: "int64"
     nullable: false
+    parent_id: -1  // Top-level field
     unenforced_primary_key: true
     unenforced_primary_key_position: 1  // Ordered position in primary key
 }
@@ -388,12 +393,14 @@ Field {
     name: "text"
     logical_type: "string"
     nullable: true
+    parent_id: -1  // Top-level field
 }
 Field {
     id: 2
     name: "embedding"
     logical_type: "fixed_size_list:lance.bfloat16:384"
     nullable: true
+    parent_id: -1  // Top-level field
 }
 ```
 
