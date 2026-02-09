@@ -6,7 +6,7 @@ use std::cmp::{max, min};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 use lance_core::assume_eq;
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::distance::{dot_distance_batch, l2::L2Prepared, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 
@@ -50,6 +50,23 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
             subvec_centroids,
             sub_vector_length,
         ));
+    }
+    result
+}
+
+/// Build an L2 distance table using pre-prepared [L2Prepared] per sub-vector.
+///
+/// This avoids the per-call AoS→SoA transpose by reusing targets that were
+/// transposed once at `ProductQuantizer` construction time.
+pub fn build_distance_table_l2_prepared(
+    l2_targets: &[L2Prepared],
+    query: &[f32],
+) -> Vec<f32> {
+    let sub_dim = query.len() / l2_targets.len();
+
+    let mut result = Vec::with_capacity(l2_targets.len() * l2_targets[0].num_targets());
+    for (i, sub_vec) in query.chunks_exact(sub_dim).enumerate() {
+        result.extend_from_slice(&l2_targets[i].distances(sub_vec));
     }
     result
 }
