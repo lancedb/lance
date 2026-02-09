@@ -2181,7 +2181,11 @@ mod tests {
             assert!(mask.selected(id), "Expected row id {} to be selected", id);
         }
         for &id in not_selected {
-            assert!(!mask.selected(id), "Expected row id {} to NOT be selected", id);
+            assert!(
+                !mask.selected(id),
+                "Expected row id {} to NOT be selected",
+                id
+            );
         }
     }
 
@@ -2222,7 +2226,10 @@ mod tests {
         // Allow list
         let mask = RowIdMask::from_allowed(row_ids(&[10, 20]));
         let new_mask = mask.also_allow(row_ids(&[20, 30, 40]));
-        assert_eq!(new_mask, RowIdMask::from_allowed(row_ids(&[10, 20, 30, 40])));
+        assert_eq!(
+            new_mask,
+            RowIdMask::from_allowed(row_ids(&[10, 20, 30, 40]))
+        );
 
         // Block list
         let mask = RowIdMask::from_block(row_ids(&[10, 20, 30]));
