@@ -2938,8 +2938,29 @@ impl Scanner {
             .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?;
 
+        // Get target fragments
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
+                // Get unindexed fragments and filter to target fragments
+                let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+                let target_bitmap =
+                    RoaringBitmap::from_iter(target_fragments.iter().map(|f| f.id as u32));
+                unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+
+                // If all target fragments are unindexed, skip index entirely
+                if unindexed_fragments.len() == target_fragments.len() {
+                    let flat_match_plan = self
+                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .await?;
+                    return Ok(flat_match_plan);
+                }
+
+                // Mixed case: use index + flat search for unindexed
                 let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
                     self.dataset.clone(),
                     query.clone(),
@@ -2947,7 +2968,6 @@ impl Scanner {
                     prefilter_source.clone(),
                 ));
 
-                let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
                 if unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
@@ -2958,9 +2978,9 @@ impl Scanner {
                 }
             }
             None => {
-                let unindexed_fragments = self.dataset.fragments().iter().cloned().collect();
+                // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -3102,7 +3122,20 @@ impl Scanner {
             None
         };
 
-        if let Some((index, _idx, index_metric)) = matching_index {
+        // Only return index and deltas if there is an index on the column and at least one of the target fragments are indexed
+        let index_and_deltas = if let Some((index, _idx, index_metric)) = matching_index {
+            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
+            let index_frags = self.get_indexed_frags(&deltas);
+            if !index_frags.is_empty() {
+                Some((index, deltas, index_metric))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((index, deltas, index_metric)) = index_and_deltas {
             log::trace!("index found for vector search");
             // Use the index's metric type
             q.metric_type = Some(index_metric);
@@ -3114,9 +3147,6 @@ impl Scanner {
                     location!(),
                 ));
             }
-
-            // Find all deltas with the same index name.
-            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => self.ann(&q, &deltas, filter_plan).await?,
                 DataType::List(_) => self.multivec_ann(&q, &deltas, filter_plan).await?,
@@ -3166,7 +3196,7 @@ impl Scanner {
                     filter_plan,
                     vector_scan_projection,
                     /*include_deleted_rows=*/ true,
-                    None,
+                    self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
                 )
@@ -3187,8 +3217,13 @@ impl Scanner {
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Check if we've created new versions since the index was built.
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        // Get unindexed fragments and filter to target fragments
+        let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        if let Some(target_frags) = &self.fragments {
+            let target_bitmap = RoaringBitmap::from_iter(target_frags.iter().map(|f| f.id as u32));
+            unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+        }
+
         if !unindexed_fragments.is_empty() {
             // need to set the metric type to be the same as the index
             // to make sure the distance is comparable.
@@ -9078,5 +9113,118 @@ mod test {
             "Tasks should have finished within 10 seconds but there are still {} tasks running",
             runtime.handle().metrics().num_alive_tasks()
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_respects_fragment_list() {
+        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        // Create index on first 2 fragments
+        test_ds.make_vector_index().await.unwrap();
+
+        // Append one more fragment after indexing (this will be unindexed)
+        test_ds.append_new_data().await.unwrap();
+
+        // Now we have 3 fragments:
+        // Fragment 0: i=0..200 (indexed)
+        // Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed)
+
+        let fragments = test_ds.dataset.fragments();
+        assert_eq!(fragments.len(), 3);
+
+        // Test 1: Query only unindexed fragment (fragment 2)
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        let fragment_2 = vec![fragments[2].clone()];
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query, 5)
+            .unwrap()
+            .with_fragments(fragment_2);
+
+        let batches: Vec<_> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Should only get results from fragment 2 (i=400..410)
+        let mut has_results = false;
+        for batch in &batches {
+            let i_col = batch.column_by_name("i").unwrap();
+            let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
+            for idx in 0..i_array.len() {
+                has_results = true;
+                let val = i_array.value(idx);
+                assert!(
+                    (400..410).contains(&val),
+                    "Expected only values from fragment 2 (i=400..410), but got i={}",
+                    val
+                );
+            }
+        }
+        assert!(has_results, "Expected some results from fragment 2");
+    }
+
+    #[tokio::test]
+    async fn test_fts_respects_fragment_list() {
+        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        // Create FTS index on first 2 fragments
+        test_ds.make_fts_index().await.unwrap();
+
+        // Append one more fragment after indexing (this will be unindexed)
+        test_ds.append_new_data().await.unwrap();
+
+        // Now we have 3 fragments:
+        // Fragment 0: i=0..200 (indexed)
+        // Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed)
+
+        let fragments = test_ds.dataset.fragments();
+        assert_eq!(fragments.len(), 3);
+
+        // Test 1: Query only unindexed fragment (fragment 2)
+        let fragment_2 = vec![fragments[2].clone()];
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s-405".into()))
+            .unwrap()
+            .with_fragments(fragment_2);
+
+        let batches: Vec<_> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Should only get results from fragment 2 (i=400..410)
+        let mut has_results = false;
+        for batch in &batches {
+            let i_col = batch.column_by_name("i").unwrap();
+            let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
+            for idx in 0..i_array.len() {
+                has_results = true;
+                let val = i_array.value(idx);
+                assert!(
+                    (400..410).contains(&val),
+                    "Expected only values from fragment 2 (i=400..410), but got i={}",
+                    val
+                );
+            }
+        }
+        assert!(has_results, "Expected some results from fragment 2");
     }
 }
