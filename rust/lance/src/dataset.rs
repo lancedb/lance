@@ -1509,10 +1509,14 @@ impl Dataset {
     }
 
     /// Randomly sample `n` rows from the dataset.
+    ///
+    /// The returned rows are in row-id order (not random order), which allows
+    /// the underlying take operation to use an efficient sorted code path.
     pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
-        let ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+        let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+        ids.sort_unstable();
         self.take(&ids, projection.clone()).await
     }
 
