@@ -202,19 +202,23 @@ They are essential for robust schema evolution, as they allow fields to be renam
 **Initial assignment (depth-first order):**
 When a table is created, field IDs are assigned to all fields in depth-first order, starting from 0.
 
+Nested fields are linked via the `parent_id` field in the protobuf message. For example, if field "c" (id: 2) is a struct containing fields "x", "y", "z", those child fields will have `parent_id: 2`.
+
 Example with nested structure:
 ```
 Field order: a, b, c.x, c.y, c.z, d
 
-Assigned IDs:
-- a: 0
-- b: 1
-- c: 2 (parent)
-- c.x: 3
-- c.y: 4
-- c.z: 5
-- d: 6
+Assigned IDs with parent relationships:
+- a: 0 (parent_id: 0)
+- b: 1 (parent_id: 0)
+- c: 2 (parent_id: 0, struct type)
+- c.x: 3 (parent_id: 2)
+- c.y: 4 (parent_id: 2)
+- c.z: 5 (parent_id: 2)
+- d: 6 (parent_id: 0)
 ```
+
+Note: A `parent_id` of 0 or absence indicates a top-level field. Child fields reference their parent via `parent_id` rather than being stored as separate "children" arrays.
 
 **New field assignment (incremental):**
 When fields are added later (e.g., through schema evolution), they receive the next available ID
@@ -242,7 +246,11 @@ Fields can carry additional metadata as key-value pairs to configure encoding, p
 
 ### Primary Key Metadata
 
-For details on primary key configuration, see [Unenforced Primary Key](index.md#unenforced-primary-key) in the table format overview.
+Primary key configuration is handled by two protobuf fields in the Field message:
+- **unenforced_primary_key** (bool): Whether this field is part of the primary key
+- **unenforced_primary_key_position** (uint32): Position in primary key ordering (1-based for ordered, 0 for unordered)
+
+For detailed discussion on primary key configuration, see [Unenforced Primary Key](index.md#unenforced-primary-key) in the table format overview.
 
 ### Encoding Metadata
 
@@ -267,10 +275,13 @@ The schema is serialized using protobuf messages. Key messages include:
 The Field message contains:
 - **id**: Unique field identifier (int32)
 - **name**: Field name (string)
+- **type**: Field type enum (PARENT, REPEATED, or LEAF)
+- **logical_type**: Logical type string representation (string) - e.g., "int64", "struct", "list"
 - **nullable**: Whether the field can be null (bool)
-- **type**: Logical type string (string)
-- **children**: Child fields for struct/list/map types (repeated Field)
-- **metadata**: Key-value pairs for additional configuration (map<string, string>)
+- **parent_id**: Parent field ID for nested fields; 0 or unset for top-level fields (int32)
+- **metadata**: Key-value pairs for additional configuration (map<string, bytes>)
+- **unenforced_primary_key**: Whether this field is part of the primary key (bool)
+- **unenforced_primary_key_position**: Position in primary key ordering (uint32, 0 = unordered)
 
 ### Schema Message
 
@@ -290,25 +301,27 @@ The use of field IDs ensures that data files can be correctly interpreted even a
 
 ## Example Schemas
 
+The examples below use a simplified representation of the field structure. In the actual protobuf format, `type` refers to the field type enum (PARENT/REPEATED/LEAF) and `logical_type` contains the data type string representation.
+
 ### Simple Table
 
 ```
 Field {
     id: 0
     name: "id"
-    type: "int64"
+    logical_type: "int64"
     nullable: false
 }
 Field {
     id: 1
     name: "name"
-    type: "string"
+    logical_type: "string"
     nullable: true
 }
 Field {
     id: 2
     name: "created_at"
-    type: "timestamp:us:UTC"
+    logical_type: "timestamp:us:UTC"
     nullable: true
 }
 ```
@@ -319,42 +332,43 @@ Field {
 Field {
     id: 0
     name: "id"
-    type: "int64"
+    logical_type: "int64"
     nullable: false
 }
 Field {
     id: 1
     name: "user"
-    type: "struct"
+    logical_type: "struct"
     nullable: true
-    children: [
-        Field {
-            id: 2
-            name: "name"
-            type: "string"
-            nullable: true
-        }
-        Field {
-            id: 3
-            name: "email"
-            type: "string"
-            nullable: true
-        }
-    ]
+    parent_id: 0  // This is a top-level field, so parent_id is 0 or omitted
+}
+Field {
+    id: 2
+    name: "name"
+    logical_type: "string"
+    nullable: true
+    parent_id: 1  // Nested under "user" struct (id: 1)
+}
+Field {
+    id: 3
+    name: "email"
+    logical_type: "string"
+    nullable: true
+    parent_id: 1  // Nested under "user" struct (id: 1)
 }
 Field {
     id: 4
     name: "tags"
-    type: "list"
+    logical_type: "list"
     nullable: true
-    children: [
-        Field {
-            id: 5
-            name: "item"
-            type: "string"
-            nullable: true
-        }
-    ]
+    parent_id: 0  // This is a top-level field
+}
+Field {
+    id: 5
+    name: "item"
+    logical_type: "string"
+    nullable: true
+    parent_id: 4  // Nested under "tags" list (id: 4)
 }
 ```
 
@@ -364,22 +378,21 @@ Field {
 Field {
     id: 0
     name: "id"
-    type: "int64"
+    logical_type: "int64"
     nullable: false
-    metadata: {
-        "lance-schema:unenforced-primary-key": "true"
-    }
+    unenforced_primary_key: true
+    unenforced_primary_key_position: 1  // Ordered position in primary key
 }
 Field {
     id: 1
     name: "text"
-    type: "string"
+    logical_type: "string"
     nullable: true
 }
 Field {
     id: 2
     name: "embedding"
-    type: "fixed_size_list:lance.bfloat16:384"
+    logical_type: "fixed_size_list:lance.bfloat16:384"
     nullable: true
 }
 ```
