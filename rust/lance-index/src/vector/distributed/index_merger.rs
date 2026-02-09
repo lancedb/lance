@@ -19,6 +19,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::pb;
+use crate::vector::bq::storage::{
+    unpack_codes, RabitQuantizationMetadata, RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
+};
+use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::ivf::storage::{IvfModel as IvfStorageModel, IVF_METADATA_KEY};
 use crate::vector::pq::storage::{transpose, ProductQuantizationMetadata, PQ_METADATA_KEY};
@@ -251,6 +255,42 @@ pub async fn init_writer_for_sq(
     Ok(w)
 }
 
+/// Create and initialize a unified writer for RQ (Residual Quantization) storage.
+pub async fn init_writer_for_rq(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_out: &object_store::path::Path,
+    dt: DistanceType,
+    rq_meta: &RabitQuantizationMetadata,
+) -> Result<FileWriter> {
+    let code_len = rq_meta
+        .rotate_mat
+        .as_ref()
+        .map(|m| m.len() * usize::from(rq_meta.num_bits) / u8::BITS as usize)
+        .unwrap_or(0);
+    let arrow_schema = ArrowSchema::new(vec![
+        (*ROW_ID_FIELD).clone(),
+        Field::new(
+            RABIT_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                code_len as i32,
+            ),
+            true,
+        ),
+        Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+        Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+    ]);
+    let writer = object_store.create(aux_out).await?;
+    let mut w = FileWriter::try_new(
+        writer,
+        LanceSchema::try_from(&arrow_schema)?,
+        FileWriterOptions::default(),
+    )?;
+    let rq_meta_json = serde_json::to_string(rq_meta)?;
+    init_writer_for_storage(&mut w, dt, &rq_meta_json, RABIT_METADATA_KEY)?;
+    Ok(w)
+}
+
 /// Stream and write a range of rows from reader into writer.
 ///
 /// The caller is responsible for ensuring that `range` corresponds to a
@@ -311,6 +351,49 @@ async fn write_partition_rows_pq_transposed(
         num_bytes as i32,
     )?);
     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
+
+    // Write in reasonably sized chunks to avoid huge batches.
+    let batch_size: usize = 10_240;
+    for offset in (0..num_rows).step_by(batch_size) {
+        let len = std::cmp::min(batch_size, num_rows - offset);
+        let slice = batch.slice(offset, len);
+        w.write_batch(&slice).await?;
+    }
+    Ok(())
+}
+
+/// Transpose and write RQ (Residual Quantization) codes for a batch.
+///
+/// This helper assumes `batch` contains a contiguous range of rows for a single
+/// IVF partition. RQ codes are stored in packed format in shards but need to
+/// be unpacked when merging.
+async fn write_partition_rows_rq(w: &mut FileWriter, mut batch: RecordBatch) -> Result<()> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+
+    // Get RABIT_CODE_COLUMN and unpack it
+    let rq_col = batch
+        .column_by_name(RABIT_CODE_COLUMN)
+        .ok_or_else(|| Error::Index {
+            message: format!("RQ column {} missing in auxiliary shard", RABIT_CODE_COLUMN),
+            location: location!(),
+        })?;
+    let rq_fsl = rq_col
+        .as_fixed_size_list_opt()
+        .ok_or_else(|| Error::Index {
+            message: format!(
+                "RQ column {} is not a FixedSizeList in auxiliary shard, got {}",
+                RABIT_CODE_COLUMN,
+                rq_col.data_type(),
+            ),
+            location: location!(),
+        })?;
+
+    // Unpack the codes (they are stored in packed format in shards)
+    let unpacked_codes = unpack_codes(rq_fsl);
+    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(unpacked_codes))?;
 
     // Write in reasonably sized chunks to avoid huge batches.
     let batch_size: usize = 10_240;
@@ -621,6 +704,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
                         "IVF_PQ" => SupportedIvfIndexType::IvfPq,
                         "IVF_SQ" => SupportedIvfIndexType::IvfSq,
+                        "IVF_RQ" => SupportedIvfIndexType::IvfRq,
                         "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                         "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                         "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
@@ -753,6 +837,85 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed).await?;
+                    v2w_opt = Some(w);
+                }
+            }
+            SupportedIvfIndexType::IvfRq => {
+                // Handle Residual Quantization (RQ) storage for IVF_RQ
+                // RQ uses RABIT_CODE_COLUMN, ADD_FACTORS_COLUMN, and SCALE_FACTORS_COLUMN
+                let rq_json = if let Some(rq_json) = reader
+                    .metadata()
+                    .file_schema
+                    .metadata
+                    .get(RABIT_METADATA_KEY)
+                {
+                    rq_json.clone()
+                } else if let Some(storage_meta_json) = reader
+                    .metadata()
+                    .file_schema
+                    .metadata
+                    .get(STORAGE_METADATA_KEY)
+                {
+                    // Try to extract RQ metadata from storage metadata
+                    let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
+                        .map_err(|e| Error::Index {
+                            message: format!("Failed to parse storage metadata: {}", e),
+                            location: location!(),
+                        })?;
+                    if let Some(first_meta) = storage_metadata_vec.first() {
+                        // Check if this is RQ metadata by trying to parse it
+                        if let Ok(_rq_meta) =
+                            serde_json::from_str::<RabitQuantizationMetadata>(first_meta)
+                        {
+                            first_meta.clone()
+                        } else {
+                            return Err(Error::Index {
+                                message: "RQ metadata missing in storage metadata".to_string(),
+                                location: location!(),
+                            });
+                        }
+                    } else {
+                        return Err(Error::Index {
+                            message: "RQ metadata missing in storage metadata".to_string(),
+                            location: location!(),
+                        });
+                    }
+                } else {
+                    return Err(Error::Index {
+                        message: "RQ metadata missing".to_string(),
+                        location: location!(),
+                    });
+                };
+                let mut rq_meta: RabitQuantizationMetadata = serde_json::from_str(&rq_json)
+                    .map_err(|e| Error::Index {
+                        message: format!("RQ metadata parse error: {}", e),
+                        location: location!(),
+                    })?;
+                // Load rotate_mat from global buffer if not present
+                if rq_meta.rotate_mat.is_none() {
+                    let tensor_bytes = reader
+                        .read_global_buffer(rq_meta.rotate_mat_position as u32)
+                        .await?;
+                    let rotate_mat_tensor: crate::pb::Tensor =
+                        prost::Message::decode(tensor_bytes)?;
+                    rq_meta.rotate_mat = Some(FixedSizeListArray::try_from(&rotate_mat_tensor)?);
+                }
+                let d0 = rq_meta
+                    .rotate_mat
+                    .as_ref()
+                    .map(|m| m.value_length() as usize)
+                    .unwrap_or(0);
+                dim.get_or_insert(d0);
+                if let Some(dprev) = dim {
+                    if dprev != d0 {
+                        return Err(Error::Index {
+                            message: "Dimension mismatch across shards".to_string(),
+                            location: location!(),
+                        });
+                    }
+                }
+                if v2w_opt.is_none() {
+                    let w = init_writer_for_rq(object_store, &aux_out, dt, &rq_meta).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1222,6 +1385,54 @@ pub async fn merge_partial_vector_auxiliary_files(
                 let partition_batch = concat_batches(&schema, part_batches.iter())?;
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_pq_transposed(w, partition_batch).await?;
+                }
+            }
+        }
+        SupportedIvfIndexType::IvfRq => {
+            // For RQ-backed indices, unpack RQ codes while merging partitions
+            // so that the unified file stores unpacked RQ codes.
+            for pid in 0..nlist {
+                let total_len = accumulated_lengths[pid] as usize;
+                if total_len == 0 {
+                    continue;
+                }
+
+                let mut part_batches: Vec<RecordBatch> = Vec::new();
+                for (path, lens, _) in shard_infos.iter() {
+                    let part_len = lens[pid] as usize;
+                    if part_len == 0 {
+                        continue;
+                    }
+                    let offset: usize = lens.iter().take(pid).map(|x| *x as usize).sum();
+                    let fh = sched.open_file(path, &CachedFileSize::unknown()).await?;
+                    let reader = V2Reader::try_open(
+                        fh,
+                        None,
+                        Arc::default(),
+                        &lance_core::cache::LanceCache::no_cache(),
+                        V2ReaderOptions::default(),
+                    )
+                    .await?;
+                    let mut stream = reader.read_stream(
+                        lance_io::ReadBatchParams::Range(offset..offset + part_len),
+                        u32::MAX,
+                        4,
+                        lance_encoding::decoder::FilterExpression::no_filter(),
+                    )?;
+                    while let Some(rb) = stream.next().await {
+                        let rb = rb?;
+                        part_batches.push(rb);
+                    }
+                }
+
+                if part_batches.is_empty() {
+                    continue;
+                }
+
+                let schema = part_batches[0].schema();
+                let partition_batch = concat_batches(&schema, part_batches.iter())?;
+                if let Some(w) = v2w_opt.as_mut() {
+                    write_partition_rows_rq(w, partition_batch).await?;
                 }
             }
         }
