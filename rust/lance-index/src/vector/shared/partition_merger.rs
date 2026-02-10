@@ -75,6 +75,15 @@ impl SupportedIvfIndexType {
     ///
     /// This is primarily used by the distributed index merger when
     /// consolidating partial auxiliary files.
+    ///
+    /// ## Index Type Detection Logic
+    ///
+    /// The function checks for the presence of quantization code columns
+    /// (PQ, SQ, RQ) and HNSW-related columns. Note that:
+    /// * RQ does not support HNSW because it lacks `dist_calculator_from_id`.
+    ///   When both HNSW and RQ are detected, the result falls back to
+    ///   `IvfHnswPq` (since `IvfHnswRq` does not exist).
+    /// * PQ and SQ are mutually exclusive in the same index.
     pub fn detect_from_reader_and_schema(reader: &V2Reader, schema: &ArrowSchema) -> Result<Self> {
         let has_pq_code_col = schema.fields.iter().any(|f| f.name() == PQ_CODE_COLUMN);
         let has_sq_code_col = schema.fields.iter().any(|f| f.name() == SQ_CODE_COLUMN);
@@ -104,13 +113,15 @@ impl SupportedIvfIndexType {
         let has_hnsw_pointer_col = schema.fields.iter().any(|f| f.name() == "__pointer");
         let has_hnsw = has_hnsw_vector_id_col || has_hnsw_pointer_col;
 
-        // RQ takes precedence over PQ/SQ when detected (RQ has its own column)
+        // Note: RQ does not support HNSW (missing dist_calculator_from_id).
+        // When both HNSW and RQ are detected, we fall back to IvfHnswPq.
         let index_type = match (has_hnsw, is_pq, is_sq, is_rq) {
             (false, false, false, true) => Self::IvfRq,
             (false, true, false, false) => Self::IvfPq,
             (false, false, true, false) => Self::IvfSq,
             (false, false, false, false) => Self::IvfFlat,
-            (true, false, false, true) => Self::IvfHnswPq, // RQ on HNSW uses PQ storage format
+            // RQ detected with HNSW: falls back to HNSW+PQ since IvfHnswRq doesn't exist
+            (true, false, false, true) => Self::IvfHnswPq,
             (true, true, false, false) => Self::IvfHnswPq,
             (true, false, true, false) => Self::IvfHnswSq,
             (true, false, false, false) => Self::IvfHnswFlat,
