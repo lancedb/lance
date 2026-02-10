@@ -4,12 +4,13 @@
 import json
 import tempfile
 from pathlib import Path
+from typing import Union
 
 import lance
 import pyarrow as pa
 
 
-def check_json_type(ds: lance.LanceDataset | pa.Table, col_name: str):
+def check_json_type(ds: Union[lance.LanceDataset, pa.Table], col_name: str):
     # TODO: In the future it should be possible to verify
     # the logical type of a column.
 
