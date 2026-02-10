@@ -203,25 +203,29 @@ impl ProductQuantizer {
                     flatten_data.values().len(),
                 )
             };
-            flat_f32
-                .chunks_exact(dim)
-                .flat_map(|vector| {
-                    let sub_vec_code: Vec<u8> = vector
-                        .chunks_exact(sub_dim)
-                        .enumerate()
-                        .map(|(sub_idx, sv)| targets[sub_idx].nearest(sv).unwrap_or(0) as u8)
-                        .collect();
-                    if NUM_BITS == 4 {
-                        sub_vec_code
-                            .chunks_exact(2)
-                            .map(|v| (v[1] << 4) | v[0])
-                            .collect::<Vec<_>>()
-                    } else {
-                        sub_vec_code
+            let mut values = vec![0u8; total_code_length];
+            let bytes_per_vector = num_sub_vectors / (8 / NUM_BITS as usize);
+            let mut dist_buf = vec![0.0f32; num_centroids];
+            for (vec_idx, vector) in flat_f32.chunks_exact(dim).enumerate() {
+                let out = &mut values[vec_idx * bytes_per_vector..][..bytes_per_vector];
+                if NUM_BITS == 4 {
+                    for (pair_idx, pair) in vector.chunks_exact(sub_dim * 2).enumerate() {
+                        let lo = targets[pair_idx * 2]
+                            .nearest_into(&pair[..sub_dim], &mut dist_buf)
+                            .unwrap_or(0) as u8;
+                        let hi = targets[pair_idx * 2 + 1]
+                            .nearest_into(&pair[sub_dim..], &mut dist_buf)
+                            .unwrap_or(0) as u8;
+                        out[pair_idx] = (hi << 4) | lo;
                     }
-                })
-                .exact_size(total_code_length)
-                .collect::<Vec<_>>()
+                } else {
+                    for (sub_idx, sv) in vector.chunks_exact(sub_dim).enumerate() {
+                        out[sub_idx] =
+                            targets[sub_idx].nearest_into(sv, &mut dist_buf).unwrap_or(0) as u8;
+                    }
+                }
+            }
+            values
         } else {
             flatten_data
                 .values()

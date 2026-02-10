@@ -226,21 +226,38 @@ impl L2Prepared {
         }
     }
 
-    /// Compute L2 distances from `query` to every target.
-    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+    /// Compute L2 distances from `query` to every target, writing into `out`.
+    ///
+    /// `out` must have length `num_targets`. It will be zeroed before accumulation.
+    pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
         debug_assert_eq!(query.len(), self.dimension);
+        debug_assert_eq!(out.len(), self.num_targets);
 
-        let mut result = vec![0.0f32; self.num_targets];
+        out.fill(0.0);
         for (d, &q) in query.iter().enumerate() {
             let row = &self.transposed[d * self.num_targets..][..self.num_targets];
-            accumulate_l2_dimension(q, row, &mut result);
+            accumulate_l2_dimension(q, row, out);
         }
+    }
+
+    /// Compute L2 distances from `query` to every target.
+    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0f32; self.num_targets];
+        self.distances_into(query, &mut result);
         result
+    }
+
+    /// Return the index of the nearest target to `query`, using `buf` as scratch space.
+    ///
+    /// `buf` must have length `num_targets`.
+    pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
+        self.distances_into(query, buf);
+        crate::kernels::argmin_value_float(buf.iter().copied()).map(|(idx, _)| idx)
     }
 
     /// Return the index of the nearest target to `query`.
     pub fn nearest(&self, query: &[f32]) -> Option<u32> {
-        crate::kernels::argmin_value_float(self.distances(query).into_iter()).map(|(idx, _)| idx)
+        self.nearest_into(query, &mut vec![0.0f32; self.num_targets])
     }
 
     /// Number of targets in this set.
