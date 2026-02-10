@@ -665,14 +665,32 @@ please provide PQBuildParams.codebook for distributed indexing"
         }
 
         IndexType::IvfRq => {
-            return Err(Error::Index {
-                message: format!(
-                    "Build Distributed Vector Index: invalid index type: {:?} \
-is not supported in distributed mode; skipping this shard",
-                    index_type
-                ),
-                location: location!(),
-            });
+            let StageParams::RQ(rq_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            let index_dir = new_index_dir();
+
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .with_fragment_filter(fragment_filter)
+            .build()
+            .await?;
         }
 
         _ => {
