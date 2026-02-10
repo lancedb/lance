@@ -944,7 +944,7 @@ async fn resolve_commit_handler(
                 .map(|opts| opts.object_store.is_some())
                 .unwrap_or_default()
             {
-                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: Default::default() });
+                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
             }
             commit_handler_from_url(uri, store_options).await
         }
@@ -953,7 +953,7 @@ async fn resolve_commit_handler(
                 Err(Error::InvalidInput {
                     source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
                         .into(),
-                    location: Default::default(),
+                    location: location!(),
                 })
             } else {
                 Ok(commit_handler)

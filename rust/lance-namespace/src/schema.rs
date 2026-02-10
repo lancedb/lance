@@ -9,7 +9,7 @@
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_namespace_reqwest_client::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
-use snafu::Location;
+use snafu::location;
 
 /// Convert Arrow Schema to JsonArrowSchema
 pub fn arrow_schema_to_json(arrow_schema: &ArrowSchema) -> Result<JsonArrowSchema> {
@@ -189,7 +189,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                         data_type
                     )
                         .into(),
-                    location: Location::new(file!(), line!(), column!()),
+                    location: location!(),
                 });
             }
             let inner_type = arrow_type_to_json(entries_field.data_type())?;
@@ -217,7 +217,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 data_type
             )
             .into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         }),
         DataType::ListView(_) | DataType::LargeListView(_) => Err(Error::Namespace {
             source: format!(
@@ -225,7 +225,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 data_type
             )
             .into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         }),
         DataType::Utf8View | DataType::BinaryView => Err(Error::Namespace {
             source: format!(
@@ -233,7 +233,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 data_type
             )
             .into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         }),
     }
 }
@@ -284,7 +284,7 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
         "binary" => Ok(DataType::Binary),
         _ => Err(Error::Namespace {
             source: format!("Unsupported Arrow type: {}", type_name).into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         }),
     }
 }

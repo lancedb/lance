@@ -300,7 +300,7 @@ pub trait ToSnafuLocation {
 
 impl ToSnafuLocation for std::panic::Location<'static> {
     fn to_snafu_location(&'static self) -> snafu::Location {
-        snafu::Location::new(self.file(), self.line(), self.column())
+        self
     }
 }
 

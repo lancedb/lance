@@ -1734,7 +1734,7 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(
                 format!("Dataset base path with ID {} not found", base_id),
-                Default::default(),
+                location!(),
             )
         })?;
 

@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance_core::{Error, Result};
-use snafu::Location;
+use snafu::location;
 
 use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
@@ -67,7 +67,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<ListNamespacesResponse> {
         Err(Error::NotSupported {
             source: "list_namespaces not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -82,7 +82,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DescribeNamespaceResponse> {
         Err(Error::NotSupported {
             source: "describe_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -97,7 +97,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateNamespaceResponse> {
         Err(Error::NotSupported {
             source: "create_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -113,7 +113,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DropNamespaceResponse> {
         Err(Error::NotSupported {
             source: "drop_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -125,7 +125,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn namespace_exists(&self, _request: NamespaceExistsRequest) -> Result<()> {
         Err(Error::NotSupported {
             source: "namespace_exists not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -133,7 +133,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn list_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
         Err(Error::NotSupported {
             source: "list_tables not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -144,7 +144,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DescribeTableResponse> {
         Err(Error::NotSupported {
             source: "describe_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -155,7 +155,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<RegisterTableResponse> {
         Err(Error::NotSupported {
             source: "register_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -163,7 +163,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn table_exists(&self, _request: TableExistsRequest) -> Result<()> {
         Err(Error::NotSupported {
             source: "table_exists not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -171,7 +171,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn drop_table(&self, _request: DropTableRequest) -> Result<DropTableResponse> {
         Err(Error::NotSupported {
             source: "drop_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -182,7 +182,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DeregisterTableResponse> {
         Err(Error::NotSupported {
             source: "deregister_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -190,7 +190,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn count_table_rows(&self, _request: CountTableRowsRequest) -> Result<i64> {
         Err(Error::NotSupported {
             source: "count_table_rows not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -202,7 +202,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateTableResponse> {
         Err(Error::NotSupported {
             source: "create_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -210,7 +210,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn declare_table(&self, _request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         Err(Error::NotSupported {
             source: "declare_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -229,7 +229,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateEmptyTableResponse> {
         Err(Error::NotSupported {
             source: "create_empty_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -241,7 +241,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<InsertIntoTableResponse> {
         Err(Error::NotSupported {
             source: "insert_into_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -253,7 +253,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<MergeInsertIntoTableResponse> {
         Err(Error::NotSupported {
             source: "merge_insert_into_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -261,7 +261,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn update_table(&self, _request: UpdateTableRequest) -> Result<UpdateTableResponse> {
         Err(Error::NotSupported {
             source: "update_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -272,7 +272,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DeleteFromTableResponse> {
         Err(Error::NotSupported {
             source: "delete_from_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -280,7 +280,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn query_table(&self, _request: QueryTableRequest) -> Result<Bytes> {
         Err(Error::NotSupported {
             source: "query_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -291,7 +291,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateTableIndexResponse> {
         Err(Error::NotSupported {
             source: "create_table_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -302,7 +302,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<ListTableIndicesResponse> {
         Err(Error::NotSupported {
             source: "list_table_indices not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -313,7 +313,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DescribeTableIndexStatsResponse> {
         Err(Error::NotSupported {
             source: "describe_table_index_stats not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -324,7 +324,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DescribeTransactionResponse> {
         Err(Error::NotSupported {
             source: "describe_transaction not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -335,7 +335,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTransactionResponse> {
         Err(Error::NotSupported {
             source: "alter_transaction not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -346,7 +346,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateTableScalarIndexResponse> {
         Err(Error::NotSupported {
             source: "create_table_scalar_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -357,7 +357,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DropTableIndexResponse> {
         Err(Error::NotSupported {
             source: "drop_table_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -365,7 +365,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn list_all_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
         Err(Error::NotSupported {
             source: "list_all_tables not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -373,7 +373,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn restore_table(&self, _request: RestoreTableRequest) -> Result<RestoreTableResponse> {
         Err(Error::NotSupported {
             source: "restore_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -381,7 +381,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     async fn rename_table(&self, _request: RenameTableRequest) -> Result<RenameTableResponse> {
         Err(Error::NotSupported {
             source: "rename_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -392,7 +392,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<ListTableVersionsResponse> {
         Err(Error::NotSupported {
             source: "list_table_versions not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -417,7 +417,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateTableVersionResponse> {
         Err(Error::NotSupported {
             source: "create_table_version not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -441,7 +441,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DescribeTableVersionResponse> {
         Err(Error::NotSupported {
             source: "describe_table_version not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -463,7 +463,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<BatchDeleteTableVersionsResponse> {
         Err(Error::NotSupported {
             source: "batch_delete_table_versions not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -474,7 +474,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<UpdateTableSchemaMetadataResponse> {
         Err(Error::NotSupported {
             source: "update_table_schema_metadata not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -485,7 +485,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<GetTableStatsResponse> {
         Err(Error::NotSupported {
             source: "get_table_stats not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -496,7 +496,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<String> {
         Err(Error::NotSupported {
             source: "explain_table_query_plan not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -507,7 +507,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<String> {
         Err(Error::NotSupported {
             source: "analyze_table_query_plan not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -518,7 +518,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTableAddColumnsResponse> {
         Err(Error::NotSupported {
             source: "alter_table_add_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -529,7 +529,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTableAlterColumnsResponse> {
         Err(Error::NotSupported {
             source: "alter_table_alter_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -540,7 +540,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTableDropColumnsResponse> {
         Err(Error::NotSupported {
             source: "alter_table_drop_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -551,7 +551,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<ListTableTagsResponse> {
         Err(Error::NotSupported {
             source: "list_table_tags not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -562,7 +562,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<GetTableTagVersionResponse> {
         Err(Error::NotSupported {
             source: "get_table_tag_version not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -573,7 +573,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<CreateTableTagResponse> {
         Err(Error::NotSupported {
             source: "create_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -584,7 +584,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<DeleteTableTagResponse> {
         Err(Error::NotSupported {
             source: "delete_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
@@ -595,7 +595,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<UpdateTableTagResponse> {
         Err(Error::NotSupported {
             source: "update_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: location!(),
         })
     }
 
