@@ -982,16 +982,14 @@ impl RowIdSet {
         self.inner.iter()
     }
     /// Returns the union of `self` and `other`.
-    pub fn union(&self, other: &Self) -> Self {
-        let mut result = self.clone();
-        result.inner |= &other.inner;
-        result
+    pub fn union(mut self, other: &Self) -> Self {
+        self.inner |= &other.inner;
+        self
     }
     /// Returns the set difference `self \\ other`.
-    pub fn difference(&self, other: &Self) -> Self {
-        let mut result = self.clone();
-        result.inner -= &other.inner;
-        result
+    pub fn difference(mut self, other: &Self) -> Self {
+        self.inner -= &other.inner;
+        self
     }
 }
 
