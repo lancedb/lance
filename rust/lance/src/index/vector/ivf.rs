@@ -2139,9 +2139,13 @@ where
 
     let on_progress: Arc<dyn Fn(u32, u32) + Send + Sync> = {
         let progress_tx = progress_tx.clone();
-        Arc::new(move |iter: u32, _max_iters: u32| {
+        let cumulative_iters = std::sync::atomic::AtomicU64::new(0);
+        Arc::new(move |_iter: u32, _max_iters: u32| {
+            // Track cumulative iterations across all kmeans runs in this stage
+            // (flat and hierarchical both invoke the callback per-iteration).
+            let total = cumulative_iters.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Non-blocking send from sync kmeans loop into async progress worker.
-            let _ = progress_tx.send(iter as u64);
+            let _ = progress_tx.send(total);
         })
     };
     let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
