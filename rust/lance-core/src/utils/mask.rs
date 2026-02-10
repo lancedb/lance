@@ -1008,7 +1008,9 @@ impl RowSetOps for RowIdSet {
         self.inner.contains(row)
     }
     fn union_all(other: &[&Self]) -> Self {
-        let mut result = other.first().map_or(Self::default(), |&first| first.clone());
+        let mut result = other
+            .first()
+            .map_or(Self::default(), |&first| first.clone());
         for set in other {
             result.inner |= &set.inner;
         }
