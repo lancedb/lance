@@ -180,7 +180,6 @@ impl PageMetadataSpill {
         self.writer.shutdown().await?;
         Ok(())
     }
-
 }
 
 fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Page>> {
