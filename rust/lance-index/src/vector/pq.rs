@@ -220,8 +220,9 @@ impl ProductQuantizer {
                     }
                 } else {
                     for (sub_idx, sv) in vector.chunks_exact(sub_dim).enumerate() {
-                        out[sub_idx] =
-                            targets[sub_idx].nearest_into(sv, &mut dist_buf).unwrap_or(0) as u8;
+                        out[sub_idx] = targets[sub_idx]
+                            .nearest_into(sv, &mut dist_buf)
+                            .unwrap_or(0) as u8;
                     }
                 }
             }
