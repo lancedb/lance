@@ -299,6 +299,7 @@ impl IndexParams for VectorIndexParams {
 }
 
 /// Build a Distributed Vector Index for specific fragments
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_distributed_vector_index(
     dataset: &Dataset,

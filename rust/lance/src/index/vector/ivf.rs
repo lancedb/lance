@@ -1353,6 +1353,7 @@ pub async fn load_precomputed_partitions_if_available(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
     column: &str,
