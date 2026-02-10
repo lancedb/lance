@@ -58,10 +58,7 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
 ///
 /// This avoids the per-call AoS→SoA transpose by reusing targets that were
 /// transposed once at `ProductQuantizer` construction time.
-pub fn build_distance_table_l2_prepared(
-    l2_targets: &[L2Prepared],
-    query: &[f32],
-) -> Vec<f32> {
+pub fn build_distance_table_l2_prepared(l2_targets: &[L2Prepared], query: &[f32]) -> Vec<f32> {
     let sub_dim = query.len() / l2_targets.len();
 
     let mut result = Vec::with_capacity(l2_targets.len() * l2_targets[0].num_targets());

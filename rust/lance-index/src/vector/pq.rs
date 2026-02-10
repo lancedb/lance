@@ -28,7 +28,9 @@ pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::distance::{build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance};
+use self::distance::{
+    build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance,
+};
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
@@ -364,9 +366,8 @@ impl ProductQuantizer {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
                     Ok(build_distance_table_l2_prepared(targets, query))
                 } else {
-                    Ok(self.build_l2_distance_table_impl::<datatypes::Float32Type>(
-                        key.as_primitive(),
-                    ))
+                    Ok(self
+                        .build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
                 }
             }
             DataType::Float64 => {
