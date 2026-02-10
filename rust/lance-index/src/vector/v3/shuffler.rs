@@ -182,9 +182,7 @@ impl Shuffler for IvfShuffler {
             try_join_all(futs).await?;
 
             counter += 1;
-            self.progress
-                .stage_progress("shuffle", counter)
-                .await?;
+            self.progress.stage_progress("shuffle", counter).await?;
         }
 
         // finish all writers
