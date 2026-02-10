@@ -104,13 +104,28 @@ pub struct FileWriterOptions {
 // to the spill file. Divided evenly across columns (with a floor of 64 bytes).
 const DEFAULT_SPILL_BUFFER_LIMIT: usize = 256 * 1024;
 
+/// Spills serialized page metadata to a temporary file to bound memory usage.
+///
+/// The spill file is an unstructured sequence of "chunks". Each chunk is a
+/// contiguous run of length-delimited protobuf `Page` messages belonging to a
+/// single column. Chunks from different columns are interleaved in the order
+/// they are flushed (i.e. whenever a column's in-memory buffer exceeds
+/// `per_column_limit`). The `column_chunks` index records the (offset, length)
+/// of every chunk so each column's pages can be read back and reassembled in
+/// order.
 struct PageMetadataSpill {
     writer: ObjectWriter,
     object_store: Arc<ObjectStore>,
     path: Path,
+    /// Current write position in the spill file.
     position: u64,
+    /// Per-column buffer of serialized (length-delimited protobuf) page metadata
+    /// that has not yet been flushed to the spill file.
     column_buffers: Vec<Vec<u8>>,
+    /// Per-column list of chunks that have been flushed to the spill file.
+    /// Each entry is (offset, length) pointing into the spill file.
     column_chunks: Vec<Vec<(u64, u32)>>,
+    /// Maximum bytes to buffer per column before flushing to the spill file.
     per_column_limit: usize,
 }
 
