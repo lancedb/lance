@@ -2736,8 +2736,12 @@ impl Dataset {
                 )
                 .await
             }
-            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
-            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
+            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ, IVF_RQ
+            IndexType::IvfFlat
+            | IndexType::IvfPq
+            | IndexType::IvfSq
+            | IndexType::IvfRq
+            | IndexType::Vector => {
                 // Merge distributed vector index partials and finalize root index via Lance IVF helper
                 crate::index::vector::ivf::finalize_distributed_merge(
                     self.object_store(),
