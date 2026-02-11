@@ -691,6 +691,47 @@ def test_json_append(tmp_path: Path):
     assert result["id"].to_pylist() == [2, 3, 4]
 
 
+def test_json_add_columns(tmp_path: Path):
+    """Test adding a JSON column to an existing dataset via add_columns."""
+
+    dataset_path = tmp_path / "json_add_col.lance"
+
+    # Create a dataset without a JSON column
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "name": pa.array(["Alice", "Bob", "Charlie"], type=pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(table, dataset_path)
+
+    # Add a JSON column using a record batch reader
+    names = table.column("name").to_pylist()
+    json_values = [json.dumps({"greeting": f"hello {n}"}) for n in names]
+    new_col = pa.record_batch([pa.array(json_values, type=pa.json_())], ["metadata"])
+    reader_schema = pa.schema([pa.field("metadata", pa.json_())])
+
+    dataset.add_columns(iter([new_col]), reader_schema=reader_schema)
+    dataset = lance.dataset(dataset_path)
+
+    # Verify the new column exists and has the right type
+    assert dataset.schema.names == ["id", "name", "metadata"]
+    check_json_type(dataset, "metadata")
+
+    # Verify data round-trips
+    result = dataset.to_table()
+    assert result.num_rows == 3
+    metadata_values = result.column("metadata").to_pylist()
+    for name, val in zip(names, metadata_values):
+        assert json.loads(val) == {"greeting": f"hello {name}"}
+
+    result = dataset.to_table(
+        filter="json_get_string(metadata, 'greeting') = 'hello Alice'"
+    )
+    assert result.num_rows == 1
+    assert result["id"][0].as_py() == 1
+
+
 def test_json_merge_insert(tmp_path: Path):
     """Test merge_insert with JSON data."""
 
