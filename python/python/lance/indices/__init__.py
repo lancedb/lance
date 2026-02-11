@@ -23,5 +23,6 @@ class SupportedDistributedIndices(str, Enum):
     IVF_FLAT = "IVF_FLAT"
     IVF_PQ = "IVF_PQ"
     IVF_SQ = "IVF_SQ"
+    IVF_RQ = "IVF_RQ"
     # Deprecated generic placeholder (kept for backward compatibility)
     VECTOR = "VECTOR"
