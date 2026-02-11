@@ -2307,6 +2307,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=self.latest_storage_options(),
             storage_options_provider=self._storage_options_provider,
         )
+
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> "LanceDataset":
