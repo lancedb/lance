@@ -3,6 +3,7 @@
 
 mod dataset_common;
 mod dataset_concurrency_store;
+#[cfg(feature = "geo")]
 mod dataset_geo;
 mod dataset_index;
 mod dataset_io;

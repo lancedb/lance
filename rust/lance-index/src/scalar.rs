@@ -39,6 +39,7 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+#[cfg(feature = "geo")]
 pub mod rtree;
 pub mod zoned;
 pub mod zonemap;

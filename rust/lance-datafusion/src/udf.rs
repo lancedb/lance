@@ -27,6 +27,7 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
     // GEO functions
+    #[cfg(feature = "geo")]
     lance_geo::register_functions(ctx);
 }
 
