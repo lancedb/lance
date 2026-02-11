@@ -144,6 +144,50 @@ text: [["I left my umbrella on the evening train to Boston", "This train is sche
 _score: [[..., ...]]
 ```
 
+## Combining Full-Text Search with Metadata
+
+It can be useful to combine FTS with metadata filtering in a single query to find more relevant results.
+This is done by passing in the column name and its value to the `filter` parameter when querying.
+
+```python
+import lance
+import pyarrow as pa
+
+table = pa.table(
+    {
+        "id": [1, 2, 3],
+        "text": [
+            "I left my umbrella on the morning train to Boston",
+            "This ramen recipe simmers the broth for three hours with dried mushrooms.",
+            "This train is scheduled to leave for Edinburgh at 9:30 AM",
+        ],
+        "category": ["travel", "food", "travel"],
+    }
+)
+
+# Temp write dataset
+lance.write_dataset(table, "./fts_test_with_metadata.lance", mode="overwrite")
+
+ds = lance.dataset("./fts_test_with_metadata.lance")
+
+# Create FTS index
+ds.create_scalar_index(
+    column="text",
+    index_type="INVERTED",
+)
+
+# Run FTS query with metadata filter
+query_result = ds.to_table(
+    full_text_query="three",
+    filter='category = "food"',
+)
+
+# Returns
+# id: [[2]]
+# text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]
+# category: [["food"]]
+```
+
 ## Advanced Search Features
 
 ### Boolean Search Operators
@@ -234,7 +278,7 @@ table = ds.to_table(full_text_query="'train to boston'")
 ```
 
 !!! warning "Stopwords are removed by default"
-    Common words like "_to_", "_the_", etc. are categorized as stopwords, and are removed by default when creating the index. If you want to search exact phrases that include stopwords, you need to set `remove_stop_words=False` when creating the index.
+    Common words like "to", "the", etc. are categorized as stopwords, and are removed by default when creating the index. If you want to search exact phrases that include stopwords, you need to set `remove_stop_words=False` when creating the index.
 
 ### Substring matches with N-gram indexing
 
@@ -265,51 +309,57 @@ You can explain the query plan to confirm the N-gram index's usage as shown belo
 print(ds.scanner(filter="contains(text, 'train')").explain_plan())
 ```
 
-## Combining Full-Text Search with Metadata
+### Fuzzy Search
 
-It can be useful to combine FTS with metadata filtering in a single query to find more relevant results.
-This is done by passing in the column name and its value to the `filter` parameter when querying.
+Fuzzy search is supported for FTS `MatchQuery` on `INVERTED` indexes. It uses Levenshtein edit distance to match terms with typos or slight variations.
 
 ```python
-import lance
-import pyarrow as pa
+from lance.query import MatchQuery
 
-table = pa.table(
-    {
-        "id": [1, 2, 3],
-        "text": [
-            "I left my umbrella on the morning train to Boston",
-            "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-            "This train is scheduled to leave for Edinburgh at 9:30 AM",
-        ],
-        "category": ["travel", "food", "travel"],
-    }
-)
-
-# Temp write dataset
-lance.write_dataset(table, "./fts_test_with_metadata.lance", mode="overwrite")
-
-ds = lance.dataset("./fts_test_with_metadata.lance")
-
-# Create FTS index
-ds.create_scalar_index(
-    column="text",
-    index_type="INVERTED",
-)
-
-# Run FTS query with metadata filter
+# Explicit edit distance (1)
 query_result = ds.to_table(
-    full_text_query="three",
-    filter='category = "food"',
+    full_text_query=MatchQuery(
+        "rammen",  # Misspelled 'ramen'
+        "text",
+        fuzziness=1,
+        max_expansions=50,  # default: 50
+    )
 )
-
-# Returns
-# id: [[2]]
-# text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]
-# category: [["food"]]
 ```
 
-## Index Maintenance
+You can also set `fuzziness=None` to use automatic fuzziness:
+
+- `0` for term length `<= 2`
+- `1` for term length `<= 5`
+- `2` for term length `> 5`
+
+```python
+query_result = ds.to_table(
+    full_text_query=MatchQuery(
+        "rammen",
+        "text",
+        fuzziness=None,
+    )
+)
+```
+
+To enforce exact prefixes during fuzzy matching, set `prefix_length`.
+This means the first `N` characters must match exactly before fuzzy edits are allowed on the rest of the term. For example, with `prefix_length=2`, `"rammen"` can match terms starting with `"ra"` (like `"ramen"`), but not terms starting with other prefixes.
+
+```python
+query_result = ds.to_table(
+    full_text_query=MatchQuery(
+        "rammen",
+        "text",
+        fuzziness=1,
+        prefix_length=2,  # "ra" must match exactly
+    )
+)
+```
+
+## Performance Tips
+
+### Index Maintenance
 
 When you append new rows after creating an `INVERTED` index, Lance still returns those rows in `full_text_query` results. It searches indexed fragments using the FTS index and scans unindexed fragments with flat search, then merges the results.
 
@@ -339,7 +389,7 @@ print(stats["num_unindexed_rows"], stats["num_indexed_rows"])
 
 If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, stop words, or stemming), rebuild the index with `create_scalar_index(..., replace=True)` so the full dataset is indexed with the new configuration.
 
-## Index Configuration Best Practices
+### Index Configuration Best Practices
 
 - The `with_position` parameter should be enabled when you need phrase queries, as it stores word positions within documents. However, for simple term searches, disabling this feature can save considerable storage space without impacting performance.
 
@@ -349,8 +399,7 @@ If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, st
 
 - Consider enabling `remove_stop_words=True` for cleaner search results, especially in content-heavy applications. This removes common words like "the", "and", "is" from the index, reducing noise and improving relevance. However, keep stop words if they carry important meaning in your domain.
 
-
-## Query Optimization
+### Query Optimization
 
 Using specific, targeted search terms often yields better performance than broad, generic queries. More specific terms reduce the number of potential matches and allow the index to work more efficiently. Consider analyzing your most common search patterns and optimizing your index configuration accordingly.
 
