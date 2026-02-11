@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
+use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
@@ -921,170 +921,16 @@ impl DatasetIndexExt for Dataset {
         }
 
         if index_name == FRAG_REUSE_INDEX_NAME {
-            let index = self
-                .open_frag_reuse_index(&NoOpMetricsCollector)
-                .await?
-                .expect("FragmentReuse index does not exist");
-            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
-                message: format!("Failed to serialize index statistics: {}", e),
-                location: location!(),
-            });
+            return index_statistics_frag_reuse(self).boxed().await;
         }
 
         if index_name == MEM_WAL_INDEX_NAME {
-            let index = self
-                .open_mem_wal_index(&NoOpMetricsCollector)
-                .await?
-                .expect("MemWal index does not exist");
-            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
-                message: format!("Failed to serialize index statistics: {}", e),
-                location: location!(),
-            });
+            return index_statistics_mem_wal(self).boxed().await;
         }
 
-        let field_id = metadatas[0].fields[0];
-        let field_path = self.schema().field_path(field_id)?;
-
-        let mut indices_stats = Vec::with_capacity(metadatas.len());
-        let mut index_uri: Option<String> = None;
-        let mut index_typename: Option<String> = None;
-
-        for meta in metadatas.iter() {
-            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
-            let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
-            if index_uri.is_none() {
-                index_uri = Some(index_details.type_url.clone());
-            }
-            let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-
-            if let Ok(plugin) = index_details_wrapper.get_plugin() {
-                if index_typename.is_none() {
-                    index_typename = Some(plugin.name().to_string());
-                }
-
-                if let Some(stats) = plugin
-                    .load_statistics(index_store.clone(), index_details.as_ref())
-                    .await?
-                {
-                    indices_stats.push(stats);
-                    continue;
-                }
-            }
-
-            let index = self
-                .open_generic_index(&field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
-                .await?;
-
-            if index_typename.is_none() {
-                // Fall back to a friendly name from the type URL if the plugin is unknown
-                let uri = index_uri
-                    .as_deref()
-                    .unwrap_or_else(|| index_details.type_url.as_str());
-                index_typename = Some(type_name_from_uri(uri));
-            }
-
-            indices_stats.push(index.statistics()?);
-        }
-
-        let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
-        let index_type_hint = indices_stats
-            .first()
-            .and_then(|stats| stats.get("index_type"))
-            .and_then(|v| v.as_str());
-        let index_type = legacy_type_name(&index_uri, index_type_hint);
-
-        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
-
-        let res = indexed_fragments_per_delta
-            .iter()
-            .map(|frags| {
-                let mut sum = 0;
-                for frag in frags.iter() {
-                    sum += frag.num_rows().ok_or_else(|| Error::Internal {
-                        message: "Fragment should have row counts, please upgrade lance and \
-                                      trigger a single write to fix this"
-                            .to_string(),
-                        location: location!(),
-                    })?;
-                }
-                Ok(sum)
-            })
-            .collect::<Result<Vec<_>>>();
-
-        async fn migrate_and_recompute(ds: &Dataset, index_name: &str) -> Result<String> {
-            let mut ds = ds.clone();
-            log::warn!(
-                "Detecting out-dated fragment metadata, migrating dataset. \
-                        To disable migration, set LANCE_AUTO_MIGRATION=false"
-            );
-            ds.delete("false").await.map_err(|err| {
-                Error::Execution {
-                    message: format!("Failed to migrate dataset while calculating index statistics. \
-                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}", err),
-                    location: location!(),
-                }
-            })?;
-            ds.index_statistics(index_name).await
-        }
-
-        let num_indexed_rows_per_delta = match res {
-            Ok(rows) => rows,
-            Err(Error::Internal { message, .. })
-                if auto_migrate_corruption() && message.contains("trigger a single write") =>
-            {
-                return migrate_and_recompute(self, index_name).await;
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut fragment_ids = HashSet::new();
-        for frags in indexed_fragments_per_delta.iter() {
-            for frag in frags.iter() {
-                if !fragment_ids.insert(frag.id) {
-                    if auto_migrate_corruption() {
-                        return migrate_and_recompute(self, index_name).await;
-                    } else {
-                        return Err(Error::Internal {
-                            message:
-                                "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
-                                  and trigger a single write to fix this"
-                                    .to_string(),
-                            location: location!(),
-                        });
-                    }
-                }
-            }
-        }
-        let num_indexed_fragments = fragment_ids.len();
-
-        let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
-        let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
-        let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
-
-        // Calculate updated_at as max(created_at) from all index metadata
-        let updated_at = metadatas
-            .iter()
-            .filter_map(|m| m.created_at)
-            .max()
-            .map(|dt| dt.timestamp_millis() as u64);
-
-        let stats = json!({
-            "index_type": index_type,
-            "name": index_name,
-            "num_indices": metadatas.len(),
-            "indices": indices_stats,
-            "num_indexed_fragments": num_indexed_fragments,
-            "num_indexed_rows": num_indexed_rows,
-            "num_unindexed_fragments": num_unindexed_fragments,
-            "num_unindexed_rows": num_unindexed_rows,
-            "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
-            "updated_at_timestamp_ms": updated_at,
-        });
-
-        serde_json::to_string(&stats).map_err(|e| Error::Index {
-            message: format!("Failed to serialize index statistics: {}", e),
-            location: location!(),
-        })
+        index_statistics_scalar(self, index_name, metadatas)
+            .boxed()
+            .await
     }
 
     async fn read_index_partition(
@@ -1130,6 +976,213 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+}
+
+fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {
+    let mut rows_per_delta = Vec::with_capacity(indexed_fragments_per_delta.len());
+    for frags in indexed_fragments_per_delta {
+        let mut sum = 0usize;
+        for frag in frags {
+            sum += frag.num_rows().ok_or_else(|| Error::Internal {
+                message: "Fragment should have row counts, please upgrade lance and \
+                                      trigger a single write to fix this"
+                    .to_string(),
+                location: location!(),
+            })?;
+        }
+        rows_per_delta.push(sum);
+    }
+    Ok(rows_per_delta)
+}
+
+fn unique_indexed_fragment_count(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Option<usize> {
+    let mut fragment_ids = HashSet::new();
+    for frags in indexed_fragments_per_delta {
+        for frag in frags {
+            if !fragment_ids.insert(frag.id) {
+                return None;
+            }
+        }
+    }
+    Some(fragment_ids.len())
+}
+
+fn serialize_index_statistics(stats: &serde_json::Value) -> Result<String> {
+    serde_json::to_string(stats).map_err(|e| Error::Index {
+        message: format!("Failed to serialize index statistics: {}", e),
+        location: location!(),
+    })
+}
+
+async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) -> Result<String> {
+    let mut ds = ds.clone();
+    log::warn!(
+        "Detecting out-dated fragment metadata, migrating dataset. \
+                        To disable migration, set LANCE_AUTO_MIGRATION=false"
+    );
+    ds.delete("false").await.map_err(|err| Error::Execution {
+        message: format!(
+            "Failed to migrate dataset while calculating index statistics. \
+                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
+            err
+        ),
+        location: location!(),
+    })?;
+    ds.index_statistics(index_name).await
+}
+
+async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
+    let index = ds
+        .open_frag_reuse_index(&NoOpMetricsCollector)
+        .await?
+        .expect("FragmentReuse index does not exist");
+    serialize_index_statistics(&index.statistics()?)
+}
+
+async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
+    let index = ds
+        .open_mem_wal_index(&NoOpMetricsCollector)
+        .await?
+        .expect("MemWal index does not exist");
+    serialize_index_statistics(&index.statistics()?)
+}
+
+async fn index_statistics_scalar(
+    ds: &Dataset,
+    index_name: &str,
+    metadatas: Vec<IndexMetadata>,
+) -> Result<String> {
+    let field_id = metadatas[0].fields[0];
+    let field_path = ds.schema().field_path(field_id)?;
+
+    let (indices_stats, index_uri, num_indices, updated_at) =
+        collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
+
+    let index_type_hint = indices_stats
+        .first()
+        .and_then(|stats| stats.get("index_type"))
+        .and_then(|v| v.as_str());
+    let index_type = legacy_type_name(&index_uri, index_type_hint);
+
+    let Some((
+        num_indexed_rows_per_delta,
+        num_indexed_fragments,
+        num_unindexed_fragments,
+        num_indexed_rows,
+        num_unindexed_rows,
+    )) = gather_fragment_statistics(ds, index_name).await?
+    else {
+        return migrate_and_recompute_index_statistics(ds, index_name).await;
+    };
+
+    let stats = json!({
+        "index_type": index_type,
+        "name": index_name,
+        "num_indices": num_indices,
+        "indices": indices_stats,
+        "num_indexed_fragments": num_indexed_fragments,
+        "num_indexed_rows": num_indexed_rows,
+        "num_unindexed_fragments": num_unindexed_fragments,
+        "num_unindexed_rows": num_unindexed_rows,
+        "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
+        "updated_at_timestamp_ms": updated_at,
+    });
+
+    serialize_index_statistics(&stats)
+}
+
+async fn collect_regular_indices_statistics(
+    ds: &Dataset,
+    metadatas: Vec<IndexMetadata>,
+    field_path: &str,
+) -> Result<(Vec<serde_json::Value>, String, usize, Option<u64>)> {
+    let num_indices = metadatas.len();
+    let updated_at = metadatas
+        .iter()
+        .filter_map(|m| m.created_at)
+        .max()
+        .map(|dt| dt.timestamp_millis() as u64);
+
+    let mut indices_stats = Vec::with_capacity(num_indices);
+    let mut index_uri: Option<String> = None;
+
+    for meta in metadatas.iter() {
+        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta)?);
+        let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
+        if index_uri.is_none() {
+            index_uri = Some(index_details.type_url.clone());
+        }
+
+        let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+        if let Ok(plugin) = index_details_wrapper.get_plugin() {
+            if let Some(stats) = plugin
+                .load_statistics(index_store.clone(), index_details.as_ref())
+                .await?
+            {
+                indices_stats.push(stats);
+                continue;
+            }
+        }
+
+        let index = ds
+            .open_generic_index(field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await?;
+
+        indices_stats.push(index.statistics()?);
+    }
+
+    Ok((
+        indices_stats,
+        index_uri.unwrap_or_else(|| "unknown".to_string()),
+        num_indices,
+        updated_at,
+    ))
+}
+
+async fn gather_fragment_statistics(
+    ds: &Dataset,
+    index_name: &str,
+) -> Result<Option<(Vec<usize>, usize, usize, usize, usize)>> {
+    let indexed_fragments_per_delta = ds.indexed_fragments(index_name).await?;
+
+    let num_indexed_rows_per_delta = match sum_indexed_rows_per_delta(&indexed_fragments_per_delta)
+    {
+        Ok(rows) => rows,
+        Err(Error::Internal { message, .. })
+            if auto_migrate_corruption() && message.contains("trigger a single write") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let Some(num_indexed_fragments) = unique_indexed_fragment_count(&indexed_fragments_per_delta)
+    else {
+        if auto_migrate_corruption() {
+            return Ok(None);
+        }
+        return Err(Error::Internal {
+            message: "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                                  and trigger a single write to fix this"
+                .to_string(),
+            location: location!(),
+        });
+    };
+
+    let num_unindexed_fragments = ds.fragments().len() - num_indexed_fragments;
+    let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().sum();
+
+    drop(indexed_fragments_per_delta);
+    let total_rows = ds.count_rows(None).await?;
+    let num_unindexed_rows = total_rows - num_indexed_rows;
+
+    Ok(Some((
+        num_indexed_rows_per_delta,
+        num_indexed_fragments,
+        num_unindexed_fragments,
+        num_indexed_rows,
+        num_unindexed_rows,
+    )))
 }
 
 pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
