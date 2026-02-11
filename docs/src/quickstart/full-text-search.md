@@ -87,6 +87,7 @@ You can customize the index creation with various parameters to optimize for you
 ds.create_scalar_index(
     column="text",
     index_type="INVERTED",
+    name="text_idx",              # Optional index name (if omitted, default is "text_idx")
     with_position=False,          # Set True to enable phrase queries (stores token positions)
     base_tokenizer="simple",      # Tokenizer: "simple" (whitespace+punct), "whitespace", or "raw" (no tokenization)
     language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
@@ -308,34 +309,37 @@ query_result = ds.to_table(
 # category: [["food"]]
 ```
 
-## Performance Optimization Tips
+## Index Maintenance
 
-### Fast Search Mode
+When you append new rows after creating an `INVERTED` index, Lance still returns those rows in `full_text_query` results. It searches indexed fragments using the FTS index and scans unindexed fragments with flat search, then merges the results.
 
-For maximum performance, you can enable fast search mode which only searches indexed data:
+To keep FTS latency low as new data arrives, you can periodically add unindexed fragments into the existing FTS index to keep the index up-to-date by calling `ds.optimize.optimize_indices()` as follows.
 
 ```python
-table = ds.to_table(
-    full_text_query="train",
-    fast_search=True  # Only search indexed data for faster results
+# Append new data
+new_rows = pa.table(
+    {
+        "id": [4],
+        "text": ["The next train leaves at noon"],
+    }
 )
+ds.insert(new_rows)
+
+# Incrementally update existing indices (including "text_idx")
+ds.optimize.optimize_indices(index_names=["text_idx"])
+
+# Optional: monitor index coverage
+stats = ds.stats.index_stats("text_idx")
+print(stats["num_unindexed_rows"], stats["num_indexed_rows"])
 ```
 
-### Index Maintenance
+!!! info
+    If you used a custom index name, replace `"text_idx"` with your index name.
+    If you did not set `name=...` when creating the FTS index on column `"text"`, the default index name is `"text_idx"`.
 
-As your data evolves over time, it's important to periodically rebuild your indexes to maintain optimal search performance. When you add, modify, or delete documents, the existing index may become less efficient. Consider scheduling regular index rebuilds, especially for datasets with frequent updates.
+If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, stop words, or stemming), rebuild the index with `create_scalar_index(..., replace=True)` so the full dataset is indexed with the new configuration.
 
-Large indexes consume more storage space but provide significantly faster search performance. Monitor your index sizes and balance storage costs against performance requirements. For production systems, you may want to set up monitoring to track index growth and performance metrics.
-
-### Query Optimization
-
-Using specific, targeted search terms often yields better performance than broad, generic queries. More specific terms reduce the number of potential matches and allow the index to work more efficiently. Consider analyzing your most common search patterns and optimizing your index configuration accordingly.
-
-For maximum performance when you only need results from indexed data, enable the `fast_search=True` parameter. This bypasses any non-indexed data and can dramatically improve query speed, though it may miss some results if your index doesn't cover all your data.
-
-Combining full-text search with metadata filters can significantly reduce the search space and improve performance. Use structured data filters to narrow down results before applying text search, or vice versa. This approach is particularly effective for large datasets where you can eliminate many irrelevant documents early in the query process.
-
-### Index Configuration Best Practices
+## Index Configuration Best Practices
 
 - The `with_position` parameter should be enabled when you need phrase queries, as it stores word positions within documents. However, for simple term searches, disabling this feature can save considerable storage space without impacting performance.
 
@@ -344,6 +348,13 @@ Combining full-text search with metadata filters can significantly reduce the se
 - Enable stemming (`stem=True`) when you want better recall by matching word variations (e.g., "running" matches "run"). However, disable stemming if you need exact term matching or if your domain requires precise terminology.
 
 - Consider enabling `remove_stop_words=True` for cleaner search results, especially in content-heavy applications. This removes common words like "the", "and", "is" from the index, reducing noise and improving relevance. However, keep stop words if they carry important meaning in your domain.
+
+
+## Query Optimization
+
+Using specific, targeted search terms often yields better performance than broad, generic queries. More specific terms reduce the number of potential matches and allow the index to work more efficiently. Consider analyzing your most common search patterns and optimizing your index configuration accordingly.
+
+Combining full-text search with metadata filters can significantly reduce the search space and improve performance. Use structured data filters to narrow down results before applying text search, or vice versa. This approach is particularly effective for large datasets where you can eliminate many irrelevant documents early in the query process.
 
 ## Next Steps
 
