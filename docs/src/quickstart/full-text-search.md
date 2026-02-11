@@ -5,7 +5,7 @@ description: Full-text search (FTS) with inverted BM25 indexes and N-gram search
 
 # Full-Text Search in Lance
 
-Lance provides powerful full-text search (FTS) capabilities using an inverted index. This tutorial will guide you through building and using FTS indexes to dramatically speed up text search operations while maintaining high accuracy.
+Lance provides powerful full-text search (FTS) capabilities using an inverted index. This tutorial guides you through building and using FTS indexes to dramatically speed up text search operations while maintaining high accuracy.
 
 By the end of this tutorial, you'll be able to build and use an FTS index, understand performance differences between indexed and non-indexed searches, and learn how to tune search parameters for optimal performance.
 
@@ -28,16 +28,16 @@ import pyarrow as pa
 
 ## Prepare Your Text Data
 
-For this quickstart page, we'll create a simple dataset with text documents:
+In this quickstart, we'll create a simple dataset with text documents:
 
 ```python
 table = pa.table(
     {
         "id": [1, 2, 3],
         "text": [
-            "I left my umbrella on the morning train to Boston",
+            "I left my umbrella on the evening train to Boston",
             "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-            "This train is scheduled to leave for Edinburgh at 9:30 AM",
+            "This train is scheduled to leave for Edinburgh at 9:30 in the morning",
         ],
     }
 )
@@ -46,7 +46,7 @@ table = pa.table(
 lance.write_dataset(table, "/tmp/fts.lance", mode="overwrite")
 ```
 
-This creates a Lance dataset with three text documents containing somewhat overlapping keywords that we'll use to demonstrate various search scenarios.
+This creates a Lance dataset with three text documents containing overlapping keywords that we'll use to demonstrate different search scenarios.
 
 ## Explore Your Dataset Schema
 
@@ -65,7 +65,7 @@ text: large_string
 
 ## Build the Full-Text Search Index
 
-Full-text search is created with an inverted scalar index on your text column. You can choose the `INVERTED` index type when calling the `create_scalar_index` method on your Lance dataset. Lance uses the BM25 ranking algorithm for relevance scoring. Results are automatically ranked by relevance, with higher scores indicating better matches.
+Full-text search is created with an inverted scalar index on your text column. Choose the `INVERTED` index type when calling `create_scalar_index` on your Lance dataset. Lance uses the BM25 ranking algorithm for relevance scoring. Results are automatically ranked by relevance, with higher scores indicating better matches.
 
 ```python
 ds.create_scalar_index(
@@ -147,7 +147,7 @@ _score: [[..., ...]]
 ## Combining Full-Text Search with Metadata
 
 It can be useful to combine FTS with metadata filtering in a single query to find more relevant results.
-This is done by passing in the column name and its value to the `filter` parameter when querying.
+You can do this by passing a filter expression to the `filter` parameter.
 
 ```python
 import lance
@@ -192,7 +192,7 @@ query_result = ds.to_table(
 
 ### Boolean Search Operators
 
-You can query via boolean search operators by constructing a structured query object.
+You can use boolean search operators by constructing a structured query object.
 
 #### All terms: `AND`
 ```python
@@ -220,7 +220,7 @@ query_result = ds.to_table(full_text_query=or_query)
 
 #### Mix `AND`/`OR` queries via operators
 
-You can mix `AND`/`OR` queries using operators and syntactic sugar in Python:
+You can mix `AND`/`OR` queries using operators in Python:
 
 ```python
 from lance.query import FullTextOperator, MatchQuery
@@ -277,12 +277,12 @@ table = ds.to_table(full_text_query="'train to boston'")
 # text: [["I left my umbrella on the evening train to Boston"]]
 ```
 
-!!! warning "Stopwords are removed by default"
-    Common words like "to", "the", etc. are categorized as stopwords, and are removed by default when creating the index. If you want to search exact phrases that include stopwords, you need to set `remove_stop_words=False` when creating the index.
+!!! warning "Stop Words Are Removed by Default"
+    Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set `remove_stop_words=False` when creating the index.
 
 ### Substring matches with N-gram indexing
 
-`NGRAM` is a type of scalar index for **substring / pattern-style** searches over text. It's a good alternative to "wildcard" search queries like `term*` / `*term` (which are not parsed by `full_text_query` in Lance).
+`NGRAM` is a type of scalar index for **substring / pattern-style** searches over text. It is a good alternative to wildcard-style queries like `term*` / `*term` (which are not parsed by `full_text_query` in Lance).
 
 The N-gram index creates a bitmap for each N-gram in the string. By default, Lance uses trigrams. This index can be used to speed up queries using the `contains` function in filters.
 
@@ -344,7 +344,8 @@ query_result = ds.to_table(
 ```
 
 To enforce exact prefixes during fuzzy matching, set `prefix_length`.
-This means the first `N` characters must match exactly before fuzzy edits are allowed on the rest of the term. For example, with `prefix_length=2`, `"rammen"` can match terms starting with `"ra"` (like `"ramen"`), but not terms starting with other prefixes.
+This means the first `N` characters must match exactly before fuzzy edits are allowed on the rest of the term.
+For example, with `prefix_length=2`, `"rammen"` can match terms starting with `"ra"` (like `"ramen"`), but not terms starting with other prefixes.
 
 ```python
 query_result = ds.to_table(
@@ -361,9 +362,9 @@ query_result = ds.to_table(
 
 ### Index Maintenance
 
-When you append new rows after creating an `INVERTED` index, Lance still returns those rows in `full_text_query` results. It searches indexed fragments using the FTS index and scans unindexed fragments with flat search, then merges the results.
+When you append new rows after creating an `INVERTED` index, Lance still returns those rows in `full_text_query` results. It searches indexed fragments using the FTS index, scans unindexed fragments with flat search, and then merges the results.
 
-To keep FTS latency low as new data arrives, you can periodically add unindexed fragments into the existing FTS index to keep the index up-to-date by calling `ds.optimize.optimize_indices()` as follows.
+To keep FTS latency low as new data arrives, periodically add unindexed fragments into the existing FTS index by calling `ds.optimize.optimize_indices()`:
 
 ```python
 # Append new data
@@ -391,13 +392,13 @@ If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, st
 
 ### Index Configuration Best Practices
 
-- The `with_position` parameter should be enabled when you need phrase queries, as it stores word positions within documents. However, for simple term searches, disabling this feature can save considerable storage space without impacting performance.
+- Enable `with_position` when you need phrase queries, because it stores word positions within documents. For simple term searches, disabling this option can save considerable storage space without impacting performance.
 
 - Keep `lower_case=True` enabled for most applications to ensure case-insensitive search behavior. This provides a better user experience and matches common search expectations, though you can disable it if case sensitivity is important for your use case.
 
-- Enable stemming (`stem=True`) when you want better recall by matching word variations (e.g., "running" matches "run"). However, disable stemming if you need exact term matching or if your domain requires precise terminology.
+- Enable stemming (`stem=True`) when you want better recall by matching word variations (e.g., "running" matches "run"). Disable stemming if you need exact term matching or if your domain requires precise terminology.
 
-- Consider enabling `remove_stop_words=True` for cleaner search results, especially in content-heavy applications. This removes common words like "the", "and", "is" from the index, reducing noise and improving relevance. However, keep stop words if they carry important meaning in your domain.
+- Consider enabling `remove_stop_words=True` for cleaner search results, especially in content-heavy applications. This removes common words like "the", "and", and "is" from the index, reducing noise and improving relevance. Keep stop words if they carry important meaning in your domain.
 
 ### Query Optimization
 
