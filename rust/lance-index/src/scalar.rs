@@ -736,6 +736,7 @@ impl AnyQuery for TokenQuery {
     }
 }
 
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationQuery {
     pub value: ScalarValue,
@@ -743,12 +744,14 @@ pub struct RelationQuery {
 }
 
 /// A query that a Geo index can satisfy
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeoQuery {
     IntersectQuery(RelationQuery),
     IsNull,
 }
 
+#[cfg(feature = "geo")]
 impl AnyQuery for GeoQuery {
     fn as_any(&self) -> &dyn Any {
         self

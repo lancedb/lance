@@ -80,9 +80,17 @@ impl IndexPluginRegistry {
         self.plugins
             .get(name)
             .map(|plugin| plugin.as_ref())
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("No scalar index plugin found for name {}", name).into(),
-                location: location!(),
+            .ok_or_else(|| {
+                let hint = if name == "rtree" {
+                    ". The 'rtree' index requires the `geo` feature. \
+                     Rebuild with `--features geo` to enable geospatial support"
+                } else {
+                    ""
+                };
+                Error::InvalidInput {
+                    source: format!("No scalar index plugin found for name '{name}'{hint}").into(),
+                    location: location!(),
+                }
             })
     }
 
