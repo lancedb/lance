@@ -48,6 +48,7 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    tag: Option<String>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -65,6 +66,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
+            tag: None,
         }
     }
 
@@ -178,6 +180,15 @@ impl<'a> CommitBuilder<'a> {
         transaction_properties: HashMap<String, String>,
     ) -> Self {
         self.transaction_properties = Some(Arc::new(transaction_properties));
+        self
+    }
+
+    /// If set, a tag with this name will be created pointing to the committed
+    /// version. The tag is created after the commit succeeds. If the tag
+    /// creation fails (e.g. because a tag with that name already exists),
+    /// the commit will still be persisted but an error will be returned.
+    pub fn with_tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag;
         self
     }
 
@@ -377,14 +388,14 @@ impl<'a> CommitBuilder<'a> {
 
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
-        match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
+        let dataset = match &self.dest {
+            WriteDestination::Dataset(dataset) => Dataset {
                 manifest: Arc::new(manifest),
                 manifest_location,
                 session,
                 fragment_bitmap,
                 ..dataset.as_ref().clone()
-            }),
+            },
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -396,7 +407,7 @@ impl<'a> CommitBuilder<'a> {
                     },
                 );
 
-                Ok(Dataset {
+                Dataset {
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),
@@ -410,9 +421,26 @@ impl<'a> CommitBuilder<'a> {
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
-                })
+                }
             }
+        };
+
+        if let Some(ref tag_name) = self.tag {
+            let version = dataset.manifest.version;
+            dataset
+                .tags()
+                .create(tag_name, version)
+                .await
+                .map_err(|e| Error::Internal {
+                    message: format!(
+                        "Commit successful (v{}) but tag '{}' creation failed: {}",
+                        version, tag_name, e
+                    ),
+                    location: location!(),
+                })?;
         }
+
+        Ok(dataset)
     }
 
     /// Commit a set of transactions as a single new version.
@@ -791,5 +819,55 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_with_tag() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test_tag")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Commit with a tag
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .with_tag(Some("v1".to_string()))
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(new_ds.manifest.version, 2);
+
+        // Verify tag exists and points to correct version
+        let tag_version = new_ds.tags().get_version("v1").await.unwrap();
+        assert_eq!(tag_version, 2);
+
+        // Commit without a tag still works (no regression)
+        let new_ds2 = CommitBuilder::new(Arc::new(new_ds))
+            .execute(sample_transaction(2))
+            .await
+            .unwrap();
+        assert_eq!(new_ds2.manifest.version, 3);
+
+        // Duplicate tag name should fail (data committed, but error raised)
+        let result = CommitBuilder::new(Arc::new(new_ds2))
+            .with_tag(Some("v1".to_string()))
+            .execute(sample_transaction(3))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("tag"),
+            "Error should mention tag: {err_msg}"
+        );
     }
 }

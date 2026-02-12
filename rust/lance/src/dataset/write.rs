@@ -245,6 +245,10 @@ pub struct WriteParams {
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// If set, a tag with this name will be created pointing to the committed
+    /// version. The tag is created after a successful commit.
+    pub tag: Option<String>,
 }
 
 impl Default for WriteParams {
@@ -269,6 +273,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            tag: None,
         }
     }
 }

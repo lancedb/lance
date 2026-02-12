@@ -2110,7 +2110,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, tag = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2123,6 +2123,7 @@ impl Dataset {
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
+        tag: Option<String>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2143,13 +2144,14 @@ impl Dataset {
             detached,
             max_retries,
             enable_stable_row_ids,
+            tag,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, tag = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2160,6 +2162,7 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
+        tag: Option<String>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2187,7 +2190,8 @@ impl Dataset {
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
-            .with_max_retries(max_retries.unwrap_or(20));
+            .with_max_retries(max_retries.unwrap_or(20))
+            .with_tag(tag);
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);
@@ -3109,6 +3113,10 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             if !target_bases_list.is_empty() {
                 p = p.with_target_base_names_or_paths(target_bases_list);
             }
+        }
+
+        if let Some(tag) = get_dict_opt::<String>(options, "tag")? {
+            p.tag = Some(tag);
         }
 
         // Handle properties

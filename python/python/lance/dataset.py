@@ -3396,6 +3396,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        tag: Optional[str] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3462,6 +3463,11 @@ class LanceDataset(pa.dataset.Dataset):
             row IDs assign each row a monotonically increasing id that persists
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
+        tag: str, optional
+            If set, a tag with this name will be created pointing to the committed
+            version. The tag is created after the commit succeeds. If the tag
+            creation fails (e.g. because a tag with that name already exists),
+            the data will still be committed but an error will be raised.
 
         Returns
         -------
@@ -3532,6 +3538,7 @@ class LanceDataset(pa.dataset.Dataset):
                 detached=detached,
                 max_retries=max_retries,
                 enable_stable_row_ids=enable_stable_row_ids,
+                tag=tag,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3546,6 +3553,7 @@ class LanceDataset(pa.dataset.Dataset):
                 max_retries=max_retries,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
+                tag=tag,
             )
         else:
             raise TypeError(
@@ -5593,6 +5601,7 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    tag: Optional[str] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5694,6 +5703,11 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
+    tag : optional, str
+        If set, a tag with this name will be created pointing to the committed
+        version. The tag is created after the commit succeeds. If the tag
+        creation fails (e.g. because a tag with that name already exists),
+        the data will still be committed but an error will be raised.
 
     Notes
     -----
@@ -5843,6 +5857,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "tag": tag,
     }
 
     # Add storage_options_provider if created from namespace

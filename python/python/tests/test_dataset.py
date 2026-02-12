@@ -571,6 +571,33 @@ def test_tag_order(tmp_path: Path):
     assert tags_default == tags_desc, "Default order should match descending order"
 
 
+def test_tag_on_write(tmp_path: Path):
+    table = pa.table({"a": [1, 2], "b": ["x", "y"]})
+    base_dir = tmp_path / "test"
+
+    # write_dataset with tag
+    ds = lance.write_dataset(table, base_dir, tag="v1")
+    assert ds.tags.get_version("v1") == 1
+
+    # append with tag
+    ds = lance.write_dataset(table, base_dir, mode="append", tag="v2")
+    assert ds.tags.get_version("v2") == 2
+
+    # commit API with tag
+    tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+    frag = lance.fragment.LanceFragment.create(base_dir, tab2)
+    operation = lance.LanceOperation.Append([frag])
+    ds = lance.LanceDataset.commit(base_dir, operation, read_version=2, tag="v3")
+    assert ds.tags.get_version("v3") == 3
+
+    # duplicate tag should raise error (but data is committed)
+    with pytest.raises(Exception, match="tag"):
+        lance.write_dataset(table, base_dir, mode="append", tag="v1")
+    # verify version 4 was still committed
+    ds = lance.dataset(base_dir)
+    assert ds.version == 4
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"
