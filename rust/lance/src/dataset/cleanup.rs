@@ -1131,7 +1131,9 @@ mod tests {
         fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
-            let dataset_path = format!("{}/my_db", tmpdir_path);
+            // Use file-object-store:// scheme so that writes go through the ObjectStore
+            // wrapper chain (MockObjectStore) instead of the optimized local writer path.
+            let dataset_path = format!("file-object-store://{}/my_db", tmpdir_path);
             Ok(Self {
                 _tmpdir: tmpdir,
                 dataset_path,
