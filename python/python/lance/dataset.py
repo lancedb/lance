@@ -2490,6 +2490,8 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
+        preprocessed_data=None,
+        range_id: Optional[int] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2758,11 +2760,15 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
-        # Add fragment_ids and index_uuid to kwargs if provided
+        # Add fragment_ids, index_uuid, preprocessed_data, range_id to kwargs
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
         if index_uuid is not None:
             kwargs["index_uuid"] = index_uuid
+        if preprocessed_data is not None:
+            kwargs["preprocessed_data"] = preprocessed_data
+        if range_id is not None:
+            kwargs["range_id"] = range_id
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 

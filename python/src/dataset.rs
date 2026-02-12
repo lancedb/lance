@@ -1823,10 +1823,19 @@ impl Dataset {
 
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::new(ScalarIndexParams {
-                index_type: "btree".to_string(),
-                params: None,
-            }),
+            "BTREE" => {
+                let mut btree_params: Option<String> = None;
+                if let Some(kwargs) = kwargs {
+                    if let Some(range_id) = kwargs.get_item("range_id")? {
+                        let range_id: u32 = range_id.extract()?;
+                        btree_params = Some(format!("{{\"range_id\":{}}}", range_id));
+                    }
+                }
+                Box::new(ScalarIndexParams {
+                    index_type: "btree".to_string(),
+                    params: btree_params,
+                })
+            }
             "BITMAP" => Box::new(ScalarIndexParams {
                 index_type: "bitmap".to_string(),
                 params: None,
@@ -1962,7 +1971,29 @@ impl Dataset {
             None
         };
 
-        // Add fragment_ids and index_uuid support
+        // Extract preprocessed_data from kwargs
+        let preprocessed_data: Option<Box<dyn RecordBatchReader + Send>> =
+            if let Some(kwargs) = kwargs {
+                kwargs
+                    .get_item("preprocessed_data")?
+                    .and_then(|v| {
+                        if v.is_none() {
+                            None
+                        } else {
+                            Some(
+                                ArrowArrayStreamReader::from_pyarrow_bound(&v)
+                                    .map(|r| Box::new(r) as Box<dyn RecordBatchReader + Send>),
+                            )
+                        }
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+
+        let has_preprocessed_data = preprocessed_data.is_some();
+
+        // Add fragment_ids, index_uuid, and preprocessed_data support
         let has_fragment_ids = fragment_ids.is_some();
         if let Some(fragment_ids) = fragment_ids {
             builder = builder.fragments(fragment_ids);
@@ -1970,11 +2001,14 @@ impl Dataset {
         if let Some(index_uuid) = index_uuid {
             builder = builder.index_uuid(index_uuid);
         }
+        if let Some(preprocessed_data) = preprocessed_data {
+            builder = builder.preprocessed_data(preprocessed_data);
+        }
 
         use std::future::IntoFuture;
 
-        // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
-        let index_metadata = if has_fragment_ids {
+        // Use execute_uncommitted if fragment_ids or preprocessed_data is provided
+        let index_metadata = if has_fragment_ids || has_preprocessed_data {
             // For fragment-level indexing, use execute_uncommitted
             let index_metadata = rt()
                 .block_on(None, builder.execute_uncommitted())?
