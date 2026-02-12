@@ -9156,16 +9156,16 @@ mod test {
         // Verify we get results from all fragments by checking all value ranges are present
         let has_fragment_0 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (0..200).contains(&val)));
+            .any(|v| v.is_some_and(|val| (0..200).contains(&val)));
         let has_fragment_1 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (200..400).contains(&val)));
+            .any(|v| v.is_some_and(|val| (200..400).contains(&val)));
         let has_fragment_2 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (400..410).contains(&val)));
+            .any(|v| v.is_some_and(|val| (400..410).contains(&val)));
         let has_fragment_3 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (410..420).contains(&val)));
+            .any(|v| v.is_some_and(|val| (410..420).contains(&val)));
         assert!(
             has_fragment_0 && has_fragment_1 && has_fragment_2 && has_fragment_3,
             "Expected results from all fragments"
@@ -9291,16 +9291,16 @@ mod test {
         // Verify we get results from all fragments
         let has_fragment_0 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (0..200).contains(&val)));
+            .any(|v| v.is_some_and(|val| (0..200).contains(&val)));
         let has_fragment_1 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (200..400).contains(&val)));
+            .any(|v| v.is_some_and(|val| (200..400).contains(&val)));
         let has_fragment_2 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (400..410).contains(&val)));
+            .any(|v| v.is_some_and(|val| (400..410).contains(&val)));
         let has_fragment_3 = i_array
             .iter()
-            .any(|v| v.map_or(false, |val| (410..420).contains(&val)));
+            .any(|v| v.is_some_and(|val| (410..420).contains(&val)));
         assert!(
             has_fragment_0 && has_fragment_1 && has_fragment_2 && has_fragment_3,
             "Expected results from all fragments"
