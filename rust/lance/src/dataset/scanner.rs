@@ -9120,6 +9120,103 @@ mod test {
         );
     }
 
+    fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {
+        assert!(!array.is_empty(), "Expected some results but got none");
+        assert!(
+            array
+                .iter()
+                .all(|v| v.is_some_and(|val| range.contains(&val))),
+            "{msg} (expected range {range:?})"
+        );
+    }
+
+    // Helper to assert that results exist from all fragment ranges
+    fn assert_has_all_fragments(array: &Int32Array) {
+        assert!(
+            array
+                .iter()
+                .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (200..400).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (400..410).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (410..420).contains(&val))),
+            "Expected results from all fragments"
+        );
+    }
+
+    // Common test function for fragment list filtering
+    async fn test_fragment_list_filtering(
+        test_ds: &TestVectorDataset,
+        fragments: &[Fragment],
+        mut build_scanner: impl FnMut(&Dataset) -> Scanner,
+    ) {
+        // Test 1: Query without fragment filter - should get results from all fragments
+        let batch = build_scanner(&test_ds.dataset)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_has_all_fragments(i_array);
+
+        // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[2].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(i_array, 400..410, "Should only get results from fragment 2");
+
+        // Test 3: Query only indexed fragments (fragments 0 and 1)
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            0..400,
+            "Should only get results from indexed fragments",
+        );
+
+        // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![
+            fragments[0].clone(),
+            fragments[1].clone(),
+            fragments[2].clone(),
+        ]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            0..410,
+            "Should get results from fragments 0, 1, and 2, excluding fragment 3",
+        );
+    }
+
     #[tokio::test]
     async fn test_vector_search_respects_fragment_list() {
         // Create dataset with 2 initial fragments (400 rows, max 200 per file)
@@ -9145,113 +9242,12 @@ mod test {
 
         let query: Float32Array = (0..32).map(|v| v as f32).collect();
 
-        // Test 1: Query without fragment filter - should get results from all fragments
-        let mut scanner = test_ds.dataset.scan();
-        scanner.nearest("vec", &query, 420).unwrap();
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Verify we get results from all fragments by checking all value ranges are present
-        let has_fragment_0 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (0..200).contains(&val)));
-        let has_fragment_1 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (200..400).contains(&val)));
-        let has_fragment_2 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (400..410).contains(&val)));
-        let has_fragment_3 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (410..420).contains(&val)));
-        assert!(
-            has_fragment_0 && has_fragment_1 && has_fragment_2 && has_fragment_3,
-            "Expected results from all fragments"
-        );
-
-        // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
-        let fragment_2 = vec![fragments[2].clone()];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .nearest("vec", &query, 10)
-            .unwrap()
-            .with_fragments(fragment_2);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should only get results from fragment 2 (i=400..410)
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (400..410).contains(&val),
-                "Expected only values from fragment 2 (i=400..410), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from fragment 2");
-
-        // Test 3: Query only indexed fragments (fragments 0 and 1)
-        let indexed_fragments = vec![fragments[0].clone(), fragments[1].clone()];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .nearest("vec", &query, 400)
-            .unwrap()
-            .with_fragments(indexed_fragments);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should only get results from indexed fragments (i=0..400)
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (0..400).contains(&val),
-                "Expected only values from indexed fragments (i=0..400), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from indexed fragments");
-
-        // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
-        let mixed_fragments = vec![
-            fragments[0].clone(),
-            fragments[1].clone(),
-            fragments[2].clone(),
-        ];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .nearest("vec", &query, 410)
-            .unwrap()
-            .with_fragments(mixed_fragments);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should get results from fragments 0, 1, and 2 (i=0..410) only, excluding fragment 3
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (0..410).contains(&val),
-                "Expected only values from fragments 0, 1, and 2 (i=0..410), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from mixed fragments");
+        test_fragment_list_filtering(&test_ds, fragments, |dataset| {
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query, 420).unwrap();
+            scanner
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -9277,116 +9273,14 @@ mod test {
         let fragments = test_ds.dataset.fragments();
         assert_eq!(fragments.len(), 4);
 
-        // Test 1: Query without fragment filter - should get results from all fragments
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .full_text_search(FullTextSearchQuery::new("s-5".into()))
-            .unwrap();
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
         // "s-5" matches: s-5, s-50-59, s-150-159 (frag 0), s-250-259, s-350-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
-        // Verify we get results from all fragments
-        let has_fragment_0 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (0..200).contains(&val)));
-        let has_fragment_1 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (200..400).contains(&val)));
-        let has_fragment_2 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (400..410).contains(&val)));
-        let has_fragment_3 = i_array
-            .iter()
-            .any(|v| v.is_some_and(|val| (410..420).contains(&val)));
-        assert!(
-            has_fragment_0 && has_fragment_1 && has_fragment_2 && has_fragment_3,
-            "Expected results from all fragments"
-        );
-
-        // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
-        let fragment_2 = vec![fragments[2].clone()];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .full_text_search(FullTextSearchQuery::new("s-405".into()))
-            .unwrap()
-            .with_fragments(fragment_2);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should only get results from fragment 2 (i=400..410)
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (400..410).contains(&val),
-                "Expected only values from fragment 2 (i=400..410), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from fragment 2");
-
-        // Test 3: Query only indexed fragments (fragments 0 and 1)
-        let indexed_fragments = vec![fragments[0].clone(), fragments[1].clone()];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .full_text_search(FullTextSearchQuery::new("s-5".into()))
-            .unwrap()
-            .with_fragments(indexed_fragments);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should only get results from indexed fragments (i=0..400)
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (0..400).contains(&val),
-                "Expected only values from indexed fragments (i=0..400), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from indexed fragments");
-
-        // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
-        let mixed_fragments = vec![
-            fragments[0].clone(),
-            fragments[1].clone(),
-            fragments[2].clone(),
-        ];
-
-        let mut scanner = test_ds.dataset.scan();
-        scanner
-            .full_text_search(FullTextSearchQuery::new("s-5".into()))
-            .unwrap()
-            .with_fragments(mixed_fragments);
-
-        let batch = scanner.try_into_batch().await.unwrap();
-        let i_col = batch.column_by_name("i").unwrap();
-        let i_array = i_col.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Should get results from fragments 0, 1, and 2 (i=0..410) only, excluding fragment 3
-        // "s-5" matches: s-5, s-50-59, s-150-159 (frag 0), s-250-259, s-350-359 (frag 1), s-405 (frag 2)
-        let mut has_results = false;
-        for idx in 0..i_array.len() {
-            has_results = true;
-            let val = i_array.value(idx);
-            assert!(
-                (0..410).contains(&val),
-                "Expected only values from fragments 0, 1, and 2 (i=0..410), but got i={}",
-                val
-            );
-        }
-        assert!(has_results, "Expected some results from mixed fragments");
+        test_fragment_list_filtering(&test_ds, fragments, |dataset| {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s-5".into()))
+                .unwrap();
+            scanner
+        })
+        .await;
     }
 }
