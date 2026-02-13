@@ -4,7 +4,7 @@
 //! Future implementation for thread-local io_uring operations.
 //!
 //! This future actively processes completions during polling instead of
-//! relying on background threads to wake it up.
+//! relying on background tasks.
 
 use super::current_thread::{process_thread_local_completions, submit_and_wait_thread_local};
 use super::requests::IoRequest;
@@ -55,12 +55,11 @@ impl Future for UringCurrentThreadFuture {
 
         drop(state);
 
-        // If not, then we should do any available work and the process completions.
+        // If not, then we should do any available work and then process completions.
         if let Err(e) = submit_and_wait_thread_local() {
             log::debug!("Submit and wait error: {:?}", e);
         }
 
-        // Process completions
         if let Err(e) = process_thread_local_completions() {
             log::warn!("Error processing completions: {:?}", e);
         }
@@ -85,6 +84,13 @@ impl Future for UringCurrentThreadFuture {
         }
 
         // Not done yet - immediately wake and return Pending (don't store waker)
+        // which will force the future to be polled again.  This is intentionally
+        // a busy loop.  io_uring is intended for fast disks where read latency is
+        // so small that the cost of a true context switch (parking and unparking)
+        // would be too high.
+        //
+        // We are effectively doing a "yield" here while we wait for
+        // the io_uring thread to complete the request.
         drop(state);
         cx.waker().wake_by_ref();
         Poll::Pending

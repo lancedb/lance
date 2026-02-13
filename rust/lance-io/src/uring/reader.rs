@@ -140,8 +140,8 @@ impl UringReader {
         if let Some(data) = HANDLE_CACHE.get(&cache_key).await {
             // Use known_size if provided, otherwise use cached size
             let size = known_size.unwrap_or(data.size);
-            return Ok(Box::new(UringReader {
-                handle: data.handle.clone(),
+            return Ok(Box::new(Self {
+                handle: data.handle,
                 block_size,
                 size,
                 io_tracker,
@@ -150,7 +150,7 @@ impl UringReader {
 
         // Cache miss - open file and get size
         let path_clone = path.clone();
-        let local_path = to_local_path(&path);
+        let local_path = to_local_path(path);
 
         let data = tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
@@ -178,7 +178,7 @@ impl UringReader {
         HANDLE_CACHE.insert(cache_key, data.clone()).await;
 
         // Return new reader instance
-        Ok(Box::new(UringReader {
+        Ok(Box::new(Self {
             handle: data.handle.clone(),
             block_size,
             size: data.size,

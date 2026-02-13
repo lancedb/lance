@@ -302,7 +302,7 @@ impl Default for ObjectStoreRegistry {
             "file-object-store".into(),
             Arc::new(local::FileStoreProvider),
         );
-        #[cfg(all(target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         providers.insert("file+uring".into(), Arc::new(local::FileStoreProvider));
 
         #[cfg(feature = "aws")]

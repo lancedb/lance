@@ -26,15 +26,13 @@ impl Future for UringReadFuture {
         if state.completed {
             // Operation completed - take the result
             match state.err.take() {
-                Some(err) => {
-                    return Poll::Ready(Err(object_store::Error::Generic {
-                        store: "io_uring",
-                        source: Box::new(err),
-                    }));
-                }
+                Some(err) => Poll::Ready(Err(object_store::Error::Generic {
+                    store: "io_uring",
+                    source: Box::new(err),
+                })),
                 None => {
                     let bytes = std::mem::take(&mut state.buffer).freeze();
-                    return Poll::Ready(Ok(bytes));
+                    Poll::Ready(Ok(bytes))
                 }
             }
         } else {

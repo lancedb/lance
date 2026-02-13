@@ -1,30 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! io_uring-based I/O for high-performance local file access.
+//! io_uring-based I/O for disks with high IOPS capacity (e.g. NVMe)
 //!
-//! This module provides a [`UringReader`] that implements the [`Reader`](crate::traits::Reader) trait
-//! using Linux's io_uring interface for asynchronous I/O. It uses a dedicated background thread
-//! that owns an io_uring instance and processes read requests from a channel.
+//! This module provides two implementations of the [`Reader`](crate::traits::Reader) trait
+//! using Linux's io_uring interface for asynchronous I/O.
 //!
-//! # Architecture
+//! One of these uses a pool of dedicated background threads which each own an io_uring instance.
+//! Read requests are submitted to a background thread's pool.
 //!
-//! - A dedicated background thread owns a local io_uring instance
-//! - Readers submit requests via an MPSC channel to the thread
-//! - The thread submits requests to io_uring and processes completions
-//! - Futures are woken by the thread when operations complete
-//! - Proper async integration using wakers (no busy-looping)
+//! The other implementation uses a thread-local io_uring instance.  This only works if the future
+//! is polled by the same thread that submitted the request.  This means that the runtime must be
+//! a single-threaded runtime.
 //!
 //! # Configuration
 //!
 //! The io_uring reader is enabled by using the `file+uring://` URI scheme instead of `file://`.
 //! Additional tuning parameters are controlled by environment variables:
 //!
-//! - `LANCE_URING_BLOCK_SIZE` - Block size in bytes (default: 64KB)
-//! - `LANCE_URING_IO_PARALLELISM` - Max concurrent operations (default: 32)
+//! - `LANCE_URING_CURRENT_THREAD` - Use thread-local io_uring (default: false)
+//! - `LANCE_URING_BLOCK_SIZE` - Block size in bytes (default: 4KB)
+//! - `LANCE_URING_IO_PARALLELISM` - Max concurrent operations (default: 128)
 //! - `LANCE_URING_QUEUE_DEPTH` - io_uring queue depth (default: 16K)
-//! - `LANCE_URING_CORE` - Pin io_uring thread to specific CPU core (optional)
+//! - `LANCE_URING_THREAD_COUNT` - Number of io_uring threads to use (default: 2)
+//! - `LANCE_URING_SUBMIT_BATCH_SIZE` - Number of requests to batch before submitting (default: 128)
 //! - `LANCE_URING_POLL_TIMEOUT_MS` - Thread poll timeout in milliseconds (default: 10)
+//!
+//! Note: the block size and io parallelism are not actually used by the io_uring implementation.  These
+//! variables just control what the filesystem reports up to Lance.
 //!
 //! # Platform Support
 //!
@@ -62,11 +65,11 @@ mod tests;
 pub(crate) use current_thread::UringCurrentThreadReader;
 pub use reader::UringReader;
 
-/// Default block size for io_uring reads (64KB)
-pub const DEFAULT_URING_BLOCK_SIZE: usize = 64 * 1024;
+/// Default block size for io_uring reads (4KB)
+pub const DEFAULT_URING_BLOCK_SIZE: usize = 4 * 1024;
 
-/// Default I/O parallelism for io_uring (32 concurrent operations)
-pub const DEFAULT_URING_IO_PARALLELISM: usize = 32;
+/// Default I/O parallelism for io_uring (128 concurrent operations)
+pub const DEFAULT_URING_IO_PARALLELISM: usize = 128;
 
 /// Default io_uring queue depth (16K entries)
 pub const DEFAULT_URING_QUEUE_DEPTH: usize = 16 * 1024;

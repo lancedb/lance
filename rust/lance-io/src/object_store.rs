@@ -32,7 +32,7 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
 mod list_retry;
 pub mod providers;
@@ -599,7 +599,7 @@ impl ObjectStore {
                 )
                 .await
             }
-            #[cfg(all(target_os = "linux"))]
+            #[cfg(target_os = "linux")]
             "file+uring" => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
@@ -661,7 +661,7 @@ impl ObjectStore {
                 )
                 .await
             }
-            #[cfg(all(target_os = "linux"))]
+            #[cfg(target_os = "linux")]
             "file+uring" => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")

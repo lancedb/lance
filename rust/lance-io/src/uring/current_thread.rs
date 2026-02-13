@@ -11,6 +11,7 @@ use super::requests::{IoRequest, RequestState};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM};
 use crate::local::to_local_path;
 use crate::traits::Reader;
+use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
 use crate::utils::tracking_store::IOTracker;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
@@ -34,8 +35,6 @@ use tracing::instrument;
 // Re-use file handle types from reader.rs
 use super::reader::{CacheKey, CachedReaderData, UringFileHandle, HANDLE_CACHE};
 
-const DEFAULT_QUEUE_DEPTH: usize = 1024;
-
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -47,7 +46,7 @@ struct ThreadLocalUring {
 }
 
 thread_local! {
-    static URING: RefCell<Option<ThreadLocalUring>> = RefCell::new(None);
+    static URING: RefCell<Option<ThreadLocalUring>> = const { RefCell::new(None) };
 }
 
 /// Ensure the thread-local IoUring instance is initialized
@@ -60,18 +59,15 @@ fn ensure_uring_initialized(
         let queue_depth = std::env::var("LANCE_URING_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_QUEUE_DEPTH);
+            .unwrap_or(DEFAULT_URING_QUEUE_DEPTH);
 
         let ring = IoUring::builder()
+            // Ensures work is only done in submit_and_wait
             .setup_defer_taskrun()
+            // Enable perf. optimization when there is only one issuer thread
             .setup_single_issuer()
             .build(queue_depth as u32)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to create io_uring: {}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("Failed to create io_uring: {}", e)))?;
 
         log::debug!(
             "Created thread-local io_uring with queue depth {}",
@@ -123,7 +119,7 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
         // Push to SQ
         unsafe {
             sq.push(&read_op.build().user_data(user_data))
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to push to SQ"))?;
+                .map_err(|_| io::Error::other("Failed to push to SQ"))?;
         }
         drop(sq);
 
@@ -240,8 +236,8 @@ impl UringCurrentThreadReader {
         if let Some(data) = HANDLE_CACHE.get(&cache_key).await {
             // Use known_size if provided, otherwise use cached size
             let size = known_size.unwrap_or(data.size);
-            return Ok(Box::new(UringCurrentThreadReader {
-                handle: data.handle.clone(),
+            return Ok(Box::new(Self {
+                handle: data.handle,
                 block_size,
                 size,
                 io_tracker,
@@ -250,7 +246,7 @@ impl UringCurrentThreadReader {
 
         // Cache miss - open file and get size
         let path_clone = path.clone();
-        let local_path = to_local_path(&path);
+        let local_path = to_local_path(path);
 
         let data = tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
@@ -278,7 +274,7 @@ impl UringCurrentThreadReader {
         HANDLE_CACHE.insert(cache_key, data.clone()).await;
 
         // Return new reader instance
-        Ok(Box::new(UringCurrentThreadReader {
+        Ok(Box::new(Self {
             handle: data.handle.clone(),
             block_size,
             size: data.size,

@@ -115,26 +115,6 @@ fn get_thread_count() -> usize {
 /// 3. Processes completions
 /// 4. Wakes futures via their wakers
 fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, thread_id: usize) {
-    // Pin to core if configured
-    // Format: LANCE_URING_CORE=0,1,2 or LANCE_URING_CORE=0 (applies to thread 0 only)
-    if let Ok(core_str) = std::env::var("LANCE_URING_CORE") {
-        let cores: Vec<&str> = core_str.split(',').collect();
-        if let Some(core_str) = cores.get(thread_id).or_else(|| cores.first()) {
-            if let Ok(core) = core_str.parse() {
-                if let Err(e) = pin_to_core(core) {
-                    log::warn!(
-                        "Failed to pin io_uring thread {} to core {}: {}",
-                        thread_id,
-                        core,
-                        e
-                    );
-                } else {
-                    log::info!("io_uring thread {} pinned to core {}", thread_id, core);
-                }
-            }
-        }
-    }
-
     // Create local io_uring instance
     let mut ring = IoUring::builder()
         // .setup_sqpoll(100)
@@ -296,7 +276,7 @@ fn push_to_sq(
     // Push to SQ
     unsafe {
         sq.push(&read_op.build().user_data(user_data))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to push to SQ"))?;
+            .map_err(|_| io::Error::other("Failed to push to SQ"))?;
     }
     drop(sq);
 
@@ -357,42 +337,4 @@ fn process_completions(
     }
 
     Ok(CompletionStats { iops, sectors })
-}
-
-/// Pin the current thread to a specific CPU core.
-///
-/// This uses Linux's sched_setaffinity to improve cache locality.
-fn pin_to_core(core: usize) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
-        use std::mem;
-
-        unsafe {
-            let mut cpuset: cpu_set_t = mem::zeroed();
-            CPU_ZERO(&mut cpuset);
-            CPU_SET(core, &mut cpuset);
-
-            let result = sched_setaffinity(
-                0, // current thread
-                mem::size_of::<cpu_set_t>(),
-                &cpuset,
-            );
-
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = core;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CPU pinning only supported on Linux",
-        ))
-    }
 }

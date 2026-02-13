@@ -21,7 +21,7 @@ pub mod stream;
 #[cfg(test)]
 pub mod testing;
 pub mod traits;
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub mod uring;
 pub mod utils;
 
