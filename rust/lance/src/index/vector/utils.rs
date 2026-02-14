@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
 use arrow_array::{cast::AsArray, Array, ArrayRef, FixedSizeListArray, RecordBatch};
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, MutableBuffer};
 use futures::StreamExt;
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
@@ -406,47 +406,24 @@ async fn sample_nullable_training_data(
 
     let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
 
-    let mut scan = dataset.take_scan(
+    let scan = dataset.take_scan(
         Box::pin(futures::stream::iter(ranges).map(Ok)),
         Arc::new(dataset.schema().project(&[column])?),
         dataset.object_store().io_parallelism(),
     );
 
-    // Peek at the first non-empty batch to determine the column type, then
-    // dispatch to the remainder of the scan, along with the first batch, to the
-    // appropriate streaming strategy.
-    loop {
-        let Some(batch) = scan.next().await else {
-            // No data at all — return an empty FSL array.
-            return fsl_values_to_array(vector_field, &[], 0);
-        };
-        let batch = batch?;
-        let array = get_column_from_batch(&batch, column)?;
-        if array.logical_null_count() >= array.len() {
-            continue;
+    match vector_field.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
         }
-
-        return match array.data_type() {
-            arrow::datatypes::DataType::FixedSizeList(_, _) => {
-                sample_nullable_fsl(
-                    column,
-                    sample_size_hint,
-                    byte_width,
-                    vector_field,
-                    array,
-                    scan,
-                )
-                .await
-            }
-            _ => sample_nullable_fallback(column, sample_size_hint, array, batch, scan).await,
-        };
+        _ => sample_nullable_fallback(column, sample_size_hint, scan).await,
     }
 }
 
 /// Build a FixedSizeListArray from raw flat value bytes.
 fn fsl_values_to_array(
     field: &lance_core::datatypes::Field,
-    values_buf: &[u8],
+    mut values_buf: MutableBuffer,
     num_rows: usize,
 ) -> Result<FixedSizeListArray> {
     let (inner_field, dim) = match field.data_type() {
@@ -471,7 +448,9 @@ fn fsl_values_to_array(
         })?;
 
     let expected_bytes = num_rows * dim * elem_size;
-    let buf = Buffer::from(&values_buf[..expected_bytes]);
+    debug_assert_eq!(values_buf.len(), expected_bytes);
+    values_buf.truncate(expected_bytes);
+    let buf: Buffer = values_buf.into();
     let values_array = arrow_array::make_array(ArrayData::try_new(
         inner_field.data_type().clone(),
         num_rows * dim,
@@ -501,16 +480,11 @@ async fn sample_nullable_fsl(
     sample_size_hint: usize,
     byte_width: usize,
     vector_field: &lance_core::datatypes::Field,
-    first_array: ArrayRef,
     mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
 ) -> Result<FixedSizeListArray> {
-    let mut values_buf: Vec<u8> = Vec::with_capacity(sample_size_hint * byte_width);
+    let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
     let mut num_non_null: usize = 0;
 
-    // Process the already-read first batch.
-    accumulate_fsl_non_nulls(&mut values_buf, &mut num_non_null, &first_array, byte_width)?;
-
-    // Continue streaming remaining batches.
     while num_non_null < sample_size_hint {
         let Some(batch) = scan.next().await else {
             break;
@@ -531,7 +505,7 @@ async fn sample_nullable_fsl(
         num_rows_out
     );
 
-    fsl_values_to_array(vector_field, &values_buf, num_rows_out)
+    fsl_values_to_array(vector_field, values_buf, num_rows_out)
 }
 
 /// Append non-null values from a FixedSizeList array into a flat byte buffer.
@@ -539,7 +513,7 @@ async fn sample_nullable_fsl(
 /// Uses Arrow's `filter` kernel to handle null removal and offset arithmetic,
 /// then copies the resulting contiguous bytes into the output buffer.
 fn accumulate_fsl_non_nulls(
-    values_buf: &mut Vec<u8>,
+    values_buf: &mut MutableBuffer,
     num_non_null: &mut usize,
     array: &ArrayRef,
     byte_width: usize,
@@ -566,18 +540,11 @@ fn accumulate_fsl_non_nulls(
 async fn sample_nullable_fallback(
     column: &str,
     sample_size_hint: usize,
-    first_array: ArrayRef,
-    first_batch: RecordBatch,
     mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
 ) -> Result<FixedSizeListArray> {
-    let schema = first_batch.schema();
+    let mut schema = None;
     let mut filtered = Vec::new();
     let mut num_non_null: usize = 0;
-
-    // Filter and collect the already-read first batch.
-    let batch = filter_non_null_rows(first_array, first_batch)?;
-    num_non_null += batch.num_rows();
-    filtered.push(batch);
 
     while num_non_null < sample_size_hint {
         let Some(batch) = scan.next().await else {
@@ -588,11 +555,18 @@ async fn sample_nullable_fallback(
         if array.logical_null_count() >= array.len() {
             continue;
         }
+        schema.get_or_insert_with(|| batch.schema());
         let batch = filter_non_null_rows(array, batch)?;
         num_non_null += batch.num_rows();
         filtered.push(batch);
     }
 
+    let Some(schema) = schema else {
+        return Err(Error::Index {
+            message: "No non-null training data found".to_string(),
+            location: location!(),
+        });
+    };
     let batch = arrow::compute::concat_batches(&schema, &filtered)?;
     let num_rows_out = batch.num_rows().min(sample_size_hint);
     let batch = batch.slice(0, num_rows_out);
@@ -755,7 +729,7 @@ mod tests {
         let num_rows = 3;
         // Fill with recognizable byte patterns: each element gets its index as bytes.
         let num_elems = num_rows * dim;
-        let values_buf: Vec<u8> = (0..num_elems)
+        let values_vec: Vec<u8> = (0..num_elems)
             .flat_map(|i| {
                 let mut bytes = vec![0u8; elem_size];
                 // Write index into the first bytes (little-endian).
@@ -765,21 +739,22 @@ mod tests {
                 bytes
             })
             .collect();
+        let expected_bytes = values_vec.clone();
+        let values_buf = MutableBuffer::from(values_vec);
 
         let dt = DataType::FixedSizeList(
             Arc::new(arrow::datatypes::Field::new("item", elem_type, true)),
             dim as i32,
         );
         let field = lance_core::datatypes::Field::new_arrow("vec", dt, true).unwrap();
-
-        let fsl = fsl_values_to_array(&field, &values_buf, num_rows).unwrap();
+        let fsl = fsl_values_to_array(&field, values_buf, num_rows).unwrap();
         assert_eq!(fsl.len(), num_rows);
         assert_eq!(fsl.value_length(), dim as i32);
 
         // Verify the raw bytes round-tripped correctly.
         let out_data = fsl.values().to_data();
         let out_bytes = out_data.buffers()[0].as_slice();
-        assert_eq!(&out_bytes[..values_buf.len()], &values_buf[..]);
+        assert_eq!(&out_bytes[..expected_bytes.len()], &expected_bytes[..]);
     }
 
     #[rstest::rstest]
