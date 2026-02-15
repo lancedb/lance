@@ -189,5 +189,9 @@ harness = false
 name = "mem_wal_read"
 harness = false
 
+[[bench]]
+name = "manifest_commit"
+harness = false
+
 [lints]
 workspace = true
