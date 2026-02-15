@@ -3,12 +3,12 @@
 
 //! Protobuf serialization for [`FilteredReadExec`] and related types.
 //!
-//! Proto message definitions live in `lance-datafusion` (see `proto::pb`).
+//! Proto message definitions live in `lance-datafusion` (see `pb`).
 //! Conversion functions live here because they need access to `FilteredReadExec`
 //! and `Dataset`, which are defined in this crate.
 //!
-//! The enterprise `PhysicalExtensionCodec` calls these functions in `try_encode`
-//! and `try_decode`.
+//! A datafusion `PhysicalExtensionCodec` can call these functions in `try_encode`
+//! and `try_decode` to support distributed execution (planner → executor).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
-use lance_core::datatypes::Projection;
+use lance_core::datatypes::{BlobHandling, Projection};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
@@ -310,6 +310,42 @@ fn projection_to_proto(proj: &Projection) -> pb::ProjectionProto {
         field_ids: proj.field_ids.iter().copied().collect(),
         with_row_id: proj.with_row_id,
         with_row_addr: proj.with_row_addr,
+        with_row_last_updated_at_version: proj.with_row_last_updated_at_version,
+        with_row_created_at_version: proj.with_row_created_at_version,
+        blob_handling: Some(blob_handling_to_proto(&proj.blob_handling)),
+    }
+}
+
+fn blob_handling_to_proto(bh: &BlobHandling) -> pb::BlobHandlingProto {
+    use pb::blob_handling_proto::Mode;
+    let mode = match bh {
+        BlobHandling::AllBinary => Some(Mode::AllBinary(true)),
+        BlobHandling::BlobsDescriptions => Some(Mode::BlobsDescriptions(true)),
+        BlobHandling::AllDescriptions => Some(Mode::AllDescriptions(true)),
+        BlobHandling::SomeBlobsBinary(ids) => Some(Mode::SomeBlobsBinary(pb::FieldIdSet {
+            field_ids: ids.iter().copied().collect(),
+        })),
+        BlobHandling::SomeBinary(ids) => Some(Mode::SomeBinary(pb::FieldIdSet {
+            field_ids: ids.iter().copied().collect(),
+        })),
+    };
+    pb::BlobHandlingProto { mode }
+}
+
+fn blob_handling_from_proto(proto: Option<&pb::BlobHandlingProto>) -> BlobHandling {
+    use pb::blob_handling_proto::Mode;
+    match proto.and_then(|p| p.mode.as_ref()) {
+        Some(Mode::AllBinary(_)) => BlobHandling::AllBinary,
+        Some(Mode::BlobsDescriptions(_)) => BlobHandling::BlobsDescriptions,
+        Some(Mode::AllDescriptions(_)) => BlobHandling::AllDescriptions,
+        Some(Mode::SomeBlobsBinary(ids)) => {
+            BlobHandling::SomeBlobsBinary(ids.field_ids.iter().copied().collect())
+        }
+        Some(Mode::SomeBinary(ids)) => {
+            BlobHandling::SomeBinary(ids.field_ids.iter().copied().collect())
+        }
+        // Default for backwards compatibility with protos that don't have blob_handling
+        None => BlobHandling::default(),
     }
 }
 
@@ -332,6 +368,14 @@ fn projection_from_proto(
     if proto.with_row_addr {
         projection = projection.with_row_addr();
     }
+    if proto.with_row_last_updated_at_version {
+        projection = projection.with_row_last_updated_at_version();
+    }
+    if proto.with_row_created_at_version {
+        projection = projection.with_row_created_at_version();
+    }
+    projection =
+        projection.with_blob_handling(blob_handling_from_proto(proto.blob_handling.as_ref()));
     Ok(projection)
 }
 
@@ -488,7 +532,12 @@ mod tests {
 
         let mut projection = Projection::empty(base.clone());
         projection.field_ids = HashSet::from([0, 2]);
-        projection = projection.with_row_id();
+        projection = projection
+            .with_row_id()
+            .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
+            .with_blob_handling(BlobHandling::SomeBlobsBinary(HashSet::from([1, 3])));
 
         let proto = projection_to_proto(&projection);
         let back = projection_from_proto(Some(&proto), base).unwrap();
@@ -496,6 +545,15 @@ mod tests {
         assert_eq!(projection.field_ids, back.field_ids);
         assert_eq!(projection.with_row_id, back.with_row_id);
         assert_eq!(projection.with_row_addr, back.with_row_addr);
+        assert_eq!(
+            projection.with_row_last_updated_at_version,
+            back.with_row_last_updated_at_version
+        );
+        assert_eq!(
+            projection.with_row_created_at_version,
+            back.with_row_created_at_version
+        );
+        assert_eq!(projection.blob_handling, back.blob_handling);
     }
 
     #[test]
@@ -578,13 +636,17 @@ mod tests {
         let state = ctx.state();
 
         let filter_expr = datafusion_expr::col("x").gt(datafusion_expr::lit(5i32));
+        let refine_expr = datafusion_expr::col("x").lt(datafusion_expr::lit(100i32));
         let projection = dataset
             .empty_projection()
             .union_column("x", OnMissing::Error)
             .unwrap()
             .with_row_id();
-        let mut options = FilteredReadOptions::new(projection);
+        let mut options = FilteredReadOptions::new(projection)
+            .with_deleted_rows()
+            .unwrap();
         options.full_filter = Some(filter_expr);
+        options.refine_filter = Some(refine_expr);
         options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
 
         let proto = options_to_proto(&options, &state).unwrap();
@@ -592,12 +654,13 @@ mod tests {
         // Verify filter schema IPC was generated
         assert!(proto.filter_schema_ipc.is_some());
         assert!(proto.full_filter_substrait.is_some());
-        assert!(proto.refine_filter_substrait.is_none());
+        assert!(proto.refine_filter_substrait.is_some());
 
         let back = options_from_proto(proto, &dataset, &state).await.unwrap();
 
         assert!(back.full_filter.is_some());
-        assert!(back.refine_filter.is_none());
+        assert!(back.refine_filter.is_some());
+        assert!(back.with_deleted_rows);
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
         assert!(back.projection.with_row_id);
