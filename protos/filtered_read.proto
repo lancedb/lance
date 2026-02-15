@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.datafusion;
+
+import "table_identifier.proto";
+
+message U64Range {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+message ProjectionProto {
+  repeated int32 field_ids = 1;
+  bool with_row_id = 2;
+  bool with_row_addr = 3;
+}
+
+message FilteredReadThreadingModeProto {
+  oneof mode {
+    uint64 one_partition_multiple_threads = 1;
+    uint64 multiple_partitions = 2;
+  }
+}
+
+// Serializable form of FilteredReadOptions.
+message FilteredReadOptionsProto {
+  optional U64Range scan_range_before_filter = 1;
+  optional U64Range scan_range_after_filter = 2;
+  bool with_deleted_rows = 3;
+  optional uint32 batch_size = 4;
+  optional uint64 fragment_readahead = 5;
+  repeated uint64 fragment_ids = 6;
+  ProjectionProto projection = 7;
+  optional bytes refine_filter_substrait = 8;
+  optional bytes full_filter_substrait = 9;
+  FilteredReadThreadingModeProto threading_mode = 10;
+  optional uint64 io_buffer_size_bytes = 11;
+  // Arrow IPC schema for decoding Substrait filters (may be wider than projection).
+  optional bytes filter_schema_ipc = 12;
+}
+
+// Serializable form of FilteredReadPlan (planned/distributed mode).
+// RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
+// Per-fragment filters are Substrait-encoded.
+message FilteredReadPlanProto {
+  bytes row_addr_tree_map = 1;
+  map<uint32, bytes> filters = 2;
+  optional U64Range scan_range_after_filter = 3;
+}
+
+// Top-level wrapper for FilteredReadExec serialization.
+message FilteredReadExecProto {
+  TableIdentifier table = 1;
+  FilteredReadOptionsProto options = 2;
+  optional FilteredReadPlanProto plan = 3;
+  // index_input (child plan) handled by DataFusion's codec via inputs[]
+}

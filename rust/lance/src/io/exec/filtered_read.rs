@@ -1751,6 +1751,11 @@ impl FilteredReadExec {
     pub fn index_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.index_input.as_ref()
     }
+
+    /// Return the pre-computed plan if one exists, without triggering initialization.
+    pub fn plan(&self) -> Option<FilteredReadPlan> {
+        self.plan.get().map(|p| p.to_external_plan())
+    }
 }
 
 impl DisplayAs for FilteredReadExec {
