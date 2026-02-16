@@ -654,8 +654,16 @@ impl ObjectStore {
                 if let Some(parent) = local_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                let parent = local_path.parent().expect("file path must have parent");
-                let named_temp = tempfile::NamedTempFile::new_in(parent)?;
+                let parent = local_path
+                    .parent()
+                    .expect("file path must have parent")
+                    .to_owned();
+                let named_temp =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await
+                        .map_err(|e| {
+                            Error::io(format!("spawn_blocking failed: {}", e), location!())
+                        })??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(LocalWriter::new(

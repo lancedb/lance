@@ -575,20 +575,25 @@ impl Writer for LocalWriter {
                 location!(),
             )
         })?;
-        temp_path.persist(&final_path).map_err(|e| {
-            Error::io(
-                format!("failed to persist temp file to {}: {}", final_path, e.error),
-                location!(),
-            )
-        })?;
+        let path_clone = self.path.clone();
+        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+            temp_path.persist(&final_path).map_err(|e| {
+                Error::io(
+                    format!("failed to persist temp file to {}: {}", final_path, e.error),
+                    location!(),
+                )
+            })?;
 
-        let metadata = std::fs::metadata(&final_path).map_err(|e| {
-            Error::io(
-                format!("failed to read metadata for {}: {}", self.path, e),
-                location!(),
-            )
-        })?;
-        let e_tag = get_etag(&metadata);
+            let metadata = std::fs::metadata(&final_path).map_err(|e| {
+                Error::io(
+                    format!("failed to read metadata for {}: {}", path_clone, e),
+                    location!(),
+                )
+            })?;
+            Ok(get_etag(&metadata))
+        })
+        .await
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e), location!()))??;
 
         self.io_tracker
             .record_write("put", self.path.clone(), self.cursor as u64);
