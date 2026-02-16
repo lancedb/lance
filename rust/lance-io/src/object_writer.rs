@@ -577,10 +577,7 @@ impl Writer for LocalWriter {
         })?;
         temp_path.persist(&final_path).map_err(|e| {
             Error::io(
-                format!(
-                    "failed to persist temp file to {}: {}",
-                    final_path, e.error
-                ),
+                format!("failed to persist temp file to {}: {}", final_path, e.error),
                 location!(),
             )
         })?;
