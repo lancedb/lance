@@ -27,10 +27,12 @@ use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Substrait doesn't yet support all data types.
+/// FixedSizeList has no Substrait producer support in datafusion-substrait.
+/// Other unsupported types (Null, Float16) are encoded as UserDefined and
+/// handled by `remove_extension_types` on the decode side.
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
-        DataType::Null | DataType::FixedSizeList(_, _) | DataType::Float16 => false,
+        DataType::FixedSizeList(_, _) => false,
         DataType::List(inner) => is_substrait_compatible(inner.data_type()),
         DataType::Struct(fields) => fields
             .iter()
@@ -39,8 +41,8 @@ fn is_substrait_compatible(data_type: &DataType) -> bool {
     }
 }
 
-/// Removes top-level fields that contain data types that Substrait
-/// is not capable of serializing.
+/// Removes top-level fields that contain data types that the Substrait
+/// producer cannot encode (currently only FixedSizeList).
 pub fn prune_schema_for_substrait(schema: &ArrowSchema) -> ArrowSchema {
     ArrowSchema::new(
         schema
@@ -847,6 +849,44 @@ mod tests {
         ]);
 
         assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_null_and_float16_columns() {
+        // Float16 and Null are encoded as UserDefined types in Substrait.
+        // The decode side (remove_extension_types) strips them and remaps
+        // field references, so filters on other columns still work.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("embedding", DataType::Float16, true),
+            Field::new("empty", DataType::Null, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_fixed_size_list_column() {
+        // FixedSizeList has no Substrait producer support, so it must be
+        // pruned from the schema before encoding. Verify that a schema with
+        // FSL columns works when the filter references a different column.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+                true,
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        // Encoding with the full schema would fail, but pruning removes the FSL column
+        let pruned = prune_schema_for_substrait(&schema);
+        assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 
     // ==================== Aggregate parsing tests ====================

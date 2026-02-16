@@ -81,7 +81,7 @@ pub fn filtered_read_exec_to_proto(
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
     let filter_schema = Arc::new(prune_schema_for_substrait(&exec.dataset().schema().into()));
-    let options = options_to_proto(exec.options(), &filter_schema, state)?;
+    let options = fr_options_to_proto(exec.options(), &filter_schema, state)?;
 
     let plan = match exec.plan() {
         Some(plan) => Some(plan_to_proto(&plan, &filter_schema, state)?),
@@ -111,7 +111,7 @@ pub async fn filtered_read_exec_from_proto(
         location: location!(),
     })?;
 
-    let options = options_from_proto(options_proto, &dataset, state).await?;
+    let options = fr_options_from_proto(options_proto, &dataset, state).await?;
     let exec = FilteredReadExec::try_new(dataset.clone(), options, index_input)?;
 
     // Apply pre-computed plan if present
@@ -127,7 +127,7 @@ pub async fn filtered_read_exec_from_proto(
 // FilteredReadOptions <-> Proto
 // =============================================================================
 
-fn options_to_proto(
+fn fr_options_to_proto(
     options: &FilteredReadOptions,
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
@@ -181,7 +181,7 @@ fn options_to_proto(
     })
 }
 
-async fn options_from_proto(
+async fn fr_options_from_proto(
     proto: pb::FilteredReadOptionsProto,
     dataset: &Arc<Dataset>,
     state: &SessionState,
@@ -670,8 +670,10 @@ mod tests {
             .with_fragment_readahead(4)
             .with_io_buffer_size(1024 * 1024);
 
-        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
-        let back = options_from_proto(proto, &dataset, &state).await.unwrap();
+        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
 
         assert_eq!(
             options.scan_range_before_filter,
@@ -711,14 +713,16 @@ mod tests {
         options.refine_filter = Some(refine_expr);
         options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
 
-        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
+        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
 
         // Verify filter schema IPC was generated
         assert!(proto.filter_schema_ipc.is_some());
         assert!(proto.full_filter_substrait.is_some());
         assert!(proto.refine_filter_substrait.is_some());
 
-        let back = options_from_proto(proto, &dataset, &state).await.unwrap();
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
 
         assert!(back.full_filter.is_some());
         assert!(back.refine_filter.is_some());
@@ -740,10 +744,12 @@ mod tests {
         let options =
             FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(first_frag));
 
-        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
+        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
         assert_eq!(proto.fragment_ids.len(), 1);
 
-        let back = options_from_proto(proto, &dataset, &state).await.unwrap();
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
         assert!(back.fragments.is_some());
         assert_eq!(back.fragments.as_ref().unwrap().len(), 1);
         assert_eq!(
