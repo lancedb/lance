@@ -650,13 +650,18 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" => {
                 let local_path = super::local::to_local_path(path);
-                if let Some(parent) = std::path::Path::new(&local_path).parent() {
+                let local_path = std::path::PathBuf::from(&local_path);
+                if let Some(parent) = local_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                let file = tokio::fs::File::create(&local_path).await?;
+                let parent = local_path.parent().expect("file path must have parent");
+                let named_temp = tempfile::NamedTempFile::new_in(parent)?;
+                let (std_file, temp_path) = named_temp.into_parts();
+                let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(LocalWriter::new(
                     file,
                     path.clone(),
+                    temp_path,
                     Arc::new(self.io_tracker.clone()),
                 )))
             }

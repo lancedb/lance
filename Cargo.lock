@@ -5161,6 +5161,7 @@ dependencies = [
  "serde",
  "shellexpand",
  "snafu",
+ "tempfile",
  "test-log",
  "tokio",
  "tracing",

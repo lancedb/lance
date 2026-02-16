@@ -504,15 +504,23 @@ pub struct LocalWriter {
     inner: tokio::io::BufWriter<tokio::fs::File>,
     cursor: usize,
     path: Path,
+    /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
+    temp_path: Option<tempfile::TempPath>,
     io_tracker: Arc<IOTracker>,
 }
 
 impl LocalWriter {
-    pub fn new(file: tokio::fs::File, path: Path, io_tracker: Arc<IOTracker>) -> Self {
+    pub fn new(
+        file: tokio::fs::File,
+        path: Path,
+        temp_path: tempfile::TempPath,
+        io_tracker: Arc<IOTracker>,
+    ) -> Self {
         Self {
             inner: tokio::io::BufWriter::new(file),
             cursor: 0,
             path,
+            temp_path: Some(temp_path),
             io_tracker,
         }
     }
@@ -560,8 +568,24 @@ impl Writer for LocalWriter {
             )
         })?;
 
-        let local_path = crate::local::to_local_path(&self.path);
-        let metadata = std::fs::metadata(&local_path).map_err(|e| {
+        let final_path = crate::local::to_local_path(&self.path);
+        let temp_path = self.temp_path.take().ok_or_else(|| {
+            Error::io(
+                format!("local writer for {} already shut down", self.path),
+                location!(),
+            )
+        })?;
+        temp_path.persist(&final_path).map_err(|e| {
+            Error::io(
+                format!(
+                    "failed to persist temp file to {}: {}",
+                    final_path, e.error
+                ),
+                location!(),
+            )
+        })?;
+
+        let metadata = std::fs::metadata(&final_path).map_err(|e| {
             Error::io(
                 format!("failed to read metadata for {}: {}", self.path, e),
                 location!(),
@@ -666,19 +690,53 @@ mod tests {
         let os_path = Path::from_absolute_path(&file_path).unwrap();
         let io_tracker = Arc::new(IOTracker::default());
 
-        let file = tokio::fs::File::create(&file_path).await.unwrap();
-        let mut writer = LocalWriter::new(file, os_path, io_tracker.clone());
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, io_tracker.clone());
 
         let data = b"hello local writer";
         writer.write_all(data).await.unwrap();
+
+        // Before shutdown, the final path should not exist
+        assert!(!file_path.exists());
+        // But the temp file should exist
+        assert!(temp_file_path.exists());
 
         let result = Writer::shutdown(&mut writer).await.unwrap();
         assert_eq!(result.size, data.len());
         assert!(result.e_tag.is_some());
         assert!(!result.e_tag.as_ref().unwrap().is_empty());
 
+        // After shutdown, the final path should exist and temp should be gone
+        assert!(file_path.exists());
+        assert!(!temp_file_path.exists());
+
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_drop_cleans_up() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("test_drop.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let io_tracker = Arc::new(IOTracker::default());
+
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, io_tracker);
+
+        writer.write_all(b"some data").await.unwrap();
+        assert!(temp_file_path.exists());
+
+        // Drop without shutdown should clean up the temp file
+        drop(writer);
+        assert!(!temp_file_path.exists());
+        assert!(!file_path.exists());
     }
 }
