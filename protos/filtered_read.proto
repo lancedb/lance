@@ -66,11 +66,16 @@ message FilteredReadOptionsProto {
 
 // Serializable form of FilteredReadPlan (planned/distributed mode).
 // RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
-// Per-fragment filters are Substrait-encoded.
+// Per-fragment filters are Substrait-encoded and deduplicated.
 message FilteredReadPlanProto {
   bytes row_addr_tree_map = 1;
-  map<uint32, bytes> filters = 2;
-  optional U64Range scan_range_after_filter = 3;
+  optional U64Range scan_range_after_filter = 2;
+  // Arrow IPC schema for decoding Substrait filters (matches the schema used at encode time).
+  optional bytes filter_schema_ipc = 3;
+  // Deduplicated filter storage: frag_id → index into filter_expressions.
+  map<uint32, uint32> fragment_filter_ids = 4;
+  // Unique Substrait-encoded filter expressions (indexed by fragment_filter_ids values).
+  repeated bytes filter_expressions = 5;
 }
 
 // Top-level wrapper for FilteredReadExec serialization.

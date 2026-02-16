@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::{execution::SessionState, logical_expr::Expr};
 
 use crate::aggregate::Aggregate;
@@ -26,6 +26,31 @@ use prost::Message;
 use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Substrait doesn't yet support all data types.
+fn is_substrait_compatible(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null | DataType::FixedSizeList(_, _) | DataType::Float16 => false,
+        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|f| is_substrait_compatible(f.data_type())),
+        _ => true,
+    }
+}
+
+/// Removes top-level fields that contain data types that Substrait
+/// is not capable of serializing.
+pub fn prune_schema_for_substrait(schema: &ArrowSchema) -> ArrowSchema {
+    ArrowSchema::new(
+        schema
+            .fields()
+            .iter()
+            .filter(|f| is_substrait_compatible(f.data_type()))
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
 
 /// Convert a DF Expr into a Substrait ExtendedExpressions message
 ///

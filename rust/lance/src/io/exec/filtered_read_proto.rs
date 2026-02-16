@@ -17,12 +17,13 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
-use lance_datafusion::substrait::{encode_substrait, parse_substrait};
+use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
 use lance_table::format::Fragment;
 use prost::Message;
 use snafu::location;
@@ -76,13 +77,14 @@ pub fn filtered_read_exec_to_proto(
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
     let table = table_identifier_from_dataset(exec.dataset());
-    let options = options_to_proto(exec.options(), state)?;
+    // Use the pruned dataset schema for filter encoding — filters can reference columns
+    // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
+    // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
+    let filter_schema = Arc::new(prune_schema_for_substrait(&exec.dataset().schema().into()));
+    let options = options_to_proto(exec.options(), &filter_schema, state)?;
 
     let plan = match exec.plan() {
-        Some(plan) => {
-            let filter_schema = Arc::new(exec.options().projection.to_arrow_schema());
-            Some(plan_to_proto(&plan, &filter_schema, state)?)
-        }
+        Some(plan) => Some(plan_to_proto(&plan, &filter_schema, state)?),
         None => None,
     };
 
@@ -127,11 +129,9 @@ pub async fn filtered_read_exec_from_proto(
 
 fn options_to_proto(
     options: &FilteredReadOptions,
+    filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadOptionsProto> {
-    // Build a schema that covers both projection and filter columns for Substrait encoding
-    let filter_schema = Arc::new(options.projection.to_arrow_schema());
-
     let refine_filter_substrait = match &options.refine_filter {
         Some(expr) => Some(encode_substrait(
             expr.clone(),
@@ -238,17 +238,25 @@ async fn options_from_proto(
         options.threading_mode = threading_mode_from_proto(&mode)?;
     }
 
-    // Filters
-    let filter_schema = match &proto.filter_schema_ipc {
-        Some(ipc_bytes) => schema_from_bytes(ipc_bytes)?,
-        None => Arc::new(options.projection.to_arrow_schema()),
-    };
+    // Filters — require filter_schema_ipc when filters are present
+    let has_filters =
+        proto.refine_filter_substrait.is_some() || proto.full_filter_substrait.is_some();
+    if has_filters {
+        let filter_schema =
+            schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
+                Error::InvalidInput {
+                    source: "missing filter_schema_ipc but filters are present".into(),
+                    location: location!(),
+                }
+            })?)?;
 
-    if let Some(bytes) = &proto.refine_filter_substrait {
-        options.refine_filter = Some(parse_substrait(bytes, filter_schema.clone(), state).await?);
-    }
-    if let Some(bytes) = &proto.full_filter_substrait {
-        options.full_filter = Some(parse_substrait(bytes, filter_schema, state).await?);
+        if let Some(bytes) = &proto.refine_filter_substrait {
+            options.refine_filter =
+                Some(parse_substrait(bytes, filter_schema.clone(), state).await?);
+        }
+        if let Some(bytes) = &proto.full_filter_substrait {
+            options.full_filter = Some(parse_substrait(bytes, filter_schema, state).await?);
+        }
     }
 
     Ok(options)
@@ -259,6 +267,9 @@ async fn options_from_proto(
 // =============================================================================
 
 /// Convert a [`FilteredReadPlan`] to proto.
+///
+/// Deduplicates filter expressions: many fragments often share the same `Arc<Expr>`.
+/// We detect sharing via `Arc::as_ptr()` and encode each unique expression only once.
 pub fn plan_to_proto(
     plan: &FilteredReadPlan,
     filter_schema: &Arc<ArrowSchema>,
@@ -267,31 +278,80 @@ pub fn plan_to_proto(
     let mut buf = Vec::with_capacity(plan.rows.serialized_size());
     plan.rows.serialize_into(&mut buf)?;
 
-    let mut filters = HashMap::new();
+    // Deduplicate filter expressions by Arc pointer identity.
+    let mut ptr_to_id: HashMap<*const Expr, u32> = HashMap::new();
+    let mut filter_expressions: Vec<Vec<u8>> = Vec::new();
+    let mut fragment_filter_ids: HashMap<u32, u32> = HashMap::new();
+
     for (frag_id, expr) in &plan.filters {
-        let encoded = encode_substrait(expr.as_ref().clone(), filter_schema.clone(), state)?;
-        filters.insert(*frag_id, encoded);
+        let ptr = Arc::as_ptr(expr);
+        let id = match ptr_to_id.get(&ptr) {
+            Some(&id) => id,
+            None => {
+                let id = filter_expressions.len() as u32;
+                let encoded =
+                    encode_substrait(expr.as_ref().clone(), filter_schema.clone(), state)?;
+                filter_expressions.push(encoded);
+                ptr_to_id.insert(ptr, id);
+                id
+            }
+        };
+        fragment_filter_ids.insert(*frag_id, id);
     }
+
+    let filter_schema_ipc = if fragment_filter_ids.is_empty() {
+        None
+    } else {
+        Some(schema_to_bytes(filter_schema)?)
+    };
 
     Ok(pb::FilteredReadPlanProto {
         row_addr_tree_map: buf,
-        filters,
         scan_range_after_filter: plan.scan_range_after_filter.as_ref().map(range_to_proto),
+        filter_schema_ipc,
+        fragment_filter_ids,
+        filter_expressions,
     })
 }
 
 async fn plan_from_proto(
     proto: pb::FilteredReadPlanProto,
-    dataset: &Arc<Dataset>,
+    _dataset: &Arc<Dataset>,
     state: &SessionState,
 ) -> Result<FilteredReadPlan> {
     let rows = RowAddrTreeMap::deserialize_from(Cursor::new(&proto.row_addr_tree_map))?;
 
-    let filter_schema: Arc<ArrowSchema> = Arc::new(dataset.schema().into());
     let mut filters = HashMap::new();
-    for (frag_id, bytes) in &proto.filters {
-        let expr = parse_substrait(bytes, filter_schema.clone(), state).await?;
-        filters.insert(*frag_id, Arc::new(expr));
+    if !proto.fragment_filter_ids.is_empty() {
+        let filter_schema =
+            schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
+                Error::InvalidInput {
+                    source: "missing filter_schema_ipc but plan has filters".into(),
+                    location: location!(),
+                }
+            })?)?;
+
+        // Decode each unique expression once, then share via Arc.
+        let mut decoded: Vec<Arc<Expr>> = Vec::with_capacity(proto.filter_expressions.len());
+        for bytes in &proto.filter_expressions {
+            let expr = parse_substrait(bytes, filter_schema.clone(), state).await?;
+            decoded.push(Arc::new(expr));
+        }
+
+        for (frag_id, expr_id) in &proto.fragment_filter_ids {
+            let expr = decoded
+                .get(*expr_id as usize)
+                .ok_or_else(|| Error::InvalidInput {
+                    source: format!(
+                        "filter expression index {} out of bounds (have {})",
+                        expr_id,
+                        decoded.len()
+                    )
+                    .into(),
+                    location: location!(),
+                })?;
+            filters.insert(*frag_id, Arc::clone(expr));
+        }
     }
 
     Ok(FilteredReadPlan {
@@ -601,6 +661,7 @@ mod tests {
         let dataset = make_test_dataset().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
 
         let options = FilteredReadOptions::basic_full_read(&dataset)
             .with_scan_range_before_filter(10..90)
@@ -609,7 +670,7 @@ mod tests {
             .with_fragment_readahead(4)
             .with_io_buffer_size(1024 * 1024);
 
-        let proto = options_to_proto(&options, &state).unwrap();
+        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
         let back = options_from_proto(proto, &dataset, &state).await.unwrap();
 
         assert_eq!(
@@ -634,6 +695,7 @@ mod tests {
         let dataset = make_test_dataset().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
 
         let filter_expr = datafusion_expr::col("x").gt(datafusion_expr::lit(5i32));
         let refine_expr = datafusion_expr::col("x").lt(datafusion_expr::lit(100i32));
@@ -649,7 +711,7 @@ mod tests {
         options.refine_filter = Some(refine_expr);
         options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
 
-        let proto = options_to_proto(&options, &state).unwrap();
+        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
 
         // Verify filter schema IPC was generated
         assert!(proto.filter_schema_ipc.is_some());
@@ -671,13 +733,14 @@ mod tests {
         let dataset = make_test_dataset().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
 
         let frags = dataset.get_fragments();
         let first_frag = vec![frags[0].metadata().clone()];
         let options =
             FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(first_frag));
 
-        let proto = options_to_proto(&options, &state).unwrap();
+        let proto = options_to_proto(&options, &filter_schema, &state).unwrap();
         assert_eq!(proto.fragment_ids.len(), 1);
 
         let back = options_from_proto(proto, &dataset, &state).await.unwrap();
@@ -748,13 +811,18 @@ mod tests {
         let state = ctx.state();
 
         let mut rows = RowAddrTreeMap::new();
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert_range(0..25);
-        rows.insert_bitmap(0, bitmap);
+        let mut bitmap0 = RoaringBitmap::new();
+        bitmap0.insert_range(0..25);
+        rows.insert_bitmap(0, bitmap0);
+        let mut bitmap1 = RoaringBitmap::new();
+        bitmap1.insert_range(0..30);
+        rows.insert_bitmap(1, bitmap1);
 
-        let filter_expr = datafusion_expr::col("x").gt(datafusion_expr::lit(10i32));
+        // Two fragments share the same Arc<Expr> — dedup should encode it once.
+        let shared_filter = Arc::new(datafusion_expr::col("x").gt(datafusion_expr::lit(10i32)));
         let mut filters = HashMap::new();
-        filters.insert(0u32, Arc::new(filter_expr));
+        filters.insert(0u32, Arc::clone(&shared_filter));
+        filters.insert(1u32, Arc::clone(&shared_filter));
 
         let plan = FilteredReadPlan {
             rows,
@@ -762,14 +830,25 @@ mod tests {
             scan_range_after_filter: Some(5..20),
         };
 
-        let filter_schema = Arc::new(dataset.schema().into());
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
         let proto = plan_to_proto(&plan, &filter_schema, &state).unwrap();
+
+        // Verify dedup: 2 fragments but only 1 unique expression
+        assert_eq!(proto.fragment_filter_ids.len(), 2);
+        assert_eq!(
+            proto.filter_expressions.len(),
+            1,
+            "shared Arc<Expr> should be deduplicated into a single expression"
+        );
 
         let back = plan_from_proto(proto, &dataset, &state).await.unwrap();
 
         assert_eq!(plan.rows, back.rows);
         assert_eq!(plan.scan_range_after_filter, back.scan_range_after_filter);
-        assert_eq!(plan.filters.len(), back.filters.len());
+        assert_eq!(back.filters.len(), 2);
         assert!(back.filters.contains_key(&0));
+        assert!(back.filters.contains_key(&1));
+        // After roundtrip, the decoded expressions should be shared via Arc too
+        assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
     }
 }
