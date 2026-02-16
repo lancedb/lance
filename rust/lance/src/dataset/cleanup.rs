@@ -1133,7 +1133,11 @@ mod tests {
             let tmpdir_path = tmpdir.as_str();
             // Use file-object-store:// scheme so that writes go through the ObjectStore
             // wrapper chain (MockObjectStore) instead of the optimized local writer path.
-            let dataset_path = format!("file-object-store://{}/my_db", tmpdir_path);
+            // The path must always start with "/" (three slashes after the scheme) so that
+            // on Windows, a drive letter like "C:" isn't parsed as the URL authority.
+            let path_prefix = if tmpdir_path.starts_with('/') { "" } else { "/" };
+            let dataset_path =
+                format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
                 _tmpdir: tmpdir,
                 dataset_path,
