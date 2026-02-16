@@ -6,9 +6,10 @@
 //! Default format (with type prefix):
 //! ```text
 //! | varint: format_string_len | raw: format_string_bytes |
-//! | varint: num_buffers |
-//! | varint: buffer_0_len | ... | varint: buffer_{n-1}_len |
-//! | raw: buffer_0 bytes  | ... | raw: buffer_{n-1} bytes  |
+//! | varint: null_flag (0 = non-null, 1 = null) |
+//! | varint: num_buffers |                          (only if non-null)
+//! | varint: buffer_0_len | ... | varint: buffer_{n-1}_len |  (only if non-null)
+//! | raw: buffer_0 bytes  | ... | raw: buffer_{n-1} bytes  |  (only if non-null)
 //! ```
 //!
 //! The format string uses the
@@ -277,7 +278,8 @@ impl ArrowScalar {
     /// type information. Use [`encode_with_options`](Self::encode_with_options)
     /// to omit the prefix when the caller already knows the type.
     ///
-    /// Only non-null, non-nested scalars are supported.
+    /// Only non-nested scalars are supported. Null scalars are encoded as a
+    /// null flag with no buffer data.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.encode_with_options(&EncodeOptions::default())
     }
@@ -285,11 +287,6 @@ impl ArrowScalar {
     /// Serialize this scalar with the given [`EncodeOptions`].
     pub fn encode_with_options(&self, options: &EncodeOptions) -> Result<Vec<u8>> {
         let array = self.as_array();
-        if array.null_count() != 0 {
-            return Err(ArrowError::InvalidArgumentError(
-                "Cannot encode null scalar".to_string(),
-            ));
-        }
         let data = array.to_data();
         if !data.child_data().is_empty() {
             return Err(ArrowError::InvalidArgumentError(
@@ -297,7 +294,6 @@ impl ArrowScalar {
             ));
         }
 
-        let buffers = data.buffers();
         let mut out = Vec::with_capacity(64);
 
         if options.include_data_type {
@@ -306,12 +302,18 @@ impl ArrowScalar {
             out.extend_from_slice(fmt.as_bytes());
         }
 
-        encode_varint(&mut out, buffers.len() as u64);
-        for b in buffers {
-            encode_varint(&mut out, b.len() as u64);
-        }
-        for b in buffers {
-            out.extend_from_slice(b.as_slice());
+        if self.is_null() {
+            encode_varint(&mut out, 1); // null_flag = 1
+        } else {
+            encode_varint(&mut out, 0); // null_flag = 0
+            let buffers = data.buffers();
+            encode_varint(&mut out, buffers.len() as u64);
+            for b in buffers {
+                encode_varint(&mut out, b.len() as u64);
+            }
+            for b in buffers {
+                out.extend_from_slice(b.as_slice());
+            }
         }
         Ok(out)
     }
@@ -348,6 +350,16 @@ impl ArrowScalar {
                 format_string_to_data_type(fmt_str)?
             }
         };
+
+        let null_flag = decode_varint(buf, &mut offset)?;
+        if null_flag == 1 {
+            if offset != buf.len() {
+                return Err(ArrowError::InvalidArgumentError(
+                    "Invalid scalar buffer: trailing bytes after null flag".to_string(),
+                ));
+            }
+            return Self::new_null(&data_type);
+        }
 
         let num_buffers = decode_varint(buf, &mut offset)? as usize;
 
@@ -441,10 +453,31 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_rejects_null() {
+    fn test_null_encode_decode_roundtrip() {
         let array: ArrayRef = Arc::new(Int32Array::from(vec![None]));
         let scalar = ArrowScalar::try_from_array(array).unwrap();
-        assert!(scalar.encode().is_err());
+        assert!(scalar.is_null());
+        let encoded = scalar.encode().unwrap();
+        let decoded = ArrowScalar::decode(&encoded).unwrap();
+        assert!(decoded.is_null());
+        assert_eq!(decoded.data_type(), &DataType::Int32);
+        assert_eq!(scalar, decoded);
+    }
+
+    #[test]
+    fn test_null_encode_decode_without_type_prefix() {
+        let array: ArrayRef = Arc::new(StringArray::from(vec![Option::<&str>::None]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        let opts = EncodeOptions {
+            include_data_type: false,
+        };
+        let encoded = scalar.encode_with_options(&opts).unwrap();
+        let decode_opts = DecodeOptions {
+            data_type: Some(&DataType::Utf8),
+        };
+        let decoded = ArrowScalar::decode_with_options(&encoded, &decode_opts).unwrap();
+        assert!(decoded.is_null());
+        assert_eq!(decoded.data_type(), &DataType::Utf8);
     }
 
     #[test]

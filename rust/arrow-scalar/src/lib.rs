@@ -16,7 +16,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{make_array, ArrayRef};
+use arrow_array::{make_array, new_null_array, ArrayRef};
 use arrow_cast::display::ArrayFormatter;
 use arrow_data::transform::MutableArrayData;
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -81,6 +81,11 @@ impl ArrowScalar {
 
         let row = Self::compute_row(&array)?;
         Ok(Self { array, row })
+    }
+
+    /// Create a null scalar of the given data type.
+    pub fn new_null(data_type: &DataType) -> Result<Self> {
+        Self::try_from_array(new_null_array(data_type, 1))
     }
 
     fn compute_row(array: &ArrayRef) -> Result<OwnedRow> {
