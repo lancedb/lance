@@ -153,7 +153,7 @@ fn options_to_proto(
     // Serialize the filter schema as Arrow IPC if we have filters
     let filter_schema_ipc = if refine_filter_substrait.is_some() || full_filter_substrait.is_some()
     {
-        Some(schema_to_bytes(&filter_schema)?)
+        Some(schema_to_bytes(filter_schema)?)
     } else {
         None
     };
