@@ -82,6 +82,7 @@ public class WriteDatasetBuilder {
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -282,6 +283,21 @@ public class WriteDatasetBuilder {
 
   public WriteDatasetBuilder targetBases(List<String> targetBases) {
     this.targetBases = Optional.of(targetBases);
+    return this;
+  }
+
+  /**
+   * Sets the session to share caches with other datasets.
+   *
+   * <p>Note: For write operations, the session is currently not used during the write itself, but
+   * is stored for future use when the resulting dataset needs to be reopened with the same session.
+   * This is a placeholder for future session support in write operations.
+   *
+   * @param session The session to use
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 

@@ -76,6 +76,8 @@ public class Dataset implements Closeable {
 
   private BufferAllocator allocator;
   private boolean selfManagedAllocator = false;
+  private Session session;
+  private boolean ownsSession = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -266,7 +268,8 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
   }
 
   /**
@@ -280,7 +283,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
   }
 
   /**
@@ -309,7 +312,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options);
+    return open(allocator, false, path, options, null);
   }
 
   /**
@@ -320,10 +323,21 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   static Dataset open(
-      BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
+
+    Session effectiveSession = session;
+    if (effectiveSession == null && options.getSession().isPresent()) {
+      effectiveSession = options.getSession().get();
+    }
+    long sessionHandle = effectiveSession != null ? effectiveSession.getNativeHandle() : 0;
+
     Dataset dataset =
         openNative(
             path,
@@ -333,9 +347,16 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider());
+            options.getStorageOptionsProvider(),
+            sessionHandle);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
+    if (effectiveSession != null) {
+      dataset.session = effectiveSession;
+    } else {
+      dataset.session = Session.fromHandle(dataset.nativeGetSessionHandle());
+      dataset.ownsSession = true;
+    }
     return dataset;
   }
 
@@ -347,7 +368,8 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider);
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      long sessionHandle);
 
   /**
    * Creates a builder for opening a dataset.
@@ -955,6 +977,26 @@ public class Dataset implements Closeable {
   private native long nativeCountRows(Optional<String> filter);
 
   /**
+   * Returns the session associated with this dataset.
+   *
+   * <p>The session holds runtime state for the dataset, including index and metadata caches. If a
+   * session was provided when opening the dataset, that session is returned. Otherwise, a new
+   * session was created automatically.
+   *
+   * <p>The returned session can be used to open other datasets to share caches.
+   *
+   * @return the session associated with this dataset
+   */
+  public Session session() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return session;
+    }
+  }
+
+  private native long nativeGetSessionHandle();
+
+  /**
    * Count rows matching a filter using a specific scalar index. This directly queries the index and
    * counts matching row addresses, which is more efficient than scanning when the index covers the
    * filter column.
@@ -1258,6 +1300,11 @@ public class Dataset implements Closeable {
       }
       if (selfManagedAllocator) {
         allocator.close();
+      }
+      if (ownsSession && session != null) {
+        session.close();
+        session = null;
+        ownsSession = false;
       }
     }
   }

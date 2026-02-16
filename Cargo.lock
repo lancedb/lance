@@ -4731,6 +4731,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
+ "datafusion-substrait",
  "deepsize",
  "dirs 5.0.1",
  "either",

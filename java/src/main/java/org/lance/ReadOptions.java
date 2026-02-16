@@ -32,6 +32,7 @@ public class ReadOptions {
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
   private final Optional<StorageOptionsProvider> storageOptionsProvider;
+  private final Optional<Session> session;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
@@ -41,6 +42,7 @@ public class ReadOptions {
     this.storageOptions = builder.storageOptions;
     this.serializedManifest = builder.serializedManifest;
     this.storageOptionsProvider = builder.storageOptionsProvider;
+    this.session = builder.session;
   }
 
   public Optional<Long> getVersion() {
@@ -71,6 +73,15 @@ public class ReadOptions {
     return storageOptionsProvider;
   }
 
+  /**
+   * Get the session to use for opening the dataset.
+   *
+   * @return the session, or empty if no session was specified
+   */
+  public Optional<Session> getSession() {
+    return session;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -89,11 +100,12 @@ public class ReadOptions {
 
     private Optional<Long> version = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
-    private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
-    private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
+    private long indexCacheSizeBytes = 6L * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
+    private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
     private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
+    private Optional<Session> session = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -211,6 +223,24 @@ public class ReadOptions {
      */
     public Builder setStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
       this.storageOptionsProvider = Optional.of(storageOptionsProvider);
+      return this;
+    }
+
+    /**
+     * Set a session to share caches between multiple datasets.
+     *
+     * <p>When a session is provided, the index and metadata caches from the session will be used
+     * instead of creating new caches. This can improve cache hit rates when opening multiple
+     * related datasets.
+     *
+     * <p>Note: When a session is provided, the indexCacheSizeBytes and metadataCacheSizeBytes
+     * settings are ignored because the session's caches are used instead.
+     *
+     * @param session the session to use
+     * @return this builder
+     */
+    public Builder setSession(Session session) {
+      this.session = Optional.of(session);
       return this;
     }
 

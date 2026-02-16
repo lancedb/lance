@@ -23,6 +23,7 @@ use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::{noop_progress, IndexBuildProgress};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -298,6 +299,7 @@ impl IndexParams for VectorIndexParams {
 }
 
 /// Build a Distributed Vector Index for specific fragments
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_distributed_vector_index(
     dataset: &Dataset,
@@ -307,6 +309,7 @@ pub(crate) async fn build_distributed_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     fragment_ids: &[u32],
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -373,7 +376,7 @@ for concurrent distributed create_index"
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions);
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
 
     let filtered_dataset = dataset.clone();
 
@@ -441,6 +444,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                 )?
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -461,6 +465,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                 )?
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -517,6 +522,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                     // and transpose only after all shards are merged.
                     .with_transpose(false)
                     .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -548,6 +554,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                 frag_reuse_index,
             )?
             .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -577,6 +584,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                 frag_reuse_index,
             )?
             .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -622,6 +630,7 @@ please provide PQBuildParams.codebook for distributed indexing"
             // and transpose only after all shards are merged.
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -660,6 +669,7 @@ please provide PQBuildParams.codebook for distributed indexing"
                 frag_reuse_index,
             )?
             .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -698,6 +708,7 @@ pub(crate) async fn build_vector_index(
     uuid: &str,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -741,7 +752,7 @@ pub(crate) async fn build_vector_index(
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions);
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -756,6 +767,7 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -771,6 +783,7 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -800,6 +813,7 @@ pub(crate) async fn build_vector_index(
                         params.metric_type,
                         &ivf_params,
                         pq_params,
+                        progress.clone(),
                     )
                     .await?;
                 }
@@ -815,6 +829,7 @@ pub(crate) async fn build_vector_index(
                         (),
                         frag_reuse_index,
                     )?
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -839,6 +854,7 @@ pub(crate) async fn build_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -861,6 +877,7 @@ pub(crate) async fn build_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -882,6 +899,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -909,6 +927,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -936,6 +955,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -959,6 +979,7 @@ pub(crate) async fn build_vector_index_incremental(
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -1008,7 +1029,9 @@ pub(crate) async fn build_vector_index_incremental(
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()));
+    let shuffler = Box::new(
+        IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()).with_progress(progress.clone()),
+    );
 
     let index_dir = dataset.indices_dir().child(uuid);
 
@@ -1031,6 +1054,7 @@ pub(crate) async fn build_vector_index_incremental(
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -1047,6 +1071,7 @@ pub(crate) async fn build_vector_index_incremental(
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -1071,6 +1096,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -1088,6 +1114,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -1105,6 +1132,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -1134,6 +1162,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -1150,6 +1179,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -1166,6 +1196,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -1542,6 +1573,7 @@ pub async fn initialize_vector_index(
         &params,
         source_vector_index,
         frag_reuse_index,
+        noop_progress(),
     )
     .await?;
 
@@ -2143,9 +2175,16 @@ mod tests {
             ..Default::default()
         };
         let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
-        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dim,
+            MetricType::L2,
+            &ivf_params,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
 
         // Attach precomputed global centroids to ivf_params for distributed build.
         ivf_params.centroids = ivf_model.centroids.clone().map(Arc::new);
@@ -2160,6 +2199,7 @@ mod tests {
             &params,
             None,
             &[invalid_id],
+            noop_progress(),
         )
         .await;
 
@@ -2187,9 +2227,16 @@ mod tests {
             ..Default::default()
         };
         let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
-        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dim,
+            MetricType::L2,
+            &ivf_params,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
 
         // Attach precomputed global centroids to ivf_params for distributed build.
         ivf_params.centroids = ivf_model.centroids.clone().map(Arc::new);
@@ -2204,6 +2251,7 @@ mod tests {
             &params,
             None,
             &[],
+            noop_progress(),
         )
         .await;
 
@@ -2211,6 +2259,86 @@ mod tests {
             result.is_ok(),
             "Expected Ok for empty fragment ids, got {:?}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_train_ivf_progress_is_emitted_before_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct RecordingProgress {
+            train_ivf_complete: AtomicBool,
+            saw_train_ivf_progress_before_complete: AtomicBool,
+            saw_train_ivf_progress_after_complete: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for RecordingProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+
+            async fn stage_progress(&self, stage: &str, _: u64) -> Result<()> {
+                if stage == "train_ivf" {
+                    if self.train_ivf_complete.load(Ordering::Relaxed) {
+                        self.saw_train_ivf_progress_after_complete
+                            .store(true, Ordering::Relaxed);
+                    } else {
+                        self.saw_train_ivf_progress_before_complete
+                            .store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+
+            async fn stage_complete(&self, stage: &str) -> Result<()> {
+                if stage == "train_ivf" {
+                    self.train_ivf_complete.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
+        let uuid = Uuid::new_v4().to_string();
+        let progress = Arc::new(RecordingProgress {
+            train_ivf_complete: AtomicBool::new(false),
+            saw_train_ivf_progress_before_complete: AtomicBool::new(false),
+            saw_train_ivf_progress_after_complete: AtomicBool::new(false),
+        });
+
+        build_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_flat_progress",
+            &uuid,
+            &params,
+            None,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            progress
+                .saw_train_ivf_progress_before_complete
+                .load(Ordering::Relaxed),
+            "expected at least one train_ivf progress event before completion"
+        );
+        assert!(
+            !progress
+                .saw_train_ivf_progress_after_complete
+                .load(Ordering::Relaxed),
+            "found train_ivf progress after completion"
         );
     }
 
@@ -2260,6 +2388,7 @@ mod tests {
             &params,
             None,
             &[valid_id],
+            noop_progress(),
         )
         .await;
 

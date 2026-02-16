@@ -4388,3 +4388,122 @@ def test_describe_indices(tmp_path):
     indices = ds.describe_indices()
     for index in indices:
         assert index.num_rows_indexed == 50
+
+
+def test_vector_filter_fts_search(tmp_path):
+    # Create test data
+    ids = list(range(1, 301))
+    vectors = [[float(i)] * 4 for i in ids]
+
+    # Create text data:
+    #   "text <i>" for ids 1-255, 299, 300,
+    #   "noop <i>" for 256-298,
+    texts = []
+    for i in ids:
+        if i <= 255:
+            texts.append(f"text {i}")
+        elif i <= 298:
+            texts.append(f"noop {i}")
+        else:
+            texts.append(f"text {i}")
+
+    categories = []
+    for i in ids:
+        if i % 3 == 1:
+            categories.append("literature")
+        elif i % 3 == 2:
+            categories.append("science")
+        else:
+            categories.append("geography")
+
+    table = pa.table(
+        {
+            "id": ids,
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 4)),
+            "text": texts,
+            "category": categories,
+        }
+    )
+
+    # Write dataset and create indices
+    ds = lance.write_dataset(table, tmp_path)
+
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=4,
+    )
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    # Create vector_query
+    vector_query = {
+        "column": "vector",
+        "q": np.array([300, 300, 300, 300], dtype=np.float32),
+        "k": 5,
+        "minimum_nprobes": 20,
+        "use_index": True,
+    }
+
+    # Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
+    scanner = ds.scanner(
+        prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
+    )
+    result = scanner.to_table()
+    assert [300, 299] == result["id"].to_pylist()
+
+    # Case 2: search with prefilter=true, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = ds.scanner(
+        prefilter=True,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300, 255, 252, 249, 246] == result["id"].to_pylist()
+
+    # Case 3: search with prefilter=false, search_filter=match("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter=MatchQuery("text", "text"),
+    )
+    result = scanner.to_table()
+    assert [300, 299] == result["id"].to_pylist()
+
+    # Case 4: search with prefilter=false, search_filter=match("text"),
+    #       filter="category='geography'"
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300] == result["id"].to_pylist()
+
+    # Case 5: search with prefilter=false, search_filter=phrase("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter=PhraseQuery("text", "text"),
+    )
+    result = scanner.to_table()
+    assert [299, 300] == result["id"].to_pylist()
+
+    # Case 6: search with prefilter=false, search_filter=phrase("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": PhraseQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300] == result["id"].to_pylist()

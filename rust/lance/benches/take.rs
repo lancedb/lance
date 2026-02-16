@@ -352,6 +352,38 @@ fn fragment_take(
     }
 }
 
+/// Benchmarks Dataset::sample(), which is used during IVF training.
+fn bench_sample(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // 100 batches * 1024 rows = 102,400 rows total, spread across multiple fragments
+    let num_batches = 100;
+    let file_size = 10 * BATCH_SIZE as usize; // 10,240 rows per fragment → 10 fragments
+    let dataset = rt.block_on(create_dataset(
+        "memory://sample_bench.lance",
+        LanceFileVersion::V2_1,
+        num_batches,
+        file_size as i32,
+    ));
+    let total_rows = num_batches as u64 * BATCH_SIZE;
+    let schema = dataset.schema().clone();
+
+    for sample_size in [1024, 8192] {
+        c.bench_function(
+            &format!("sample({sample_size} of {total_rows} rows)"),
+            |b| {
+                b.to_async(&rt).iter(|| {
+                    let schema = schema.clone();
+                    let dataset = dataset.clone();
+                    async move {
+                        dataset.sample(sample_size, &schema).await.unwrap();
+                    }
+                })
+            },
+        );
+    }
+}
+
 async fn create_dataset(
     path: &str,
     data_storage_version: LanceFileVersion,
@@ -431,10 +463,10 @@ criterion_group!(
         .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
 criterion_main!(benches);

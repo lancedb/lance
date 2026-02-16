@@ -69,6 +69,7 @@ pub struct IvfShuffler {
 
     // options
     precomputed_shuffle_buffers: Option<Vec<String>>,
+    progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
 
 impl IvfShuffler {
@@ -78,7 +79,13 @@ impl IvfShuffler {
             output_dir,
             num_partitions,
             precomputed_shuffle_buffers: None,
+            progress: crate::progress::noop_progress(),
         }
+    }
+
+    pub fn with_progress(mut self, progress: Arc<dyn crate::progress::IndexBuildProgress>) -> Self {
+        self.progress = progress;
+        self
     }
 
     pub fn with_precomputed_shuffle_buffers(
@@ -159,6 +166,7 @@ impl Shuffler for IvfShuffler {
             .buffered(get_num_compute_intensive_cpus());
 
         let mut total_loss = 0.0;
+        let mut counter: u64 = 0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
             let (shuffled, loss) = shuffled?;
             total_loss += loss;
@@ -172,6 +180,9 @@ impl Shuffler for IvfShuffler {
                 }
             }
             try_join_all(futs).await?;
+
+            counter += 1;
+            self.progress.stage_progress("shuffle", counter).await?;
         }
 
         // finish all writers

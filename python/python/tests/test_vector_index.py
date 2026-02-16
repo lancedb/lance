@@ -21,6 +21,7 @@ import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import Index, VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
+from lance.query import MatchQuery, PhraseQuery
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -2747,3 +2748,128 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     assert ids_12 == ids_21
     for a, b in zip(dists_12, dists_21):
         assert np.allclose(a, b, atol=1e-6)
+
+
+def test_fts_filter_vector_search(tmp_path):
+    # Create dataset with vector and text columns
+    ids = list(range(1, 301))
+    vectors = [[float(i)] * 4 for i in ids]
+
+    # Create text data:
+    #   "text <i>" for ids 1-255, 299, 300,
+    #   "noop <i>" for 256-298,
+    texts = []
+    for i in ids:
+        if i <= 255:
+            texts.append(f"text {i}")
+        elif i <= 298:
+            texts.append(f"noop {i}")
+        else:
+            texts.append(f"text {i}")
+
+    categories = []
+    for i in ids:
+        if i % 3 == 1:
+            categories.append("literature")
+        elif i % 3 == 2:
+            categories.append("science")
+        else:
+            categories.append("geography")
+
+    table = pa.table(
+        {
+            "id": ids,
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 4)),
+            "text": texts,
+            "category": categories,
+        }
+    )
+
+    # Write dataset and create indices
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=4,
+    )
+    dataset.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    query_vector = [300.0, 300.0, 300.0, 300.0]
+
+    # Case 1: search with prefilter=true, query_filter=match("text")
+    scanner = dataset.scanner(
+        filter=MatchQuery("text", "text"),
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=True,
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 299, 255, 254, 253] == ids_result
+
+    # Case 2: search with prefilter=true, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=True,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 255, 252, 249, 246] == ids_result
+
+    # Case 3: search with prefilter=false, search_filter=match("text")
+    scanner = dataset.scanner(
+        filter=MatchQuery("text", "text"),
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 299] == ids_result
+
+    # Case 4: search with prefilter=false, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300] == ids_result
+
+    # Case 5: search with prefilter=false, search_filter=phrase("text")
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter=PhraseQuery("text", "text"),
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [299, 300] == ids_result
+
+    # Case 6: search with prefilter=false, search_filter=phrase("text")
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": PhraseQuery("text", "text"),
+        },
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300] == ids_result

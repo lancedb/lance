@@ -159,7 +159,7 @@ jobs:
           11. Push the branch: "git push origin codex/fix-ci-<run_id>". If the remote branch exists, delete it first with "gh api -X DELETE repos/lancedb/lance/git/refs/heads/codex/fix-ci-<run_id>" then push. Do NOT use "git push --force" or "git push -f".
 
           12. Create a pull request targeting "${BRANCH}":
-              - Title: "fix: resolve CI failures from workflow run"
+              - Title: "ci: <short summary describing the fix>" (e.g., "ci: fix clippy warnings in lance-core" or "ci: resolve test flakiness in vector search")
               - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'PREOF' > /tmp/pr-body.md). The body should include:
                 - Link to the failing workflow run
                 - Summary of what failed

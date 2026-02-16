@@ -12,6 +12,7 @@ on:
       - rust/**
       - protos/**
       - .github/workflows/rust.yml
+      - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
       - deny.toml

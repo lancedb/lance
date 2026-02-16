@@ -43,52 +43,78 @@ Maintainer and PMC rosters information follow these guidelines:
 
 This section details the projects maintained in the Lance community.
 
-### Core Projects
+### Core Project
 
-Core projects are the foundational repositories maintained by the Lance community with strict quality and release standards.
-[Contributing Guidelines](./contributing.md), [Community Voting Process](./voting.md) and [Release Guidelines](./release.md) 
-are all applicable to these projects.
+[lance](https://github.com/lance-format/lance) is the core project of the lance-format GitHub Organization,
+which hosts most of the development on the table and file format, Rust SDK, Python and Java binding SDKs, documentation and discussions.
 
-Here is the list of current core projects:
-
-| Project Name      | Repository                                     | Contents                                                                                                                 |
-|-------------------|------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| lance             | https://github.com/lance-format/lance             | Lance file and table format specification, Rust SDK (including Namespace Integration SDK), Python SDK, Java SDK, Website |
-| lance-namespace   | https://github.com/lance-format/lance-namespace   | Lance namespace format specification, Rust/Python/Java Codegen SDKs, Java/Python Integration SDK                         |
-| lance-python-docs | https://github.com/lance-format/lance-python-docs | Lance Python SDK generated docs and integration hook with readthedocs                                                    |
-| lance-ray         | https://github.com/lance-format/lance-ray         | Ray integration for Lance                                                                                                |
-| lance-spark       | https://github.com/lance-format/lance-spark       | Apache Spark connector for Lance                                                                                         |
+The core project is maintained by the Lance community with strict quality and release standards.
+[Contributing Guidelines](./contributing.md), [Community Voting Process](./voting.md) and [Release Guidelines](./release.md)
+are all applicable to the core project.
 
 ### Subprojects
 
 Subprojects are initiatives or repositories that extend Lance's functionality.
 They must align with Lance's overall mission and technical direction.
-New subprojects can be created with PMC approval.
+New subprojects are created by graduating from incubating subprojects through a PMC vote.
 
-Subprojects have relaxed requirements for contribution,
-where contributors may receive write access even if not maintainers.
+Subprojects have relaxed requirements compared to core projects:
+
+- Contributors may receive write access even if not maintainers
+- Merges may be allowed without review at maintainer discretion
+- Release processes may be simplified compared to core projects
 
 Here is the list of current subprojects:
 
-| Project Name      | Repository                                     | Contents                                            |
-|-------------------|------------------------------------------------|-----------------------------------------------------|
+| Project Name      | Repository                                        | Contents                                                               |
+|-------------------|---------------------------------------------------|------------------------------------------------------------------------|
+| lance-duckdb      | https://github.com/lance-format/lance-duckdb      | DuckDB extension for Lance                                             |
+| lance-huggingface | https://github.com/lance-format/lance-huggingface | Hugging Face integration for Lance                                     |
+| lance-namespace   | https://github.com/lance-format/lance-namespace   | Lance namespace format specification, Rust/Python/Java Codegen SDKs    |
+| lance-namespace-impls | https://github.com/lance-format/lance-namespace-impls | Lance Namespace Implementations - Apache Hive, Apache Polaris, Apache Gravitino, Unity Catalog, AWS Glue and more |
+| lance-python-docs | https://github.com/lance-format/lance-python-docs | Lance Python SDK generated docs and integration hook with readthedocs  |
+| lance-ray         | https://github.com/lance-format/lance-ray         | Ray integration for Lance                                              |
+| lance-spark       | https://github.com/lance-format/lance-spark       | Apache Spark connector for Lance                                       |
+
+### Incubating Subprojects
+
+Incubating subprojects are experimental or early-stage repositories in the Lance ecosystem.
+Any PMC member can create an incubating subproject without a formal vote.
+These projects provide a space for new ideas to develop before committing to full subproject standards.
+
+Incubating subprojects have the most relaxed requirements:
+
+- Anyone can be added as a committer by the project creator or existing PMC members
+- Merges without review are allowed
+- No formal release process is required
+
+**Important**: All incubating subprojects must include a prominent notice in their README with the following exact notice:
+
+> ⚠️ **Incubating Subproject**: This project is in incubation and is not yet an official Lance subproject.
+> APIs and functionality may change without notice. Use it in production at your own risk.
+
+Here is the list of current incubating subprojects:
+
+| Project Name      | Repository                                        | Contents                                            |
+|-------------------|---------------------------------------------------|-----------------------------------------------------|
+| lance-context     | https://github.com/lance-format/lance-context     | Manage Multimodal Agentic Context Lifecycle with Lance |
 | lance-data-viewer | https://github.com/lance-format/lance-data-viewer | Read-only web interface for browsing Lance datasets |
-| lance-duckdb      | https://github.com/lance-format/lance-duckdb      | DuckDB extension for Lance                          |
 | lance-flink       | https://github.com/lance-format/lance-flink       | Apache Flink connector for Lance                    |
 | lance-graph       | https://github.com/lance-format/lance-graph       | Cypher-capable graph query engine on top of Lance   |
 | lance-trino       | https://github.com/lance-format/lance-trino       | Trino connector for Lance                           |
 | pglance           | https://github.com/lance-format/pglance           | PostgreSQL extension for Lance                      |
 
-### Graduating a Subproject
+### Graduating from Incubating to Subproject
 
-The PMC can vote to promote a subproject to a core project once the subproject has demonstrated aspects including:
+The PMC can vote to promote an incubating subproject to a subproject once the project has demonstrated:
 
-- Proper repository setup including CI, issue tracking, contributing guide, etc.
-- Proper code standard enforcement including lint, testing, etc.
-- Automated release mechanism
-- Established production use cases
+- Proper repository setup including CI, issue tracking, and contributing guide
+- Proper code standard enforcement including lint and testing
+- Established use cases
 - Community adoption outside the primary contributor
-- Consistent contributions from the community to add new features and fix bugs
+- At least one Lance maintainer actively maintaining the project
+
+Contributors with write access will retain their access after graduation to subproject.
 
 ### Project License
 

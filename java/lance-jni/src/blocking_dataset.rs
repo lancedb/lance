@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
@@ -35,6 +36,7 @@ use lance::dataset::{
     Version, WriteParams,
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
+use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -132,6 +134,7 @@ impl BlockingDataset {
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
+        session: Option<Arc<LanceSession>>,
     ) -> Result<Self> {
         // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
@@ -159,6 +162,7 @@ impl BlockingDataset {
             index_cache_size_bytes: index_cache_size_bytes as usize,
             metadata_cache_size_bytes: metadata_cache_size_bytes as usize,
             store_options: Some(store_params),
+            session,
             ..Default::default()
         };
 
@@ -1045,6 +1049,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     storage_options_obj: JObject,          // Map<String, String>
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    session_handle: jlong,                 // Session handle, 0 means no session
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1058,6 +1063,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             storage_options_obj,
             serialized_manifest,
             storage_options_provider_obj,
+            session_handle,
         )
     )
 }
@@ -1073,6 +1079,7 @@ fn inner_open_native<'local>(
     storage_options_obj: JObject,          // Map<String, String>
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    session_handle: jlong,                 // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
@@ -1090,6 +1097,10 @@ fn inner_open_native<'local>(
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
+
+    // Convert session handle to Arc<LanceSession> if provided
+    let session = session_from_handle(session_handle);
+
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -1099,6 +1110,7 @@ fn inner_open_native<'local>(
         storage_options,
         serialized_manifest,
         storage_options_provider_arc,
+        session,
     )?;
     dataset.into_java(env)
 }
@@ -2687,4 +2699,25 @@ fn inner_count_indexed_rows(
     };
 
     Ok(count)
+}
+
+//////////////////////////////
+// Session Methods          //
+//////////////////////////////
+
+/// Returns the session handle from a dataset.
+/// The returned handle can be used to create a Java Session object.
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetSessionHandle(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_get_session_handle(&mut env, java_dataset), 0)
+}
+
+fn inner_get_session_handle(env: &mut JNIEnv, java_dataset: JObject) -> Result<jlong> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let session = dataset_guard.inner.session();
+    Ok(handle_from_session(session))
 }

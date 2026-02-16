@@ -116,6 +116,7 @@ aws-sdk-s3 = { workspace = true }
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
+datafusion-substrait = { workspace = true }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent"]

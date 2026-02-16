@@ -15,8 +15,8 @@ name: Codex Backport PR
 on:
   workflow_dispatch:
     inputs:
-      pr_url:
-        description: "PR URL to backport (e.g., https://github.com/lancedb/lance/pull/1234)"
+      pr_urls:
+        description: "Comma-separated PR URLs to backport in order (e.g., https://github.com/lancedb/lance/pull/1234,https://github.com/lancedb/lance/pull/5678)"
         required: true
         type: string
       release_branch:
@@ -43,7 +43,7 @@ jobs:
     steps:
       - name: Show inputs
         run: |
-          echo "pr_url = ${{ inputs.pr_url }}"
+          echo "pr_urls = ${{ inputs.pr_urls }}"
           echo "release_branch = ${{ inputs.release_branch }}"
           echo "guidelines = ${{ inputs.guidelines }}"
 
@@ -97,9 +97,9 @@ jobs:
           git config user.name "lance-community"
           git config user.email "community@lance.org"
 
-      - name: Run Codex to backport PR
+      - name: Run Codex to backport PRs
         env:
-          PR_URL: ${{ inputs.pr_url }}
+          PR_URLS: ${{ inputs.pr_urls }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
           GUIDELINES: ${{ inputs.guidelines }}
           GITHUB_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
@@ -109,38 +109,38 @@ jobs:
           set -euo pipefail
 
           cat <<EOF >/tmp/codex-prompt.txt
-          You are running inside the lance repository on a GitHub Actions runner. Your task is to backport a merged PR to a release branch.
+          You are running inside the lance repository on a GitHub Actions runner. Your task is to backport one or more merged PRs to a release branch.
 
           Input parameters:
-          - PR URL: ${PR_URL}
+          - PR URLs (comma-separated, apply in order): ${PR_URLS}
           - Release branch: ${RELEASE_BRANCH}
           - Additional guidelines: ${GUIDELINES:-"None provided"}
 
           Follow these steps exactly:
 
-          1. Extract the PR number from the PR URL. The URL format is https://github.com/lancedb/lance/pull/<number>.
+          1. Parse the comma-separated PR URLs into a list. Trim any whitespace around each URL. The URL format is https://github.com/lancedb/lance/pull/<number>.
 
-          2. Use "gh pr view <number> --json state,mergeCommit,title,number" to verify the PR is merged. If the PR is not merged (state != "MERGED"), exit with an error message explaining that only merged PRs can be backported.
+          2. For each PR URL in order, extract the PR number and use "gh pr view <number> --json state,mergeCommit,title,number" to verify the PR is merged. If any PR is not merged (state != "MERGED"), exit with an error message explaining that only merged PRs can be backported.
 
-          3. Store the PR title and merge commit SHA for later use.
+          3. Store all PR numbers, titles, and merge commit SHAs for later use.
 
           4. Verify the release branch exists with "git ls-remote --heads origin ${RELEASE_BRANCH}". If it doesn't exist, exit with an error.
 
           5. Checkout the release branch: "git checkout ${RELEASE_BRANCH}" and pull latest: "git pull origin ${RELEASE_BRANCH}".
 
-          6. Create a new branch for the backport: "git checkout -b backport/pr-<number>-to-${RELEASE_BRANCH//\//-}".
+          6. Create a new branch for the backport. If there's only one PR, use "backport/pr-<number>-to-${RELEASE_BRANCH//\//-}". If there are multiple PRs, use "backport/pr-<first_number>-and-more-to-${RELEASE_BRANCH//\//-}".
 
-          7. Cherry-pick the merge commit: "git cherry-pick -m 1 <merge_commit_sha>".
+          7. For each PR in order, cherry-pick its merge commit: "git cherry-pick -m 1 <merge_commit_sha>".
              - If there are conflicts, try to resolve them. Inspect conflicting files with "git status" and "git diff".
              - For simple conflicts, fix them and continue with "git add -A && git cherry-pick --continue".
-             - If conflicts are too complex to resolve automatically, abort and exit with a clear error message.
+             - If conflicts are too complex to resolve automatically, abort and exit with a clear error message indicating which PR caused the conflict.
 
           8. Run "cargo fmt --all" to ensure formatting is correct.
 
           9. Run "cargo clippy --workspace --tests --benches -- -D warnings" to check for issues. Fix any warnings and rerun until clean.
 
-          10. Run ONLY the tests related to the changes in this PR:
-              - Use "git diff --name-only HEAD~1" to see which files were changed.
+          10. Run ONLY the tests related to the changes in these PRs:
+              - Use "git diff --name-only ${RELEASE_BRANCH}...HEAD" to see all files changed across all cherry-picked commits.
               - For Rust changes: Run tests for the affected crates only (e.g., "cargo test -p lance-core" if lance-core files changed).
               - For Python changes (python/** files): Build with "cd python && maturin develop" then run "pytest" on the specific test files that were modified, or related test files.
               - For Java changes (java/** files): Run "cd java && mvn test" for the affected modules.
@@ -149,19 +149,23 @@ jobs:
 
           11. If additional guidelines are provided, follow them as well when making decisions or resolving issues.
 
-          12. Stage any additional changes with "git add -A" and amend the commit if needed: "git commit --amend --no-edit".
+          12. Stage any additional changes with "git add -A" and amend the last commit if needed: "git commit --amend --no-edit".
 
-          13. Push the branch: "git push origin backport/pr-<number>-to-${RELEASE_BRANCH//\//-}". If the remote branch exists, delete it first with "gh api -X DELETE repos/lancedb/lance/git/refs/heads/backport/pr-<number>-to-${RELEASE_BRANCH//\//-}" then push. Do NOT use "git push --force" or "git push -f".
+          13. Push the branch: "git push origin <branch_name>". If the remote branch exists, delete it first with "gh api -X DELETE repos/lancedb/lance/git/refs/heads/<branch_name>" then push. Do NOT use "git push --force" or "git push -f".
 
           14. Create a pull request targeting "${RELEASE_BRANCH}":
-              - Title should be the same as the original PR title.
-              - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'PREOF' > /tmp/pr-body.md). The body should say:
-                "Backport of ${PR_URL}
+              - If single PR: Title should be the same as the original PR title.
+              - If multiple PRs: Title should be "Backport multiple PRs to ${RELEASE_BRANCH}" or similar descriptive title.
+              - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'PREOF' > /tmp/pr-body.md). The body should list all backported PRs:
+                "Backport of the following PRs:
+                - <PR_URL_1>
+                - <PR_URL_2>
+                ...
 
-                This PR backports the changes from the original PR to the ${RELEASE_BRANCH} branch."
-              - Then run "gh pr create --base ${RELEASE_BRANCH} --title '<original PR title>' --body-file /tmp/pr-body.md".
+                This PR backports the changes from the original PRs to the ${RELEASE_BRANCH} branch."
+              - Then run "gh pr create --base ${RELEASE_BRANCH} --title '<title>' --body-file /tmp/pr-body.md".
 
-          15. Display the new PR URL, "git status --short", and a summary of what was done.
+          15. Display the new PR URL, "git status --short", and a summary of what was done including which PRs were backported.
 
           Constraints:
           - Use bash commands for all operations.
