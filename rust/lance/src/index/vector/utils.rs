@@ -298,8 +298,15 @@ pub async fn maybe_sample_training_data(
 
     let should_sample = num_rows > sample_size_hint;
     if should_sample {
-        sample_training_data(dataset, column, sample_size_hint, num_rows, vector_field, is_nullable)
-            .await
+        sample_training_data(
+            dataset,
+            column,
+            sample_size_hint,
+            num_rows,
+            vector_field,
+            is_nullable,
+        )
+        .await
     } else {
         // too small to require sampling
         let batch = scan_all_training_data(dataset, column, is_nullable).await?;
@@ -394,15 +401,24 @@ async fn sample_training_data(
 
     match vector_field.data_type() {
         DataType::FixedSizeList(_, _) if !is_nullable => {
-            sample_fsl_uniform(dataset, column, sample_size_hint, num_rows, byte_width, vector_field)
-                .await
+            sample_fsl_uniform(
+                dataset,
+                column,
+                sample_size_hint,
+                num_rows,
+                byte_width,
+                vector_field,
+            )
+            .await
         }
         DataType::FixedSizeList(_, _) => {
-            let scan = sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
+            let scan =
+                sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
             sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
         }
         _ => {
-            let scan = sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
+            let scan =
+                sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
             sample_nullable_fallback(column, sample_size_hint, is_nullable, scan).await
         }
     }
@@ -857,7 +873,11 @@ mod tests {
         let dims: u32 = 8;
         let sample_size: usize = 500;
 
-        let col_gen = if nullable { vec_gen.with_random_nulls(0.5) } else { vec_gen };
+        let col_gen = if nullable {
+            vec_gen.with_random_nulls(0.5)
+        } else {
+            vec_gen
+        };
         let data = gen_batch()
             .col("vec", col_gen)
             .into_batch_rows(RowCount::from(nrows as u64))
