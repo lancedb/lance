@@ -233,12 +233,7 @@ incrementally. This preserves the history of field additions.
 
 ### Using Field IDs
 
-Field IDs can be used in several contexts:
-
-1. **Data File References**: Specify which columns are present in each data file
-2. **Deletion Tracking**: Reference specific columns when applying deletions
-3. **Schema Evolution**: Track added, dropped, or modified fields
-4. **Query Projection**: Select columns by ID instead of by name for robustness against renames
+When referencing fields internally within the format, use the field ids rather than field names or positions.
 
 ## Field Metadata
 
@@ -295,7 +290,7 @@ Field IDs enable efficient schema evolution:
 - **Drop Column**: Remove field from schema; its ID may be reused in some systems
 - **Rename Column**: Change field name; ID remains the same
 - **Reorder Columns**: Change field order in schema; IDs remain the same
-- **Type Evolution**: Subject to compatibility rules defined by Apache Arrow
+- **Type Evolution**: Data type can be changed. This might require rewriting the column in the data, depending on how the type was changed.
 
 The use of field IDs ensures that data files can be correctly interpreted even as the schema changes over time.
 
