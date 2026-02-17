@@ -64,6 +64,9 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                 |
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
+| Jinglun                | wojiaodoubao         | Bytedance         |                     | Apache Hadoop Committer                         |
+| Beinan Wang            | beinan               | Uber              |                     | PrestoDB TSC and Committer                      |
+| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                 |
 
 ## Becoming a Maintainer
 
