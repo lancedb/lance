@@ -85,9 +85,15 @@ message FilteredReadPlanProto {
 message FilteredReadExecProto {
   TableIdentifier table = 1;
   FilteredReadOptionsProto options = 2;
+  // FilteredRead has two modes
+  // Plan-then-execute (distributed): The planner creates a FilteredReadPlan and sends it to a remote executor.
+  // Plan-and-execute (local): The executor creates the plan itself at execution time.
   optional FilteredReadPlanProto plan = 3;
   // Note: FilteredReadExec.index_input (child ExecutionPlan) is NOT serialized here.
-  // DataFusion's PhysicalExtensionCodec serializes child plans separately via the
-  // plan tree traversal (children() / with_new_children()), and passes them back
-  // as the `inputs` parameter in try_decode.
+  // DataFusion's PhysicalExtensionCodec handles child plans automatically: it walks
+  // the plan tree via children() / with_new_children(), serializes each node, and
+  // passes deserialized children back as the `inputs` parameter in try_decode.
+  // This means any ExecutionPlan in the tree (including index_input) must also
+  // implement try_encode/try_decode in the PhysicalExtensionCodec.
+  // TODO: implement serialize/deserialize for lance-specific index input ExecutionPlans.
 }
