@@ -12,6 +12,8 @@ rust-version.workspace = true
 readme = "README.md"
 
 [dependencies]
+# Note: this is a core crate and we should aim to keep this dependency list
+# as minimal as possible.
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
@@ -21,6 +23,8 @@ arrow-schema = { workspace = true }
 half = { workspace = true }
 
 [dev-dependencies]
+arrow-ord = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 
 [lints]

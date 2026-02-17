@@ -310,6 +310,148 @@ mod tests {
     }
 
     #[test]
+    fn test_boolean_roundtrip() {
+        let t = ArrowScalar::from(true);
+        let f = ArrowScalar::from(false);
+        assert_eq!(t.data_type(), &DataType::Boolean);
+        assert!(!t.is_null());
+        assert_eq!(format!("{t}"), "true");
+        assert_eq!(format!("{f}"), "false");
+
+        // Extract from multi-element array
+        let array: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true]));
+        let s = ArrowScalar::try_new(&array, 1).unwrap();
+        assert_eq!(format!("{s}"), "false");
+        assert_eq!(s.data_type(), &DataType::Boolean);
+    }
+
+    #[test]
+    fn test_boolean_equality_and_ordering() {
+        let t1 = ArrowScalar::from(true);
+        let t2 = ArrowScalar::from(true);
+        let f1 = ArrowScalar::from(false);
+        assert_eq!(t1, t2);
+        assert_ne!(t1, f1);
+        // false < true in arrow row encoding
+        assert!(f1 < t1);
+    }
+
+    #[test]
+    fn test_boolean_null() {
+        let array: ArrayRef = Arc::new(BooleanArray::from(vec![None]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert!(scalar.is_null());
+        assert_eq!(scalar.data_type(), &DataType::Boolean);
+        assert_eq!(format!("{scalar}"), "null");
+
+        // null sorts before false
+        let f = ArrowScalar::from(false);
+        assert!(scalar < f);
+    }
+
+    #[test]
+    fn test_string_view_roundtrip() {
+        let array: ArrayRef = Arc::new(StringViewArray::from(vec![
+            "hello world, this is a long string view",
+        ]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert_eq!(scalar.data_type(), &DataType::Utf8View);
+        assert!(!scalar.is_null());
+        assert_eq!(
+            format!("{scalar}"),
+            "hello world, this is a long string view"
+        );
+
+        // Extract from multi-element array
+        let array: ArrayRef = Arc::new(StringViewArray::from(vec!["alpha", "beta", "gamma"]));
+        let s = ArrowScalar::try_new(&array, 1).unwrap();
+        assert_eq!(format!("{s}"), "beta");
+        assert_eq!(s.data_type(), &DataType::Utf8View);
+    }
+
+    #[test]
+    fn test_binary_view_roundtrip() {
+        let values: Vec<&[u8]> = vec![b"\xDE\xAD\xBE\xEF"];
+        let array: ArrayRef = Arc::new(BinaryViewArray::from(values));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert_eq!(scalar.data_type(), &DataType::BinaryView);
+        assert!(!scalar.is_null());
+
+        // Extract from multi-element array
+        let values: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
+        let array: ArrayRef = Arc::new(BinaryViewArray::from(values));
+        let s = ArrowScalar::try_new(&array, 2).unwrap();
+        assert_eq!(s.data_type(), &DataType::BinaryView);
+    }
+
+    #[test]
+    fn test_string_view_equality_and_ordering() {
+        let mk = |s: &str| {
+            let array: ArrayRef = Arc::new(StringViewArray::from(vec![s]));
+            ArrowScalar::try_from_array(array).unwrap()
+        };
+        let a = mk("apple");
+        let b = mk("apple");
+        let c = mk("banana");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a < c);
+    }
+
+    #[test]
+    fn test_binary_view_equality_and_ordering() {
+        let mk = |b: &[u8]| {
+            let values: Vec<&[u8]> = vec![b];
+            let array: ArrayRef = Arc::new(BinaryViewArray::from(values));
+            ArrowScalar::try_from_array(array).unwrap()
+        };
+        let a = mk(b"\x01\x02");
+        let b = mk(b"\x01\x02");
+        let c = mk(b"\x01\x03");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a < c);
+    }
+
+    #[test]
+    fn test_string_view_in_collections() {
+        let mk = |s: &str| {
+            let array: ArrayRef = Arc::new(StringViewArray::from(vec![s]));
+            ArrowScalar::try_from_array(array).unwrap()
+        };
+
+        let mut hset = HashSet::new();
+        hset.insert(mk("foo"));
+        hset.insert(mk("bar"));
+        hset.insert(mk("foo"));
+        assert_eq!(hset.len(), 2);
+
+        let mut bset = BTreeSet::new();
+        bset.insert(mk("cherry"));
+        bset.insert(mk("apple"));
+        bset.insert(mk("banana"));
+        let sorted: Vec<_> = bset.iter().map(|s| format!("{s}")).collect();
+        assert_eq!(sorted, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn test_string_view_null() {
+        let array: ArrayRef = Arc::new(StringViewArray::from(vec![Option::<&str>::None]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert!(scalar.is_null());
+        assert_eq!(scalar.data_type(), &DataType::Utf8View);
+        assert_eq!(format!("{scalar}"), "null");
+    }
+
+    #[test]
+    fn test_binary_view_null() {
+        let array: ArrayRef = Arc::new(BinaryViewArray::from(vec![Option::<&[u8]>::None]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert!(scalar.is_null());
+        assert_eq!(scalar.data_type(), &DataType::BinaryView);
+    }
+
+    #[test]
     fn test_cross_type_comparison_is_consistent() {
         let int_scalar = ArrowScalar::from(42i32);
         let str_scalar = ArrowScalar::from("hello");
@@ -319,5 +461,120 @@ mod tests {
         assert_eq!(ord1, ord2);
         // And the reverse should be opposite
         assert_eq!(str_scalar.cmp(&int_scalar), ord1.reverse());
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use std::sync::Arc;
+
+    use arrow_array::*;
+    use arrow_ord::sort::sort;
+    use arrow_schema::SortOptions;
+    use proptest::prelude::*;
+
+    use super::ArrowScalar;
+
+    /// Generate an arbitrary Arrow array of a randomly chosen type, including
+    /// nulls. Covers primitives, booleans, string/binary types and their view
+    /// variants.
+    fn arbitrary_array() -> BoxedStrategy<ArrayRef> {
+        let len = 0..=100usize;
+
+        prop_oneof![
+            // --- integer types ---
+            proptest::collection::vec(proptest::option::of(any::<i8>()), len.clone())
+                .prop_map(|v| Arc::new(Int8Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<i16>()), len.clone())
+                .prop_map(|v| Arc::new(Int16Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<i32>()), len.clone())
+                .prop_map(|v| Arc::new(Int32Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<i64>()), len.clone())
+                .prop_map(|v| Arc::new(Int64Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<u8>()), len.clone())
+                .prop_map(|v| Arc::new(UInt8Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<u16>()), len.clone())
+                .prop_map(|v| Arc::new(UInt16Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<u32>()), len.clone())
+                .prop_map(|v| Arc::new(UInt32Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<u64>()), len.clone())
+                .prop_map(|v| Arc::new(UInt64Array::from(v)) as ArrayRef),
+            // --- float types ---
+            proptest::collection::vec(proptest::option::of(any::<f32>()), len.clone())
+                .prop_map(|v| Arc::new(Float32Array::from(v)) as ArrayRef),
+            proptest::collection::vec(proptest::option::of(any::<f64>()), len.clone())
+                .prop_map(|v| Arc::new(Float64Array::from(v)) as ArrayRef),
+            // --- boolean ---
+            proptest::collection::vec(proptest::option::of(any::<bool>()), len.clone())
+                .prop_map(|v| Arc::new(BooleanArray::from(v)) as ArrayRef),
+            // --- string types ---
+            proptest::collection::vec(proptest::option::of(any::<String>()), len.clone()).prop_map(
+                |v| {
+                    let refs: Vec<Option<&str>> = v.iter().map(|o| o.as_deref()).collect();
+                    Arc::new(StringArray::from(refs)) as ArrayRef
+                }
+            ),
+            proptest::collection::vec(proptest::option::of(any::<String>()), len.clone()).prop_map(
+                |v| {
+                    let refs: Vec<Option<&str>> = v.iter().map(|o| o.as_deref()).collect();
+                    Arc::new(LargeStringArray::from(refs)) as ArrayRef
+                }
+            ),
+            proptest::collection::vec(proptest::option::of(any::<String>()), len.clone()).prop_map(
+                |v| {
+                    let refs: Vec<Option<&str>> = v.iter().map(|o| o.as_deref()).collect();
+                    Arc::new(StringViewArray::from(refs)) as ArrayRef
+                }
+            ),
+            // --- binary types ---
+            proptest::collection::vec(
+                proptest::option::of(proptest::collection::vec(any::<u8>(), 0..50)),
+                len.clone(),
+            )
+            .prop_map(|v| {
+                let refs: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
+                Arc::new(BinaryArray::from(refs)) as ArrayRef
+            }),
+            proptest::collection::vec(
+                proptest::option::of(proptest::collection::vec(any::<u8>(), 0..50)),
+                len.clone(),
+            )
+            .prop_map(|v| {
+                let refs: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
+                Arc::new(LargeBinaryArray::from(refs)) as ArrayRef
+            }),
+            proptest::collection::vec(
+                proptest::option::of(proptest::collection::vec(any::<u8>(), 0..50)),
+                len.clone(),
+            )
+            .prop_map(|v| {
+                let refs: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
+                Arc::new(BinaryViewArray::from(refs)) as ArrayRef
+            }),
+        ]
+        .boxed()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn sorted_array_produces_sorted_scalars(array in arbitrary_array()) {
+            let sorted = sort(
+                &array,
+                Some(SortOptions { descending: false, nulls_first: true }),
+            )
+            .unwrap();
+
+            let scalars: Vec<ArrowScalar> = (0..sorted.len())
+                .map(|i| ArrowScalar::try_new(&sorted, i).unwrap())
+                .collect();
+
+            for i in 1..scalars.len() {
+                prop_assert!(
+                    scalars[i - 1] <= scalars[i],
+                    "scalar[{}] ({:?}) should be <= scalar[{}] ({:?})",
+                    i - 1, scalars[i - 1], i, scalars[i],
+                );
+            }
+        }
     }
 }

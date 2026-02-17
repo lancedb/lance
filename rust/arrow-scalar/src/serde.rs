@@ -398,7 +398,10 @@ impl ArrowScalar {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, Int32Array, StringArray, StringViewArray,
+        TimestampMicrosecondArray,
+    };
     use arrow_schema::DataType;
     use rstest::rstest;
 
@@ -428,6 +431,8 @@ mod tests {
     #[rstest]
     #[case::int32(Arc::new(Int32Array::from(vec![42])) as ArrayRef)]
     #[case::string(Arc::new(StringArray::from(vec!["hello"])) as ArrayRef)]
+    #[case::string_view(Arc::new(StringViewArray::from(vec!["hello world, long string view"])) as ArrayRef)]
+    #[case::binary_view(Arc::new(BinaryViewArray::from(vec![b"\xDE\xAD\xBE\xEF".as_ref()])) as ArrayRef)]
     fn test_encode_decode_roundtrip(#[case] array: ArrayRef) {
         let scalar = ArrowScalar::try_from_array(array).unwrap();
         let encoded = scalar.encode().unwrap();
@@ -439,6 +444,8 @@ mod tests {
     #[rstest]
     #[case::int32(Arc::new(Int32Array::from(vec![42])) as ArrayRef, DataType::Int32)]
     #[case::string(Arc::new(StringArray::from(vec!["hello"])) as ArrayRef, DataType::Utf8)]
+    #[case::string_view(Arc::new(StringViewArray::from(vec!["hello view"])) as ArrayRef, DataType::Utf8View)]
+    #[case::binary_view(Arc::new(BinaryViewArray::from(vec![b"\xCA\xFE".as_ref()])) as ArrayRef, DataType::BinaryView)]
     fn test_encode_decode_without_type_prefix(#[case] array: ArrayRef, #[case] dt: DataType) {
         let scalar = ArrowScalar::try_from_array(array).unwrap();
         let opts = EncodeOptions {
