@@ -545,7 +545,7 @@ mod prop_tests {
             }),
             proptest::collection::vec(
                 proptest::option::of(proptest::collection::vec(any::<u8>(), 0..50)),
-                len.clone(),
+                len,
             )
             .prop_map(|v| {
                 let refs: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
