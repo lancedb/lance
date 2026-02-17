@@ -6670,13 +6670,7 @@ mod tests {
         use arrow_array::ListArray;
 
         let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
-            (0..1000).map(|i| {
-                if i % 2 == 0 {
-                    None
-                } else {
-                    Some(vec![])
-                }
-            }),
+            (0..1000).map(|i| if i % 2 == 0 { None } else { Some(vec![]) }),
         );
 
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
