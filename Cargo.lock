@@ -432,6 +432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-stats"
+version = "57.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-scalar",
+ "arrow-schema",
+ "arrow-select",
+ "half",
+ "proptest",
+ "rstest 0.23.0",
+]
+
+[[package]]
 name = "arrow-string"
 version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
