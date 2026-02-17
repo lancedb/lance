@@ -21,8 +21,9 @@ use jni::{
 };
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{OnMissing, Projection, Schema};
+use lance_core::datatypes::{BlobHandling, OnMissing, Projection, Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
@@ -219,6 +220,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
     projected_names: JObject,
     selection_ranges: JObject,
     stream_addr: jlong,
+    blob_read_mode: jint,
 ) {
     let result = (|| -> Result<()> {
         let mut read_parameter = ReadBatchParams::default();
@@ -242,10 +244,25 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
         let file_version = reader.inner.metadata().version();
         let base_schema = Schema::try_from(reader.schema()?.as_ref())?;
 
-        if !projected_names.is_null() {
-            let column_names: Vec<String> = env.get_strings(&projected_names)?;
+        let blob_handling = if blob_read_mode == 1 {
+            BlobHandling::BlobsDescriptions
+        } else {
+            BlobHandling::AllBinary
+        };
 
-            // Build field_id_to_column_index mapping from base schema (file layout)
+        {
+            let mut projection =
+                Projection::empty(Arc::new(base_schema.clone())).with_blob_handling(blob_handling);
+
+            if !projected_names.is_null() {
+                let column_names: Vec<String> = env.get_strings(&projected_names)?;
+                projection = projection.union_columns(&column_names, OnMissing::Error)?;
+            } else {
+                projection = projection.union_predicate(|_| true);
+            }
+
+            let transformed_schema = projection.to_bare_schema();
+
             let field_id_to_column_index = base_schema
                 .fields_pre_order()
                 .filter(|field| {
@@ -257,13 +274,6 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
                 .map(|(idx, field)| (field.id as u32, idx as u32))
                 .collect::<BTreeMap<_, _>>();
 
-            // Use Projection to get transformed schema (with blob fields as descriptors)
-            let projection = Projection::empty(Arc::new(base_schema.clone()))
-                .union_columns(&column_names, OnMissing::Error)?;
-            let transformed_schema = projection.to_bare_schema();
-
-            // Use from_field_ids with transformed schema
-            // This tells the decoder to expect Struct types for blob fields
             reader_projection = Some(ReaderProjection::from_field_ids(
                 file_version,
                 &transformed_schema,
