@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import io
+import tarfile
+
 import lance
 import pyarrow as pa
 import pytest
-from lance import BlobColumn
+from lance import Blob, BlobColumn
 
 
 def test_blob_read_from_binary():
@@ -48,6 +51,49 @@ def test_blob_descriptions(tmp_path):
 
     assert descriptions.field(0) == expected_positions
     assert descriptions.field(1) == expected_sizes
+
+
+def test_scan_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+
+def test_fragment_scan_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    fragment = ds.get_fragments()[0]
+
+    tbl = fragment.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+    tbl = fragment.to_table(columns=["blobs"], blob_handling="all_binary")
+    assert tbl.column("blobs").to_pylist() == values
 
 
 @pytest.fixture
@@ -108,6 +154,47 @@ def test_blob_files_by_address(dataset_with_blobs):
     for expected in [b"foo", b"bar", b"baz"]:
         with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_files_by_address_with_stable_row_ids(tmp_path):
+    table = pa.table(
+        {
+            "blobs": pa.array([b"foo"], pa.large_binary()),
+            "idx": pa.array([0], pa.uint64()),
+        },
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("idx", pa.uint64()),
+            ]
+        ),
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        enable_stable_row_ids=True,
+    )
+
+    ds.insert(
+        pa.table(
+            {
+                "blobs": pa.array([b"bar"], pa.large_binary()),
+                "idx": pa.array([1], pa.uint64()),
+            },
+            schema=table.schema,
+        )
+    )
+
+    t = ds.to_table(columns=["idx"], with_row_address=True)
+    row_idx = t.column("idx").to_pylist().index(1)
+    addr = t.column("_rowaddr").to_pylist()[row_idx]
+
+    blobs = ds.take_blobs("blobs", addresses=[addr])
+    assert len(blobs) == 1
+    with blobs[0] as f:
+        assert f.read() == b"bar"
 
 
 def test_blob_by_indices(tmp_path, dataset_with_blobs):
@@ -214,3 +301,81 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
 def test_scan_blob(tmp_path, dataset_with_blobs):
     ds = dataset_with_blobs.scanner(filter="idx = 2").to_table()
     assert ds.num_rows == 1
+
+
+def test_blob_extension_write_inline(tmp_path):
+    table = pa.table({"blob": lance.blob_array([b"foo", b"bar"])})
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2",
+        data_storage_version="2.2",
+    )
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert pa.types.is_struct(desc.type)
+
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+
+
+def test_blob_extension_write_external(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    uri = blob_path.as_uri()
+
+    table = pa.table({"blob": lance.blob_array([uri])})
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_external",
+        data_storage_version="2.2",
+    )
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_external_slice(tmp_path):
+    tar_path = tmp_path / "container.tar"
+    names = ["a.bin", "b.bin", "c.bin"]
+    payloads = [b"alpha", b"bravo", b"charlie"]
+
+    # Build a tar container with three distinct binary entries.
+    with tarfile.open(tar_path, "w") as tf:
+        for name, data in zip(names, payloads):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    # Re-open the tar to obtain offsets and sizes for each member.
+    positions: list[int] = []
+    sizes: list[int] = []
+    with tarfile.open(tar_path, "r") as tf:
+        for name in names:
+            member = tf.getmember(name)
+            positions.append(member.offset_data)
+            sizes.append(member.size)
+
+    uri = tar_path.as_uri()
+
+    blob_values = [
+        Blob.from_uri(uri, position, size) for position, size in zip(positions, sizes)
+    ]
+
+    table = pa.table({"blob": lance.blob_array(blob_values)})
+
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "ds",
+        data_storage_version="2.2",
+    )
+
+    blobs = ds.take_blobs("blob", indices=[0, 1, 2])
+    assert len(blobs) == len(payloads)
+
+    for expected, blob_file in zip(payloads, blobs):
+        assert blob_file.size() == len(expected)
+        with blob_file as f:
+            assert f.read() == expected

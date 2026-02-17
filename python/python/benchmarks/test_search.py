@@ -505,3 +505,62 @@ def test_late_materialization(test_dataset, benchmark, use_index):
         filter=f"{column} = 0",
         batch_size=32,
     )
+
+
+@pytest.fixture(scope="module")
+def test_geo_dataset(tmpdir_factory):
+    from geoarrow.rust.core import (
+        point,
+        points,
+    )
+
+    num_rows = 1_000_000
+    points_2d = points([np.random.randn(num_rows), np.random.randn(num_rows)])
+
+    schema = pa.schema(
+        [
+            pa.field(point("xy")).with_name("points"),
+        ]
+    )
+    table = pa.Table.from_arrays([points_2d], schema=schema)
+    uri = str(tmpdir_factory.mktemp("test_geo_dataset"))
+    lance.write_dataset(table, uri)
+    ds = lance.dataset(uri)
+    return ds
+
+
+@pytest.mark.benchmark(group="geo")
+@pytest.mark.parametrize(
+    "use_index",
+    (False, True),
+    ids=["no_index", "with_index"],
+)
+def test_geo_rtree(test_geo_dataset, benchmark, use_index):
+    if use_index:
+        test_geo_dataset.create_scalar_index(
+            column="points",
+            index_type="RTREE",
+            replace=True,
+        )
+
+    print(
+        test_geo_dataset.scanner(
+            columns=["points"],
+            filter="""
+                St_Contains(points,
+                ST_GeomFromText('POLYGON (( 0 0, 2 0, 0 2, 2 2, 0 0 ))'))
+            """,
+            batch_size=32,
+            use_scalar_index=use_index,
+        ).explain_plan(True)
+    )
+    benchmark(
+        test_geo_dataset.to_table,
+        columns=["points"],
+        filter="""
+            St_Contains(points,
+            ST_GeomFromText('POLYGON (( 0 0, 2 0, 0 2, 2 2, 0 0 ))'))
+        """,
+        batch_size=32,
+        use_scalar_index=use_index,
+    )

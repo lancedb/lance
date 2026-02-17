@@ -7,6 +7,8 @@
 
 mod filter;
 pub mod filtered_read;
+#[cfg(feature = "substrait")]
+pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;
@@ -31,4 +33,3 @@ pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
-pub(crate) use utils::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};

@@ -5,6 +5,7 @@ pub mod address;
 pub mod assume;
 pub mod backoff;
 pub mod bit;
+pub mod blob;
 pub mod cpu;
 pub mod deletion;
 pub mod futures;

@@ -14,6 +14,9 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::rowids::version::{
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+};
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -30,6 +33,11 @@ pub struct DataFile {
     ///
     /// Note that -1 is a possibility and it indices that the field has
     /// no top-level column in the file.
+    ///
+    /// Columns that lack a field id may still exist as extra entries in
+    /// `column_indices`; such columns are ignored by field-id–based projection.
+    /// For example, some fields, such as blob fields, occupy multiple
+    /// columns in the file but only have a single field id.
     #[serde(default)]
     pub column_indices: Vec<i32>,
     /// The major version of the file format used to write this file.
@@ -136,10 +144,12 @@ impl DataFile {
                     location!(),
                 ));
             }
-        } else if self.fields.len() != self.column_indices.len() {
+        } else if self.column_indices.len() < self.fields.len() {
+            // Every recorded field id must have a column index, but not every column needs
+            // to be associated with a field id (extra columns are allowed).
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
-                "contained an unequal number of fields / column_indices",
+                "contained fewer column_indices than fields",
                 location!(),
             ));
         }
@@ -289,6 +299,14 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Last updated at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Created at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -299,6 +317,8 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -336,6 +356,8 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -457,6 +479,14 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            last_updated_at_version_meta: p
+                .last_updated_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
+            created_at_version_meta: p
+                .created_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -487,13 +517,17 @@ impl From<&Fragment> for pb::DataFragment {
                 })
             }
         });
-
+        let last_updated_at_version_sequence =
+            last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
+        let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            last_updated_at_version_sequence,
+            created_at_version_sequence,
         }
     }
 }
@@ -504,6 +538,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use object_store::path::Path;
     use serde_json::{json, Value};
 
     #[test]
@@ -590,5 +625,24 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+    }
+
+    #[test]
+    fn data_file_validate_allows_extra_columns() {
+        let data_file = DataFile {
+            path: "foo.lance".to_string(),
+            fields: vec![1, 2],
+            // One extra column without a field id mapping
+            column_indices: vec![0, 1, 2],
+            file_major_version: MAJOR_VERSION as u32,
+            file_minor_version: MINOR_VERSION as u32,
+            file_size_bytes: Default::default(),
+            base_id: None,
+        };
+
+        let base_path = Path::from("base");
+        data_file
+            .validate(&base_path)
+            .expect("validation should allow extra columns without field ids");
     }
 }

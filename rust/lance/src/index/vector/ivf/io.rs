@@ -22,8 +22,8 @@ use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
-use lance_file::reader::FileReader;
-use lance_file::writer::FileWriter;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
@@ -201,20 +201,26 @@ pub(super) async fn write_pq_partitions(
                             location: location!(),
                         })?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
-                    let original_pq_codes = transpose(
-                        pq_code,
-                        pq_index.pq.num_sub_vectors,
-                        pq_code.len() / pq_index.pq.code_dim(),
-                    );
+                    let row_ids = pq_index.row_ids.as_ref().unwrap();
+                    let num_vectors = row_ids.len();
+                    if num_vectors == 0 || pq_code.is_empty() {
+                        continue;
+                    }
+                    if pq_code.len() % num_vectors != 0 {
+                        continue;
+                    }
+                    let num_bytes_per_code = pq_code.len() / num_vectors;
+                    let original_pq_codes = transpose(pq_code, num_bytes_per_code, num_vectors);
                     let fsl = Arc::new(
                         FixedSizeListArray::try_new_from_values(
                             original_pq_codes,
-                            pq_index.pq.code_dim() as i32,
+                            num_bytes_per_code as i32,
                         )
                         .unwrap(),
                     );
+
                     pq_array.push(fsl);
-                    row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
+                    row_id_array.push(row_ids.clone());
                 }
             }
         }
@@ -254,8 +260,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     column: &str,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
-    writer: &mut FileWriter<ManifestDescribing>,
-    mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
+    writer: &mut PreviousFileWriter<ManifestDescribing>,
+    mut auxiliary_writer: Option<&mut PreviousFileWriter<ManifestDescribing>>,
     ivf: &mut IvfModel,
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
@@ -341,7 +347,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
-        let part_writer = FileWriter::<ManifestDescribing>::try_new(
+        let part_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             part_file,
             Schema::try_from(writer.schema())?,
@@ -351,7 +357,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let aux_part_writer = match auxiliary_writer.as_ref() {
             Some(writer) => Some(
-                FileWriter::<ManifestDescribing>::try_new(
+                PreviousFileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     aux_part_file,
                     Schema::try_from(writer.schema())?,
@@ -403,7 +409,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
-            FileReader::try_new_self_described(&object_store, part_file, None).await?;
+            PreviousFileReader::try_new_self_described(&object_store, part_file, None).await?;
 
         let batches = futures::stream::iter(0..part_reader.num_batches())
             .map(|batch_id| {
@@ -427,7 +433,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
-                FileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
+                PreviousFileReader::try_new_self_described(&object_store, aux_part_file, None)
+                    .await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
@@ -457,8 +464,8 @@ async fn build_hnsw_quantization_partition(
     column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
-    writer: FileWriter<ManifestDescribing>,
-    aux_writer: Option<FileWriter<ManifestDescribing>>,
+    writer: PreviousFileWriter<ManifestDescribing>,
+    aux_writer: Option<PreviousFileWriter<ManifestDescribing>>,
     quantizer: Quantizer,
     row_ids_array: Vec<Arc<dyn Array>>,
     code_array: Vec<Arc<dyn Array>>,
@@ -519,7 +526,7 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     params: HnswBuildParams,
     distance_type: DistanceType,
-    mut writer: FileWriter<ManifestDescribing>,
+    mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<usize> {
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
@@ -532,7 +539,7 @@ async fn build_and_write_pq_storage(
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
     pq: ProductQuantizer,
-    mut writer: FileWriter<ManifestDescribing>,
+    mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
         let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;

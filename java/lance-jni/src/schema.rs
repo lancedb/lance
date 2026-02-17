@@ -9,7 +9,7 @@ use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
 use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
-use lance_core::datatypes::{Field, Schema, StorageClass};
+use lance_core::datatypes::{Field, Schema};
 
 impl IntoJava for Schema {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
@@ -25,7 +25,7 @@ impl IntoJava for Schema {
         }
         let metadata = to_java_map(env, &self.metadata)?;
         Ok(env.new_object(
-            "com/lancedb/lance/schema/LanceSchema",
+            "org/lance/schema/LanceSchema",
             "(Ljava/util/List;Ljava/util/Map;)V",
             &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
         )?)
@@ -39,52 +39,34 @@ pub fn convert_to_java_field<'local>(
     let name = env.new_string(&lance_field.name)?;
     let children = convert_children_fields(env, lance_field)?;
     let metadata = to_java_map(env, &lance_field.metadata)?;
+    let logical_type = env.new_string(lance_field.logical_type.to_string())?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
-    let storage_type = convert_storage_type(env, &lance_field.storage_class)?;
-
     let ctor_sig = "(IILjava/lang/String;".to_owned()
-        + "ZLorg/apache/arrow/vector/types/pojo/ArrowType;"
-        + "Lcom/lancedb/lance/schema/StorageType;"
+        + "ZLjava/lang/String;"
+        + "Lorg/apache/arrow/vector/types/pojo/ArrowType;"
         + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
         + "Ljava/util/Map;"
-        + "Ljava/util/List;Z)V";
+        + "Ljava/util/List;ZI)V";
+    let pk_position = lance_field.unenforced_primary_key_position.unwrap_or(0) as jint;
     let field_obj = env.new_object(
-        "com/lancedb/lance/schema/LanceField",
+        "org/lance/schema/LanceField",
         ctor_sig.as_str(),
         &[
             JValue::Int(lance_field.id as jint),
             JValue::Int(lance_field.parent_id as jint),
             JValue::Object(&JObject::from(name)),
             JValue::Bool(lance_field.nullable as jboolean),
+            JValue::Object(&JObject::from(logical_type)),
             JValue::Object(&arrow_type),
-            JValue::Object(&storage_type),
             JValue::Object(&JObject::null()),
             JValue::Object(&metadata),
             JValue::Object(&children),
-            JValue::Bool(lance_field.unenforced_primary_key as jboolean),
+            JValue::Bool(lance_field.is_unenforced_primary_key() as jboolean),
+            JValue::Int(pk_position),
         ],
     )?;
 
     Ok(field_obj)
-}
-
-fn convert_storage_type<'local>(
-    env: &mut JNIEnv<'local>,
-    storage_class: &StorageClass,
-) -> Result<JObject<'local>> {
-    let jname = match storage_class {
-        StorageClass::Blob => env.new_string("BLOB")?,
-        _ => env.new_string("DEFAULT")?,
-    };
-
-    Ok(env
-        .call_static_method(
-            "com/lancedb/lance/schema/StorageType",
-            "valueOf",
-            "(Ljava/lang/String;)Lcom/lancedb/lance/schema/StorageType;",
-            &[JValue::Object(&JObject::from(jname))],
-        )?
-        .l()?)
 }
 
 fn convert_children_fields<'local>(

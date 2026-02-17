@@ -52,6 +52,7 @@ dist/
 cmake-build-*
 .vscode
 .DS_Store
+.metals
 
 python/lance/_*.cpp
 
@@ -100,6 +101,7 @@ target
 
 python/venv
 test_data/venv
+.venv
 
 **/*.profraw
 *.lance

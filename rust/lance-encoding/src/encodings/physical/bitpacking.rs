@@ -120,13 +120,13 @@ impl InlineBitpacking {
                 );
             }
             chunks.push(MiniBlockChunk {
-                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u16],
+                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u32],
                 log_num_values: LOG_ELEMS_PER_CHUNK,
             });
         }
 
         // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
+        let last_chunk_elem_num = if data.num_values.is_multiple_of(ELEMS_PER_CHUNK) {
             ELEMS_PER_CHUNK
         } else {
             data.num_values % ELEMS_PER_CHUNK
@@ -149,7 +149,7 @@ impl InlineBitpacking {
         chunks.push(MiniBlockChunk {
             buffer_sizes: vec![
                 ((1 + packed_chunk_sizes[bit_widths_array.len() - 1]) * std::mem::size_of::<T>())
-                    as u16,
+                    as u32,
             ],
             log_num_values: 0,
         });
@@ -162,7 +162,7 @@ impl InlineBitpacking {
     }
 
     fn chunk_data(&self, data: FixedWidthDataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
-        assert!(data.bits_per_value % 8 == 0);
+        assert!(data.bits_per_value.is_multiple_of(8));
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
         let compressed = match bits_per_value {

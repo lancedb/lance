@@ -13,10 +13,11 @@ use futures::{
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::rowids::RowIdSequence;
 
@@ -169,16 +170,33 @@ pub struct RowIdAndDeletesConfig {
     pub with_row_id: bool,
     /// Whether to include the row address column in the final batch
     pub with_row_addr: bool,
+    /// Whether to include the last updated at version column in the final batch
+    pub with_row_last_updated_at_version: bool,
+    /// Whether to include the created at version column in the final batch
+    pub with_row_created_at_version: bool,
     /// An optional deletion vector to apply to the batch
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
+    /// The last_updated_at version sequence
+    pub last_updated_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
+    /// The created_at version sequence
+    pub created_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
     ///
     /// This is needed to convert ReadbatchParams::RangeTo into a valid range
     pub total_num_rows: u32,
+}
+
+impl RowIdAndDeletesConfig {
+    fn has_system_cols(&self) -> bool {
+        self.with_row_id
+            || self.with_row_addr
+            || self.with_row_last_updated_at_version
+            || self.with_row_created_at_version
+    }
 }
 
 #[instrument(level = "debug", skip_all)]
@@ -196,9 +214,7 @@ pub fn apply_row_id_and_deletes(
         }
     }
     let has_deletions = deletion_vector.is_some();
-    debug_assert!(
-        batch.num_columns() > 0 || config.with_row_id || config.with_row_addr || has_deletions
-    );
+    debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
 
     // If row id sequence is None, then row id IS row address.
     let should_fetch_row_addr = config.with_row_addr
@@ -274,6 +290,70 @@ pub fn apply_row_id_and_deletes(
         batch
     };
 
+    // Add version columns if requested
+    let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
+        let mut batch = batch;
+
+        if config.with_row_last_updated_at_version {
+            let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u64> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .collect();
+                Arc::new(UInt64Array::from(versions))
+            } else {
+                // Default to version 1 if sequence not provided
+                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
+            };
+            batch =
+                batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        if config.with_row_created_at_version {
+            let version_arr = if let Some(sequence) = &config.created_at_sequence {
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u64> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .collect();
+                Arc::new(UInt64Array::from(versions))
+            } else {
+                // Default to version 1 if sequence not provided
+                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
+            };
+            batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        batch
+    } else {
+        batch
+    };
+
     match (deletion_mask, config.make_deletions_null) {
         (None, _) => Ok(batch),
         (Some(mask), false) => Ok(arrow::compute::filter_record_batch(&batch, &mask)?),
@@ -299,16 +379,12 @@ pub fn wrap_with_row_id_and_delete(
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
-            let task = batch_task.task;
-            tokio::spawn(
-                async move {
-                    let batch = task.await?;
-                    apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
-                }
-                .in_current_span(),
-            )
-            .map(|join_wrapper| join_wrapper.unwrap())
-            .boxed()
+            batch_task
+                .task
+                .map(move |batch| {
+                    apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
+                })
+                .boxed()
         })
         .boxed()
 }
@@ -395,8 +471,12 @@ mod tests {
                     params: params.clone(),
                     with_row_id: true,
                     with_row_addr: false,
+                    with_row_last_updated_at_version: false,
+                    with_row_created_at_version: false,
                     deletion_vector: None,
                     row_id_sequence: None,
+                    last_updated_at_sequence: None,
+                    created_at_sequence: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
                 };
@@ -491,8 +571,12 @@ mod tests {
                                 params: ReadBatchParams::RangeFull,
                                 with_row_id,
                                 with_row_addr: false,
+                                with_row_last_updated_at_version: false,
+                                with_row_created_at_version: false,
                                 deletion_vector: deletion_vector.clone(),
                                 row_id_sequence: None,
+                                last_updated_at_sequence: None,
+                                created_at_sequence: None,
                                 make_deletions_null,
                                 total_num_rows: 100,
                             };

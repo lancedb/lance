@@ -34,7 +34,6 @@ num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-roaring.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -48,6 +47,7 @@ rstest.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
 test-log.workspace = true
+libc.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

@@ -156,7 +156,7 @@ pub(crate) fn compute_residual(
 impl Transformer for ResidualTransform {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
-    /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
+    /// The new [`RecordBatch`] will have a new column named `RESIDUAL_COLUMN`.
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
@@ -173,8 +173,9 @@ impl Transformer for ResidualTransform {
         })?;
         let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
             message: format!(
-                "Compute residual vector: original vector column not found: {}",
-                self.vec_col
+                "Compute residual vector: original vector column {} not found in batch {}",
+                self.vec_col,
+                batch.schema(),
             ),
             location: location!(),
         })?;

@@ -5,7 +5,6 @@ use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
 
 use lance_core::{Error, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use snafu::location;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {
@@ -20,8 +19,8 @@ pub trait JiebaTokenizerBuilder: Sized {
 
     fn load(p: &Path) -> Result<Self> {
         if !p.is_dir() {
-            return Err(Error::io(
-                format!("{} is not a valid directory", p.display()),
+            return Err(Error::invalid_input(
+                format!("Invalid directory path: {}", p.display()),
                 snafu::location!(),
             ));
         }
@@ -77,26 +76,26 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
         let file = std::fs::File::open(main_dict_path)?;
         let mut f = std::io::BufReader::new(file);
         let mut jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
-            Error::io(
+            Error::invalid_input(
                 format!(
-                    "load jieba tokenizer dictionary {}, error: {}",
+                    "Failed to load Jieba dictionary from {}: {}",
                     main_dict_path.display(),
                     e
                 ),
-                location!(),
+                snafu::location!(),
             )
         })?;
         for user_dict_path in &self.user_dict_paths() {
             let file = std::fs::File::open(user_dict_path)?;
             let mut f = std::io::BufReader::new(file);
             jieba.load_dict(&mut f).map_err(|e| {
-                Error::io(
+                Error::invalid_input(
                     format!(
-                        "load jieba tokenizer user dictionary {},  error: {}",
+                        "Failed to load Jieba user dictionary from {}: {}",
                         user_dict_path.display(),
                         e
                     ),
-                    location!(),
+                    snafu::location!(),
                 )
             })?
         }

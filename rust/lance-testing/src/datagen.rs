@@ -209,10 +209,8 @@ where
 {
     let mut rng = StdRng::from_seed(seed);
 
-    T::ArrayType::from(
-        repeat_with(|| T::Native::from_f32(rng.random::<f32>()).unwrap())
-            .take(n)
-            .collect::<Vec<_>>(),
+    <T::ArrayType as lance_arrow::FloatArray<T>>::from_iter_values(
+        repeat_with(|| T::Native::from_f32(rng.random::<f32>()).unwrap()).take(n),
     )
 }
 

@@ -26,7 +26,10 @@ pub struct IndexMetadata {
     /// Human readable index name
     pub name: String,
 
-    /// The latest version of the dataset this index covers
+    /// The version of the dataset this index was last updated on
+    ///
+    /// This is set when the index is created (based on the version used to train the index)
+    /// This is updated when the index is updated or remapped
     pub dataset_version: u64,
 
     /// The fragment ids this index covers.
@@ -94,7 +97,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::io(
+                Error::invalid_input(
                     "uuid field does not exist in Index metadata".to_string(),
                     location!(),
                 )

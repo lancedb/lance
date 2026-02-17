@@ -22,11 +22,11 @@
 //!
 //! Based on the Apache Arrow Parquet SBBF implementation but with public APIs
 //! for use in Lance indexing. This implementation follows the Parquet spec
-//! https://github.com/apache/arrow-rs/blob/main/parquet/src/bloom_filter/mod.rs
-//! for SBBF as described in https://github.com/apache/parquet-format/blob/master/BloomFilter.md
+//! <https://github.com/apache/arrow-rs/blob/main/parquet/src/bloom_filter/mod.rs>
+//! for SBBF as described in <https://github.com/apache/parquet-format/blob/master/BloomFilter.md>
 //! FIXME: Make the upstream SBBF implementation public so that this file could be
 //! removed from Lance.
-//! https://github.com/apache/arrow-rs/issues/8277
+//! <https://github.com/apache/arrow-rs/issues/8277>
 
 use crate::scalar::bloomfilter::as_bytes::AsBytes;
 use libm::lgamma;
@@ -243,7 +243,7 @@ pub struct Sbbf {
 impl Sbbf {
     /// Create a new SBBF from raw bitset data
     pub fn new(bitset: &[u8]) -> Result<Self> {
-        if bitset.len() % 32 != 0 {
+        if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
                 message: format!(
                     "Bitset length must be a multiple of 32, got {}",
@@ -351,6 +351,70 @@ impl Sbbf {
     #[allow(dead_code)]
     pub fn estimated_memory_size(&self) -> usize {
         self.blocks.capacity() * std::mem::size_of::<Block>()
+    }
+
+    /// Check if this filter might intersect with another filter.
+    /// Returns true if there's at least one bit position where both filters have a 1.
+    /// This is a fast check that may return false positives but never false negatives.
+    ///
+    /// Returns an error if the filters have different sizes, as bloom filters with
+    /// different configurations cannot be reliably compared.
+    pub fn might_intersect(&self, other: &Self) -> Result<bool> {
+        if self.blocks.len() != other.blocks.len() {
+            return Err(SbbfError::InvalidData {
+                message: format!(
+                    "Cannot compare bloom filters with different sizes: {} blocks vs {} blocks. \
+                     Both filters must use the same configuration.",
+                    self.blocks.len(),
+                    other.blocks.len()
+                ),
+            });
+        }
+        for i in 0..self.blocks.len() {
+            for j in 0..8 {
+                if (self.blocks[i][j] & other.blocks[i][j]) != 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check if this filter might intersect with a raw bitmap.
+    /// The bitmap should be in the same format as produced by to_bytes().
+    ///
+    /// Returns an error if the bitmaps have different sizes, as bloom filters with
+    /// different configurations cannot be reliably compared.
+    pub fn might_intersect_bytes(&self, other_bytes: &[u8]) -> Result<bool> {
+        Self::bytes_might_intersect(&self.to_bytes(), other_bytes)
+    }
+
+    /// Check if two raw bloom filter bitmaps might intersect.
+    /// Returns true if there's at least one bit position where both filters have a 1.
+    ///
+    /// This is a fast probabilistic check: if it returns false, the filters definitely
+    /// have no common elements. If it returns true, they might have common elements
+    /// (with possible false positives).
+    ///
+    /// Returns an error if the bitmaps have different sizes, as bloom filters with
+    /// different configurations cannot be reliably compared.
+    pub fn bytes_might_intersect(a: &[u8], b: &[u8]) -> Result<bool> {
+        if a.len() != b.len() {
+            return Err(SbbfError::InvalidData {
+                message: format!(
+                    "Cannot compare bloom filters with different sizes: {} bytes vs {} bytes. \
+                     Both filters must use the same configuration.",
+                    a.len(),
+                    b.len()
+                ),
+            });
+        }
+        for i in 0..a.len() {
+            if (a[i] & b[i]) != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

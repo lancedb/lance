@@ -9,6 +9,11 @@ debug = true
 codegen-units = 16
 lto = "thin"
 
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
 

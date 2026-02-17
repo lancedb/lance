@@ -12,8 +12,9 @@ const BITMAP_THRESDHOLD: usize = 5_000;
 // TODO: Benchmark to find a better value.
 
 /// Represents a set of deleted row offsets in a single fragment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum DeletionVector {
+    #[default]
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
@@ -170,20 +171,15 @@ impl OffsetMapper {
                     self.left = mid + 1;
                     mid = self.left + (right - self.left) / 2;
                 }
-                // There are cases where the mid is deleted but also equal in
-                // comparison. For those we need to find a lower value.
+                // Binary search left when the guess overshoots. This can happen when:
+                // - Greater: last_diff was calibrated for a denser deletion region
+                // - Equal with deleted mid: the guess lands exactly on a deleted row
                 std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
                     right = mid;
                     mid = self.left + (right - self.left) / 2;
                 }
             }
         }
-    }
-}
-
-impl Default for DeletionVector {
-    fn default() -> Self {
-        Self::NoDeletions
     }
 }
 
@@ -298,47 +294,228 @@ impl From<RoaringBitmap> for DeletionVector {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod test {
     use super::*;
+    use deepsize::DeepSizeOf;
+    use rstest::rstest;
 
-    #[test]
-    fn test_deletion_vector() {
-        let set = HashSet::from_iter(0..100);
-        let bitmap = RoaringBitmap::from_iter(0..100);
-
-        let set_dv = DeletionVector::Set(set);
-        let bitmap_dv = DeletionVector::Bitmap(bitmap);
-
-        assert_eq!(set_dv, bitmap_dv);
+    fn set_dv(vals: impl IntoIterator<Item = u32>) -> DeletionVector {
+        DeletionVector::Set(HashSet::from_iter(vals))
+    }
+    fn bitmap_dv(vals: impl IntoIterator<Item = u32>) -> DeletionVector {
+        DeletionVector::Bitmap(RoaringBitmap::from_iter(vals))
     }
 
     #[test]
-    fn test_threshold() {
+    fn test_set_bitmap_equality() {
+        assert_eq!(set_dv(0..100), bitmap_dv(0..100));
+    }
+
+    #[test]
+    fn test_threshold_promotes_to_bitmap() {
         let dv = DeletionVector::from_iter(0..(BITMAP_THRESDHOLD as u32));
         assert!(matches!(dv, DeletionVector::Bitmap(_)));
     }
 
+    #[rstest]
+    #[case::middle_deletions(&[3, 5], &[0, 1, 2, 4, 6, 7, 8])]
+    #[case::start_deletions(&[0, 1, 2], &[3, 4, 5, 6, 7, 8, 9])]
+    fn test_map_offsets(#[case] deleted: &[u32], #[case] expected: &[u32]) {
+        let dv = DeletionVector::from_iter(deleted.iter().copied());
+        let mut mapper = OffsetMapper::new(Arc::new(dv));
+        let output: Vec<_> = (0..expected.len() as u32)
+            .map(|o| mapper.map_offset(o))
+            .collect();
+        assert_eq!(output, expected);
+    }
+
     #[test]
-    fn test_map_offsets() {
-        let dv = DeletionVector::from_iter(vec![3, 5]);
+    fn test_deep_size_of() {
+        assert_eq!(
+            DeletionVector::NoDeletions.deep_size_of(),
+            std::mem::size_of::<DeletionVector>()
+        );
+        assert!(set_dv([1, 2, 3]).deep_size_of() > std::mem::size_of::<DeletionVector>());
+        assert!(bitmap_dv([1, 2, 3]).deep_size_of() > std::mem::size_of::<DeletionVector>());
+    }
+
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions, 0, true)]
+    #[case::set(set_dv([1, 2, 3]), 3, false)]
+    #[case::bitmap(bitmap_dv([1, 2, 3, 4, 5]), 5, false)]
+    fn test_len_is_empty(#[case] dv: DeletionVector, #[case] len: usize, #[case] empty: bool) {
+        assert_eq!(dv.len(), len);
+        assert_eq!(dv.is_empty(), empty);
+    }
+
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions, 1, false)]
+    #[case::set_contains(set_dv([1, 2, 3]), 1, true)]
+    #[case::set_missing(set_dv([1, 2, 3]), 0, false)]
+    #[case::bitmap_contains(bitmap_dv([10, 20, 30]), 10, true)]
+    #[case::bitmap_missing(bitmap_dv([10, 20, 30]), 5, false)]
+    fn test_contains(#[case] dv: DeletionVector, #[case] val: u32, #[case] expected: bool) {
+        assert_eq!(dv.contains(val), expected);
+    }
+
+    #[rstest]
+    #[case::no_del_empty_range(DeletionVector::NoDeletions, 0..0, true)]
+    #[case::no_del_non_empty(DeletionVector::NoDeletions, 0..1, false)]
+    #[case::set_full_range(set_dv([1, 2, 3]), 1..4, true)]
+    #[case::set_partial(set_dv([1, 2, 3]), 0..2, false)]
+    #[case::bitmap_full(bitmap_dv([10, 11, 12]), 10..13, true)]
+    #[case::bitmap_partial(bitmap_dv([10, 11, 12]), 9..11, false)]
+    fn test_contains_range(
+        #[case] dv: DeletionVector,
+        #[case] range: std::ops::Range<u32>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(dv.contains_range(range), expected);
+    }
+
+    #[test]
+    fn test_range_cardinality() {
+        assert_eq!(DeletionVector::NoDeletions.range_cardinality(0..100), 0);
+        let bm = bitmap_dv([5, 10, 15]);
+        assert_eq!(bm.range_cardinality(0..20), 3);
+        assert_eq!(bm.range_cardinality(6..14), 1);
+    }
+
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions, vec![])]
+    #[case::set(set_dv([3, 1, 2]), vec![1, 2, 3])]
+    #[case::bitmap(bitmap_dv([30, 10, 20]), vec![10, 20, 30])]
+    fn test_iterators(#[case] dv: DeletionVector, #[case] expected: Vec<u32>) {
+        // Test iter()
+        let mut items: Vec<_> = dv.iter().collect();
+        items.sort();
+        assert_eq!(items, expected);
+
+        // Test to_sorted_iter()
+        assert_eq!(dv.to_sorted_iter().collect::<Vec<_>>(), expected);
+
+        // Test into_sorted_iter() and into_iter() (both consume, so clone first)
+        assert_eq!(dv.clone().into_sorted_iter().collect::<Vec<_>>(), expected);
+        assert_eq!(dv.into_iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_build_predicate() {
+        let addrs = [0u64, 1, 2, 3, 4];
+        assert!(DeletionVector::NoDeletions
+            .build_predicate(addrs.iter())
+            .is_none());
+
+        let pred = set_dv([1, 3]).build_predicate(addrs.iter()).unwrap();
+        assert_eq!(
+            pred.iter().map(|v| v.unwrap()).collect::<Vec<_>>(),
+            [true, false, true, false, true]
+        );
+
+        let pred = bitmap_dv([0, 2, 4]).build_predicate(addrs.iter()).unwrap();
+        assert_eq!(
+            pred.iter().map(|v| v.unwrap()).collect::<Vec<_>>(),
+            [false, true, false, true, false]
+        );
+    }
+
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions, 0)]
+    #[case::set(set_dv([1, 2, 3]), 3)]
+    #[case::bitmap(bitmap_dv([10, 20]), 2)]
+    fn test_to_roaring(#[case] dv: DeletionVector, #[case] len: u64) {
+        let bitmap: RoaringBitmap = (&dv).into();
+        assert_eq!(bitmap.len(), len);
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        assert_eq!(DeletionVector::NoDeletions, DeletionVector::NoDeletions);
+        assert_eq!(set_dv([1, 2, 3]), set_dv([1, 2, 3]));
+        assert_eq!(bitmap_dv([1, 2, 3]), bitmap_dv([1, 2, 3]));
+        assert_eq!(set_dv([5, 6, 7]), bitmap_dv([5, 6, 7])); // cross-type
+        assert_eq!(bitmap_dv([5, 6, 7]), set_dv([5, 6, 7])); // reverse
+        assert_ne!(DeletionVector::NoDeletions, set_dv([1]));
+        assert_ne!(DeletionVector::NoDeletions, bitmap_dv([1]));
+    }
+
+    #[test]
+    fn test_extend() {
+        // Empty iter -> stays NoDeletions
+        let mut dv = DeletionVector::NoDeletions;
+        dv.extend(std::iter::empty::<u32>());
+        assert!(matches!(dv, DeletionVector::NoDeletions));
+
+        // Unknown size small -> Set
+        let mut dv = DeletionVector::NoDeletions;
+        dv.extend(std::iter::from_fn({
+            let mut i = 0u32;
+            move || {
+                i += 1;
+                (i <= 10).then_some(i - 1)
+            }
+        }));
+        assert!(matches!(dv, DeletionVector::Set(_)));
+
+        // Unknown size large -> Bitmap
+        let mut dv = DeletionVector::NoDeletions;
+        dv.extend((0u32..10_000).filter(|_| true));
+        assert!(matches!(dv, DeletionVector::Bitmap(_)));
+
+        // Set stays Set when small
+        let mut dv = set_dv([1, 2, 3]);
+        dv.extend([4, 5, 6]);
+        assert!(matches!(dv, DeletionVector::Set(_)) && dv.len() == 6);
+
+        // Set promotes to Bitmap when large
+        let mut dv = set_dv([1, 2, 3]);
+        dv.extend(100..(BITMAP_THRESDHOLD as u32 + 100));
+        assert!(matches!(dv, DeletionVector::Bitmap(_)));
+
+        // Bitmap stays Bitmap
+        let mut dv = bitmap_dv([1, 2, 3]);
+        dv.extend([4, 5, 6]);
+        assert!(matches!(dv, DeletionVector::Bitmap(_)) && dv.len() == 6);
+    }
+
+    #[test]
+    fn test_from_roaring() {
+        let dv: DeletionVector = RoaringBitmap::new().into();
+        assert!(matches!(dv, DeletionVector::NoDeletions));
+
+        let dv: DeletionVector = RoaringBitmap::from_iter([1, 2, 3]).into();
+        assert!(matches!(dv, DeletionVector::Bitmap(_)) && dv.len() == 3);
+    }
+
+    #[test]
+    fn test_map_offset_dense_then_sparse() {
+        // First half densely deleted (80% deleted), second half sparse (20% deleted)
+        // This creates varying deletion density that might trip up the algorithm
+        let mut deleted = Vec::new();
+        // Dense region: delete 4 out of every 5 rows (keep every 5th)
+        for i in 0..500u32 {
+            if i % 5 != 0 {
+                deleted.push(i);
+            }
+        }
+        // Sparse region: delete 1 out of every 5 rows
+        for i in 500..1000u32 {
+            if i % 5 == 0 {
+                deleted.push(i);
+            }
+        }
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter(deleted));
         let mut mapper = OffsetMapper::new(Arc::new(dv));
 
-        let offsets = [0, 1, 2, 3, 4, 5, 6];
-        let mut output = Vec::new();
-        for offset in offsets.iter() {
-            output.push(mapper.map_offset(*offset));
-        }
-        assert_eq!(output, vec![0, 1, 2, 4, 6, 7, 8]);
+        // In dense region: offset 0 -> row 0 (kept), offset 1 -> row 5 (kept), etc.
+        assert_eq!(mapper.map_offset(0), 0);
+        assert_eq!(mapper.map_offset(1), 5);
+        assert_eq!(mapper.map_offset(99), 495);
 
-        let dv = DeletionVector::from_iter(vec![0, 1, 2]);
-        let mut mapper = OffsetMapper::new(Arc::new(dv));
-
-        let offsets = [0, 1, 2, 3, 4, 5, 6];
-
-        let mut output = Vec::new();
-        for offset in offsets.iter() {
-            output.push(mapper.map_offset(*offset));
-        }
-        assert_eq!(output, vec![3, 4, 5, 6, 7, 8, 9]);
+        // Transition to sparse region
+        // At row 500, we've had 400 deletions in dense region, plus row 500 is deleted
+        // offset 100 should get row 501
+        assert_eq!(mapper.map_offset(100), 501);
     }
 }

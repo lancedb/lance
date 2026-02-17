@@ -6,7 +6,7 @@
 // TODO: these tests are copied from super::external_manifest::test
 // since these tests applies to all external manifest stores,
 // we should move them to a common place
-// https://github.com/lancedb/lance/issues/1208
+// https://github.com/lance-format/lance/issues/1208
 // Windows FS can't handle concurrent copy
 #[cfg(all(test, not(target_os = "windows")))]
 mod test {
@@ -298,13 +298,14 @@ mod test {
         let dir = TempStrDir::default();
         let ds_uri = &dir;
 
-        let mut ds = Dataset::write(
-            data_gen.batch(10),
-            ds_uri,
-            Some(write_params(handler.clone())),
-        )
-        .await
-        .unwrap();
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            enable_v2_manifest_paths: false,
+            ..Default::default()
+        };
+        let mut ds = Dataset::write(data_gen.batch(10), ds_uri, Some(params))
+            .await
+            .unwrap();
 
         for _ in 0..5 {
             let data = data_gen.batch(10);

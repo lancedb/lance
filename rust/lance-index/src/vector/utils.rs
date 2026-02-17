@@ -128,8 +128,8 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
             do_prefetch(array.values().as_ptr_range())
         }
         _ => {
-            return Err(Error::io(
-                format!("unsupported prefetch on {} type", array.data_type()),
+            return Err(Error::invalid_input(
+                format!("Unsupported data type for prefetch: {}", array.data_type()),
                 location!(),
             ));
         }

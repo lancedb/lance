@@ -12,7 +12,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID_FIELD};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -127,12 +127,12 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                let row_id_mask = prefilter.mask();
+                let row_addr_mask = prefilter.mask();
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_id) in row_ids.enumerate() {
-                        if !row_id_mask.selected(row_id) {
+                    for (id, &row_addr) in row_ids.enumerate() {
+                        if !row_addr_mask.selected(row_addr) {
                             continue;
                         }
                         let dist = dist_calc.distance(id as u32).into();
@@ -141,24 +141,24 @@ impl IvfSubIndex for FlatIndex {
                         }
 
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 } else {
-                    for (id, &row_id) in row_ids.enumerate() {
-                        if !row_id_mask.selected(row_id) {
+                    for (id, &row_addr) in row_ids.enumerate() {
+                        if !row_addr_mask.selected(row_addr) {
                             continue;
                         }
 
                         let dist = dist_calc.distance(id as u32).into();
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 }
@@ -203,7 +203,7 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
-    async fn load(_: &FileReader) -> Result<Self> {
+    async fn load(_: &PreviousFileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
 }

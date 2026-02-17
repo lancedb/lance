@@ -2,11 +2,195 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import io
-from typing import IO, Iterator, Optional, Union
+from dataclasses import dataclass
+from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
 from .lance import LanceBlobFile
+
+
+@dataclass(frozen=True)
+class Blob:
+    """
+    A logical blob value for writing Lance blob columns.
+
+    A blob can be represented as:
+    - inline bytes
+    - an external URI with position and size, if position and size are not set,
+      use the full uri.
+    """
+
+    data: Optional[bytes] = None
+    uri: Optional[str] = None
+    position: Optional[int] = None
+    size: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.data is not None and self.uri is not None:
+            raise ValueError("Blob cannot have both data and uri")
+        if self.uri == "":
+            raise ValueError("Blob uri cannot be empty")
+        if (self.position is not None or self.size is not None) and self.uri is None:
+            raise ValueError("External packed blob must have a uri")
+        if (self.position is None) != (self.size is None):
+            raise ValueError(
+                "External blob must set both position and size, or neither"
+            )
+        if self.data is not None and self.position is not None:
+            raise ValueError(
+                "Blob cannot have both inline data and external slice metadata"
+            )
+
+    @staticmethod
+    def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
+        return Blob(data=bytes(data))
+
+    @staticmethod
+    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
+        if uri == "":
+            raise ValueError("Blob uri cannot be empty")
+        if position < 0 or size < 0:
+            raise ValueError("External blob position and size must be non-negative")
+        return Blob(uri=uri, position=position, size=size)
+
+    @staticmethod
+    def empty() -> "Blob":
+        return Blob(data=b"")
+
+
+class BlobType(pa.ExtensionType):
+    """
+    A PyArrow extension type for Lance blob columns.
+
+    This is the "logical" type users write. Lance will store it in a compact
+    descriptor format, and reads will return descriptors by default.
+    """
+
+    def __init__(self) -> None:
+        storage_type = pa.struct(
+            [
+                pa.field("data", pa.large_binary(), nullable=True),
+                pa.field("uri", pa.utf8(), nullable=True),
+                pa.field("position", pa.uint64(), nullable=True),
+                pa.field("size", pa.uint64(), nullable=True),
+            ]
+        )
+        pa.ExtensionType.__init__(self, storage_type, "lance.blob.v2")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(
+        cls, storage_type: pa.DataType, serialized: bytes
+    ) -> "BlobType":
+        return BlobType()
+
+    def __arrow_ext_class__(self):
+        return BlobArray
+
+    def __reduce__(self):
+        # Workaround to ensure pickle works in earlier versions of PyArrow
+        # https://github.com/apache/arrow/issues/35599
+        return type(self).__arrow_ext_deserialize__, (
+            self.storage_type,
+            self.__arrow_ext_serialize__(),
+        )
+
+
+try:
+    pa.register_extension_type(BlobType())
+except pa.ArrowKeyError:
+    # Already registered in this interpreter.
+    pass
+
+
+class BlobArray(pa.ExtensionArray):
+    """
+    A PyArrow extension array for Lance blob columns.
+
+    Construct with :meth:`from_pylist` or use :func:`blob_array`.
+    """
+
+    @classmethod
+    def from_pylist(cls, values: list[Any]) -> "BlobArray":
+        data_values: list[Optional[bytes]] = []
+        uri_values: list[Optional[str]] = []
+        position_values: list[Optional[int]] = []
+        size_values: list[Optional[int]] = []
+        null_mask: list[bool] = []
+
+        for v in values:
+            if v is None:
+                data_values.append(None)
+                uri_values.append(None)
+                position_values.append(None)
+                size_values.append(None)
+                null_mask.append(True)
+                continue
+
+            if isinstance(v, Blob):
+                data_values.append(v.data)
+                uri_values.append(v.uri)
+                position_values.append(v.position)
+                size_values.append(v.size)
+                null_mask.append(False)
+                continue
+
+            if isinstance(v, str):
+                if v == "":
+                    raise ValueError("Blob uri cannot be empty")
+                data_values.append(None)
+                uri_values.append(v)
+                position_values.append(None)
+                size_values.append(None)
+                null_mask.append(False)
+                continue
+
+            if isinstance(v, (bytes, bytearray, memoryview)):
+                data_values.append(bytes(v))
+                uri_values.append(None)
+                position_values.append(None)
+                size_values.append(None)
+                null_mask.append(False)
+                continue
+
+            raise TypeError(
+                "BlobArray values must be bytes-like, str (URI), Blob, or None; "
+                f"got {type(v)}"
+            )
+
+        data_arr = pa.array(data_values, type=pa.large_binary())
+        uri_arr = pa.array(uri_values, type=pa.utf8())
+        position_arr = pa.array(position_values, type=pa.uint64())
+        size_arr = pa.array(size_values, type=pa.uint64())
+        mask_arr = pa.array(null_mask, type=pa.bool_())
+        storage = pa.StructArray.from_arrays(
+            [data_arr, uri_arr, position_arr, size_arr],
+            names=["data", "uri", "position", "size"],
+            mask=mask_arr,
+        )
+        return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]
+
+
+def blob_array(values: list[Any]) -> BlobArray:
+    """
+    Construct a blob array from Python values.
+
+    Each value must be one of:
+    - bytes-like: inline bytes
+    - str: an external URI
+    - Blob: explicit inline/uri/empty
+    - None: null
+    """
+
+    return BlobArray.from_pylist(values)
+
+
+def blob_field(name: str, *, nullable: bool = True) -> pa.Field:
+    """Construct an Arrow field for a Lance blob column."""
+    return pa.field(name, BlobType(), nullable=nullable)
 
 
 class BlobIterator:

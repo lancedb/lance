@@ -2,6 +2,7 @@
 #
 
 import argparse
+import time
 
 import lance
 import numpy as np
@@ -20,7 +21,7 @@ def run_query(
     results = []
     for query in queries:
         tbl = ds.scanner(
-            columns=["_id"],
+            columns=["_id", "_distance"],
             nearest={
                 "column": "openai",
                 "q": query,
@@ -56,7 +57,7 @@ def compute_recall(gt: np.ndarray, result: np.ndarray) -> float:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("uri", help="dataset uri")
+    parser.add_argument("--uri", help="dataset uri", default="./dbpedia.lance")
     parser.add_argument(
         "-k",
         "--top-k",
@@ -90,6 +91,7 @@ def main():
 
     for ivf in [256, 512, 1024]:
         for pq in [32, 96, 192]:
+            start = time.perf_counter()
             ds.create_index(
                 "openai",
                 "IVF_PQ",
@@ -98,6 +100,8 @@ def main():
                 replace=True,
                 metric=args.metric,
             )
+            end = time.perf_counter()
+            print(f"Create IVF{ivf}_PQ{pq} index in {end - start:0.2f}s")
             for refine in [None, 2, 5, 10, 50, 100]:
                 results = run_query(
                     ds,

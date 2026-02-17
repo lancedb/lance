@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 #[cfg(test)]
-use mock_instant::{SystemTime as NativeSystemTime, UNIX_EPOCH};
+use mock_instant::thread_local::{SystemTime as NativeSystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
 use std::time::{SystemTime as NativeSystemTime, UNIX_EPOCH};

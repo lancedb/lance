@@ -24,7 +24,9 @@ lance-file = { workspace = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
+lance-namespace = { workspace = true }
 lance-table = { workspace = true }
+lance-geo = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -39,6 +41,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
 deepsize.workspace = true
@@ -73,13 +76,13 @@ serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
 tantivy.workspace = true
-tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
-prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tracing.workspace = true
 humantime = { workspace = true }
 async_cell = "0.2.2"
+semver.workspace = true
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -90,6 +93,7 @@ lzma-sys = { version = "0.1" }
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
+libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
@@ -97,23 +101,28 @@ dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
+lance-io = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.11.7"
 tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
+paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
-
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+geo-types = { workspace = true }
+datafusion-substrait = { workspace = true }
 
 [features]
-default = ["aws", "azure", "gcp", "oss"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
-tensorflow = ["dep:tfrecord", "dep:prost_old"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
@@ -127,6 +136,10 @@ aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
+tencent = ["lance-io/tencent"]
+huggingface = ["lance-io/huggingface"]
+# Enable slow integration tests (disabled by default in CI)
+slow_tests = []
 
 [[bin]]
 name = "lq"
@@ -150,6 +163,30 @@ harness = false
 
 [[bench]]
 name = "take"
+harness = false
+
+[[bench]]
+name = "random_access"
+harness = false
+
+[[bench]]
+name = "fts_search"
+harness = false
+
+[[bench]]
+name = "vector_throughput"
+harness = false
+
+[[bench]]
+name = "mem_wal_write"
+harness = false
+
+[[bench]]
+name = "memtable_read"
+harness = false
+
+[[bench]]
+name = "mem_wal_read"
 harness = false
 
 [lints]

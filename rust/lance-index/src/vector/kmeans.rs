@@ -56,7 +56,6 @@ pub enum KMeanInit {
 }
 
 /// KMean Training Parameters
-#[derive(Debug)]
 pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
@@ -87,6 +86,24 @@ pub struct KMeansParams {
     /// Higher would split the clusters more aggressively, which would be more accurate but slower.
     /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
+
+    /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
+    pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for KMeansParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KMeansParams")
+            .field("max_iters", &self.max_iters)
+            .field("tolerance", &self.tolerance)
+            .field("redos", &self.redos)
+            .field("init", &self.init)
+            .field("distance_type", &self.distance_type)
+            .field("balance_factor", &self.balance_factor)
+            .field("hierarchical_k", &self.hierarchical_k)
+            .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Default for KMeansParams {
@@ -99,6 +116,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            on_progress: None,
         }
     }
 }
@@ -130,6 +148,11 @@ impl KMeansParams {
     /// which is the same as normal kmeans clustering.
     pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
         self.balance_factor = balance_factor;
+        self
+    }
+
+    pub fn with_on_progress(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
+        self.on_progress = Some(cb);
         self
     }
 
@@ -419,11 +442,15 @@ where
 
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
-            warn!(
-                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
-                is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors.",
-                empty_clusters, k
-            );
+            if data.len() / dimension < k * 256 {
+                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                is too small to have a meaningful index ({} < {}) or has many duplicate vectors.",
+                empty_clusters, k, data.len() / dimension, k * 256);
+            } else {
+                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                has many duplicate vectors.",
+                empty_clusters, k);
+            }
         }
 
         split_clusters(
@@ -611,6 +638,17 @@ impl KMeans {
     where
         T::Native: Num,
     {
+        // the data is `num_partitions * sample_rate` vectors,
+        // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
+        // so we need to sample the sampled data again here.
+        // we have to limit the number of data to avoid division underflow,
+        // the threshold 512 is chosen because the minimal normal f16 value will be 0 if divided by 1024.
+        let data = if data.len() >= k * 512 {
+            data.slice(0, k * 512)
+        } else {
+            data.clone()
+        };
+
         let n = data.len();
         let dimension = data.value_length() as usize;
 
@@ -648,6 +686,9 @@ impl KMeans {
 
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
+                if let Some(cb) = &params.on_progress {
+                    cb(i, params.max_iters);
+                }
                 if i % 10 == 0 {
                     info!(
                         "KMeans training: iteration {} / {}, redo={}",
@@ -743,6 +784,7 @@ impl KMeans {
             id: usize,
             indices: Vec<usize>,
             centroid: Vec<N>,
+            finalized: bool,
         }
 
         impl<N> Eq for Cluster<N> {}
@@ -755,8 +797,15 @@ impl KMeans {
 
         impl<N> Ord for Cluster<N> {
             fn cmp(&self, other: &Self) -> Ordering {
-                // Max heap: larger clusters first
-                self.indices.len().cmp(&other.indices.len())
+                // Non-finalized clusters should always have higher priority than finalized ones
+                match (self.finalized, other.finalized) {
+                    (false, true) => Ordering::Greater,
+                    (true, false) => Ordering::Less,
+                    _ => {
+                        // Max heap: larger clusters first
+                        self.indices.len().cmp(&other.indices.len())
+                    }
+                }
             }
         }
 
@@ -779,7 +828,7 @@ impl KMeans {
             )))?
             .values();
 
-        // Initial clustering with k'=256
+        // Initial clustering with k'=16
         let initial_k = params.hierarchical_k.min(target_k).min(n);
         info!(
             "Hierarchical clustering: initial k={}, target k={}",
@@ -823,6 +872,7 @@ impl KMeans {
                     id: next_cluster_id,
                     indices: cluster_indices,
                     centroid,
+                    finalized: false,
                 });
                 next_cluster_id += 1;
             }
@@ -831,17 +881,22 @@ impl KMeans {
         // Iteratively split largest clusters until we have target_k clusters
         while heap.len() < target_k {
             // Get the largest cluster
-            let largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
+            let mut largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
                 "No cluster can be further split".to_string(),
             ))?;
 
-            // Skip if cluster has only 1 point
-            if largest_cluster.indices.len() <= 1 {
+            // If this cluster is already finalized, no further split is possible; stop splitting
+            if largest_cluster.finalized {
+                log::warn!("Cluster {} is already finalized, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
                 heap.push(largest_cluster);
-                if heap.iter().all(|c| c.indices.len() <= 1) {
-                    break; // No more splits possible
-                }
-                continue;
+                break;
+            }
+
+            // Because the clusters are sorted by size, if the cluster has only 1 point, no further split is possible; stop splitting
+            if largest_cluster.indices.len() <= 1 {
+                log::warn!("Cluster {} has only 1 point, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                heap.push(largest_cluster);
+                break;
             }
 
             let cluster_size = largest_cluster.indices.len();
@@ -866,17 +921,17 @@ impl KMeans {
             };
 
             // Create sub-dataset for this cluster using indices
-            let cluster_fsl = Self::create_array_from_indices::<T>(
+            let sub_data = Self::create_array_from_indices::<T>(
                 &largest_cluster.indices,
                 data_values,
                 dimension,
             )?;
 
             // Run kmeans on this cluster
-            let sub_kmeans = Self::train_kmeans::<T, Algo>(&cluster_fsl, cluster_k, params)?;
+            let sub_kmeans = Self::train_kmeans::<T, Algo>(&sub_data, cluster_k, params)?;
 
             // Get membership for points in the sub-cluster
-            let sub_data = cluster_fsl.values().as_primitive::<T>().values();
+            let sub_data = sub_data.values().as_primitive::<T>().values();
             let (sub_membership, _, _) = Algo::compute_membership_and_loss(
                 sub_kmeans.centroids.as_primitive::<T>().values(),
                 sub_data,
@@ -887,31 +942,65 @@ impl KMeans {
                 None,
             );
 
+            // Build per-cluster membership while checking whether the split is effective
+            let approx_cluster_capacity = if cluster_k > 0 {
+                largest_cluster.indices.len().div_ceil(cluster_k)
+            } else {
+                0
+            };
+            let mut cluster_assignments: Vec<Vec<usize>> = (0..cluster_k)
+                .map(|_| Vec::with_capacity(approx_cluster_capacity))
+                .collect();
+
+            let mut first_sid: Option<u32> = None;
+            let mut all_same = true;
+            for (local_idx, &membership) in sub_membership.iter().enumerate() {
+                let Some(sub_cluster_id) = membership else {
+                    continue;
+                };
+
+                if let Some(first) = first_sid {
+                    if sub_cluster_id != first {
+                        all_same = false;
+                    }
+                } else {
+                    first_sid = Some(sub_cluster_id);
+                }
+
+                let sub_cluster_id = sub_cluster_id as usize;
+                if let Some(indices) = cluster_assignments.get_mut(sub_cluster_id) {
+                    indices.push(largest_cluster.indices[local_idx]);
+                } else {
+                    // Unexpected assignment outside [0, cluster_k); treat as ineffective split.
+                    all_same = false;
+                }
+            }
+
+            // If all memberships are identical, the split is ineffective; finalize the original cluster
+            if all_same {
+                largest_cluster.finalized = true;
+                heap.push(largest_cluster);
+                continue;
+            }
+
             // Create new sub-clusters and add to heap
             let sub_centroids = sub_kmeans.centroids.as_primitive::<T>().values();
-            for i in 0..cluster_k {
-                let mut new_cluster_indices = Vec::new();
-                for (local_idx, &sub_cluster_id) in sub_membership.iter().enumerate() {
-                    if let Some(sid) = sub_cluster_id {
-                        if sid as usize == i {
-                            let global_idx = largest_cluster.indices[local_idx];
-                            new_cluster_indices.push(global_idx);
-                        }
-                    }
+            for (i, new_cluster_indices) in cluster_assignments.into_iter().enumerate() {
+                if new_cluster_indices.is_empty() {
+                    continue;
                 }
 
-                if !new_cluster_indices.is_empty() {
-                    let centroid_start = i * dimension;
-                    let centroid_end = centroid_start + dimension;
-                    let centroid = sub_centroids[centroid_start..centroid_end].to_vec();
+                let centroid_start = i * dimension;
+                let centroid_end = centroid_start + dimension;
+                let centroid = sub_centroids[centroid_start..centroid_end].to_vec();
 
-                    heap.push(Cluster {
-                        id: next_cluster_id,
-                        indices: new_cluster_indices,
-                        centroid,
-                    });
-                    next_cluster_id += 1;
-                }
+                heap.push(Cluster {
+                    id: next_cluster_id,
+                    indices: new_cluster_indices,
+                    centroid,
+                    finalized: false,
+                });
+                next_cluster_id += 1;
             }
 
             log::debug!(
@@ -1256,9 +1345,12 @@ where
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(Error::Index{message: format!(
-            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
-        ),location: location!()});
+        return Err(Error::Unprocessable {
+            message: format!(
+                "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
+            ),
+            location: location!(),
+        });
     }
 
     // Only sample sample_rate * num_clusters. See Faiss
@@ -1309,6 +1401,9 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 mod tests {
     use std::iter::repeat_n;
 
+    use arrow_array::types::Float16Type;
+    use arrow_array::Float16Array;
+    use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
 
@@ -1467,6 +1562,44 @@ mod tests {
         let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
         for val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_float16_underflow_fix() {
+        // This test verifies the fix for float16 division underflow
+        // When training k-means on many float16 vectors with small k,
+        // without limiting the data size, dividing centroids by count
+        // can underflow to 0,
+        // The fix limits data to k * 512 to prevent this
+        const DIM: usize = 2;
+        const K: usize = 2;
+        const NUM_VALUES: usize = K * 65536; // Many vectors to trigger the issue
+
+        let f32_values = generate_random_array(NUM_VALUES * DIM);
+        let f16_values = Float16Array::from_iter_values(
+            f32_values.values().iter().map(|&v| half::f16::from_f32(v)),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(f16_values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            ..Default::default()
+        };
+
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+
+        // Verify that we have the correct number of clusters
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::Float16);
+
+        // Verify that all centroids are valid (not zero or NaN)
+        // Without the fix, they would all be zero due to underflow
+        let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
+        for &val in centroids {
+            assert!(!val.is_nan(), "Centroid should not contain NaN values");
+            assert!(val != f16::ZERO);
         }
     }
 }

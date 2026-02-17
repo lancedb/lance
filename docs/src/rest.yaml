@@ -23,11 +23,11 @@ info:
     
     The `components/schemas`, `components/responses`, `components/examples`, `tags` sections define
     the request and response shape for each operation in a Lance Namespace across all implementations.
-    See https://lancedb.github.io/lance-namespace/spec/operations for more details.
+    See https://lance.org/format/namespace/operations for more details.
     
     The `servers`, `security`, `paths`, `components/parameters` sections are for the 
     Lance REST Namespace implementation, which defines a complete REST server that can work with Lance datasets.
-    See https://lancedb.github.io/lance-namespace/spec/impls/rest for more details.
+    See https://lance.org/format/namespace/impls/rest for more details.
 servers:
   - url: "{scheme}://{host}:{port}/{basePath}"
     description: Generic server URL with all parts configurable
@@ -737,6 +737,13 @@ paths:
         required: true
         schema:
           type: string
+      - name: "when_matched_delete"
+        in: query
+        description: Delete all rows in target table where a match exists in source table
+        required: false
+        schema:
+          type: boolean
+          default: false
       - name: "when_matched_update_all"
         in: query
         description: Update all columns when rows match
@@ -786,6 +793,7 @@ paths:
         It passes in the `MergeInsertIntoTableRequest` information in the following way:
         - `id`: pass through path parameter of the same name
         - `on`: pass through query parameter of the same name
+        - `when_matched_delete`: pass through query parameter of the same name
         - `when_matched_update_all`: pass through query parameter of the same name
         - `when_matched_update_all_filt`: pass through query parameter of the same name
         - `when_not_matched_insert_all`: pass through query parameter of the same name
@@ -1938,6 +1946,10 @@ components:
         "on":
           description: Column name to use for matching rows (required)
           type: string
+        when_matched_delete:
+          description: Delete all rows in target table where a match exists in source table
+          type: boolean
+          default: false
         when_matched_update_all:
           description: Update all columns when rows match
           type: boolean

@@ -31,10 +31,10 @@ use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::FileReader;
-use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
-use lance_file::v2::writer::FileWriterOptions;
-use lance_file::writer::FileWriter;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
@@ -235,7 +235,7 @@ impl PartitionListBuilder {
 ///
 /// Returns
 /// -------
-///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
+///   `Result<Vec<impl Stream<Item = Result<RecordBatch>>>>`: a vector of streams
 ///   of shuffled partitioned data. Each stream corresponds to a partition and
 ///   is sorted within the stream. Consumer of these streams is expected to merge
 ///   the streams into a single stream by k-list merge algo.
@@ -322,8 +322,11 @@ pub async fn shuffle_dataset(
             .buffer_unordered(get_num_compute_intensive_cpus())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
-                Err(err) => Err(Error::io(err.to_string(), location!())),
+                Ok(Err(err)) => Err(err),
+                Err(join_err) => Err(Error::Execution {
+                    message: join_err.to_string(),
+                    location: location!(),
+                }),
             })
             .boxed();
 
@@ -448,13 +451,17 @@ impl IvfShuffler {
         let writer = object_store.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
-        let schema = match data.as_mut().peek().await {
+        let schema = match data.as_mut().peek_mut().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
-                return Err(Error::io(err.to_string(), location!()));
+                // Using Error::Stop as dummy value to take the error out.
+                return Err(std::mem::replace(err, Error::Stop));
             }
             None => {
-                return Err(Error::io("empty stream".to_string(), location!()));
+                return Err(Error::InvalidInput {
+                    source: "data must not be empty".into(),
+                    location: location!(),
+                })
             }
         };
 
@@ -471,7 +478,7 @@ impl IvfShuffler {
         info!("Writing unsorted data to disk at {}", path);
         info!("with schema: {:?}", schema);
 
-        let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             Schema::try_from(schema.as_ref())?,
             &Default::default(),
@@ -502,7 +509,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(buffer.as_str());
 
             if self.is_legacy {
-                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
@@ -545,7 +553,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(file_name.as_str());
 
             if self.is_legacy {
-                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -627,8 +636,9 @@ impl IvfShuffler {
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
-                _reader_handle =
-                    Some(FileReader::try_new_self_described(&object_store, &path, None).await?);
+                _reader_handle = Some(
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?,
+                );
 
                 stream::iter(start..end)
                     .map(|i| {
@@ -776,7 +786,7 @@ impl IvfShuffler {
                         true,
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
-                    let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
+                    let mut file_writer = lance_file::writer::FileWriter::try_new(
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),
@@ -820,7 +830,7 @@ impl IvfShuffler {
             let file_scheduler = scan_scheduler
                 .open_file(&path, &CachedFileSize::unknown())
                 .await?;
-            let reader = lance_file::v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),

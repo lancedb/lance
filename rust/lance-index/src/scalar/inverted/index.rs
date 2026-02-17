@@ -7,10 +7,7 @@ use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-};
+use std::{collections::HashMap, ops::Range};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
@@ -38,12 +35,12 @@ use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::utils::{
-    mask::RowIdMask,
-    tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::{
+    container::list::ExpLinkedList,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
-use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -62,13 +59,10 @@ use super::{
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::compress_posting_list,
+    encoding::{compress_posting_list, compress_posting_list_with_scores},
     iter::CompressedPostingListIterator,
 };
-use super::{
-    encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
-};
+use super::{encoding::compress_positions, iter::PostingListIterator};
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
@@ -113,6 +107,21 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+
+#[derive(Debug)]
+struct PartitionCandidates {
+    tokens_by_position: Vec<String>,
+    candidates: Vec<DocCandidate>,
+}
+
+impl PartitionCandidates {
+    fn empty() -> Self {
+        Self {
+            tokens_by_position: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum TokenSetFormat {
@@ -224,6 +233,11 @@ impl InvertedIndex {
         &self.params
     }
 
+    /// Returns the number of partitions in this inverted index.
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
@@ -232,7 +246,7 @@ impl InvertedIndex {
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
-        tokens: Arc<Vec<String>>,
+        tokens: Arc<Tokens>,
         params: Arc<FtsSearchParams>,
         operator: Operator,
         prefilter: Arc<dyn PreFilter>,
@@ -254,30 +268,68 @@ impl InvertedIndex {
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
-                tokio::spawn(async move {
-                    part.bm25_search(
-                        tokens.as_ref(),
-                        params.as_ref(),
-                        operator,
-                        mask,
-                        metrics.as_ref(),
-                    )
+                async move {
+                    let postings = part
+                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                        .await?;
+                    if postings.is_empty() {
+                        return Ok(PartitionCandidates::empty());
+                    }
+                    let mut tokens_by_position = vec![String::new(); postings.len()];
+                    for posting in &postings {
+                        let idx = posting.term_index() as usize;
+                        tokens_by_position[idx] = posting.token().to_owned();
+                    }
+                    let params = params.clone();
+                    let mask = mask.clone();
+                    let metrics = metrics.clone();
+                    spawn_cpu(move || {
+                        let candidates = part.bm25_search(
+                            params.as_ref(),
+                            operator,
+                            mask,
+                            postings,
+                            metrics.as_ref(),
+                        )?;
+                        Ok(PartitionCandidates {
+                            tokens_by_position,
+                            candidates,
+                        })
+                    })
                     .await
-                })
+                }
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
+            if res.candidates.is_empty() {
+                continue;
+            }
+            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+            for token in &res.tokens_by_position {
+                let idf_weight = match idf_cache.get(token) {
+                    Some(weight) => *weight,
+                    None => {
+                        let weight = scorer.query_weight(token);
+                        idf_cache.insert(token.clone(), weight);
+                        weight
+                    }
+                };
+                idf_by_position.push(idf_weight);
+            }
             for DocCandidate {
                 row_id,
                 freqs,
                 doc_length,
-            } in res?
+            } in res.candidates
             {
                 let mut score = 0.0;
-                for (token, freq) in freqs.into_iter() {
-                    score += scorer.score(token.as_str(), freq, doc_length);
+                for (term_index, freq) in freqs.into_iter() {
+                    debug_assert!((term_index as usize) < idf_by_position.len());
+                    score +=
+                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -500,7 +552,7 @@ impl InvertedIndex {
 
         let (doc_ids, _) = self
             .bm25_search(
-                tokens.into(),
+                Arc::new(tokens),
                 params.into(),
                 Operator::And,
                 Arc::new(NoFilter),
@@ -536,7 +588,7 @@ impl ScalarIndex for InvertedIndex {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+                Ok(SearchResult::at_most(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
     }
@@ -679,7 +731,7 @@ impl InvertedPartition {
         self.tokens.get(token)
     }
 
-    pub fn expand_fuzzy(&self, tokens: &[String], params: &FtsSearchParams) -> Result<Vec<String>> {
+    pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
             let fuzziness = match params.fuzziness {
@@ -692,8 +744,9 @@ impl InvertedPartition {
                     location: location!(),
                 })?;
 
+            let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                match params.prefix_length {
+                match base_len + params.prefix_length {
                     0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
                     prefix_length => {
                         let prefix = &token[..min(prefix_length as usize, token.len())];
@@ -712,26 +765,24 @@ impl InvertedPartition {
                 });
             }
         }
-        Ok(new_tokens)
+        Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
     }
 
     // search the documents that contain the query
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    pub async fn bm25_search(
+    pub async fn load_posting_lists(
         &self,
-        tokens: &[String],
+        tokens: &Tokens,
         params: &FtsSearchParams,
-        operator: Operator,
-        mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<PostingIterator>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens, params)?,
-            false => tokens.to_vec(),
+            false => tokens.clone(),
         };
         let mut token_ids = Vec::with_capacity(tokens.len());
         for token in tokens {
@@ -753,7 +804,7 @@ impl InvertedPartition {
         }
 
         let num_docs = self.docs.len();
-        let postings = stream::iter(token_ids)
+        stream::iter(token_ids)
             .enumerate()
             .map(|(position, (token_id, token))| async move {
                 let posting = self
@@ -771,10 +822,28 @@ impl InvertedPartition {
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
-            .await?;
+            .await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn bm25_search(
+        &self,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowAddrMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // let local_metrics = LocalMetricsCollector::default();
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
-        wand.search(params, mask, metrics)
+        let hits = wand.search(params, mask, metrics)?;
+        // local_metrics.dump_into(metrics);
+        Ok(hits)
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
@@ -876,13 +945,6 @@ impl TokenSet {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
     }
 
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
@@ -1088,6 +1150,24 @@ impl TokenSet {
         }
 
         token_id
+    }
+
+    pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
+        let next_id = self.next_id;
+        match self.tokens {
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&token_id) = map.get(token) {
+                    return token_id;
+                }
+
+                map.insert(token.to_owned(), next_id);
+            }
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        }
+
+        self.next_id += 1;
+        self.total_length += token.len();
+        next_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -1317,8 +1397,7 @@ impl PostingListReader {
                 let batch = self.posting_batch(token_id, false).await?;
                 self.posting_list_from_batch(&batch, token_id)
             })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .await?
             .as_ref()
             .clone();
 
@@ -1401,7 +1480,7 @@ impl PostingListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        Ok(self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
+        let positions = self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
             let batch = self
                 .reader
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
@@ -1417,9 +1496,8 @@ impl PostingListReader {
             Result::Ok(Positions(batch[POSITION_COL]
                 .as_list::<i32>()
                 .clone()))
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))?.as_ref()
-            .clone()
-            .0)
+        }).await?;
+        Ok(positions.0.clone())
     }
 
     fn posting_list_range(&self, token_id: u32) -> Range<usize> {
@@ -1454,10 +1532,6 @@ impl PostingListReader {
 pub struct Positions(ListArray);
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of(&self) -> usize {
-        self.0.get_array_memory_size()
-    }
-
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.0.get_buffer_memory_size()
     }
@@ -1577,7 +1651,7 @@ impl PostingList {
                     let freq = freq as u32;
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1595,7 +1669,7 @@ impl PostingList {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1622,7 +1696,7 @@ impl DeepSizeOf for PlainPostingList {
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_array_memory_size())
+                .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
     }
 }
@@ -1719,11 +1793,11 @@ pub struct CompressedPostingList {
 
 impl DeepSizeOf for CompressedPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.blocks.get_array_memory_size()
+        self.blocks.get_buffer_memory_size()
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_array_memory_size())
+                .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
     }
 }
@@ -1838,18 +1912,13 @@ impl PostingListBuilder {
         }
     }
 
-    // assume the posting list is sorted by doc id
-    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    fn build_batch(
+        self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
         let length = self.len();
-        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-
-        let schema = inverted_list_schema(self.has_positions());
-        let compressed = compress_posting_list(
-            self.doc_ids.len(),
-            self.doc_ids.iter(),
-            self.frequencies.iter(),
-            block_max_scores.into_iter(),
-        )?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1860,7 +1929,7 @@ impl PostingListBuilder {
             )?) as ArrayRef,
             Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
             Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                self.len() as u32
+                length as u32,
             ))) as ArrayRef,
         ];
 
@@ -1882,6 +1951,37 @@ impl PostingListBuilder {
 
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+
+    // assume the posting list is sorted by doc id
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let schema = inverted_list_schema(self.has_positions());
+        let compressed = compress_posting_list(
+            self.doc_ids.len(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            block_max_scores.into_iter(),
+        )?;
+        self.build_batch(compressed, max_score, schema)
+    }
+
+    pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
+        let length = self.len();
+        let avgdl = docs.average_length();
+        let idf_scale = idf(length, docs.len()) * (K1 + 1.0);
+        let (compressed, max_score) = compress_posting_list_with_scores(
+            length,
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            |doc_id, freq| {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
+                let freq = freq as f32;
+                freq / (freq + doc_norm)
+            },
+            idf_scale,
+        )?;
+        self.build_batch(compressed, max_score, schema)
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -2130,7 +2230,9 @@ impl DocSet {
     ) -> Vec<f32> {
         let avgdl = self.average_length();
         let length = doc_ids.size_hint().0;
-        let mut block_max_scores = Vec::with_capacity(length);
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        let idf_scale = idf(length, self.len()) * (K1 + 1.0);
         let mut max_score = f32::MIN;
         for (i, (doc_id, freq)) in doc_ids.zip(freqs).enumerate() {
             let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
@@ -2140,13 +2242,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                max_score *= idf(length, self.len());
+                max_score *= idf_scale;
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
-        if length % BLOCK_SIZE > 0 {
-            max_score *= idf(length, self.len());
+        if !length.is_multiple_of(BLOCK_SIZE) {
+            max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
         block_max_scores
@@ -2338,9 +2440,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer, None)
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let query_tokens = collect_query_tokens(query, &mut tokenizer, None);
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -2362,9 +2462,10 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
-    query_tokens: &HashSet<String>,
+    query_tokens: &Tokens,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     scorer: &mut MemBM25Scorer,
+    schema: SchemaRef,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
@@ -2390,7 +2491,7 @@ pub fn flat_bm25_search(
                 .or_insert(1);
         }
         let mut score = 0.0;
-        for token in query_tokens.iter() {
+        for token in query_tokens {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
 
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
@@ -2402,7 +2503,7 @@ pub fn flat_bm25_search(
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
         .try_with_column(SCORE_FIELD.clone(), score_col)?
-        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
+        .project_by_schema(&schema)?;
     Ok(batch)
 }
 
@@ -2411,6 +2512,7 @@ pub fn flat_bm25_search_stream(
     doc_col: String,
     query: String,
     index: &Option<InvertedIndex>,
+    schema: SchemaRef,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
@@ -2421,10 +2523,7 @@ pub fn flat_bm25_search_stream(
             .build(),
         )),
     };
-    let tokens = collect_query_tokens(&query, &mut tokenizer, None)
-        .into_iter()
-        .sorted_unstable()
-        .collect::<HashSet<_>>();
+    let tokens = collect_query_tokens(&query, &mut tokenizer, None);
 
     let mut bm25_scorer = match index {
         Some(index) => {
@@ -2439,7 +2538,7 @@ pub fn flat_bm25_search_stream(
                     token_docs.insert(token.clone(), token_nq);
                 }
                 MemBM25Scorer::new(
-                    index_bm25_scorer.avg_doc_length() as u64 * index_bm25_scorer.num_docs() as u64,
+                    index_bm25_scorer.total_tokens(),
                     index_bm25_scorer.num_docs(),
                     token_docs,
                 )
@@ -2448,10 +2547,18 @@ pub fn flat_bm25_search_stream(
         None => MemBM25Scorer::new(0, 0, HashMap::new()),
     };
 
+    let batch_schema = schema.clone();
     let stream = input.map(move |batch| {
         let batch = batch?;
 
-        let batch = flat_bm25_search(batch, &doc_col, &tokens, &mut tokenizer, &mut bm25_scorer)?;
+        let batch = flat_bm25_search(
+            batch,
+            &doc_col,
+            &tokens,
+            &mut tokenizer,
+            &mut bm25_scorer,
+            batch_schema.clone(),
+        )?;
 
         // filter out rows with score 0
         let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
@@ -2465,7 +2572,7 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
@@ -2474,16 +2581,19 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::inverted::lance_tokenizer::DocType;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, UInt32Type};
 
     use super::*;
 
@@ -2523,6 +2633,54 @@ mod tests {
             .iter()
             .zip(expected.frequencies.iter())
             .all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn test_posting_list_batch_matches_docset_scoring() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE + 3;
+        for doc_id in 0..num_docs as u32 {
+            docs.append(doc_id as u64, doc_id % 7 + 1);
+        }
+
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        let freqs = doc_ids
+            .iter()
+            .map(|doc_id| doc_id % 5 + 1)
+            .collect::<Vec<_>>();
+
+        let mut builder_scores = PostingListBuilder::new(false);
+        let mut builder_docs = PostingListBuilder::new(false);
+        for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+            builder_scores.add(doc_id, PositionRecorder::Count(freq));
+            builder_docs.add(doc_id, PositionRecorder::Count(freq));
+        }
+
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let batch_scores = builder_scores.to_batch(block_max_scores).unwrap();
+        let batch_docs = builder_docs
+            .to_batch_with_docs(&docs, inverted_list_schema(false))
+            .unwrap();
+
+        let scores_posting = batch_scores[POSTING_COL].as_list::<i32>().value(0);
+        let scores_posting = scores_posting.as_binary::<i64>();
+        let docs_posting = batch_docs[POSTING_COL].as_list::<i32>().value(0);
+        let docs_posting = docs_posting.as_binary::<i64>();
+        assert_eq!(scores_posting, docs_posting);
+
+        let score_left = batch_scores[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let score_right = batch_docs[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert!((score_left - score_right).abs() < 1e-6);
+
+        let len_left = batch_scores[LENGTH_COL]
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let len_right = batch_docs[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        assert_eq!(len_left, len_right);
     }
 
     #[tokio::test]
@@ -2672,7 +2830,7 @@ mod tests {
         // Prewarm the inverted index (this loads posting lists into cache)
         index.prewarm().await.unwrap();
 
-        let tokens = Arc::new(vec!["test".to_string()]);
+        let tokens = Arc::new(Tokens::new(vec!["test".to_string()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
         let prefilter = Arc::new(NoFilter);
         let metrics = Arc::new(NoOpMetricsCollector);
@@ -2702,5 +2860,104 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[test]
+    fn test_block_max_scores_capacity_matches_block_count() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE * 3 + 7;
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        for doc_id in &doc_ids {
+            docs.append(*doc_id as u64, 1);
+        }
+
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let expected_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+
+        assert_eq!(block_max_scores.len(), expected_blocks);
+        assert_eq!(block_max_scores.capacity(), expected_blocks);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_uses_global_idf() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Partition 0: 3 docs, only one contains "alpha".
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.tokens.add("beta".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(2, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.docs.append(101, 1);
+        builder0.docs.append(102, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        // Partition 1: 1 doc, contains "alpha".
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(200, 1);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids.len(), 2);
+        assert!(row_ids.contains(&100));
+        assert!(row_ids.contains(&200));
+        assert_eq!(row_ids.len(), scores.len());
+
+        let expected_idf = idf(2, 4);
+        for score in scores {
+            assert!(
+                (score - expected_idf).abs() < 1e-6,
+                "score: {}, expected: {}",
+                score,
+                expected_idf
+            );
+        }
     }
 }

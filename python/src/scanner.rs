@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::pyarrow::*;
@@ -28,6 +29,7 @@ use pyo3::exceptions::PyValueError;
 
 use crate::reader::LanceReader;
 use crate::rt;
+use crate::schema::logical_arrow_schema;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
@@ -42,7 +44,7 @@ impl Scanner {
         Self { scanner }
     }
 
-    pub(crate) async fn to_reader(&self) -> ::lance::error::Result<LanceReader> {
+    pub(crate) async fn to_reader(&self) -> ::lance::Result<LanceReader> {
         LanceReader::try_new(self.scanner.clone()).await
     }
 }
@@ -54,21 +56,31 @@ pub struct ScanStatistics {
     /// Number of IO operations performed.  This may be slightly higher than
     /// the actual number due to coalesced I/O
     pub iops: usize,
+    /// Number of requests made to the storage layer
+    pub requests: usize,
     /// Number of bytes read from disk
     pub bytes_read: usize,
     /// Number of indices loaded
     pub indices_loaded: usize,
     /// Number of index partitions loaded
     pub parts_loaded: usize,
+    /// Number of index comparisons performed
+    pub index_comparisons: usize,
+    /// Additional metrics for more detailed statistics. These are subject to change in the future
+    /// and should only be used for debugging purposes.
+    pub all_counts: HashMap<String, usize>,
 }
 
 impl ScanStatistics {
     pub fn from_lance(stats: &ExecutionSummaryCounts) -> Self {
         Self {
             iops: stats.iops,
+            requests: stats.requests,
             bytes_read: stats.bytes_read,
             indices_loaded: stats.indices_loaded,
             parts_loaded: stats.parts_loaded,
+            index_comparisons: stats.index_comparisons,
+            all_counts: stats.all_counts.clone(),
         }
     }
 }
@@ -77,8 +89,8 @@ impl ScanStatistics {
 impl ScanStatistics {
     fn __repr__(&self) -> String {
         format!(
-            "ScanStatistics(iops={}, bytes_read={}, indices_loaded={}, parts_loaded={})",
-            self.iops, self.bytes_read, self.indices_loaded, self.parts_loaded
+            "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, all_counts={:?})",
+            self.iops, self.requests, self.bytes_read, self.indices_loaded, self.parts_loaded, self.index_comparisons, self.all_counts
         )
     }
 }
@@ -86,11 +98,13 @@ impl ScanStatistics {
 #[pymethods]
 impl Scanner {
     #[getter(schema)]
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let scanner = self_.scanner.clone();
-        rt().spawn(Some(self_.py()), async move { scanner.schema().await })?
-            .map(|s| s.to_pyarrow(self_.py()))
-            .map_err(|err| PyValueError::new_err(err.to_string()))?
+        let schema = rt()
+            .spawn(Some(self_.py()), async move { scanner.schema().await })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let logical_schema = logical_arrow_schema(schema.as_ref());
+        logical_schema.to_pyarrow(self_.py())
     }
 
     #[pyo3(signature = (*, verbose = false))]

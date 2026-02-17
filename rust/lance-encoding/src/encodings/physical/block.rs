@@ -29,8 +29,10 @@ use std::str::FromStr;
 
 use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
-use crate::format::pb21::{self, CompressiveEncoding};
-use crate::format::ProtobufUtils21;
+use crate::format::{
+    pb21::{self, CompressiveEncoding},
+    ProtobufUtils21,
+};
 use crate::{
     buffer::LanceBuffer,
     compression::VariablePerValueDecompressor,
@@ -135,20 +137,59 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
 #[cfg(feature = "zstd")]
 mod zstd {
     use std::io::{Cursor, Write};
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
 
-    use ::zstd::bulk::decompress_to_buffer;
+    use ::zstd::bulk::{decompress_to_buffer, Compressor};
     use ::zstd::stream::copy_decode;
 
-    #[derive(Debug, Default)]
+    /// A zstd buffer compressor that lazily creates and reuses compression contexts.
+    ///
+    /// The compression context is cached to enable reuse across chunks within a
+    /// page. It is lazily initialized to prevent it from getting initialized on
+    /// decode-only codepaths.
+    ///
+    /// Reuse is not implemented for decompression, only for compression:
+    /// * The single-threaded benefit of reuse was negligible when measured.
+    /// * Decompressors can get shared across threads, leading to mutex
+    ///   contention if the same strategy is used as for compression here. This
+    ///   should be mitigable with pooling but we can skip the complexity until a
+    ///   need is demonstrated. The multithreaded decode benchmark effectively
+    ///   demonstrates this scenario.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
+        compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
+    }
+
+    impl std::fmt::Debug for ZstdBufferCompressor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ZstdBufferCompressor")
+                .field("compression_level", &self.compression_level)
+                .finish()
+        }
     }
 
     impl ZstdBufferCompressor {
         pub fn new(compression_level: i32) -> Self {
-            Self { compression_level }
+            Self {
+                compression_level,
+                compressor: OnceLock::new(),
+            }
+        }
+
+        fn get_compressor(&self) -> Result<&Mutex<Compressor<'static>>> {
+            self.compressor
+                .get_or_init(|| {
+                    Compressor::new(self.compression_level)
+                        .map(Mutex::new)
+                        .map_err(|e| e.to_string())
+                })
+                .as_ref()
+                .map_err(|e| Error::Internal {
+                    message: format!("Failed to create zstd compressor: {}", e),
+                    location: location!(),
+                })
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -211,13 +252,23 @@ mod zstd {
     impl BufferCompressor for ZstdBufferCompressor {
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
-            let mut encoder = ::zstd::stream::Encoder::new(output_buf, self.compression_level)?;
 
-            encoder.write_all(input_buf)?;
-            match encoder.finish() {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            let max_compressed_size = ::zstd::zstd_safe::compress_bound(input_buf.len());
+            let start_pos = output_buf.len();
+            output_buf.resize(start_pos + max_compressed_size, 0);
+
+            let compressed_size = self
+                .get_compressor()?
+                .lock()
+                .unwrap()
+                .compress_to_buffer(input_buf, &mut output_buf[start_pos..])
+                .map_err(|e| Error::Internal {
+                    message: format!("Zstd compression error: {}", e),
+                    location: location!(),
+                })?;
+
+            output_buf.truncate(start_pos + compressed_size);
+            Ok(())
         }
 
         fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -385,6 +436,33 @@ impl GeneralBufferCompressor {
             }
             CompressionScheme::None => Ok(Box::new(NoopBufferCompressor {})),
         }
+    }
+}
+
+/// A block decompressor that first applies general-purpose compression (LZ4/Zstd)
+/// before delegating to an inner block decompressor.
+#[derive(Debug)]
+pub struct GeneralBlockDecompressor {
+    inner: Box<dyn BlockDecompressor>,
+    compressor: Box<dyn BufferCompressor>,
+}
+
+impl GeneralBlockDecompressor {
+    pub fn try_new(
+        inner: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+    ) -> Result<Self> {
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        Ok(Self { inner, compressor })
+    }
+}
+
+impl BlockDecompressor for GeneralBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+        self.inner
+            .decompress(LanceBuffer::from(decompressed), num_values)
     }
 }
 
@@ -702,6 +780,7 @@ mod tests {
 
         use super::*;
 
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
         use crate::{
             constants::{
                 COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
@@ -742,6 +821,8 @@ mod tests {
                 // Some bad cardinality estimatation causes us to use dictionary encoding currently
                 // which causes the expected encoding check to fail.
                 field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+                // Also disable size-based dictionary encoding
                 field_meta.insert(
                     STRUCTURAL_ENCODING_META_KEY.to_string(),
                     STRUCTURAL_ENCODING_FULLZIP.to_string(),

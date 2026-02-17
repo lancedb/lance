@@ -102,7 +102,7 @@ message MiniBlockLayout {
   // If there is repetition then the depth must be at least 1.  If there are many layers
   // of repetition then deeper repetition indices will support deeper nested random access.  For
   // example, given 5 layers of repetition then the repetition index depth must be at least
-  // 3 to support access like rows[50][17][3].
+  // 3 to support access like `rows[50][17][3]`.
   //
   // We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition
   // index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store
@@ -112,6 +112,9 @@ message MiniBlockLayout {
   // The page already records how many rows are in the page.  For mini-block we also need to know how
   // many "items" are in the page.  A row and an item are the same thing unless the page has lists.
   uint64 num_items = 9;
+
+  // Since Lance 2.2, miniblocks have larger chunk sizes (>= 64KB)
+  bool has_large_chunk = 10;
 }
 
 // A layout used for pages where the data is large
@@ -144,21 +147,36 @@ message FullZipLayout {
   repeated RepDefLayer layers = 8;
 }
 
-// A layout used for pages where all values are null
+// A layout used for pages where all (visible) values are the same scalar value.
 //
-// There may be buffers of repetition and definition information
-// if required in order to interpret what kind of nulls are present
-message AllNullLayout {
+// This generalizes the prior AllNullLayout semantics for file_version >= 2.2.
+//
+// There may be buffers of repetition and definition information if required in order
+// to interpret what kind of nulls are present / which items are visible.
+message ConstantLayout {
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
   repeated RepDefLayer layers = 5;
-  // The compression algorithm that encodes the repetition buffer
-  CompressiveEncoding rep_compression = 6;
-  // The compression algorithm that encodes the definition buffer
-  CompressiveEncoding def_compression = 7;
-  // Number of values in the repetition buffer
-  uint64 num_rep_values = 8;
-  // Number of values in the definition buffer
-  uint64 num_def_values = 9;
+
+  // Inline fixed-width scalar value bytes.
+  //
+  // This MUST only be used for types where a single non-null element is represented by a single
+  // fixed-width Arrow value buffer (i.e. no offsets buffer, no child data).
+  //
+  // Constraints:
+  // - MUST be absent for an all-null page
+  // - MUST be <= 32 bytes if present
+  optional bytes inline_value = 6;
+
+  // Optional compression algorithm used for the repetition buffer.
+  // If absent, repetition levels are stored as raw u16 values.
+  CompressiveEncoding rep_compression = 7;
+  // Optional compression algorithm used for the definition buffer.
+  // If absent, definition levels are stored as raw u16 values.
+  CompressiveEncoding def_compression = 8;
+  // Number of values in repetition buffer after decompression.
+  uint64 num_rep_values = 9;
+  // Number of values in definition buffer after decompression.
+  uint64 num_def_values = 10;
 }
 
 // A layout where large binary data is encoded externally and only
@@ -181,8 +199,8 @@ message PageLayout {
   oneof layout {
     // A layout used for pages where the data is small
     MiniBlockLayout mini_block_layout = 1;
-    // A layout used for pages where all values are null
-    AllNullLayout all_null_layout = 2;
+    // A layout used for pages where all (visible) values are the same scalar value or null.
+    ConstantLayout constant_layout = 2;
     // A layout used for pages where the data is large
     FullZipLayout full_zip_layout = 3;
     // A layout where large binary data is encoded externally
@@ -387,21 +405,38 @@ message FixedSizeList {
   CompressiveEncoding values = 2;
 }
 
-// Converts a struct data block into either a fixed-width data block or a variable-width data block
+// Packs a struct containing only fixed-width children into a single fixed-width data block
 //
-// This encoding does not actually compress the data, it just converts the block into something workable
-//
-// This is a transparent encoding.
-//
-// TODO: This needs support for variable-width data blocks and more flexible compression
-//
-// The input is a single struct data block
-// The output is a single fixed-width or variable-width data block
+// The children are concatenated row by row and stored as a single fixed-width buffer. This is
+// the legacy packed struct representation and remains available for backwards compatibility.
 message PackedStruct {
-  // The number of bits per value for each field
+  // The number of bits contributed by each child field in the packed row
   repeated uint64 bits_per_value = 1;
-  // The compression used to store the values data block
+  // The compression used to store the packed fixed-width values
   CompressiveEncoding values = 2;
+}
+
+// Variable-width packed struct encoding (2.2 extension)
+//
+// Each child value is compressed independently before being transposed into
+// a row-major layout. This preserves per-field compression boundaries at the
+// cost of disabling mini-block compression. Readers must prefer this field
+// when present and fall back to the legacy encoding otherwise.
+message VariablePackedStruct {
+  // Per-field encoding metadata in struct order
+  repeated FieldEncoding fields = 1;
+
+  // Encoding description for a single child field
+  message FieldEncoding {
+    // Compression applied to individual field values before transposition
+    CompressiveEncoding value = 1;
+    oneof layout {
+      // Bit width of each compressed value (when fixed width)
+      uint64 bits_per_value = 2;
+      // Bit width of the length prefix for variable-width compressed values
+      uint64 bits_per_length = 3;
+    }
+  }
 }
 
 // A compression scheme that wraps the underlying data with general compression
@@ -471,6 +506,6 @@ message CompressiveEncoding {
         General general = 10;
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
+        VariablePackedStruct variable_packed_struct = 13;
     }
 }
-

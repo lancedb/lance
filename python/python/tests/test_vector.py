@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import lance
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -92,3 +93,57 @@ def _to_vec(lst):
     return pa.FixedSizeListArray.from_arrays(
         pa.array(np.array(lst).ravel(), type=pa.float32()), list_size=8
     )
+
+
+def _binary_vectors_table():
+    vectors = pa.FixedSizeListArray.from_arrays(
+        pa.array(
+            [
+                0x0F,
+                0,
+                0,
+                0,
+                0x03,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            type=pa.uint8(),
+        ),
+        list_size=4,
+    )
+    ids = pa.array([0, 1, 2], type=pa.int32())
+    return pa.Table.from_arrays([ids, vectors], names=["id", "vector"])
+
+
+def test_binary_vectors_default_hamming(tmp_path):
+    dataset = lance.write_dataset(_binary_vectors_table(), tmp_path / "bin")
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": [0x0F, 0, 0, 0], "k": 3}
+    )
+
+    plan = scanner.analyze_plan()
+    assert "metric=hamming" in plan
+
+    tbl = scanner.to_table()
+    assert tbl["id"].to_pylist() == [0, 1, 2]
+    assert tbl["_distance"].to_pylist() == [0.0, 2.0, 4.0]
+
+
+def test_binary_vectors_invalid_metric(tmp_path):
+    dataset = lance.write_dataset(_binary_vectors_table(), tmp_path / "bin")
+    with pytest.raises(
+        ValueError, match="Distance type l2 does not support .*UInt8 vectors"
+    ):
+        dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": [0x0F, 0, 0, 0],
+                "k": 1,
+                "metric": "l2",
+            }
+        ).to_table()

@@ -22,7 +22,7 @@ layouts which represent the same data.
 
 ### Data Types
 
-Lance uses a subset of Arrow's type system for data types. An Arrow data type is is both a data type and an encoding.
+Lance uses a subset of Arrow's type system for data types. An Arrow data type is both a data type and an encoding.
 When writing data Lance will often normalize Arrow data types. For example, a string array and a large string array
 might end up traveling down the same path (variable width data). In fact, most types fall into two general paths. One
 for fixed-width data and one for variable-width data (where we recognize both 32-bit and 64-bit offsets).
@@ -253,7 +253,7 @@ blocks as opaque chunks. This means we can use any compression algorithm that we
 %%% proto.message.MiniBlockLayout %%%
 ```
 
-The protobuf for the mini block layout describes the cmopression of the various buffers. It also tells us
+The protobuf for the mini block layout describes the compression of the various buffers. It also tells us
 some information about the dictionary (if present) and the repetition index (if present).
 
 ### Full Zip Page Layout
@@ -328,11 +328,13 @@ The protobuf for the full zip layout describes the compression of the data buffe
 size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
 have per offset (for variable-width data).
 
-### All Null Page Layout
+### Constant Page Layout
 
-This layout is used when all the values are null. Surprisingly, this does not mean there is no data. If there
-are any levels of struct or list then we need to store the rep/def levels so that we can distinguish between
-null structs, null lists, empty lists, and null values.
+This layout is used when all (visible) values in the page are the same scalar value.
+
+The all-null case is represented by a constant page without an inline scalar value. Surprisingly, this does not
+mean there is no data. If there are any levels of struct or list then we need to store the rep/def levels so that
+we can distinguish between null structs, null lists, empty lists, and null values.
 
 #### Repetition and Definition Levels (Buffers 0 and 1)
 
@@ -342,10 +344,10 @@ in the second buffer with a flat layout of 16-bit values. This will likely chang
 #### Protobuf
 
 ```protobuf
-%%% proto.message.AllNullLayout %%%
+%%% proto.message.ConstantLayout %%%
 ```
 
-All we need to know is the meaning of each rep/def level.
+All we need to know is the meaning of each rep/def level and (when present) the inline scalar value bytes.
 
 ### Blob Page Layout
 
@@ -478,7 +480,7 @@ This will likely change in future versions.
 Bitpacking is a compression technique that removes the unused bits from a set of values. For example, if we have
 a u32 array and the maximum value is 5000 then we only need 13 bits to store each value.
 
-When used in a mini-block context we always use 1024 values per block. In addition, we store the compresesed bit
+When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
 
 Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
@@ -548,6 +550,19 @@ options. However, they can also be set in the field metadata in the schema.
 
 ### Configuration Details
 
+#### Compression Scheme
+
+The `lance-encoding:compression` setting enables general-purpose compression algorithms to be applied. Available schemes:
+
+- **`lz4`**: Fast compression with good compression ratios. Default compression level is fast mode.
+- **`zstd`**: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.
+- **`none`**: No general compression applied (default).
+- **`fsst`**: Fast Static Symbol Table compression for string data.
+
+General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
+data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
+(≥32KiB), compression is automatically applied per-value.
+
 #### Compression Level
 
 The compression level is scheme dependent. Currently the following schemes support the following levels:
@@ -557,12 +572,27 @@ The compression level is scheme dependent. Currently the following schemes suppo
 | `zstd` | [`zstd`](https://crates.io/crates/zstd) | `0-22` | `crate dependent` (3 as of this writing)                                                                                                                                                                                          |
 | `lz4`  | [`lz4`](https://crates.io/crates/lz4)   | N/A    | The LZ4 crate has two modes (fast and high compression) and currently this is not exposed to configuration. The LZ4 crate wraps a C library and the default is dependent on the C library. The default as of this writing is fast |
 
-#### Run Length Encoding Threshold
+Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
+is typically less affected by the compression level.
+
+#### Run Length Encoding (RLE) Threshold
 
 The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
 calculated by dividing the number of runs by the number of values. If the ratio is less than the threshold then
 we apply run-length encoding. The default is 0.5 which means we apply run-length encoding if the number of runs
 is less than half the number of values.
+
+**Key points:**
+- RLE is automatically selected when data has sufficient repetition (run_count / num_values < threshold)
+- Supported types: All fixed-width primitives (u8, i8, u16, i16, u32, i32, f32, u64, i64, f64)
+- Maximum chunk size: 2048 values per mini-block
+- Setting threshold to `0.0` effectively disables RLE
+- Setting threshold to `1.0` makes RLE very aggressive (used whenever any runs exist)
+
+RLE is particularly effective for:
+- Sorted or partially sorted data
+- Columns with many repeated values (status codes, categories, etc.)
+- Low-cardinality columns
 
 #### Byte Stream Split (BSS)
 
@@ -570,7 +600,24 @@ The configuration variable for BSS is a simple enum. A value of `off` means to n
 means to always apply BSS, and a value of `auto` means to apply BSS based on an entropy calculation (see code for
 details).
 
-BSS is only applied when the `lance-encoding:compression` variable is also set (to a non-`none` value).
+**Important:** BSS is only applied when the `lance-encoding:compression` variable is also set (to a non-`none` value).
+BSS is a data transformation that makes floating-point data more compressible; it does not reduce size on its own.
+
+**Key points:**
+- Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
+- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
+- `on` mode: Always applies BSS for supported types
+- `off` mode: Never applies BSS
+
+BSS works by splitting multi-byte values by byte position, creating separate byte streams. This clusters similar
+bits together (especially mantissa bits in floating-point numbers), which general compression algorithms can then
+compress more effectively.
+
+BSS is particularly effective for:
+- Floating-point measurements with similar ranges
+- Time-series data with consistent precision
+- Scientific data with correlated mantissa patterns
 
 #### Dictionary Divisor
 
@@ -580,8 +627,15 @@ threshold. If the number of unique values is less than the threshold then we app
 configuration variable defines the divisor that we apply and it defaults to 2 which means we apply dictionary
 encoding if we estimate that less than half the values are unique.
 
+Dictionary encoding is effective for columns with low cardinality where the same values repeat many times.
+The dictionary is stored once per page and indices are stored in place of the actual values.
+
 This is likely to change in future versions.
 
 #### Packed Struct Encoding
 
-Packed struct encoding is a semi-structural transformation described above.
+Packed struct encoding is a semi-structural transformation described above. When enabled, struct values are stored
+in row-major format rather than the default columnar format. This reduces the number of I/O operations needed for
+random access but prevents reading individual fields independently.
+
+This is always opt-in and should only be used when all struct fields are typically accessed together.

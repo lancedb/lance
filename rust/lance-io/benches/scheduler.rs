@@ -12,7 +12,7 @@ use lance_io::{
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
 use std::{fmt::Display, process::Command, sync::Arc};
-use tokio::{runtime::Runtime, sync::mpsc};
+use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(target_os = "linux")]
@@ -22,14 +22,15 @@ use pprof::criterion::{Output, PProfProfiler};
 struct FullReadParams {
     io_parallelism: u32,
     page_size: u64,
+    use_lite_scheduler: bool,
 }
 
 impl Display for FullReadParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "full_read,parallel={},read_size={}",
-            self.io_parallelism, self.page_size
+            "full_read,parallel={},read_size={},use_lite_scheduler={}",
+            self.io_parallelism, self.page_size, self.use_lite_scheduler
         )
     }
 }
@@ -73,50 +74,60 @@ fn bench_full_read(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     let (obj_store, tmp_file) = runtime.block_on(create_data(DATA_SIZE));
 
-    for io_parallelism in [1, 16, 32, 64] {
-        for page_size in [4096, 16 * 1024, 1024 * 1024] {
-            let params = FullReadParams {
-                io_parallelism,
-                page_size,
-            };
-            group.bench_with_input(BenchmarkId::from_parameter(params), &params, |b, params| {
-                b.iter(|| {
-                    let obj_store = obj_store.clone();
-                    if obj_store.is_local() {
-                        let path_str = format!("/{}", tmp_file);
-                        Command::new("dd")
-                            .arg(format!("of={}", path_str))
-                            .arg("oflag=nocache")
-                            .arg("conv=notrunc,fdatasync")
-                            .arg("count=0")
-                            .output()
-                            .unwrap();
-                    }
-                    std::env::set_var("IO_THREADS", io_parallelism.to_string());
-                    runtime.block_on(async {
-                        let scheduler =
-                            ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
-                        let file_scheduler = scheduler
-                            .open_file(&tmp_file, &CachedFileSize::unknown())
-                            .await
-                            .unwrap();
+    for use_lite_scheduler in [false, true] {
+        for io_parallelism in [1, 16] {
+            for page_size in [4096, 1024 * 1024] {
+                let params = FullReadParams {
+                    io_parallelism,
+                    page_size,
+                    use_lite_scheduler,
+                };
+                group.bench_with_input(
+                    BenchmarkId::from_parameter(params),
+                    &params,
+                    |b, params| {
+                        b.iter(|| {
+                            let obj_store = obj_store.clone();
+                            if obj_store.is_local() {
+                                let path_str = format!("/{}", tmp_file);
+                                Command::new("dd")
+                                    .arg(format!("of={}", path_str))
+                                    .arg("oflag=nocache")
+                                    .arg("conv=notrunc,fdatasync")
+                                    .arg("count=0")
+                                    .output()
+                                    .unwrap();
+                            }
+                            std::env::set_var("IO_THREADS", io_parallelism.to_string());
+                            let mut config = SchedulerConfig::default_for_testing();
+                            if use_lite_scheduler {
+                                config = config.with_lite_scheduler();
+                            }
+                            runtime.block_on(async {
+                                let scheduler = ScanScheduler::new(obj_store, config);
+                                let file_scheduler = scheduler
+                                    .open_file(&tmp_file, &CachedFileSize::unknown())
+                                    .await
+                                    .unwrap();
 
-                        let (tx, rx) = mpsc::channel(1024);
-                        let drainer = tokio::spawn(drain_task(rx));
-                        let mut offset = 0;
-                        while offset < DATA_SIZE {
-                            #[allow(clippy::single_range_in_vec_init)]
-                            let req = vec![offset..(offset + params.page_size)];
-                            let req = file_scheduler.submit_request(req, 0);
-                            tx.send(req).await.unwrap();
-                            offset += params.page_size;
-                        }
-                        drop(tx);
-                        let bytes_received = drainer.await.unwrap();
-                        assert_eq!(bytes_received, DATA_SIZE);
-                    });
-                });
-            });
+                                let (tx, rx) = mpsc::channel(1024);
+                                let drainer = tokio::spawn(drain_task(rx));
+                                let mut offset = 0;
+                                while offset < DATA_SIZE {
+                                    #[allow(clippy::single_range_in_vec_init)]
+                                    let req = vec![offset..(offset + params.page_size)];
+                                    let req = file_scheduler.submit_request(req, 0);
+                                    tx.send(req).await.unwrap();
+                                    offset += params.page_size;
+                                }
+                                drop(tx);
+                                let bytes_received = drainer.await.unwrap();
+                                assert_eq!(bytes_received, DATA_SIZE);
+                            });
+                        });
+                    },
+                );
+            }
         }
     }
 }
@@ -129,15 +140,35 @@ struct RandomReadParams {
     io_parallelism: u32,
     item_size: u32,
     indices: Arc<Vec<u32>>,
+    use_lite_scheduler: bool,
+    noisy_runtime: bool,
 }
 
 impl Display for RandomReadParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "random_read,parallel={},item_size={}",
-            self.io_parallelism, self.item_size
+            "random_read,parallel={},item_size={},use_lite_scheduler={},noisy={}",
+            self.io_parallelism, self.item_size, self.use_lite_scheduler, self.noisy_runtime
         )
+    }
+}
+
+/// Performs approximately 1ms of CPU busy-work
+async fn cpu_busy_work() {
+    loop {
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        // Busy loop for approximately 1ms
+        while start.elapsed().as_micros() < 1000 {
+            for i in 0..1000 {
+                sum = sum.wrapping_add(i);
+                sum = sum.wrapping_mul(31);
+            }
+        }
+        // Use sum to prevent optimization
+        std::hint::black_box(sum);
+        tokio::task::yield_now().await;
     }
 }
 
@@ -148,74 +179,108 @@ impl Display for RandomReadParams {
 fn bench_random_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("from_elem");
 
-    group.throughput(criterion::Throughput::Elements(INDICES_PER_ITER as u64));
+    // Each iteration performs 100 takes
+    group.throughput(criterion::Throughput::Elements(
+        (100 * INDICES_PER_ITER) as u64,
+    ));
 
-    let runtime = Runtime::new().unwrap();
-    let (obj_store, tmp_file) = runtime.block_on(create_data(DATA_SIZE));
+    for noisy_runtime in [false, true] {
+        for use_lite_scheduler in [false, true] {
+            for io_parallelism in [1, 16] {
+                for item_size in [4096, 32 * 1024] {
+                    let runtime = Runtime::new().unwrap();
+                    let (obj_store, tmp_file) = runtime.block_on(create_data(DATA_SIZE));
 
-    for io_parallelism in [1, 16, 32, 64] {
-        for item_size in [8, 1024, 4096] {
-            let num_indices = DATA_SIZE as u32 / item_size;
-            let mut rng = rand::rng();
-            let mut indices = (0..num_indices).collect::<Vec<_>>();
-            let (shuffled, _) = indices.partial_shuffle(&mut rng, INDICES_PER_ITER);
-            let mut indices = shuffled.to_vec();
-            indices.sort_unstable();
+                    let num_indices = DATA_SIZE as u32 / item_size;
+                    let mut rng = rand::rng();
+                    let mut indices = (0..num_indices).collect::<Vec<_>>();
+                    let (shuffled, _) = indices.partial_shuffle(&mut rng, INDICES_PER_ITER);
+                    let mut indices = shuffled.to_vec();
+                    indices.sort_unstable();
 
-            let params = RandomReadParams {
-                io_parallelism,
-                item_size,
-                indices: Arc::new(indices),
-            };
-            group.bench_with_input(
-                BenchmarkId::from_parameter(&params),
-                &params,
-                |b, params| {
-                    b.iter(|| {
-                        let obj_store = obj_store.clone();
-                        if obj_store.is_local() {
-                            let path_str = format!("/{}", tmp_file);
-                            Command::new("dd")
-                                .arg(format!("of={}", path_str))
-                                .arg("oflag=nocache")
-                                .arg("conv=notrunc,fdatasync")
-                                .arg("count=0")
-                                .output()
-                                .unwrap();
-                        }
-                        std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
-                        runtime.block_on(async {
-                            let scheduler = ScanScheduler::new(
-                                obj_store,
-                                SchedulerConfig::default_for_testing(),
-                            );
-                            let file_scheduler = scheduler
-                                .open_file(&tmp_file, &CachedFileSize::unknown())
-                                .await
-                                .unwrap();
+                    let params = RandomReadParams {
+                        io_parallelism,
+                        item_size,
+                        indices: Arc::new(indices),
+                        use_lite_scheduler,
+                        noisy_runtime,
+                    };
+                    group.bench_with_input(
+                        BenchmarkId::from_parameter(&params),
+                        &params,
+                        |b, params| {
+                            b.iter(|| {
+                                let obj_store = obj_store.clone();
+                                if obj_store.is_local() {
+                                    let path_str = format!("/{}", tmp_file);
+                                    Command::new("dd")
+                                        .arg(format!("of={}", path_str))
+                                        .arg("oflag=nocache")
+                                        .arg("conv=notrunc,fdatasync")
+                                        .arg("count=0")
+                                        .output()
+                                        .unwrap();
+                                }
+                                std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
+                                runtime.block_on(async {
+                                    // Spawn background CPU tasks if noisy_runtime is enabled
+                                    let mut noise_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-                            let (tx, rx) = mpsc::channel(1024);
-                            let drainer = tokio::spawn(drain_task(rx));
-                            let mut idx = 0;
-                            while idx < params.indices.len() {
-                                let iops = (idx..(idx + INDICES_PER_BATCH as usize))
-                                    .map(|idx| {
-                                        let start = idx as u64 * params.item_size as u64;
-                                        let end = start + params.item_size as u64;
-                                        start..end
-                                    })
-                                    .collect::<Vec<_>>();
-                                idx += INDICES_PER_BATCH as usize;
-                                let req = file_scheduler.submit_request(iops, 0);
-                                tx.send(req).await.unwrap();
-                            }
-                            drop(tx);
-                            let bytes_received = drainer.await.unwrap();
-                            assert_eq!(bytes_received, INDICES_PER_ITER as u64 * item_size as u64);
-                        });
-                    });
-                },
-            );
+                                    if params.noisy_runtime {
+                                        for _ in 0..12 {
+                                            let task = tokio::spawn(cpu_busy_work());
+                                            noise_tasks.push(task);
+                                        }
+                                    }
+
+                                    let mut config = SchedulerConfig::default_for_testing();
+                                    if use_lite_scheduler {
+                                        config = config.with_lite_scheduler();
+                                    }
+                                    let scheduler = ScanScheduler::new(obj_store, config);
+                                    let file_scheduler = scheduler
+                                        .open_file(&tmp_file, &CachedFileSize::unknown())
+                                        .await
+                                        .unwrap();
+
+                                    // Perform 100 takes
+                                    for _ in 0..100 {
+                                        let (tx, rx) = mpsc::channel(1024);
+                                        let drainer = tokio::spawn(drain_task(rx));
+                                        let mut idx = 0;
+                                        while idx < params.indices.len() {
+                                            let iops = (idx..(idx + INDICES_PER_BATCH as usize))
+                                                .map(|idx| {
+                                                    let start =
+                                                        idx as u64 * params.item_size as u64;
+                                                    let end = start + params.item_size as u64;
+                                                    start..end
+                                                })
+                                                .collect::<Vec<_>>();
+                                            idx += INDICES_PER_BATCH as usize;
+                                            let req = file_scheduler.submit_request(iops, 0);
+                                            tx.send(req).await.unwrap();
+                                        }
+                                        drop(tx);
+                                        let bytes_received = drainer.await.unwrap();
+                                        assert_eq!(
+                                            bytes_received,
+                                            INDICES_PER_ITER as u64 * item_size as u64
+                                        );
+                                    }
+
+                                    // Stop background tasks
+                                    if params.noisy_runtime {
+                                        for task in noise_tasks {
+                                            task.abort();
+                                        }
+                                    }
+                                });
+                            });
+                        },
+                    );
+                }
+            }
         }
     }
 }

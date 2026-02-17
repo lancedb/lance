@@ -15,7 +15,7 @@ use std::{borrow::Cow, ops::Deref};
 use deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, LanceCache},
-    utils::{deletion::DeletionVector, mask::RowIdMask},
+    utils::{deletion::DeletionVector, mask::RowAddrMask},
 };
 use lance_table::{
     format::{DeletionFile, Manifest},
@@ -119,15 +119,15 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowIdMaskKey {
+pub struct RowAddrMaskKey {
     pub version: u64,
 }
 
-impl CacheKey for RowIdMaskKey {
-    type ValueType = RowIdMask;
+impl CacheKey for RowAddrMaskKey {
+    type ValueType = RowAddrMask;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_mask/{}", self.version))
+        Cow::Owned(format!("row_addr_mask/{}", self.version))
     }
 }
 

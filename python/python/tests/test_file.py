@@ -648,3 +648,112 @@ def test_multithreaded_writer(tmp_path):
             pc.equal(result_table.column("thread_id"), thread_id)
         )
         assert thread_rows.num_rows == records_per_thread
+
+
+def test_session_list_all_files(tmp_path):
+    """Test that LanceFileSession.list() returns all files with relative paths"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Write files at different levels
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    with session.open_writer("file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+
+    with session.open_writer("subdir/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+
+    with session.open_writer("other/file5.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [5]}))
+
+    # List all files
+    files = sorted(session.list())
+
+    # Verify relative paths (no absolute paths)
+    assert files == [
+        "file1.lance",
+        "file2.lance",
+        "other/file5.lance",
+        "subdir/file3.lance",
+        "subdir/file4.lance",
+    ]
+
+    # Verify no absolute paths
+    for f in files:
+        assert not f.startswith("/")
+        assert str(tmp_path) not in f
+
+
+def test_session_list_with_prefix(tmp_path):
+    """Test that LanceFileSession.list() filters by prefix correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Write files in different directories
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    with session.open_writer("subdir/file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+
+    with session.open_writer("other/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+
+    # List with prefix "subdir"
+    subdir_files = sorted(session.list("subdir"))
+    assert subdir_files == ["subdir/file2.lance", "subdir/file3.lance"]
+
+    # List with prefix "other"
+    other_files = sorted(session.list("other"))
+    assert other_files == ["other/file4.lance"]
+
+    # List with non-existent prefix
+    empty = session.list("nonexistent")
+    assert empty == []
+
+
+def test_session_list_with_trailing_slash(tmp_path):
+    """Test that LanceFileSession.list() handles trailing slashes correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    with session.open_writer("dir/file.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    # Both with and without trailing slash should work
+    files_no_slash = session.list("dir")
+    files_with_slash = session.list("dir/")
+
+    assert files_no_slash == files_with_slash
+    assert files_no_slash == ["dir/file.lance"]
+
+
+def test_session_contains(tmp_path):
+    """Test that LanceFileSession.contains() works correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # File doesn't exist yet
+    assert not session.contains("test.lance")
+
+    # Write a file
+    with session.open_writer("test.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    # File exists now
+    assert session.contains("test.lance")
+
+    # Nested file
+    with session.open_writer("subdir/nested.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    assert session.contains("subdir/nested.lance")
+    assert not session.contains("subdir/nonexistent.lance")

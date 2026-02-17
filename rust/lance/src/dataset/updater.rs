@@ -14,6 +14,7 @@ use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
 use super::write::{open_writer, GenericWriter};
 use super::Dataset;
+use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::FileFragment;
 
 /// Update or insert a new column.
@@ -42,6 +43,9 @@ pub struct Updater {
 
     /// The schema the new files will be written in. This only contains new columns.
     write_schema: Option<Schema>,
+
+    /// The adapter to convert the logical data to physical data.
+    schema_adapter: Option<SchemaAdapter>,
 
     finished: bool,
 
@@ -89,6 +93,9 @@ impl Updater {
             writer: None,
             write_schema,
             final_schema,
+            // The schema adapter needs the data schema, not the logical schema, so it can't be
+            // created until after the first batch is read.
+            schema_adapter: None,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
@@ -155,14 +162,14 @@ impl Updater {
     /// Update one batch.
     pub async fn update(&mut self, batch: RecordBatch) -> Result<()> {
         let Some(last) = self.last_input.as_ref() else {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 "Fragment Updater: no input data is available before update".to_string(),
                 location!(),
             ));
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "Fragment Updater: new batch has different size with the source batch: {} != {}",
                     last.num_rows(),
@@ -195,6 +202,15 @@ impl Updater {
                     .await?,
             );
         }
+
+        let schema_adapter = if let Some(schema_adapter) = self.schema_adapter.as_ref() {
+            schema_adapter
+        } else {
+            self.schema_adapter = Some(SchemaAdapter::new(batch.schema()));
+            self.schema_adapter.as_ref().unwrap()
+        };
+
+        let batch = schema_adapter.to_physical_batch(batch)?;
 
         let writer = self.writer.as_mut().unwrap();
 

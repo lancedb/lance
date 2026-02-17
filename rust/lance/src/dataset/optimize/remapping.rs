@@ -307,7 +307,6 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     removed_indices: vec![curr_index_meta.clone()],
                 },
                 None,
-                None,
             );
 
             dataset

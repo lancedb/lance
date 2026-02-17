@@ -288,8 +288,12 @@ fn bench_apply_row_id(c: &mut Criterion) {
         params: ReadBatchParams::default(),
         with_row_id: true,
         with_row_addr: false,
+        with_row_last_updated_at_version: false,
+        with_row_created_at_version: false,
         deletion_vector: None,
         row_id_sequence: None,
+        last_updated_at_sequence: None,
+        created_at_sequence: None,
         make_deletions_null: false,
         total_num_rows: num_rows() as u32,
     };

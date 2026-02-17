@@ -108,6 +108,24 @@ def test_dataset_overwrite(tmp_path: Path):
     assert ds_v1.to_table() == table1
 
 
+def test_truncate_table(tmp_path: Path):
+    base_dir = tmp_path / "truncate"
+    table = pa.table(
+        {
+            "i": pa.array([1, 2, 3], pa.int32()),
+            "dict": pa.DictionaryArray.from_arrays(
+                pa.array([0, 1, 2], pa.uint16()), pa.array(["a", "b", "c"])
+            ),
+        }
+    )
+    ds = lance.write_dataset(table, base_dir, data_storage_version="stable")
+    assert ds.count_rows() == 3
+
+    ds.truncate_table()
+    assert ds.count_rows() == 0
+    assert ds.schema == table.schema
+
+
 def test_dataset_append(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"
@@ -410,6 +428,13 @@ def test_v2_manifest_paths(tmp_path: Path):
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
+def test_default_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
 def test_v2_manifest_paths_migration(tmp_path: Path):
     # Create a dataset with v1 manifest paths
     lance.write_dataset(
@@ -466,7 +491,7 @@ def test_tag(tmp_path: Path):
 
     # test tag update
     with pytest.raises(
-        ValueError, match="Version not found error: version 3 does not exist"
+        ValueError, match="Version not found error: version main:3 does not exist"
     ):
         ds.tags.update("tag1", 3)
 
@@ -485,6 +510,33 @@ def test_tag(tmp_path: Path):
 
     version = ds.tags.get_version("tag1")
     assert version == 1
+
+    ds.create_branch("branch", "tag1")
+    ds.tags.create("tag3", ("branch", None))
+    target_tag = ds.tags.list().get("tag3")
+    assert ds.tags.get_version("tag3") == 1
+    assert len(ds.tags.list()) == 3
+    assert target_tag is not None
+    assert target_tag["version"] == 1
+    assert target_tag["branch"] == "branch"
+
+    ds.tags.update("tag3", (None, 2))
+    target_tag = ds.tags.list()["tag3"]
+    assert ds.tags.get_version("tag3") == 2
+    assert target_tag is not None
+    assert target_tag["version"] == 2
+    assert target_tag["branch"] is None
+
+    ds.create_branch("branch2", 2)
+    ds.tags.update("tag3", ("branch2", 2))
+    target_tag = ds.tags.list()["tag3"]
+    assert ds.tags.get_version("tag3") == 2
+    assert target_tag is not None
+    assert target_tag["version"] == 2
+    assert target_tag["branch"] == "branch2"
+
+    ds.tags.delete("tag3")
+    assert len(ds.tags.list()) == 2
 
 
 def test_tag_order(tmp_path: Path):
@@ -549,6 +601,234 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+def test_take_rowid_rowaddr(tmp_path: Path):
+    sample_size = 10
+    table1 = pa.table({"a": range(1000), "b": range(1000)})
+    base_dir = tmp_path / "test_take_rowid_rowaddr"
+    lance.write_dataset(
+        table1, base_dir, enable_stable_row_ids=False, max_rows_per_file=50
+    )
+    dataset = lance.dataset(base_dir)
+    total_rows = len(dataset)
+    sampled_indices = random.sample(range(total_rows), min(sample_size, total_rows))
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr", "_rowid"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr", "b"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+
+@pytest.mark.parametrize(
+    "column_name",
+    [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ],
+)
+def test_take_system_columns_values(tmp_path: Path, column_name: str):
+    """Test that system columns return correct values in take."""
+    table = pa.table({"a": range(100), "b": range(100, 200)})
+    base_dir = tmp_path / "test_take_system_columns_values"
+    # Use max_rows_per_file to create multiple fragments
+    lance.write_dataset(table, base_dir, max_rows_per_file=25)
+    dataset = lance.dataset(base_dir)
+
+    indices = [0, 5, 10, 50, 99]
+    result = dataset.take(indices, columns=[column_name, "a"])
+    assert result.num_rows == len(indices)
+    assert result.schema.names == [column_name, "a"]
+
+    col_values = result.column(column_name).to_pylist()
+    a_values = result.column("a").to_pylist()
+
+    # Verify column type is UInt64
+    assert result.column(column_name).type == pa.uint64()
+
+    # Verify data column values
+    assert a_values == indices
+
+    # Verify system column values based on column type
+    if column_name == "_rowid":
+        # Without stable row IDs, _rowid equals _rowaddr (not the index).
+        # Row address = (fragment_id << 32) | row_offset_within_fragment
+        # With max_rows_per_file=25: frag0=0-24, frag1=25-49, frag2=50-74, frag3=75-99
+        expected_rowids = [
+            (0 << 32) | 0,  # index 0: fragment 0, offset 0
+            (0 << 32) | 5,  # index 5: fragment 0, offset 5
+            (0 << 32) | 10,  # index 10: fragment 0, offset 10
+            (2 << 32) | 0,  # index 50: fragment 2, offset 0
+            (3 << 32) | 24,  # index 99: fragment 3, offset 24
+        ]
+        assert col_values == expected_rowids
+    elif column_name in ("_row_created_at_version", "_row_last_updated_at_version"):
+        # All rows created/updated at version 1
+        assert col_values == [1] * len(indices)
+    # _rowaddr and _rowoffset values depend on fragment layout
+
+
+def test_take_system_columns_column_ordering(tmp_path: Path):
+    """Test that column ordering is preserved when using system columns."""
+    table = pa.table({"a": range(50), "b": range(50, 100)})
+    base_dir = tmp_path / "test_take_column_ordering"
+    lance.write_dataset(table, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    indices = [0, 1, 2]
+
+    # Test different orderings with all system columns
+    result = dataset.take(indices, columns=["_rowid", "a", "_rowaddr"])
+    assert result.schema.names == ["_rowid", "a", "_rowaddr"]
+
+    result = dataset.take(indices, columns=["a", "_rowaddr", "_rowid"])
+    assert result.schema.names == ["a", "_rowaddr", "_rowid"]
+
+    result = dataset.take(indices, columns=["_rowaddr", "_rowid", "b", "a"])
+    assert result.schema.names == ["_rowaddr", "_rowid", "b", "a"]
+
+    # Test with version columns
+    result = dataset.take(
+        indices,
+        columns=[
+            "_row_created_at_version",
+            "a",
+            "_row_last_updated_at_version",
+            "_rowid",
+        ],
+    )
+    assert result.schema.names == [
+        "_row_created_at_version",
+        "a",
+        "_row_last_updated_at_version",
+        "_rowid",
+    ]
+
+    # Test with all system columns in mixed order
+    result = dataset.take(
+        indices,
+        columns=[
+            "_rowoffset",
+            "_row_last_updated_at_version",
+            "b",
+            "_rowaddr",
+            "_row_created_at_version",
+            "a",
+            "_rowid",
+        ],
+    )
+    assert result.schema.names == [
+        "_rowoffset",
+        "_row_last_updated_at_version",
+        "b",
+        "_rowaddr",
+        "_row_created_at_version",
+        "a",
+        "_rowid",
+    ]
+
+
+def test_take_version_system_columns(tmp_path: Path):
+    """Test _row_created_at_version and _row_last_updated_at_version columns."""
+    table = pa.table({"a": range(50)})
+    base_dir = tmp_path / "test_take_version_columns"
+    lance.write_dataset(table, base_dir, enable_stable_row_ids=True)
+    dataset = lance.dataset(base_dir)
+
+    # Initial version is 1
+    initial_version = dataset.version
+
+    indices = [0, 10, 25]
+    result = dataset.take(
+        indices,
+        columns=["a", "_row_created_at_version", "_row_last_updated_at_version"],
+    )
+
+    assert result.num_rows == 3
+    created_at = result.column("_row_created_at_version").to_pylist()
+    updated_at = result.column("_row_last_updated_at_version").to_pylist()
+
+    # All rows were created and last updated at the initial version
+    assert created_at == [initial_version] * 3
+    assert updated_at == [initial_version] * 3
+
+    # Now update some rows by overwriting
+    table2 = pa.table({"a": range(50, 100)})
+    lance.write_dataset(table2, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+
+    # New rows should have version 2
+    result = dataset.take([50, 60], columns=["_row_created_at_version"])
+    created_at = result.column("_row_created_at_version").to_pylist()
+    assert created_at == [dataset.version] * 2
 
 
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
@@ -888,19 +1168,12 @@ def test_count_rows_via_scanner(tmp_path: Path):
     ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
 
     assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(with_row_id=True).count_rows()
-
-    with pytest.raises(ValueError, match="with_row_id is false"):
-        ds.scanner(columns=[]).count_rows()
+    assert (
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows() == 50
+    )
+    assert ds.scanner(with_row_id=True).count_rows() == 100
+    assert ds.scanner(columns=[]).count_rows() == 100
+    assert ds.scanner().count_rows() == 100
 
 
 def test_select_none(tmp_path: Path):
@@ -966,7 +1239,9 @@ def test_analyze_vector_search(tmp_path: Path):
     plan = dataset.scanner(
         nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}
     ).analyze_plan()
-    assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
+    assert "KNNVectorDistance:" in plan
+    assert "metric=l2" in plan
+    assert "output_rows=10" in plan
 
 
 def test_get_fragments(tmp_path: Path):
@@ -1097,6 +1372,44 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
+
+
+def test_cleanup_with_retain_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_policy"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.versions()) == 4
+    stats = ds.cleanup_old_versions(retain_versions=3)
+    assert stats.old_versions == 1
+    assert len(ds.versions()) == 3
+    assert ds.count_rows() == len(ds.to_table())
+
+
+def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_policy"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    moment = datetime.now()
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    stats = ds.cleanup_old_versions(
+        older_than=datetime.now() - moment, retain_versions=2
+    )
+    assert stats.old_versions == 2
+    assert len(ds.versions()) == 2
+    assert ds.count_rows() == len(ds.to_table())
 
 
 def test_auto_cleanup(tmp_path):
@@ -1610,40 +1923,45 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     assert scanner.to_table().num_rows == 2 * 100
 
 
-def test_write_unstable_data_version(tmp_path: Path, capfd):
-    # Note: this test will only work if no earlier test attempts
-    # to use an unstable version.  If we need that later we can find a way to
-    # run this test in a separate process (pytest-xdist?)
+def test_merge_data_legacy(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100)})
-    ds = lance.write_dataset(
-        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
+    lance.write_dataset(
+        tab, tmp_path / "dataset", mode="append", data_storage_version="legacy"
     )
-    assert ds.to_table() == tab
-    assert "You have requested an unstable format version" in capfd.readouterr().err
-
-
-def test_merge_data(tmp_path: Path):
-    tab = pa.table({"a": range(100), "b": range(100)})
-    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
 
     dataset = lance.dataset(tmp_path / "dataset")
 
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
-    # TODO: this should be ValueError
-    with pytest.raises(
-        OSError, match=".+Lance does not yet support nulls for type Int64."
-    ):
+    with pytest.raises(OSError, match=r"Join produced null values for type: Int64"):
         dataset.merge(new_tab, "a")
 
-    # accepts a full merge
-    new_tab = pa.table({"a": range(100), "c": range(100)})
+
+def test_merge_data(tmp_path: Path):
+    tab = pa.table({"a": range(100)})
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
+    dataset = lance.dataset(tmp_path / "dataset")
+
+    # accepts partial data for nullable types
+    new_tab = pa.table({"a": range(40), "b": range(40)})
     dataset.merge(new_tab, "a")
     assert dataset.version == 2
     assert dataset.to_table() == pa.table(
         {
             "a": range(100),
-            "b": range(100),
+            "b": pa.array(list(range(40)) + [None] * 60),
+        }
+    )
+
+    # accepts a full merge
+    new_tab = pa.table({"a": range(100), "c": range(100)})
+    dataset.merge(new_tab, "a")
+    assert dataset.version == 3
+    assert dataset.to_table() == pa.table(
+        {
+            "a": range(100),
+            "b": pa.array(list(range(40)) + [None] * 60),
             "c": range(100),
         }
     )
@@ -1651,11 +1969,11 @@ def test_merge_data(tmp_path: Path):
     # accepts a partial for string
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
-    assert dataset.version == 3
+    assert dataset.version == 4
     expected = pa.table(
         {
             "a": range(100),
-            "b": range(100),
+            "b": pa.array(list(range(40)) + [None] * 60),
             "c": range(100),
             "d": ["a", "b", "c", "d", "e"] + [None] * 95,
         }
@@ -1916,6 +2234,51 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert dataset.to_table().sort_by("a") == expected
 
 
+def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
+    base_dir = tmp_path / "merge_insert_pk_default"
+
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+
+    base_table = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}, schema=schema)
+    dataset = lance.write_dataset(base_table, base_dir)
+
+    new_table = pa.table({"id": [2, 3, 4], "value": [200, 300, 400]}, schema=schema)
+
+    builder = dataset.merge_insert()
+    builder = builder.when_matched_update_all().when_not_matched_insert_all()
+    stats = builder.execute(new_table)
+
+    assert stats["num_inserted_rows"] == 1
+    assert stats["num_updated_rows"] == 2
+    assert stats["num_deleted_rows"] == 0
+
+    result = dataset.to_table().sort_by("id")
+    assert result.to_pydict() == {"id": [1, 2, 3, 4], "value": [10, 200, 300, 400]}
+
+
+def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
+    base_dir = tmp_path / "merge_insert_no_pk"
+
+    table = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset = lance.write_dataset(table, base_dir)
+
+    with pytest.raises(ValueError) as excinfo:
+        dataset.merge_insert()
+
+    msg = str(excinfo.value)
+    assert "join keys" in msg or "primary key" in msg
+
+
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -2127,6 +2490,134 @@ def test_merge_insert_vector_column(tmp_path: Path):
     check_merge_stats(merge_dict, (1, 1, 0))
 
 
+def test_merge_insert_when_matched_fail(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # No matching rows should succeed
+    new_data = pa.table({"id": [6, 7, 8], "val": [60, 70, 80]})
+    result = (
+        ds.merge_insert("id")
+        .when_matched_fail()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+    assert result["num_deleted_rows"] == 0
+
+    # Matching rows should fail
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    new_data = pa.table({"id": [1, 2, 9], "val": [100, 200, 900]})
+    with pytest.raises(Exception):
+        ds.merge_insert("id").when_matched_fail().when_not_matched_insert_all().execute(
+            new_data
+        )
+
+    # Test with execute_uncommitted
+    # This should raise an exception because there are matching rows
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    with pytest.raises(Exception):
+        transaction, _ = (
+            ds.merge_insert("id")
+            .when_matched_fail()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(new_data)
+        )
+
+    # Verify that the data remains unchanged after failed operation
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    unchanged_ds = lance.dataset(tmp_path / "dataset")
+    unchanged_data = unchanged_ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    assert unchanged_data == expected
+
+
+def test_merge_insert_when_matched_delete(tmp_path: Path):
+    """Test when_matched_delete functionality for merge insert."""
+    # Create initial dataset with ids 1-6
+    data = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # Test 1: Basic when_matched_delete - delete matched rows only
+    # Source has ids 4, 5, 6 (match) and 7, 8, 9 (no match)
+    # Only matched rows should be deleted, unmatched rows are ignored
+    delete_keys = pa.table({"id": [4, 5, 6, 7, 8, 9], "val": [0, 0, 0, 0, 0, 0]})
+    result = ds.merge_insert("id").when_matched_delete().execute(delete_keys)
+
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Verify only ids 1, 2, 3 remain
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3], "val": [10, 20, 30]})
+    assert remaining == expected
+
+    # Test 2: when_matched_delete with ID-only source
+    # Source contains only the key column
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    id_only_source = pa.table({"id": [2, 4, 6]})  # Delete even ids
+    result = ds.merge_insert("id").when_matched_delete().execute(id_only_source)
+
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Verify only odd ids remain
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 3, 5], "val": [10, 30, 50]})
+    assert remaining == expected
+
+    # Test 3: when_matched_delete combined with when_not_matched_insert_all
+    # Delete existing rows that match, insert new rows that don't match
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    new_data = pa.table(
+        {"id": [4, 5, 6, 7, 8, 9], "val": [400, 500, 600, 700, 800, 900]}
+    )
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+
+    # Should delete 3 (ids 4, 5, 6) and insert 3 (ids 7, 8, 9)
+    assert result["num_deleted_rows"] == 3
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+
+    # Verify: ids 1, 2, 3 (original), 7, 8, 9 (new inserts)
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 7, 8, 9], "val": [10, 20, 30, 700, 800, 900]})
+    assert remaining == expected
+
+    # Test 4: when_matched_delete with no matches (should be a no-op delete)
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    non_matching = pa.table({"id": [100, 200, 300], "val": [0, 0, 0]})
+    result = ds.merge_insert("id").when_matched_delete().execute(non_matching)
+
+    assert result["num_deleted_rows"] == 0
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    # Data should be unchanged
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    assert remaining == expected
+
+
 def test_merge_insert_large():
     # Doing subcolumns update with merge insert triggers this error.
     # Data needs to be large enough to make DataFusion create multiple batches
@@ -2327,6 +2818,56 @@ def test_add_null_columns(tmp_path: Path):
     )
 
 
+def test_merge_insert_permissive_nullability(tmp_path):
+    """
+    Reported in https://github.com/lancedb/lance/issues/4518
+    Tests that merge_insert works when the source schema is nullable
+    but the target is not, as long as no nulls are present.
+    """
+    target_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("value", pa.int64(), nullable=False),
+        ]
+    )
+    initial_data = pa.table(
+        {"id": [1, 2, 3], "value": [10, 20, 30]}, schema=target_schema
+    )
+
+    uri = tmp_path / "dataset"
+    ds = lance.write_dataset(initial_data, uri)
+
+    source_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=True),
+            pa.field("value", pa.int64(), nullable=True),
+        ]
+    )
+
+    new_data = pa.table(
+        {"id": [2, 4, 5], "value": [200, 400, 500]}, schema=source_schema
+    )
+
+    # Execute merge_insert, which should now succeed.
+    stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+
+    # Verify the results.
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 2
+
+    expected_data = pa.table(
+        {"id": [1, 2, 3, 4, 5], "value": [10, 200, 30, 400, 500]}, schema=target_schema
+    )
+
+    result_table = ds.to_table()
+    assert result_table.sort_by("id").equals(expected_data.sort_by("id"))
+
+
 def test_add_null_columns_with_conflict_names(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)
@@ -2334,10 +2875,14 @@ def test_add_null_columns_with_conflict_names(tmp_path: Path):
     assert len(fragments) == 1
     assert len(fragments[0].data_files()) == 1
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns(pa.field("id", pa.float32()))
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
 
 
@@ -3705,7 +4250,7 @@ def test_default_storage_version(tmp_path: Path):
 
 def test_no_detached_v1(tmp_path: Path):
     table = pa.table({"x": [0]})
-    dataset = lance.write_dataset(table, tmp_path)
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=False)
 
     # Make a detached append
     table = pa.table({"x": [1]})
@@ -4145,48 +4690,34 @@ def test_commit_message_and_get_properties(tmp_path):
     )
 
 
-def test_diff_meta(tmp_path: Path):
-    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
-    lance.write_dataset(table1, tmp_path)
+def test_commit_with_stable_row_ids(tmp_path: Path):
+    """Test that commit() with enable_stable_row_ids creates stable row IDs."""
+    base_uri = str(tmp_path)
+    table = pa.table({"a": range(10)})
 
-    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
-    dataset = lance.write_dataset(
-        table2, tmp_path, mode="append", commit_message="Append data"
+    # Create dataset via commit with Overwrite and enable_stable_row_ids
+    fragments = lance.fragment.write_fragments(table, base_uri)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        operation,
+        enable_stable_row_ids=True,
     )
 
-    dataset.delete("id = 2")
+    # Append more data
+    table2 = pa.table({"a": range(10, 20)})
+    fragments2 = lance.fragment.write_fragments(table2, base_uri)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        lance.LanceOperation.Append(fragments2),
+        read_version=ds.version,
+    )
 
-    diff = dataset.diff_meta(1)
-
-    assert len(diff) == 2
-
-    for transaction in diff:
-        assert hasattr(transaction, "read_version")
-        assert hasattr(transaction, "transaction_properties")
-
-    dataset_v2 = lance.dataset(tmp_path, version=2)
-    diff_v2 = dataset_v2.diff_meta(1)
-
-    assert len(diff_v2) == 1
-
-    # Test diff with current version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version)
-
-    # Test diff with future version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version + 1)
-
-    # Test diff with non-existent version after cleanup
-    moment = datetime.now()
-    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
-    dataset = lance.write_dataset(table3, tmp_path, mode="append")
-
-    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-
-    # Now try to diff with the cleaned up version 1 (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(1)
+    # Verify row IDs are sequential (stable row IDs assign monotonic IDs)
+    result = ds.scanner(with_row_id=True).to_table()
+    assert len(result) == 20
+    row_ids = [result["_rowid"][i].as_py() for i in range(20)]
+    assert row_ids == list(range(20))
 
 
 def test_table_metadata_updates(tmp_path: Path):
@@ -4585,3 +5116,167 @@ def test_update_config_transaction(tmp_path: Path):
     assert table_metadata == {
         "only_key": "only_value"
     }  # All previous metadata should be gone
+
+
+def test_shallow_clone(tmp_path: Path):
+    """Shallow clone a filesystem dataset by version number and by tag.
+
+    Arrange:
+      - Create a source dataset at a filesystem path with two versions
+        (create v1, then overwrite to v2).
+      - Create a tag "v1" pointing to version 1.
+    Act:
+      - Shallow clone by version=2 (numeric) to one destination.
+      - Shallow clone by version="v1" (tag) to another destination.
+    Assert:
+      - Re-open cloned datasets and verify their tables equal the source
+        version they were cloned from (schema and record count).
+
+    This test uses pathlib paths and tmp_path for cross-platform compatibility
+    and should not skip on Windows.
+    """
+    # Prepare source dataset with two versions
+    src_dir = tmp_path / "shallow_src"
+    table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
+    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+
+    # Create a tag pointing to version 1
+    ds.tags.create("v1", 1)
+
+    # Clone by numeric version (v2) and assert equality
+    clone_v2_dir = tmp_path / "clone_v2"
+    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, 2)
+    assert ds_clone_v2.to_table() == table_v2
+    assert lance.dataset(clone_v2_dir).to_table() == table_v2
+
+    # Clone by tag (v1) and assert equality
+    clone_v1_tag_dir = tmp_path / "clone_v1_tag"
+    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, "v1")
+    assert ds_clone_v1_tag.to_table() == table_v1
+    assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1
+
+    table_v3 = pa.table({"a": [7, 8, 9], "b": [40, 50, 60]})
+    branch = ds.create_branch("branch", 2)
+    lance.write_dataset(table_v3, branch.uri, mode="overwrite")
+    clone_branch_v3 = tmp_path / "clone_branch_v3"
+    cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
+    assert cloned_by_branch.to_table() == table_v3
+    assert lance.dataset(clone_branch_v3).to_table() == table_v3
+
+
+def test_branches(tmp_path: Path):
+    # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
+    base_dir = tmp_path / "test_branches"
+    main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
+    ds_main = lance.write_dataset(main_table, base_dir)
+
+    branch1 = ds_main.create_branch("branch1")
+    assert branch1.version == 1
+    branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
+    branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
+    assert branch1.version == 2
+
+    expected_branch1 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8], "b": [4, 5, 6, 9, 10]}
+    )
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+
+    # Step 2:
+    # tag latest of branch1 → create branch2 from that tag
+    # test create tag on the main branch by different ways
+    # test create branch from the main branch by specifying "main"
+    branch1.tags.create("branch1_latest", ("branch1", None))
+    branch1.tags.create("main_latest", (None, None))
+    branch1.tags.create("main_latest2", ("main", None))
+    branch1.create_branch("branch_from_main", ("main", None))
+    assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
+    assert branch1.tags.list()["main_latest"]["branch"] is None
+    assert branch1.tags.list()["main_latest2"]["branch"] is None
+    assert branch1.branches.list()["branch_from_main"]["parent_branch"] is None
+    assert branch1.branches.list()["branch_from_main"]["parent_version"] == 1
+    assert branch1.checkout_version("main_latest").latest_version == 1
+    assert branch1.checkout_version("main_latest2").latest_version == 1
+    assert branch1.checkout_version(("branch_from_main", None)).latest_version == 1
+    branch2 = branch1.create_branch("branch2", "branch1_latest")
+    assert branch2.version == 2
+
+    # Step 3: append more data to branch2 → verify contains branch1 data + new
+    branch2_append = pa.Table.from_pydict({"a": [11], "b": [12]})
+    branch2 = lance.write_dataset(branch2_append, branch2, mode="append")
+    assert branch2.version == 3
+
+    expected_branch2 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8, 11], "b": [4, 5, 6, 9, 10, 12]}
+    )
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+
+    # Step 4: validate branches.list() and metadata
+    # delete branch1; validate list after deletion
+    branches = ds_main.branches.list()
+    assert "branch1" in branches
+    assert "branch2" in branches
+
+    b1_meta = branches["branch1"]
+    assert isinstance(b1_meta["parent_version"], int)
+    assert b1_meta["manifest_size"] > 0
+    assert "create_at" in b1_meta
+
+    try:
+        ds_main.checkout_version("branch_not_exists")
+        assert False, "Expected OSError was not raised"
+    except OSError as e:
+        if "does not exist" not in str(e):
+            raise
+
+    ds_main.branches.delete("branch2")
+    branches_after = ds_main.branches.list()
+    assert "branch2" not in branches_after
+    assert "branch1" in branches_after
+
+    branch1 = ds_main.checkout_version(("branch1", None))
+    assert branch1.version == 2
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+    branch1 = ds_main.checkout_version(("branch1", 1))
+    assert branch1.version == 1
+    assert branch1.to_table().combine_chunks() == main_table.combine_chunks()
+    branch1.checkout_latest()
+    assert branch1.version == 2
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+
+
+def test_default_scan_options_nearest(tmp_path: Path) -> None:
+    dim = 4
+    num_rows = 10
+
+    values = []
+    for i in range(num_rows):
+        values.extend(float(i) for _ in range(dim))
+    value_array = pa.array(values, type=pa.float32())
+    vector_array = pa.FixedSizeListArray.from_arrays(value_array, dim)
+    table = pa.Table.from_pydict({"vector": vector_array, "id": list(range(num_rows))})
+
+    base_dir = tmp_path / "nearest_default_scan_options"
+    lance.write_dataset(table, base_dir)
+
+    query_vec = [0.0] * dim
+    default_scan_options = {
+        "nearest": {
+            "column": "vector",
+            "q": query_vec,
+            "k": 5,
+        },
+    }
+
+    ds = lance.dataset(base_dir, default_scan_options=default_scan_options)
+    result = ds.to_table()
+
+    assert result.num_rows == 5
+
+    assert "_distance" in result.column_names
+    distances = result["_distance"].to_pylist()
+    assert distances == sorted(distances)
+
+    assert "id" in result.column_names

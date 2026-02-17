@@ -22,7 +22,7 @@ pub struct OssStoreProvider;
 impl ObjectStoreProvider for OssStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
 
         let bucket = base_path
             .host_str()
@@ -70,6 +70,10 @@ impl ObjectStoreProvider for OssStoreProvider {
             config_map.insert("region".to_string(), region.clone());
         }
 
+        if let Some(security_token) = storage_options.0.get("oss_security_token") {
+            config_map.insert("security_token".to_string(), security_token.clone());
+        }
+
         if !config_map.contains_key("endpoint") {
             return Err(Error::invalid_input(
                 "OSS endpoint is required. Please provide 'oss_endpoint' in storage options or set OSS_ENDPOINT environment variable",
@@ -102,6 +106,8 @@ impl ObjectStoreProvider for OssStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            io_tracker: Default::default(),
+            store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
         })
     }
 }

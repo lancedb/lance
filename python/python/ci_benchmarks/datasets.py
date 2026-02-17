@@ -4,11 +4,12 @@
 from functools import cache
 from pathlib import Path
 
+import lance
 import requests
 from lance.log import LOGGER
 
 
-def _is_on_google() -> bool:
+def is_on_google() -> bool:
     LOGGER.info("Testing if running on Google Cloud")
     try:
         rsp = requests.get("http://metadata.google.internal", timeout=5)
@@ -21,7 +22,7 @@ def _is_on_google() -> bool:
 
 @cache
 def _get_base_uri() -> str:
-    if _is_on_google():
+    if is_on_google():
         LOGGER.info("Running on Google Cloud, using gs://lance-benchmarks-ci-datasets/")
         return "gs://lance-benchmarks-ci-datasets/"
     else:
@@ -37,7 +38,23 @@ def get_dataset_uri(name: str) -> str:
     # This is a custom-built dataset, on a unique bucket, that is too big to reproduce
     # locally
     if name == "image_eda":
-        if not _is_on_google():
+        if not is_on_google():
             raise ValueError("The image_eda dataset is only available on Google Cloud")
         return "gs://lance-benchmarks-ci-datasets/image_eda.lance"
     return f"{_get_base_uri()}{name}"
+
+
+def open_dataset(name: str) -> lance.LanceDataset:
+    if name.startswith("mem-"):
+        if name == "mem-tpch":
+            from ci_benchmarks.datagen.lineitems import gen_mem_tcph
+
+            return gen_mem_tcph(data_storage_version="2.0")
+        elif name == "mem-tpch-2.1":
+            from ci_benchmarks.datagen.lineitems import gen_mem_tcph
+
+            return gen_mem_tcph(data_storage_version="2.1")
+        else:
+            raise ValueError(f"Unknown memory dataset: {name}")
+    else:
+        return lance.dataset(get_dataset_uri(name))

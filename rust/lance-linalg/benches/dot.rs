@@ -39,7 +39,7 @@ where
     let type_name = std::any::type_name::<T::Native>();
     c.bench_function(format!("Dot({type_name}, arrow_artiy)").as_str(), |b| {
         b.iter(|| {
-            T::ArrayType::from(
+            <T::ArrayType as FloatArray<T>>::from_values(
                 target
                     .as_slice()
                     .chunks(DIMENSION)

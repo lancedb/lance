@@ -5,21 +5,24 @@ use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
+use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::Field as ArrowField;
+use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_expr::Expr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
-use lance_core::ROW_ADDR;
-use lance_datafusion::projection::ProjectionPlan;
+use lance_core::{ROW_ADDR, ROW_OFFSET};
+use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use snafu::location;
 
 use super::ProjectionRequest;
@@ -106,7 +109,6 @@ pub async fn take(
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
-
     if offsets.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
             projection.output_schema()?,
@@ -126,17 +128,52 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
+#[allow(clippy::needless_question_mark)]
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
+    // If we need row addresses in output, add to projection's output expressions
+    let projection = if builder.with_row_address {
+        let mut proj = (*projection).clone();
+        // Add _rowaddr to output if not already present
+        if !proj
+            .requested_output_expr
+            .iter()
+            .any(|c| c.name == ROW_ADDR)
+        {
+            proj.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ADDR)),
+                name: ROW_ADDR.to_string(),
+            });
+        }
+        Arc::new(proj)
+    } else {
+        projection
+    };
+
+    let with_row_id_in_projection = projection.physical_projection.with_row_id;
+    let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
+    let with_row_created_at_version_in_projection =
+        projection.physical_projection.with_row_created_at_version;
+    let with_row_last_updated_at_version_in_projection = projection
+        .physical_projection
+        .with_row_last_updated_at_version;
+
     let row_addrs = builder.get_row_addrs().await?.clone();
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        return Ok(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
+        let empty_batch = RecordBatch::new_empty(Arc::new(builder.projection.output_schema()?));
+        // If row addresses were requested, add an empty row address column.
+        // This ensures callers that expect the _rowaddr column don't panic.
+        if builder.with_row_address {
+            let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
+            let row_addr_field =
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
+            return Ok(empty_batch.try_with_column(row_addr_field, row_addr_col)?);
+        }
+        return Ok(empty_batch);
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -149,18 +186,27 @@ async fn do_take_rows(
         fragment: FileFragment,
         row_offsets: Vec<u32>,
         projection: Arc<Schema>,
+        with_row_id: bool,
         with_row_addresses: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
-                .take_rows(&row_offsets, projection.as_ref(), with_row_addresses)
+                .take_rows(
+                    &row_offsets,
+                    projection.as_ref(),
+                    with_row_id,
+                    with_row_addresses,
+                    with_row_created_at_version,
+                    with_row_last_updated_at_version,
+                )
                 .await
         }
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
-
-    let batch = if row_addr_stats.contiguous {
+    let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
@@ -170,18 +216,23 @@ async fn do_take_rows(
 
         let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
             Error::invalid_input(
-                format!("_rowaddr belongs to non-existent fragment: {start}"),
+                format!(
+                    "rowaddr start: {} belongs to non-existent fragment: {}",
+                    start, fragment_id
+                ),
                 location!(),
             )
         })?;
 
-        let reader = fragment
-            .open(&physical_schema, FragReadConfig::default())
-            .await?;
+        let read_config = FragReadConfig::default()
+            .with_row_id(with_row_id_in_projection)
+            .with_row_address(with_row_addr_in_projection)
+            .with_row_created_at_version(with_row_created_at_version_in_projection)
+            .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
+        let reader = fragment.open(&physical_schema, read_config).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
-
         let mut batches: Vec<_> = Vec::new();
         let mut current_fragment = row_addrs[0] >> 32;
         let mut current_start = 0;
@@ -211,7 +262,7 @@ async fn do_take_rows(
                 .ok_or_else(|| {
                     Error::invalid_input(
                         format!(
-                            "_rowaddr {} belongs to non-existent fragment: {}",
+                            "rowaddr {} belongs to non-existent fragment: {}",
                             row_addrs[range.start], fragment_id
                         ),
                         location!(),
@@ -219,7 +270,15 @@ async fn do_take_rows(
                 })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
-            let batch_fut = do_take(fragment, row_offsets, physical_schema.clone(), false);
+            let batch_fut = do_take(
+                fragment,
+                row_offsets,
+                physical_schema.clone(),
+                with_row_id_in_projection,
+                with_row_addr_in_projection,
+                with_row_created_at_version_in_projection,
+                with_row_last_updated_at_version_in_projection,
+            );
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
@@ -228,16 +287,6 @@ async fn do_take_rows(
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
-        let projection_with_row_addr = Schema::merge(
-            physical_schema.as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(
-                ROW_ADDR,
-                arrow::datatypes::DataType::UInt64,
-                false,
-            )]),
-        )?;
-        let schema_with_row_addr = Arc::new(ArrowSchema::from(&projection_with_row_addr));
-
         // Slow case: need to re-map data into expected order
         let mut sorted_row_addrs = row_addrs.clone();
         sorted_row_addrs.sort();
@@ -262,13 +311,22 @@ async fn do_take_rows(
         });
 
         let mut batches = futures::stream::iter(fragment_and_indices)
-            .map(|(fragment, indices)| do_take(fragment, indices, physical_schema.clone(), true))
+            .map(|(fragment, indices)| {
+                do_take(
+                    fragment,
+                    indices,
+                    physical_schema.clone(),
+                    with_row_id_in_projection,
+                    true,
+                    with_row_created_at_version_in_projection,
+                    with_row_last_updated_at_version_in_projection,
+                )
+            })
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-
         let one_batch = if batches.len() > 1 {
-            concat_batches(&schema_with_row_addr, &batches)?
+            concat_batches(&batches[0].schema(), &batches)?
         } else {
             batches.pop().unwrap()
         };
@@ -300,10 +358,6 @@ async fn do_take_rows(
         // if there are duplicates in the requested row ids. This is expected.
         debug_assert!(remapping_index.len() >= one_batch.num_rows());
 
-        // Remove the rowaddr column.
-        let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
-        let one_batch = one_batch.project(&keep_indices)?;
-
         // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
         // so we need to handle it manually here.
         // TODO: remove this once the bug is fixed.
@@ -312,9 +366,8 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    let batch = projection.project_batch(batch).await?;
-
-    if builder.with_row_address {
+    if builder.with_row_address || projection.must_add_row_offset {
+        // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
             return Err(Error::NotSupported  {
             source: format!(
@@ -326,12 +379,26 @@ async fn do_take_rows(
             });
         }
 
-        let row_addr_col = Arc::new(UInt64Array::from(row_addrs));
-        let row_addr_field = ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-        Ok(batch.try_with_column(row_addr_field, row_addr_col)?)
-    } else {
-        Ok(batch)
+        let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
+
+        if projection.must_add_row_offset {
+            // compile and inject `ROW_OFFSET` column
+            let row_offset_col =
+                AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
+            let row_offset_field =
+                ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
+            batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+        }
+
+        if builder.with_row_address {
+            // inject `ROW_ADDR` column
+            let row_addr_field =
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
+            batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+        }
     }
+
+    Ok(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
@@ -525,11 +592,13 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::DataType;
+    use arrow_array::{Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+    use std::collections::HashMap;
 
     use crate::dataset::{scanner::test_dataset::TestVectorDataset, WriteParams};
 
@@ -705,6 +774,325 @@ mod test {
 
         let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
         assert_eq!(values, values2);
+    }
+
+    #[tokio::test]
+    async fn test_reject_legacy_blob_schema_on_v2_2() {
+        let mut metadata = HashMap::new();
+        metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "blob",
+            DataType::LargeBinary,
+            true,
+        )
+        .with_metadata(metadata)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(
+                b"hello".as_slice(),
+            )]))],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let err = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Legacy blob columns"));
+        assert!(msg.contains("lance.blob.v2"));
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_blob_v2_struct_on_v2_2() {
+        let schema = Arc::new(ArrowSchema::new(vec![crate::blob::blob_field(
+            "blob", true,
+        )]));
+        let mut builder = crate::blob::BlobArrayBuilder::new(1);
+        builder.push_bytes(b"hello").unwrap();
+        let array = builder.finish().unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = crate::dataset::write::InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute_stream(batches)
+            .await
+            .unwrap();
+
+        let proj = ProjectionRequest::from_columns(["blob"], dataset.schema());
+        let values = dataset.take(&[0u64], proj).await.unwrap();
+
+        let struct_arr = values.column(0).as_struct();
+        assert_eq!(struct_arr.fields().len(), 5);
+        assert_eq!(struct_arr.fields()[0].name(), "kind");
+        assert_eq!(struct_arr.fields()[1].name(), "position");
+        assert_eq!(struct_arr.fields()[2].name(), "size");
+        assert_eq!(struct_arr.fields()[3].name(), "blob_id");
+        assert_eq!(struct_arr.fields()[4].name(), "blob_uri");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_rowid_rowaddr_with_projection_enable_stable_row_ids_projection_from_sql(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+        let projection = ProjectionRequest::from_sql(vec![
+            ("foo", "i"),
+            ("bar", "i*2"),
+            ("_rowid", "_rowid"),
+            ("_rowaddr", "_rowaddr"),
+        ]);
+        let values = dataset
+            .take(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("foo", DataType::Int32, false),
+            ArrowField::new("bar", DataType::Int32, false),
+            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
+        ]));
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                    Arc::new(Int32Array::from_iter_values([20, 100, 200])),
+                    Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
+        assert_eq!(values, values2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_rowid_rowaddr_with_projection_enable_stable_row_ids_projection_from_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+        let projection =
+            ProjectionRequest::from_columns(["_rowid", "_rowaddr", "i"], dataset.schema());
+
+        let values = dataset
+            .take(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
+            ArrowField::new("i", DataType::Int32, false),
+        ]));
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        let values2 = dataset
+            .take_rows(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(values, values2);
+
+        let values3 = dataset
+            .take(&[50, 100, 10], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([50, 100, 10])),
+                    Arc::new(UInt64Array::from_iter_values([4294967296, 8589934592, 10])),
+                    Arc::new(Int32Array::from_iter_values([50, 100, 10])),
+                ],
+            )
+            .unwrap(),
+            values3
+        );
+        let values4 = dataset.take_rows(&[50, 100, 10], projection).await.unwrap();
+        assert_eq!(values3, values4);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_rowid_rowaddr_with_projection_disable_stable_row_ids_projection_from_sql(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: false,
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+        let projection = ProjectionRequest::from_sql(vec![
+            ("foo", "i"),
+            ("bar", "i*2"),
+            ("_rowid", "_rowid"),
+            ("_rowaddr", "_rowaddr"),
+        ]);
+        let values = dataset
+            .take(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("foo", DataType::Int32, false),
+            ArrowField::new("bar", DataType::Int32, false),
+            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
+        ]));
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                    Arc::new(Int32Array::from_iter_values([20, 100, 200])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        let values2 = dataset
+            .take_rows(&[10, 4294967296, 8589934592], projection)
+            .await
+            .unwrap();
+        assert_eq!(values, values2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_rowid_rowaddr_with_projection_disable_stable_row_ids_projection_from_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: false,
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+
+        let projection =
+            ProjectionRequest::from_columns(["_rowid", "_rowaddr", "i"], dataset.schema());
+        let values = dataset
+            .take(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
+            ArrowField::new("i", DataType::Int32, false),
+        ]));
+
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+        let values2 = dataset
+            .take_rows(&[10, 4294967296, 8589934592], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(values, values2);
+
+        let values3 = dataset
+            .take(&[50, 100, 10], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([4294967296, 8589934592, 10])),
+                    Arc::new(UInt64Array::from_iter_values([4294967296, 8589934592, 10])),
+                    Arc::new(Int32Array::from_iter_values([50, 100, 10])),
+                ],
+            )
+            .unwrap(),
+            values3
+        );
+        let values4 = dataset
+            .take_rows(&[4294967296, 8589934592, 10], projection)
+            .await
+            .unwrap();
+        assert_eq!(values3, values4);
     }
 
     #[rstest]

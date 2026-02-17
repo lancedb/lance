@@ -174,7 +174,7 @@ message Transaction {
     //          integrity guarantees provided by the storage backend.
     bool is_shallow = 1;
     // the reference name in the source dataset
-    // in most cases it should be the the branch or tag name in the source dataset
+    // in most cases it should be the branch or tag name in the source dataset
     optional string ref_name = 2;
     // the version of the source dataset for cloning
     uint64 ref_version = 3;
@@ -184,6 +184,46 @@ message Transaction {
     optional string branch_name = 5;
   }
   
+  // Exact set of key hashes for conflict detection.
+  // Used when the number of inserted rows is small.
+  message ExactKeySetFilter {
+    // 64-bit hashes of the inserted row keys.
+    repeated uint64 key_hashes = 1;
+  }
+
+  // Bloom filter for key existence tests.
+  // Used when the number of rows is large.
+  message BloomFilter {
+    // Bitset backing the bloom filter (SBBF format).
+    bytes bitmap = 1;
+    // Number of bits in the bitmap.
+    uint32 num_bits = 2;
+    // Number of items the filter was sized for.
+    // Used for intersection validation (filters with different sizes cannot be compared).
+    // Default: 8192
+    uint64 number_of_items = 3;
+    // False positive probability the filter was sized for.
+    // Used for intersection validation (filters with different parameters cannot be compared).
+    // Default: 0.00057
+    double probability = 4;
+  }
+
+  // A filter for checking key existence in set of rows inserted by a merge insert operation.
+  // Only created when the merge insert's ON columns match the schema's unenforced primary key.
+  // The presence of this filter indicates strict primary key conflict detection should be used.
+  // Can use either an exact set (for small row counts) or a Bloom filter (for large row counts).
+  message KeyExistenceFilter {
+    // Field IDs of columns participating in the key (must match unenforced primary key).
+    repeated int32 field_ids = 1;
+    // The underlying data structure storing the key hashes.
+    oneof data {
+      // Exact set of key hashes (used for small number of rows).
+      ExactKeySetFilter exact = 2;
+      // Bloom filter (used for large number of rows).
+      BloomFilter bloom = 3;
+    }
+  }
+
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -195,13 +235,16 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// The MemWAL (pre-image) that should be marked as merged after this transaction
-    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// List of MemWAL region generations to mark as merged after this transaction
+    repeated MergedGeneration merged_generations = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
     repeated uint32 fields_for_preserving_frag_bitmap = 6;
     // The mode of update
     UpdateMode update_mode = 7;
+    // Filter for checking existence of keys in newly inserted rows, used for conflict detection.
+    // Only tracks keys from INSERT operations during merge insert, not updates.
+    optional KeyExistenceFilter inserted_rows = 8;
   }
 
   // The mode of update operation
@@ -262,15 +305,12 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
-  // Update the state of the MemWal index
+  // Update the merged generations in MemWAL index.
+  // This operation is used during merge-insert to atomically record which
+  // generations have been merged to the base table.
   message UpdateMemWalState {
-
-    repeated MemWalIndexDetails.MemWal added = 1;
-
-    repeated MemWalIndexDetails.MemWal updated = 2;
-
-    // If a MemWAL is updated, its pre-image should be in the removed list.
-    repeated MemWalIndexDetails.MemWal removed = 3;
+    // Regions and generations being marked as merged.
+    repeated MergedGeneration merged_generations = 1;
   }
 
   // An operation that updates base paths in the dataset.
@@ -298,9 +338,7 @@ message Transaction {
     UpdateBases update_bases = 114;
   }
 
-  // An operation to apply to the blob dataset
-  oneof blob_operation {
-    Append blob_append = 200;
-    Overwrite blob_overwrite = 202;
-  }  
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 200, 202;
+  reserved "blob_append", "blob_overwrite";
 }

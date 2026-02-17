@@ -276,15 +276,6 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Rang
         .collect_vec()
 }
 
-pub(crate) fn inverse_scalar_dist(
-    values: impl Iterator<Item = f32>,
-    bounds: &Range<f64>,
-) -> Vec<f32> {
-    let range = (bounds.end - bounds.start) as f32;
-    values
-        .map(|v| v * range.powi(2) / 255.0.powi(2))
-        .collect_vec()
-}
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};

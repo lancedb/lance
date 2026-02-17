@@ -19,15 +19,20 @@ use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::{noop_progress, IndexBuildProgress};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
+use object_store::path::Path;
+
+use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -49,7 +54,6 @@ use lance_index::{
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::IndexMetadata;
-use object_store::path::Path;
 use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
@@ -294,6 +298,407 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+/// Build a Distributed Vector Index for specific fragments
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip(dataset))]
+pub(crate) async fn build_distributed_vector_index(
+    dataset: &Dataset,
+    column: &str,
+    _name: &str,
+    uuid: &str,
+    params: &VectorIndexParams,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    fragment_ids: &[u32],
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<()> {
+    let stages = &params.stages;
+
+    if stages.is_empty() {
+        return Err(Error::Index {
+            message: "Build Distributed Vector Index: must have at least 1 stage".to_string(),
+            location: location!(),
+        });
+    };
+
+    let StageParams::Ivf(ivf_params0) = &stages[0] else {
+        return Err(Error::Index {
+            message: format!(
+                "Build Distributed Vector Index: invalid stages: {:?}",
+                stages
+            ),
+            location: location!(),
+        });
+    };
+
+    if ivf_params0.centroids.is_none() {
+        return Err(Error::Index {
+            message: "Build Distributed Vector Index: missing precomputed IVF centroids; \
+please provide IvfBuildParams.centroids \
+for concurrent distributed create_index"
+                .to_string(),
+            location: location!(),
+        });
+    }
+
+    let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+    if let DataType::List(_) = vector_type {
+        if params.metric_type != DistanceType::Cosine {
+            return Err(Error::Index {
+                message:
+                    "Build Distributed Vector Index: multivector type supports only cosine distance"
+                        .to_string(),
+                location: location!(),
+            });
+        }
+    }
+
+    let num_rows = dataset.count_rows(None).await?;
+    let index_type = params.index_type();
+
+    let num_partitions = ivf_params0.num_partitions.unwrap_or_else(|| {
+        recommended_num_partitions(
+            num_rows,
+            ivf_params0
+                .target_partition_size
+                .unwrap_or(index_type.target_partition_size()),
+        )
+    });
+
+    let mut ivf_params = ivf_params0.clone();
+    ivf_params.num_partitions = Some(num_partitions);
+
+    let ivf_centroids = ivf_params
+        .centroids
+        .as_ref()
+        .expect("precomputed IVF centroids required for distributed indexing; checked above")
+        .as_ref()
+        .clone();
+
+    let temp_dir = TempStdDir::default();
+    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
+
+    let filtered_dataset = dataset.clone();
+
+    let out_base = dataset.indices_dir().child(uuid);
+
+    let make_partial_index_dir = |out_base: &Path| -> Path {
+        let shard_uuid = Uuid::new_v4();
+        out_base.child(format!("partial_{}", shard_uuid))
+    };
+    let new_index_dir = || make_partial_index_dir(&out_base);
+
+    let fragment_filter = fragment_ids.to_vec();
+
+    let make_ivf_model = || IvfModel::new(ivf_centroids.clone(), None);
+
+    let make_global_pq = |pq_params: &PQBuildParams| -> Result<ProductQuantizer> {
+        if pq_params.codebook.is_none() {
+            return Err(Error::Index {
+                message: "Build Distributed Vector Index: missing precomputed PQ codebook; \
+please provide PQBuildParams.codebook for distributed indexing"
+                    .to_string(),
+                location: location!(),
+            });
+        }
+
+        let dim = crate::index::vector::utils::get_vector_dim(filtered_dataset.schema(), column)?;
+        let metric_type = params.metric_type;
+
+        let pre_codebook = pq_params
+            .codebook
+            .clone()
+            .expect("checked above that PQ codebook is present");
+        let codebook_fsl =
+            arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
+
+        Ok(ProductQuantizer::new(
+            pq_params.num_sub_vectors,
+            pq_params.num_bits as u32,
+            dim,
+            codebook_fsl,
+            if metric_type == MetricType::Cosine {
+                MetricType::L2
+            } else {
+                metric_type
+            },
+        ))
+    };
+
+    match index_type {
+        IndexType::IvfFlat => match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                let index_dir = new_index_dir();
+                let ivf_model = make_ivf_model();
+
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                    filtered_dataset,
+                    column.to_owned(),
+                    index_dir,
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params),
+                    Some(()),
+                    (),
+                    frag_reuse_index,
+                )?
+                .with_ivf(ivf_model)
+                .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
+            }
+            DataType::UInt8 => {
+                let index_dir = new_index_dir();
+                let ivf_model = make_ivf_model();
+
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                    filtered_dataset,
+                    column.to_owned(),
+                    index_dir,
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params),
+                    Some(()),
+                    (),
+                    frag_reuse_index,
+                )?
+                .with_ivf(ivf_model)
+                .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid data type: {:?}",
+                        element_type
+                    ),
+                    location: location!(),
+                });
+            }
+        },
+
+        IndexType::IvfPq => {
+            let len = stages.len();
+            let StageParams::PQ(pq_params) = &stages[len - 1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            match params.version {
+                IndexFileVersion::Legacy => {
+                    return Err(Error::Index {
+                        message: "Distributed indexing does not support legacy IVF_PQ format"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+                IndexFileVersion::V3 => {
+                    let index_dir = new_index_dir();
+                    let ivf_model = make_ivf_model();
+                    let global_pq = make_global_pq(pq_params)?;
+
+                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                        filtered_dataset,
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        Box::new(shuffler),
+                        Some(ivf_params),
+                        Some(pq_params.clone()),
+                        (),
+                        frag_reuse_index,
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(global_pq)
+                    // For distributed shards, keep PQ codes in their original layout
+                    // and transpose only after all shards are merged.
+                    .with_transpose(false)
+                    .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+            }
+        }
+
+        IndexType::IvfSq => {
+            let StageParams::SQ(sq_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            let index_dir = new_index_dir();
+
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(sq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
+
+        IndexType::IvfHnswFlat => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            let index_dir = new_index_dir();
+
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
+
+        IndexType::IvfHnswPq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+            let StageParams::PQ(pq_params) = &stages[2] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            let index_dir = new_index_dir();
+            let ivf_model = make_ivf_model();
+            let global_pq = make_global_pq(pq_params)?;
+
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(pq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(global_pq)
+            // For distributed shards, keep PQ codes in their original layout
+            // and transpose only after all shards are merged.
+            .with_transpose(false)
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
+
+        IndexType::IvfHnswSq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+            let StageParams::SQ(sq_params) = &stages[2] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Distributed Vector Index: invalid stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            let index_dir = new_index_dir();
+
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(sq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
+
+        IndexType::IvfRq => {
+            return Err(Error::Index {
+                message: format!(
+                    "Build Distributed Vector Index: invalid index type: {:?} \
+is not supported in distributed mode; skipping this shard",
+                    index_type
+                ),
+                location: location!(),
+            });
+        }
+
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "Build Distributed Vector Index: invalid index type: {:?}",
+                    index_type
+                ),
+                location: location!(),
+            });
+        }
+    };
+
+    Ok(())
+}
+
 /// Build a Vector Index
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_vector_index(
@@ -303,6 +708,7 @@ pub(crate) async fn build_vector_index(
     uuid: &str,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -346,7 +752,7 @@ pub(crate) async fn build_vector_index(
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions);
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -361,6 +767,7 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -376,6 +783,7 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -405,6 +813,7 @@ pub(crate) async fn build_vector_index(
                         params.metric_type,
                         &ivf_params,
                         pq_params,
+                        progress.clone(),
                     )
                     .await?;
                 }
@@ -420,6 +829,7 @@ pub(crate) async fn build_vector_index(
                         (),
                         frag_reuse_index,
                     )?
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -444,6 +854,7 @@ pub(crate) async fn build_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -466,6 +877,7 @@ pub(crate) async fn build_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -487,6 +899,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -514,6 +927,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -541,6 +955,7 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -564,6 +979,7 @@ pub(crate) async fn build_vector_index_incremental(
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -613,7 +1029,9 @@ pub(crate) async fn build_vector_index_incremental(
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()));
+    let shuffler = Box::new(
+        IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()).with_progress(progress.clone()),
+    );
 
     let index_dir = dataset.indices_dir().child(uuid);
 
@@ -632,9 +1050,11 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    OptimizeOptions::append(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -647,9 +1067,11 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    OptimizeOptions::append(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
+                .with_progress(progress.clone())
                 .build()
                 .await?;
             }
@@ -670,9 +1092,11 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -686,9 +1110,11 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -702,9 +1128,11 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
             .build()
             .await?;
         }
@@ -730,9 +1158,11 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -745,9 +1175,11 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -760,9 +1192,11 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
                     .build()
                     .await?;
                 }
@@ -929,7 +1363,7 @@ pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &str,
-    reader: FileReader,
+    reader: PreviousFileReader,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
@@ -1139,6 +1573,7 @@ pub async fn initialize_vector_index(
         &params,
         source_vector_index,
         frag_reuse_index,
+        noop_progress(),
     )
     .await?;
 
@@ -1180,7 +1615,6 @@ pub async fn initialize_vector_index(
             new_indices: vec![new_idx],
             removed_indices: vec![],
         },
-        None,
         None,
     );
 
@@ -1294,8 +1728,11 @@ mod tests {
     use crate::dataset::Dataset;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::Array;
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, BatchCount, RowCount};
+    use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::DatasetIndexExt;
     use lance_linalg::distance::MetricType;
@@ -1712,6 +2149,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_build_distributed_invalid_fragment_ids() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let fragments = dataset.fragments();
+        assert!(
+            !fragments.is_empty(),
+            "Dataset should have at least one fragment"
+        );
+        let max_id = fragments.iter().map(|f| f.id as u32).max().unwrap();
+        let invalid_id = max_id + 1000;
+
+        // let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
+        let uuid = Uuid::new_v4().to_string();
+
+        let mut ivf_params = IvfBuildParams {
+            num_partitions: Some(4),
+            ..Default::default()
+        };
+        let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dim,
+            MetricType::L2,
+            &ivf_params,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        // Attach precomputed global centroids to ivf_params for distributed build.
+        ivf_params.centroids = ivf_model.centroids.clone().map(Arc::new);
+
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
+
+        let result = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_flat_dist",
+            &uuid,
+            &params,
+            None,
+            &[invalid_id],
+            noop_progress(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Expected Ok for invalid fragment ids, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_distributed_empty_fragment_ids() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let uuid = Uuid::new_v4().to_string();
+        let mut ivf_params = IvfBuildParams {
+            num_partitions: Some(4),
+            ..Default::default()
+        };
+        let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dim,
+            MetricType::L2,
+            &ivf_params,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        // Attach precomputed global centroids to ivf_params for distributed build.
+        ivf_params.centroids = ivf_model.centroids.clone().map(Arc::new);
+
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
+
+        let result = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_flat_dist",
+            &uuid,
+            &params,
+            None,
+            &[],
+            noop_progress(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Expected Ok for empty fragment ids, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_train_ivf_progress_is_emitted_before_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct RecordingProgress {
+            train_ivf_complete: AtomicBool,
+            saw_train_ivf_progress_before_complete: AtomicBool,
+            saw_train_ivf_progress_after_complete: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for RecordingProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+
+            async fn stage_progress(&self, stage: &str, _: u64) -> Result<()> {
+                if stage == "train_ivf" {
+                    if self.train_ivf_complete.load(Ordering::Relaxed) {
+                        self.saw_train_ivf_progress_after_complete
+                            .store(true, Ordering::Relaxed);
+                    } else {
+                        self.saw_train_ivf_progress_before_complete
+                            .store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+
+            async fn stage_complete(&self, stage: &str) -> Result<()> {
+                if stage == "train_ivf" {
+                    self.train_ivf_complete.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
+        let uuid = Uuid::new_v4().to_string();
+        let progress = Arc::new(RecordingProgress {
+            train_ivf_complete: AtomicBool::new(false),
+            saw_train_ivf_progress_before_complete: AtomicBool::new(false),
+            saw_train_ivf_progress_after_complete: AtomicBool::new(false),
+        });
+
+        build_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_flat_progress",
+            &uuid,
+            &params,
+            None,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            progress
+                .saw_train_ivf_progress_before_complete
+                .load(Ordering::Relaxed),
+            "expected at least one train_ivf progress event before completion"
+        );
+        assert!(
+            !progress
+                .saw_train_ivf_progress_after_complete
+                .load(Ordering::Relaxed),
+            "found train_ivf progress after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_distributed_training_metadata_missing() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
+        let uuid = Uuid::new_v4().to_string();
+
+        // Pre-create a malformed global training file that is missing the
+        // `lance:global_ivf_centroids` metadata key.
+        let out_base = dataset.indices_dir().child(&*uuid);
+        let training_path = out_base.child("global_training.idx");
+
+        let writer = dataset.object_store().create(&training_path).await.unwrap();
+        let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
+        let mut v2w = lance_file::writer::FileWriter::try_new(
+            writer,
+            lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let empty_batch = RecordBatch::new_empty(Arc::new(arrow_schema));
+        v2w.write_batch(&empty_batch).await.unwrap();
+        v2w.finish().await.unwrap();
+
+        let fragments = dataset.fragments();
+        assert!(
+            !fragments.is_empty(),
+            "Dataset should have at least one fragment"
+        );
+
+        let valid_id = fragments[0].id as u32;
+        let result = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_flat_dist",
+            &uuid,
+            &params,
+            None,
+            &[valid_id],
+            noop_progress(),
+        )
+        .await;
+
+        match result {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("missing precomputed IVF centroids"),
+                    "Unexpected error message: {}",
+                    message
+                );
+            }
+            Ok(_) => panic!("Expected Error::Index when IVF training metadata is missing, got Ok"),
+            Err(e) => panic!(
+                "Expected Error::Index when IVF training metadata is missing, got {:?}",
+                e
+            ),
+        }
+    }
+
+    #[tokio::test]
     async fn test_initialize_vector_index_empty_dataset() {
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1848,9 +2545,8 @@ mod tests {
         // Run optimize_indices to index the newly added data and merge indices
         // We set num_indices_to_merge to a high value to force merging all indices into one
         use lance_index::optimize::OptimizeOptions;
-        let optimize_options = OptimizeOptions::new().num_indices_to_merge(10);
         target_dataset
-            .optimize_indices(&optimize_options)
+            .optimize_indices(&OptimizeOptions::merge(10))
             .await
             .unwrap();
 
@@ -2133,7 +2829,7 @@ mod tests {
             "SQ num_bits should match"
         );
 
-        // Verify the index is functional
+        // Verify the index is functional by performing a search
         let query_vector = lance_datagen::gen_batch()
             .anon_col(array::rand_vec::<Float32Type>(32.into()))
             .into_batch_rows(RowCount::from(1))
@@ -2392,7 +3088,7 @@ mod tests {
             "HNSW ef_construction should be extracted as 120 from source index"
         );
 
-        // Verify the index is functional by performing a search
+        // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
             .anon_col(array::rand_vec::<Float32Type>(32.into()))
             .into_batch_rows(RowCount::from(1))
@@ -2554,13 +3250,49 @@ mod tests {
             .get("sub_index")
             .and_then(|v| v.as_object())
             .expect("IVF_HNSW_SQ index should have sub_index");
-
         // Verify SQ parameters
         assert_eq!(
             sub_index.get("num_bits").and_then(|v| v.as_u64()),
             Some(8),
             "SQ should use 8 bits"
         );
+
+        // Verify the centroids are exactly the same (key verification for delta indices)
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length"
+            );
+
+            // Compare actual centroid values
+            // Since value() returns Arc<dyn Array>, we need to compare the data directly
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                // Convert to the same type for comparison
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Centroid {} values should be identical between source and target",
+                    i
+                );
+            }
+        } else {
+            panic!("Both source and target should have centroids");
+        }
 
         // Verify IVF parameters are correctly derived
         let source_ivf_params = derive_ivf_params(source_ivf_model);
