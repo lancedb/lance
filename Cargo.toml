@@ -47,7 +47,7 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.88.0"
+rust-version = "1.91.0"
 
 [workspace.dependencies]
 libc = "0.2.176"
