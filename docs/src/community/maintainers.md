@@ -56,7 +56,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Sangwu Lee             | RE-N-Y               | Krea.ai           |                     |                                                 |
 | Jeremy Leibs           | jleibs               | Rerun.io          |                     |                                                 |
 | Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                 |
-| Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PMC Member            |
+| Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member           |
 | ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                 |
 | Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                              |
 | Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer |
