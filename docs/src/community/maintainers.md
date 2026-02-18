@@ -42,6 +42,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 
 | Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                 |
 |------------------------|----------------------|-------------------|---------------------|-------------------------------------------------|
+| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                 |
 | Matt Basta             | mattbasta            | Runway AI         |                     |                                                 |
 | Giuseppe Battista      | giusedroid           | AWS               |                     |                                                 |
 | Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                 |
@@ -63,10 +64,9 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Kevin Shaffer-Morrison | kevinshaffermorrison | AWS               |                     |                                                 |
 | Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                 |
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
+| Beinan Wang            | beinan               | Uber              |                     | Alluxio PMC Member, PrestoDB TSC Member         |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
 | Jinglun                | wojiaodoubao         | Bytedance         |                     | Apache Hadoop Committer                         |
-| Beinan Wang            | beinan               | Uber              |                     | PrestoDB TSC and Committer                      |
-| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                 |
 
 ## Becoming a Maintainer
 
