@@ -1574,6 +1574,24 @@ impl Dataset {
         &self.object_store
     }
 
+    /// Clone this dataset with a different object store binding.
+    ///
+    /// The returned dataset shares metadata, session state, and caches with the
+    /// original dataset, but all subsequent operations on the returned dataset
+    /// use the supplied object store.
+    pub fn with_object_store(
+        &self,
+        object_store: Arc<ObjectStore>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.object_store = object_store;
+        if let Some(store_params) = store_params {
+            cloned.store_params = Some(Box::new(store_params));
+        }
+        cloned
+    }
+
     /// Returns the initial storage options used when opening this dataset, if any.
     ///
     /// This returns the static initial options without triggering any refresh.
