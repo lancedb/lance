@@ -64,7 +64,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Kevin Shaffer-Morrison | kevinshaffermorrison | AWS               |                     |                                                 |
 | Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                 |
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
-| Beinan Wang            | beinan               | Uber              |                     | Alluxio PMC Member, PrestoDB TSC Member         |
+| Beinan Wang            | beinan               | Uber              |                     | Alluxio PMC Member, Presto TSC Member           |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
 | Jinglun                | wojiaodoubao         | Bytedance         |                     | Apache Hadoop Committer                         |
 
