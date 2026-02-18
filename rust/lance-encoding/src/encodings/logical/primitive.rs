@@ -850,8 +850,26 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                 let decompressed = decompressor.decompress(compressed_buffer, num_values)?;
                 match decompressed {
                     DataBlock::FixedWidth(block) => {
-                        assert_eq!(block.num_values, num_values);
-                        assert_eq!(block.bits_per_value, 16);
+                        if block.num_values != num_values {
+                            return Err(Error::InvalidInput {
+                                source: format!(
+                                    "Unexpected {} level count after decompression: expected {}, got {}",
+                                    level_type, num_values, block.num_values
+                                )
+                                .into(),
+                                location: location!(),
+                            });
+                        }
+                        if block.bits_per_value != 16 {
+                            return Err(Error::InvalidInput {
+                                source: format!(
+                                    "Unexpected {} level bit width after decompression: expected 16, got {}",
+                                    level_type, block.bits_per_value
+                                )
+                                .into(),
+                                location: location!(),
+                            });
+                        }
                         Ok(block.data.borrow_to_typed_slice::<u16>())
                     }
                     _ => Err(Error::InvalidInput {
