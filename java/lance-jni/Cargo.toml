@@ -1,9 +1,9 @@
 [package]
 name = "lance-jni"
-version = "3.0.0-beta.2"
+version = "3.0.0-beta.3"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
-rust-version = "1.88"
+rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
@@ -45,7 +45,7 @@ log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
 prost = "0.14.1"
-roaring = "0.10.1"
+roaring = "0.11"
 prost-types = "0.14.1"
 chrono = "0.4.41"
 
