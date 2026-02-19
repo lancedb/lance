@@ -1852,7 +1852,7 @@ mod tests {
     use super::*;
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
-    use lance_core::utils::tempfile::TempStdDir;
+    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
@@ -3960,10 +3960,9 @@ mod tests {
     async fn test_list_table_versions() {
         use lance_namespace::models::ListTableVersionsRequest;
 
-        let temp_dir = TempStdDir::default();
-        let temp_path = temp_dir.to_str().unwrap();
+        let temp_dir = TempStrDir::default();
 
-        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.as_ref())
             .table_version_tracking_enabled(true)
             .build()
             .await
@@ -4167,8 +4166,8 @@ mod tests {
         // Each version always writes to a new file location.
         use lance_namespace::models::CreateTableVersionRequest;
 
-        let temp_dir = TempStdDir::default();
-        let temp_path = temp_dir.to_str().unwrap();
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
 
         let namespace = DirectoryNamespaceBuilder::new(temp_path)
             .table_version_tracking_enabled(true)
@@ -4581,8 +4580,8 @@ mod tests {
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::models::{CreateNamespaceRequest, DescribeTableRequest};
 
-            let temp_dir = TempStdDir::default();
-            let temp_path = temp_dir.to_str().unwrap();
+            let temp_dir = TempStrDir::default();
+            let temp_path: &str = &temp_dir;
 
             // Create namespace with table_version_tracking_enabled and manifest_enabled
             let inner_ns = DirectoryNamespaceBuilder::new(temp_path)
