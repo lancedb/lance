@@ -224,7 +224,6 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
 ) {
     let result = (|| -> Result<()> {
         let mut read_parameter = ReadBatchParams::default();
-        let mut reader_projection: Option<ReaderProjection> = None;
         // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
         // If we get reader from env.get_rust_field, we can't use env (can't borrow again) until we drop the reader.
         #[allow(unused_variables)]
@@ -250,7 +249,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
             BlobHandling::AllBinary
         };
 
-        {
+        let reader_projection = {
             let mut projection =
                 Projection::empty(Arc::new(base_schema.clone())).with_blob_handling(blob_handling);
 
@@ -274,12 +273,12 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
                 .map(|(idx, field)| (field.id as u32, idx as u32))
                 .collect::<BTreeMap<_, _>>();
 
-            reader_projection = Some(ReaderProjection::from_field_ids(
+            Some(ReaderProjection::from_field_ids(
                 file_version,
                 &transformed_schema,
                 &field_id_to_column_index,
-            )?);
-        }
+            )?)
+        };
 
         if !selection_ranges.is_null() {
             let mut ranges: Vec<Range<u64>> = Vec::new();

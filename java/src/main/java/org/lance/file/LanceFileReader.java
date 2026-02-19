@@ -125,9 +125,10 @@ public class LanceFileReader implements AutoCloseable {
   }
 
   /**
-   * Read all rows from the Lance file
+   * Read all rows from the Lance file.
    *
-   * <p>Blob-encoded columns are returned as materialized binary content.
+   * <p>Blob-encoded columns are returned as materialized binary content. Use {@link #readAll(List,
+   * List, int, FileReadOptions)} to control blob output format.
    *
    * @param projectedNames optional list of column names to project; if null, all columns are read
    * @param ranges optional array of ranges to read; if null, all rows are read.
@@ -137,25 +138,24 @@ public class LanceFileReader implements AutoCloseable {
   public ArrowReader readAll(
       @Nullable List<String> projectedNames, @Nullable List<Range> ranges, int batchSize)
       throws IOException {
-    return readAll(projectedNames, ranges, batchSize, BlobReadMode.CONTENT);
+    return readAll(projectedNames, ranges, batchSize, FileReadOptions.builder().build());
   }
 
   /**
-   * Read all rows from the Lance file with control over blob column output format.
+   * Read all rows from the Lance file with additional read options.
    *
    * @param projectedNames optional list of column names to project; if null, all columns are read
    * @param ranges optional array of ranges to read; if null, all rows are read.
    * @param batchSize the maximum number of rows to read in a single batch
-   * @param blobReadMode how to return blob-encoded columns: as materialized binary content ({@link
-   *     BlobReadMode#CONTENT}) or as descriptors with position and size ({@link
-   *     BlobReadMode#DESCRIPTOR})
+   * @param options file read options controlling output format (e.g. blob handling)
    * @return an ArrowReader for the Lance file
+   * @see FileReadOptions
    */
   public ArrowReader readAll(
       @Nullable List<String> projectedNames,
       @Nullable List<Range> ranges,
       int batchSize,
-      BlobReadMode blobReadMode)
+      FileReadOptions options)
       throws IOException {
     try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
       readAllNative(
@@ -163,7 +163,7 @@ public class LanceFileReader implements AutoCloseable {
           projectedNames,
           ranges,
           ffiArrowArrayStream.memoryAddress(),
-          blobReadMode.getValue());
+          options.getBlobReadMode().getValue());
       return Data.importArrayStream(allocator, ffiArrowArrayStream);
     }
   }

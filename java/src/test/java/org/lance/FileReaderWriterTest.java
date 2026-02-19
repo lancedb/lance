@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.file.BlobReadMode;
+import org.lance.file.FileReadOptions;
 import org.lance.file.LanceFileReader;
 import org.lance.file.LanceFileWriter;
 import org.lance.util.Range;
@@ -21,6 +22,7 @@ import org.lance.util.Range;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -350,14 +352,15 @@ public class FileReaderWriterTest {
           reader.schema().getFields().get(0).getMetadata().containsKey("lance-encoding:blob"),
           "Blob metadata should be preserved in schema");
 
+      FileReadOptions options =
+          FileReadOptions.builder().blobReadMode(BlobReadMode.DESCRIPTOR).build();
       try (ArrowReader batch =
-          reader.readAll(
-              Collections.singletonList("blob_data"), null, 10, BlobReadMode.DESCRIPTOR)) {
+          reader.readAll(Collections.singletonList("blob_data"), null, 10, options)) {
         assertTrue(batch.loadNextBatch());
         VectorSchemaRoot root = batch.getVectorSchemaRoot();
         assertEquals(5, root.getRowCount());
 
-        org.apache.arrow.vector.FieldVector column = root.getVector("blob_data");
+        FieldVector column = root.getVector("blob_data");
         assertTrue(
             column.getField().getType() instanceof ArrowType.Struct,
             "DESCRIPTOR mode should return Struct but got " + column.getField().getType());
@@ -383,7 +386,7 @@ public class FileReaderWriterTest {
         VectorSchemaRoot root = batch.getVectorSchemaRoot();
         assertEquals(5, root.getRowCount());
 
-        org.apache.arrow.vector.FieldVector column = root.getVector("blob_data");
+        FieldVector column = root.getVector("blob_data");
         assertTrue(
             column.getField().getType() instanceof ArrowType.LargeBinary,
             "CONTENT mode should return LargeBinary but got " + column.getField().getType());
