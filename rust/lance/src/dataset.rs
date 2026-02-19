@@ -806,6 +806,7 @@ impl Dataset {
                             transaction_id: fallback_resp.transaction_id,
                             location: fallback_resp.location,
                             storage_options: fallback_resp.storage_options,
+                            properties: fallback_resp.properties,
                         }
                     }
                     Err(e) => {

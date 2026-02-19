@@ -76,6 +76,15 @@ impl RestAdapter {
             .route("/v1/table/:id/rename", post(rename_table))
             .route("/v1/table/:id/restore", post(restore_table))
             .route("/v1/table/:id/version/list", get(list_table_versions))
+            .route("/v1/table/:id/version/create", post(create_table_version))
+            .route(
+                "/v1/table/:id/version/latest",
+                get(describe_table_version_latest),
+            )
+            .route(
+                "/v1/table/:id/version/:version",
+                get(describe_table_version),
+            )
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -748,6 +757,74 @@ async fn list_table_versions(
     };
 
     match backend.list_table_versions(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_table_version(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(body): Json<CreateTableVersionRequest>,
+) -> Response {
+    let request = CreateTableVersionRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        identity: extract_identity(&headers),
+        version: body.version,
+        manifest_path: body.manifest_path,
+        manifest_size: body.manifest_size,
+        e_tag: body.e_tag,
+        metadata: body.metadata,
+        ..Default::default()
+    };
+
+    match backend.create_table_version(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionPathParams {
+    id: String,
+    version: i64,
+}
+
+async fn describe_table_version(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(params): Path<VersionPathParams>,
+    Query(query): Query<DelimiterQuery>,
+) -> Response {
+    let request = DescribeTableVersionRequest {
+        id: Some(parse_id(&params.id, query.delimiter.as_deref())),
+        version: Some(params.version),
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
+
+    match backend.describe_table_version(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn describe_table_version_latest(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+) -> Response {
+    let request = DescribeTableVersionRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        version: None,
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
+
+    match backend.describe_table_version(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -2870,8 +2947,7 @@ mod tests {
                     "test_table".to_string(),
                 ]),
                 mode: Some("create".to_string()),
-                identity: None,
-                context: None,
+                ..Default::default()
             };
             let result = namespace.create_table(create_table_req, table_data).await;
             assert!(result.is_ok(), "Failed to create table: {:?}", result);

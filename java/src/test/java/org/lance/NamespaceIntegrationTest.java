@@ -1309,6 +1309,192 @@ public class NamespaceIntegrationTest {
     }
   }
 
+  /**
+   * Table version tracking namespace for managed versioning tests.
+   *
+   * <p>This namespace wraps DirectoryNamespace with table_version_tracking_enabled and
+   * manifest_enabled flags, and tracks create_table_version and describe_table_version calls.
+   */
+  static class TableVersionTrackingNamespace implements LanceNamespace {
+    private final DirectoryNamespace inner;
+    private final AtomicInteger createTableVersionCount = new AtomicInteger(0);
+    private final AtomicInteger describeTableVersionCount = new AtomicInteger(0);
+    private final Map<String, String> baseStorageOptions;
+
+    public TableVersionTrackingNamespace(String root, Map<String, String> storageOptions) {
+      this.baseStorageOptions =
+          storageOptions != null ? new HashMap<>(storageOptions) : new HashMap<>();
+
+      Map<String, String> dirProps = new HashMap<>();
+      if (storageOptions != null) {
+        for (Map.Entry<String, String> entry : storageOptions.entrySet()) {
+          dirProps.put("storage." + entry.getKey(), entry.getValue());
+        }
+      }
+      dirProps.put("root", root);
+      dirProps.put("table_version_tracking_enabled", "true");
+      dirProps.put("manifest_enabled", "true");
+
+      this.inner = new DirectoryNamespace();
+      try (BufferAllocator allocator = new RootAllocator()) {
+        this.inner.initialize(dirProps, allocator);
+      }
+    }
+
+    public int getCreateTableVersionCount() {
+      return createTableVersionCount.get();
+    }
+
+    public int getDescribeTableVersionCount() {
+      return describeTableVersionCount.get();
+    }
+
+    public long getNativeHandle() {
+      return inner.getNativeHandle();
+    }
+
+    public String getNamespaceType() {
+      return inner.getNamespaceType();
+    }
+
+    @Override
+    public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
+      // Already initialized in constructor
+    }
+
+    @Override
+    public String namespaceId() {
+      return "TableVersionTrackingNamespace { inner: " + inner.namespaceId() + " }";
+    }
+
+    @Override
+    public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
+      return inner.createEmptyTable(request);
+    }
+
+    @Override
+    public DeclareTableResponse declareTable(DeclareTableRequest request) {
+      return inner.declareTable(request);
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      return inner.describeTable(request);
+    }
+  }
+
+  @Test
+  void testManagedVersioningWithDirectoryNamespace() throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      // Set up storage options
+      Map<String, String> storageOptions = new HashMap<>();
+      storageOptions.put("allow_http", "true");
+      storageOptions.put("aws_access_key_id", ACCESS_KEY);
+      storageOptions.put("aws_secret_access_key", SECRET_KEY);
+      storageOptions.put("aws_endpoint", ENDPOINT_URL);
+      storageOptions.put("aws_region", REGION);
+
+      // Create namespace with table_version_tracking_enabled
+      TableVersionTrackingNamespace namespace =
+          new TableVersionTrackingNamespace(
+              "s3://" + BUCKET_NAME + "/managed_versioning_test", storageOptions);
+      String tableName = UUID.randomUUID().toString();
+
+      // Create schema and data
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("a", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("b", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector aVector = (IntVector) root.getVector("a");
+        IntVector bVector = (IntVector) root.getVector("b");
+
+        aVector.allocateNew(2);
+        bVector.allocateNew(2);
+
+        aVector.set(0, 1);
+        bVector.set(0, 2);
+        aVector.set(1, 10);
+        bVector.set(1, 20);
+
+        aVector.setValueCount(2);
+        bVector.setValueCount(2);
+        root.setRowCount(2);
+
+        ArrowReader testReader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return root;
+              }
+            };
+
+        // Create dataset through namespace
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(testReader)
+                .namespace(namespace)
+                .tableId(Arrays.asList(tableName))
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+          assertEquals(2, dataset.countRows());
+        }
+      }
+
+      // Verify describe_table returns managed_versioning=true
+      DescribeTableRequest descReq = new DescribeTableRequest();
+      descReq.setId(Arrays.asList(tableName));
+      DescribeTableResponse descResp = namespace.describeTable(descReq);
+
+      assertEquals(
+          Boolean.TRUE,
+          descResp.getManagedVersioning(),
+          "Expected managedVersioning=true when table_version_tracking_enabled");
+
+      // Open dataset through namespace with managed_versioning support
+      try (Dataset dsFromNamespace =
+          Dataset.open()
+              .allocator(allocator)
+              .namespace(namespace)
+              .tableId(Arrays.asList(tableName))
+              .build()) {
+
+        assertEquals(2, dsFromNamespace.countRows());
+
+        // Verify we can read the data
+        List<Version> versions = dsFromNamespace.listVersions();
+        assertEquals(1, versions.size(), "Should have 1 version after create");
+      }
+    }
+  }
+
   @Test
   void testTransactionCommitWithNamespace() throws Exception {
     try (BufferAllocator allocator = new RootAllocator()) {

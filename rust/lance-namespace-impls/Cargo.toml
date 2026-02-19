@@ -90,6 +90,7 @@ wiremock.workspace = true
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 rstest.workspace = true
+lance-table.workspace = true
 
 [lints]
 workspace = true

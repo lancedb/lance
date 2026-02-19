@@ -14,6 +14,8 @@
 package org.lance.namespace;
 
 import org.lance.namespace.model.*;
+import org.lance.namespace.model.DescribeTableVersionRequest;
+import org.lance.namespace.model.DescribeTableVersionResponse;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -304,5 +306,79 @@ public class DirectoryNamespaceTest {
 
     assertNotNull(createResp);
     assertNotNull(createResp.getLocation());
+  }
+
+  @Test
+  void testDescribeTableReturnsManagedVersioningWhenTrackingEnabled() throws Exception {
+    // Create namespace with table_version_tracking_enabled and manifest_enabled
+    DirectoryNamespace trackingNs = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.toString());
+    config.put("table_version_tracking_enabled", "true");
+    config.put("manifest_enabled", "true");
+    trackingNs.initialize(config, allocator);
+
+    try {
+      // Create parent namespace
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+      trackingNs.createNamespace(createNsReq);
+
+      // Create a table
+      byte[] tableData = createTestTableData();
+      CreateTableRequest createReq =
+          new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+      trackingNs.createTable(createReq, tableData);
+
+      // Describe table should return managedVersioning=true
+      DescribeTableRequest descReq =
+          new DescribeTableRequest().id(Arrays.asList("workspace", "test_table"));
+      DescribeTableResponse descResp = trackingNs.describeTable(descReq);
+
+      assertNotNull(descResp);
+      assertNotNull(descResp.getLocation());
+      assertTrue(
+          Boolean.TRUE.equals(descResp.getManagedVersioning()),
+          "Expected managedVersioning=true, got " + descResp.getManagedVersioning());
+    } finally {
+      trackingNs.close();
+    }
+  }
+
+  @Test
+  void testDescribeTableVersion() throws Exception {
+    // Use multi-level table ID with manifest_enabled
+    DirectoryNamespace trackingNs = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.toString());
+    config.put("manifest_enabled", "true");
+    trackingNs.initialize(config, allocator);
+
+    try {
+      // Create parent namespace
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+      trackingNs.createNamespace(createNsReq);
+
+      // Create a table with multi-level ID
+      byte[] tableData = createTestTableData();
+      CreateTableRequest createReq =
+          new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+      trackingNs.createTable(createReq, tableData);
+
+      // Describe table version
+      DescribeTableVersionRequest descReq =
+          new DescribeTableVersionRequest()
+              .id(Arrays.asList("workspace", "test_table"))
+              .version(1L);
+      DescribeTableVersionResponse descResp = trackingNs.describeTableVersion(descReq);
+
+      assertNotNull(descResp);
+      assertNotNull(descResp.getVersion());
+      assertEquals(Long.valueOf(1), descResp.getVersion().getVersion());
+      assertNotNull(descResp.getVersion().getManifestPath());
+    } finally {
+      trackingNs.close();
+    }
   }
 }

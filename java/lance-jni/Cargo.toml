@@ -26,6 +26,7 @@ lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
+lance-table = { path = "../../rust/lance-table" }
 arrow = { version = "57.1", features = ["ffi"] }
 arrow-schema = "57.1"
 object_store = { version = "0.12.2" }

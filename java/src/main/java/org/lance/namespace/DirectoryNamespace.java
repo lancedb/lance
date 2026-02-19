@@ -17,7 +17,9 @@ import org.lance.JniLoader;
 import org.lance.namespace.model.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
@@ -142,7 +144,14 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
     JniLoader.ensureLoaded();
   }
 
-  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+  private static final ObjectMapper OBJECT_MAPPER = createObjectMapper();
+
+  private static ObjectMapper createObjectMapper() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(new JavaTimeModule());
+    mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    return mapper;
+  }
 
   private long nativeDirectoryNamespaceHandle;
   private BufferAllocator allocator;
@@ -400,12 +409,52 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
     return fromJson(responseJson, AlterTransactionResponse.class);
   }
 
+  // Table version operations
+
+  @Override
+  public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = listTableVersionsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, ListTableVersionsResponse.class);
+  }
+
+  @Override
+  public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createTableVersionNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateTableVersionResponse.class);
+  }
+
+  @Override
+  public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = describeTableVersionNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, DescribeTableVersionResponse.class);
+  }
+
   @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
       nativeDirectoryNamespaceHandle = 0;
     }
+  }
+
+  /**
+   * Returns the native handle for this namespace. Used internally for passing to Dataset.open() for
+   * namespace commit handler support.
+   */
+  public long getNativeHandle() {
+    ensureInitialized();
+    return nativeDirectoryNamespaceHandle;
+  }
+
+  /** Returns the namespace type identifier. */
+  public String getNamespaceType() {
+    return "directory";
   }
 
   private void ensureInitialized() {
@@ -491,6 +540,12 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String describeTransactionNative(long handle, String requestJson);
 
   private native String alterTransactionNative(long handle, String requestJson);
+
+  private native String listTableVersionsNative(long handle, String requestJson);
+
+  private native String createTableVersionNative(long handle, String requestJson);
+
+  private native String describeTableVersionNative(long handle, String requestJson);
 
   // ==========================================================================
   // Provider loading helpers

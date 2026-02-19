@@ -328,6 +328,28 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
+    return open(allocator, selfManagedAllocator, path, options, session, 0, null, null);
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options and namespace commit handler.
+   *
+   * @param path file path
+   * @param options the open options
+   * @param namespaceHandle native namespace handle (0 if not using namespace)
+   * @param namespaceType "directory" or "rest" (null if not using namespace)
+   * @param tableId table identifier (null if not using namespace)
+   * @return Dataset
+   */
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session,
+      long namespaceHandle,
+      String namespaceType,
+      List<String> tableId) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
@@ -348,7 +370,10 @@ public class Dataset implements Closeable {
             options.getStorageOptions(),
             options.getSerializedManifest(),
             options.getStorageOptionsProvider(),
-            sessionHandle);
+            sessionHandle,
+            namespaceHandle,
+            namespaceType,
+            tableId);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     if (effectiveSession != null) {
@@ -369,7 +394,10 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      long sessionHandle);
+      long sessionHandle,
+      long namespaceHandle,
+      String namespaceType,
+      List<String> tableId);
 
   /**
    * Creates a builder for opening a dataset.

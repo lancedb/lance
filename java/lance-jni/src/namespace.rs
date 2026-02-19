@@ -11,8 +11,8 @@ use jni::JNIEnv;
 use lance_namespace::models::*;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace_impls::{
-    ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider,
-    OperationInfo, RestAdapter, RestAdapterConfig, RestNamespace, RestNamespaceBuilder,
+    ConnectBuilder, DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo, RestAdapter,
+    RestAdapterConfig, RestNamespaceBuilder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,12 +118,12 @@ fn convert_java_map_to_hashmap(
 
 /// Blocking wrapper for DirectoryNamespace
 pub struct BlockingDirectoryNamespace {
-    pub(crate) inner: DirectoryNamespace,
+    pub(crate) inner: Arc<dyn LanceNamespaceTrait>,
 }
 
 /// Blocking wrapper for RestNamespace
 pub struct BlockingRestNamespace {
-    pub(crate) inner: RestNamespace,
+    pub(crate) inner: Arc<dyn LanceNamespaceTrait>,
 }
 
 // ============================================================================
@@ -184,7 +184,9 @@ fn create_directory_namespace_internal(
         .block_on(builder.build())
         .map_err(|e| Error::runtime_error(format!("Failed to build DirectoryNamespace: {}", e)))?;
 
-    let blocking_namespace = BlockingDirectoryNamespace { inner: namespace };
+    let blocking_namespace = BlockingDirectoryNamespace {
+        inner: Arc::new(namespace),
+    };
     let handle = Box::into_raw(Box::new(blocking_namespace)) as jlong;
     Ok(handle)
 }
@@ -650,6 +652,57 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTransact
     .into_raw()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableVersionsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.list_table_versions(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.create_table_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTableVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_table_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
 // ============================================================================
 // RestNamespace JNI Functions
 // ============================================================================
@@ -705,7 +758,9 @@ fn create_rest_namespace_internal(
 
     let namespace = builder.build();
 
-    let blocking_namespace = BlockingRestNamespace { inner: namespace };
+    let blocking_namespace = BlockingRestNamespace {
+        inner: Arc::new(namespace),
+    };
     let handle = Box::into_raw(Box::new(blocking_namespace)) as jlong;
     Ok(handle)
 }
@@ -1182,6 +1237,57 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTransactionNa
         env,
         call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
             RT.block_on(ns.inner.alter_transaction(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTableVersionsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.list_table_versions(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.create_table_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_table_version(req))
         }),
         std::ptr::null_mut()
     )

@@ -838,3 +838,234 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
 
     final_describe_count = namespace.get_describe_call_count()
     assert final_describe_count == describe_count_after_second_write
+
+
+class TableVersionTrackingNamespace(LanceNamespace):
+    """Namespace wrapper that tracks table version API calls."""
+
+    def __init__(self, root: str, storage_options: Dict[str, str] = None):
+        from lance.namespace import DirectoryNamespace
+
+        self.create_table_version_count = 0
+        self.describe_table_version_count = 0
+        self.list_table_versions_count = 0
+        self.lock = Lock()
+
+        dir_props = {
+            "root": root,
+            "table_version_tracking_enabled": "true",
+        }
+        if storage_options:
+            for k, v in storage_options.items():
+                dir_props[f"storage.{k}"] = v
+
+        self.inner = DirectoryNamespace(**dir_props)
+
+    def namespace_id(self) -> str:
+        return f"TableVersionTrackingNamespace {{ inner: {self.inner.namespace_id()} }}"
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        return self.inner.describe_table(request)
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        return self.inner.declare_table(request)
+
+    def create_table_version(self, request: dict) -> dict:
+        with self.lock:
+            self.create_table_version_count += 1
+        return self.inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        with self.lock:
+            self.describe_table_version_count += 1
+        return self.inner.describe_table_version(request)
+
+    def list_table_versions(self, request):
+        with self.lock:
+            self.list_table_versions_count += 1
+        return self.inner.list_table_versions(request)
+
+
+def test_e2e_describe_table_returns_managed_versioning():
+    """Test that describe_table returns managed_versioning=True."""
+    import tempfile
+
+    from lance.namespace import CreateTableRequest, DirectoryNamespace
+    from lance_namespace import CreateNamespaceRequest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ns = DirectoryNamespace(
+            root=f"file://{tmpdir}",
+            table_version_tracking_enabled="true",
+            manifest_enabled="true",
+        )
+
+        # Create parent namespace
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        ns.create_namespace(create_ns_req)
+
+        table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+
+        import io
+
+        sink = io.BytesIO()
+        with pa.ipc.RecordBatchStreamWriter(sink, table1.schema) as writer:
+            writer.write_table(table1)
+        ipc_data = sink.getvalue()
+
+        # Use multi-level table ID (namespace + table)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        ns.create_table(create_req, ipc_data)
+
+        describe_req = DescribeTableRequest(id=["workspace", "test_table"])
+        response = ns.describe_table(describe_req)
+
+        assert response.location is not None
+        assert response.managed_versioning is True, (
+            f"Expected managed_versioning=True, got {response.managed_versioning}"
+        )
+
+
+def test_e2e_table_version_apis():
+    """Test that table version APIs work correctly."""
+    import tempfile
+
+    from lance.namespace import CreateTableRequest, DirectoryNamespace
+    from lance_namespace import CreateNamespaceRequest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ns = DirectoryNamespace(
+            root=f"file://{tmpdir}",
+            table_version_tracking_enabled="true",
+            manifest_enabled="true",
+        )
+
+        # Create parent namespace
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        ns.create_namespace(create_ns_req)
+
+        table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+
+        import io
+
+        sink = io.BytesIO()
+        with pa.ipc.RecordBatchStreamWriter(sink, table1.schema) as writer:
+            writer.write_table(table1)
+        ipc_data = sink.getvalue()
+
+        # Use multi-level table ID (namespace + table)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        ns.create_table(create_req, ipc_data)
+
+        # describe_table_version reads directly from the dataset
+        describe_req = {"id": ["workspace", "test_table"], "version": 1}
+        describe_response = ns.describe_table_version(describe_req)
+
+        assert "version" in describe_response
+        assert describe_response["version"]["version"] == 1
+        assert describe_response["version"]["manifest_path"] is not None
+
+        # Get latest version (version=None)
+        describe_latest_req = {"id": ["workspace", "test_table"], "version": None}
+        describe_latest_response = ns.describe_table_version(describe_latest_req)
+
+        assert "version" in describe_latest_response
+        assert describe_latest_response["version"]["version"] == 1
+
+
+@pytest.mark.integration
+def test_managed_versioning_with_commit_handler(s3_bucket: str):
+    """Test that managed_versioning enables namespace commit handler for writes."""
+    from lance.namespace import DirectoryNamespace
+
+    storage_options = copy.deepcopy(CONFIG)
+
+    # Create namespace with table_version_tracking_enabled
+    dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    dir_props["root"] = f"s3://{s3_bucket}/managed_versioning_test"
+    dir_props["table_version_tracking_enabled"] = "true"
+    dir_props["manifest_enabled"] = "true"
+
+    namespace = DirectoryNamespace(**dir_props)
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    # Create table
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 1
+    assert len(ds.versions()) == 1
+
+    # Verify managed_versioning=true is returned
+    from lance.namespace import DescribeTableRequest
+
+    describe_req = DescribeTableRequest(id=table_id)
+    describe_resp = namespace.describe_table(describe_req)
+    assert describe_resp.managed_versioning is True, (
+        f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
+    )
+
+    # Open dataset through namespace - this should set up commit handler
+    ds_from_namespace = lance.dataset(
+        namespace=namespace,
+        table_id=table_id,
+    )
+    assert ds_from_namespace.count_rows() == 1
+
+    # Append data - this should go through the namespace commit handler
+    table2 = pa.Table.from_pylist([{"a": 10, "b": 20}])
+    ds = lance.write_dataset(
+        table2, namespace=namespace, table_id=table_id, mode="append"
+    )
+    assert ds.count_rows() == 2
+    assert len(ds.versions()) == 2
+
+    # Verify the data through namespace
+    ds_final = lance.dataset(
+        namespace=namespace,
+        table_id=table_id,
+    )
+    assert ds_final.count_rows() == 2
+
+
+@pytest.mark.integration
+def test_e2e_table_version_tracking_with_s3(s3_bucket: str):
+    """Test end-to-end table version tracking with S3 storage."""
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TableVersionTrackingNamespace(
+        root=f"s3://{s3_bucket}/version_tracking_test",
+        storage_options=storage_options,
+    )
+
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    request = DeclareTableRequest(id=table_id, location=None)
+    response = namespace.declare_table(request)
+
+    table_uri = response.location
+    assert table_uri is not None
+    # managed_versioning indicates namespace-managed commits
+    assert response.managed_versioning is True
+
+    describe_response = namespace.describe_table(
+        DescribeTableRequest(id=table_id, version=None)
+    )
+    assert describe_response.location is not None
+    assert describe_response.managed_versioning is True
+
+    from lance_namespace import ListTableVersionsRequest
+
+    _list_response = namespace.list_table_versions(
+        ListTableVersionsRequest(id=table_id)
+    )
+    assert namespace.list_table_versions_count == 1
+
+    describe_version_response = namespace.describe_table_version(
+        {"id": table_id, "version": None}
+    )
+    assert namespace.describe_table_version_count == 1
+    assert "version" in describe_version_response

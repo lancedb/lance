@@ -35,6 +35,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
@@ -47,6 +48,9 @@ use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
+use lance_namespace::LanceNamespace;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::io::commit::CommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -135,6 +139,8 @@ impl BlockingDataset {
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
+        namespace: Option<Arc<dyn LanceNamespace>>,
+        table_id: Option<Vec<String>>,
     ) -> Result<Self> {
         // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
@@ -174,6 +180,15 @@ impl BlockingDataset {
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
+
+        // Set up namespace commit handler if namespace and table_id are provided
+        if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -1050,6 +1065,9 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
+    namespace_handle: jlong,               // Namespace handle, 0 means no namespace
+    namespace_type: JString,               // "directory" or "rest", null if no namespace
+    table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1064,6 +1082,9 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             serialized_manifest,
             storage_options_provider_obj,
             session_handle,
+            namespace_handle,
+            namespace_type,
+            table_id_obj,
         )
     )
 }
@@ -1080,7 +1101,12 @@ fn inner_open_native<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
+    namespace_handle: jlong,               // Namespace handle, 0 means no namespace
+    namespace_type: JString,               // "directory" or "rest", null if no namespace
+    table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> Result<JObject<'local>> {
+    use crate::namespace::{BlockingDirectoryNamespace, BlockingRestNamespace};
+
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
@@ -1095,6 +1121,34 @@ fn inner_open_native<'local>(
 
     let storage_options_provider_arc =
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
+
+    // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
+    let (namespace, table_id) = if namespace_handle != 0 && !namespace_type.is_null() {
+        let ns_type: String = namespace_type.extract(env)?;
+        let ns_arc: Arc<dyn LanceNamespace> = if ns_type == "directory" {
+            let ns = unsafe { &*(namespace_handle as *const BlockingDirectoryNamespace) };
+            ns.inner.clone()
+        } else if ns_type == "rest" {
+            let ns = unsafe { &*(namespace_handle as *const BlockingRestNamespace) };
+            ns.inner.clone()
+        } else {
+            return Err(Error::input_error(format!(
+                "Unknown namespace type: {}",
+                ns_type
+            )));
+        };
+
+        // Extract table_id from List<String>
+        let table_id = if !table_id_obj.is_null() {
+            env.get_strings_opt(&table_id_obj)?
+        } else {
+            None
+        };
+
+        (Some(ns_arc), table_id)
+    } else {
+        (None, None)
+    };
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
 
@@ -1111,6 +1165,8 @@ fn inner_open_native<'local>(
         serialized_manifest,
         storage_options_provider_arc,
         session,
+        namespace,
+        table_id,
     )?;
     dataset.into_java(env)
 }
