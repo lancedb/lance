@@ -1140,7 +1140,7 @@ fn inner_open_native<'local>(
 
         // Extract table_id from List<String>
         let table_id = if !table_id_obj.is_null() {
-            env.get_strings_opt(&table_id_obj)?
+            Some(env.get_strings(&table_id_obj)?)
         } else {
             None
         };
