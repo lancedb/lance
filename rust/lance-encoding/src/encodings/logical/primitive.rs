@@ -3956,8 +3956,32 @@ impl PrimitiveStructuralEncoder {
         repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
         num_rows: u64,
+        version: LanceFileVersion,
         compression_strategy: &dyn CompressionStrategy,
     ) -> Result<EncodedPage> {
+        if version.resolve() < LanceFileVersion::V2_2 {
+            let rep_bytes = if let Some(rep) = repdef.repetition_levels.as_ref() {
+                LanceBuffer::reinterpret_slice(rep.clone())
+            } else {
+                LanceBuffer::empty()
+            };
+
+            let def_bytes = if let Some(def) = repdef.definition_levels.as_ref() {
+                LanceBuffer::reinterpret_slice(def.clone())
+            } else {
+                LanceBuffer::empty()
+            };
+
+            let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, None);
+            return Ok(EncodedPage {
+                column_idx,
+                data: vec![rep_bytes, def_bytes],
+                description: PageEncoding::Structural(description),
+                num_rows,
+                row_number,
+            });
+        }
+
         let (rep_bytes, rep_encoding, num_rep_values) = if let Some(rep) =
             repdef.repetition_levels.as_ref()
         {
@@ -4765,6 +4789,7 @@ impl PrimitiveStructuralEncoder {
                     repdef,
                     row_number,
                     num_rows,
+                    version,
                     compression_strategy.as_ref(),
                 );
             }
@@ -4796,6 +4821,7 @@ impl PrimitiveStructuralEncoder {
                         repdef,
                         row_number,
                         num_rows,
+                        version,
                         compression_strategy.as_ref(),
                     )
                 };
@@ -6681,6 +6707,48 @@ mod tests {
         assert_eq!(decompressed_fixed_width.bits_per_value, 16);
         let rep_result = decompressed_fixed_width.data.borrow_to_typed_slice::<u16>();
         assert_eq!(rep_result.as_ref(), values.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_complex_all_null_compression_gated_by_version() {
+        use crate::format::pb21::page_layout::Layout;
+        use arrow_array::ListArray;
+
+        let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
+            (0..1000).map(|i| if i % 2 == 0 { None } else { Some(vec![]) }),
+        );
+        let arr: ArrayRef = Arc::new(list_array);
+        let field = arrow_schema::Field::new(
+            "c",
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            true,
+        );
+
+        let page_v21 = encode_first_page(field.clone(), arr.clone(), LanceFileVersion::V2_1).await;
+        let PageEncoding::Structural(layout_v21) = &page_v21.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout_v21) = layout_v21.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout");
+        };
+        assert!(layout_v21.rep_compression.is_none());
+        assert!(layout_v21.def_compression.is_none());
+        assert_eq!(layout_v21.num_rep_values, 0);
+        assert_eq!(layout_v21.num_def_values, 0);
+
+        let page_v22 = encode_first_page(field, arr, LanceFileVersion::V2_2).await;
+        let PageEncoding::Structural(layout_v22) = &page_v22.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout_v22) = layout_v22.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout");
+        };
+        assert!(layout_v22.def_compression.is_some());
+        assert!(layout_v22.num_def_values > 0);
     }
 
     #[tokio::test]
