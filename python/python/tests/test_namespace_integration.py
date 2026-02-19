@@ -1033,6 +1033,9 @@ def test_managed_versioning_with_commit_handler(s3_bucket: str):
 @pytest.mark.integration
 def test_e2e_table_version_tracking_with_s3(s3_bucket: str):
     """Test end-to-end table version tracking with S3 storage."""
+    import pyarrow as pa
+    from lance import write_dataset
+
     storage_options = copy.deepcopy(CONFIG)
 
     namespace = TableVersionTrackingNamespace(
@@ -1043,14 +1046,12 @@ def test_e2e_table_version_tracking_with_s3(s3_bucket: str):
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    request = DeclareTableRequest(id=table_id, location=None)
-    response = namespace.declare_table(request)
+    # Create initial dataset using write_dataset (internally calls declare_table)
+    data = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+    ds = write_dataset(data, namespace=namespace, table_id=table_id, mode="create")
+    assert ds.count_rows() == 3
 
-    table_uri = response.location
-    assert table_uri is not None
-    # managed_versioning indicates namespace-managed commits
-    assert response.managed_versioning is True
-
+    # Check managed_versioning via describe_table
     describe_response = namespace.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
