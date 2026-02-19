@@ -383,6 +383,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-scalar"
+version = "57.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-ord",
+ "arrow-row",
+ "arrow-schema",
+ "half",
+ "proptest",
+ "rstest 0.23.0",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5165,6 +5181,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "tracing-mock",
  "url",
 ]
 
@@ -7546,9 +7563,9 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 
 [[package]]
 name = "roaring"
-version = "0.10.12"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19e8d2cfa184d94d0726d650a9f4a1be7f9b76ac9fdb954219878dc00c1c1e7b"
+checksum = "8ba9ce64a8f45d7fc86358410bb1a82e8c987504c0d4900e9141d69a9f26c885"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -9167,6 +9184,16 @@ checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
  "log",
  "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-mock"
+version = "0.1.0-beta.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98a31739d4ff16a8634c5463c75d5bf9e500596958a245d1ee5b6b98ac37658d"
+dependencies = [
+ "tracing",
  "tracing-core",
 ]
 

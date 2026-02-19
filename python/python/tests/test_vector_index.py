@@ -497,9 +497,8 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
             accelerator="cuda",
         )
 
-    indices = dataset.list_indices()
-    assert len(indices) == 1
-    assert indices[0]["type"] == "IVF_HNSW_SQ"
+    stats = dataset.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_SQ"
     assert any(
         "does not support GPU acceleration; falling back to CPU" in record.message
         for record in caplog.records
@@ -561,7 +560,7 @@ def test_has_index(dataset, tmp_path):
     )
     assert ann_ds.has_index
 
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_index_type(dataset, tmp_path):
@@ -574,7 +573,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_PQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_PQ"
 
     ann_ds = ann_ds.create_index(
         "vector",
@@ -583,7 +583,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_SQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_SQ"
 
     ann_ds = ann_ds.create_index(
         "vector",
@@ -592,7 +593,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_PQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_PQ"
 
 
 def test_create_dot_index(dataset, tmp_path):
@@ -791,7 +793,7 @@ def test_create_ivf_sq_index(dataset, tmp_path):
         index_type="IVF_SQ",
         num_partitions=4,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_rq_index():
@@ -802,7 +804,7 @@ def test_create_ivf_rq_index():
         num_partitions=4,
         num_bits=1,
     )
-    assert ds.list_indices()[0]["fields"] == ["vector"]
+    assert ds.describe_indices()[0].field_names == ["vector"]
 
     with pytest.raises(
         NotImplementedError,
@@ -850,7 +852,7 @@ def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
@@ -862,7 +864,7 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
@@ -874,7 +876,7 @@ def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
@@ -940,10 +942,10 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )["id"].to_numpy()
     assert len(actual) == 10
 
-    index_meta = dataset_with_index.list_indices()[0]
-    index_uuid = index_meta["uuid"]
+    index_meta = dataset_with_index.describe_indices()[0]
+    index_uuid = index_meta.segments[0].uuid
     assert len(index_uuid) == 36
-    assert index_meta["fragment_ids"] == {0}
+    assert index_meta.segments[0].fragment_ids == {0}
 
     expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
     if platform.system() == "Windows":
@@ -1426,7 +1428,7 @@ def test_index_cast_centroids(tmp_path):
     )
 
     # Get the centroids
-    index_name = dataset.list_indices()[0]["name"]
+    index_name = dataset.describe_indices()[0].name
     index_stats = dataset.stats.index_stats(index_name)
     centroids = index_stats["indices"][0]["centroids"]
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
@@ -1508,13 +1510,13 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
 
 
 def test_load_indices(dataset):
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 0
 
     dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
 
@@ -1538,23 +1540,23 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
 def test_optimize_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 2
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 2
 
 
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
 
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 2
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 2
 
     stats = indexed_dataset.stats.index_stats("vector_idx")
     centroids = stats["indices"][0]["centroids"]
@@ -1565,8 +1567,8 @@ def test_retrain_indices(indexed_dataset):
     new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
         "centroids"
     ]
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
     assert centroids != new_centroids
 
 
@@ -1584,10 +1586,10 @@ def test_no_include_deleted_rows(indexed_dataset):
 
 
 def test_drop_indices(indexed_dataset):
-    idx_name = indexed_dataset.list_indices()[0]["name"]
+    idx_name = indexed_dataset.describe_indices()[0].name
 
     indexed_dataset.drop_index(idx_name)
-    indices = indexed_dataset.list_indices()
+    indices = indexed_dataset.describe_indices()
     assert len(indices) == 0
 
     test_vec = (
@@ -1608,7 +1610,7 @@ def test_drop_indices(indexed_dataset):
 
 
 def test_read_partition(indexed_dataset):
-    idx_name = indexed_dataset.list_indices()[0]["name"]
+    idx_name = indexed_dataset.describe_indices()[0].name
     reader = VectorIndexReader(indexed_dataset, idx_name)
 
     num_rows = indexed_dataset.count_rows()
@@ -1790,9 +1792,9 @@ def test_nested_field_vector_index(tmp_path):
     )
 
     # Verify index was created
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["data.embedding"]
+    assert indices[0].field_names == ["embedding"]
 
     # Test querying with the index
     query_vec = vectors[0]
