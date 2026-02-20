@@ -1033,22 +1033,28 @@ def test_managed_versioning_with_commit_handler(s3_bucket: str):
 @pytest.mark.integration
 def test_e2e_table_version_tracking_with_s3(s3_bucket: str):
     """Test end-to-end table version tracking with S3 storage."""
+    import lance
     import pyarrow as pa
-    from lance import write_dataset
+    from lance.namespace import DirectoryNamespace
 
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TableVersionTrackingNamespace(
-        root=f"s3://{s3_bucket}/version_tracking_test",
-        storage_options=storage_options,
-    )
+    # Create namespace with table_version_tracking_enabled and manifest_enabled
+    dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    dir_props["root"] = f"s3://{s3_bucket}/version_tracking_test"
+    dir_props["table_version_tracking_enabled"] = "true"
+    dir_props["manifest_enabled"] = "true"
+
+    namespace = DirectoryNamespace(**dir_props)
 
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
     # Create initial dataset using write_dataset (internally calls declare_table)
     data = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
-    ds = write_dataset(data, namespace=namespace, table_id=table_id, mode="create")
+    ds = lance.write_dataset(
+        data, namespace=namespace, table_id=table_id, mode="create"
+    )
     assert ds.count_rows() == 3
 
     # Check managed_versioning via describe_table
@@ -1060,13 +1066,10 @@ def test_e2e_table_version_tracking_with_s3(s3_bucket: str):
 
     from lance_namespace import ListTableVersionsRequest
 
-    _list_response = namespace.list_table_versions(
-        ListTableVersionsRequest(id=table_id)
-    )
-    assert namespace.list_table_versions_count == 1
+    list_response = namespace.list_table_versions(ListTableVersionsRequest(id=table_id))
+    assert len(list_response.versions) >= 1
 
     describe_version_response = namespace.describe_table_version(
         {"id": table_id, "version": None}
     )
-    assert namespace.describe_table_version_count == 1
     assert "version" in describe_version_response

@@ -807,6 +807,7 @@ impl Dataset {
                             location: fallback_resp.location,
                             storage_options: fallback_resp.storage_options,
                             properties: fallback_resp.properties,
+                            managed_versioning: None,
                         }
                     }
                     Err(e) => {

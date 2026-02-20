@@ -70,38 +70,46 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
     /// Direct-write commit: reads staging manifest and writes directly to final location.
     async fn commit(
         &self,
-        base_path: &Path,
+        _base_path: &Path,
         version: u64,
         staging_path: &Path,
         size: u64,
         e_tag: Option<String>,
-        object_store: &dyn OSObjectStore,
+        _object_store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         // create_table_version reads staging manifest and writes to final location
+        let naming_scheme_str = match naming_scheme {
+            ManifestNamingScheme::V1 => "V1",
+            ManifestNamingScheme::V2 => "V2",
+        };
+
         let request = CreateTableVersionRequest {
             id: Some(self.table_id.clone()),
             version: version as i64,
             manifest_path: staging_path.to_string(),
             manifest_size: Some(size as i64),
             e_tag: e_tag.clone(),
+            naming_scheme: Some(naming_scheme_str.to_string()),
             ..Default::default()
         };
 
-        self.namespace.create_table_version(request).await?;
+        let response = self.namespace.create_table_version(request).await?;
 
-        // Delete staging manifest (it's been copied to final location)
-        let _ = object_store.delete(staging_path).await;
-
-        // Return final manifest location (full path relative to object store root)
-        let final_path = naming_scheme.manifest_path(base_path, version);
+        // Get version info from response
+        let version_info = response
+            .version
+            .ok_or_else(|| lance_core::Error::Internal {
+                message: "create_table_version response missing version info".to_string(),
+                location: snafu::location!(),
+            })?;
 
         Ok(ManifestLocation {
-            version,
-            path: final_path,
-            size: Some(size),
+            version: version_info.version as u64,
+            path: Path::from(version_info.manifest_path),
+            size: version_info.manifest_size.map(|s| s as u64),
             naming_scheme,
-            e_tag,
+            e_tag: version_info.e_tag,
         })
     }
 

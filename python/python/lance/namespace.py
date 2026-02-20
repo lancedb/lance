@@ -441,6 +441,24 @@ class DirectoryNamespace(LanceNamespace):
         """
         return self._inner.describe_table_version(request)
 
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
+
 
 class RestNamespace(LanceNamespace):
     """REST-based Lance Namespace implementation backed by Rust.
@@ -635,6 +653,24 @@ class RestNamespace(LanceNamespace):
             - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
         """
         return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
 
 
 class RestAdapter:
