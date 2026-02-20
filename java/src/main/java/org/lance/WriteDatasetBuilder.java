@@ -436,8 +436,9 @@ public class WriteDatasetBuilder {
             ? null
             : new LanceNamespaceStorageOptionsProvider(namespace, tableId);
 
-    // Use Dataset.create() which handles CREATE/APPEND/OVERWRITE modes
-    return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    // Use Dataset.create() with namespace for managed versioning support
+    return createDatasetWithStreamAndNamespace(
+        tableUri, params, storageOptionsProvider, namespace, tableId);
   }
 
   private Dataset executeWithUri() {
@@ -473,6 +474,36 @@ public class WriteDatasetBuilder {
     }
 
     // If only schema is provided (empty table), use Dataset.create with schema
+    if (schema != null) {
+      return Dataset.create(allocator, path, schema, params);
+    }
+
+    throw new IllegalStateException("No data source provided");
+  }
+
+  private Dataset createDatasetWithStreamAndNamespace(
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    // If stream is directly provided, use it
+    if (stream != null) {
+      return Dataset.create(
+          allocator, stream, path, params, storageOptionsProvider, namespace, tableId);
+    }
+
+    // If reader is provided, convert to stream
+    if (reader != null) {
+      try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, tempStream);
+        return Dataset.create(
+            allocator, tempStream, path, params, storageOptionsProvider, namespace, tableId);
+      }
+    }
+
+    // If only schema is provided (empty table), use Dataset.create with schema
+    // Note: Schema-only creation doesn't support namespace-based commit handling
     if (schema != null) {
       return Dataset.create(allocator, path, schema, params);
     }

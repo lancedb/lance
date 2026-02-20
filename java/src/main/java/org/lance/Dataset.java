@@ -194,27 +194,7 @@ public class Dataset implements Closeable {
       String path,
       WriteParams params,
       StorageOptionsProvider storageOptionsProvider) {
-    Preconditions.checkNotNull(allocator);
-    Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(params);
-    Dataset dataset =
-        createWithFfiStreamAndProvider(
-            stream.memoryAddress(),
-            path,
-            params.getMaxRowsPerFile(),
-            params.getMaxRowsPerGroup(),
-            params.getMaxBytesPerFile(),
-            params.getMode(),
-            params.getEnableStableRowIds(),
-            params.getDataStorageVersion(),
-            params.getEnableV2ManifestPaths(),
-            params.getStorageOptions(),
-            Optional.ofNullable(storageOptionsProvider),
-            params.getInitialBases(),
-            params.getTargetBases());
-    dataset.allocator = allocator;
-    return dataset;
+    return create(allocator, stream, path, params, storageOptionsProvider, null, null);
   }
 
   private static native Dataset createWithFfiSchema(
@@ -258,7 +238,57 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
+      Optional<List<String>> targetBases,
+      LanceNamespace namespace,
+      List<String> tableId);
+
+  /**
+   * Creates a dataset with optional namespace support for managed versioning.
+   *
+   * <p>When a namespace is provided, the commit handler will use the namespace's
+   * create_table_version method for version tracking.
+   *
+   * @param allocator buffer allocator
+   * @param stream arrow stream
+   * @param path dataset uri
+   * @param params write parameters
+   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
+   * @param namespace optional namespace implementation for managed versioning (can be null)
+   * @param tableId optional table identifier within the namespace (can be null)
+   * @return Dataset
+   */
+  static Dataset create(
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(params);
+    Dataset dataset =
+        createWithFfiStreamAndProvider(
+            stream.memoryAddress(),
+            path,
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getEnableStableRowIds(),
+            params.getDataStorageVersion(),
+            params.getEnableV2ManifestPaths(),
+            params.getStorageOptions(),
+            Optional.ofNullable(storageOptionsProvider),
+            params.getInitialBases(),
+            params.getTargetBases(),
+            namespace,
+            tableId);
+    dataset.allocator = allocator;
+    return dataset;
+  }
 
   /**
    * Open a dataset from the specified path.

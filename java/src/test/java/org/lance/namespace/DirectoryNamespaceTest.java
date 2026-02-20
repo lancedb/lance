@@ -394,6 +394,7 @@ public class DirectoryNamespaceTest {
     private final DirectoryNamespace inner;
     private final AtomicInteger createTableVersionCount = new AtomicInteger(0);
     private final AtomicInteger describeTableVersionCount = new AtomicInteger(0);
+    private final AtomicInteger listTableVersionsCount = new AtomicInteger(0);
 
     public TableVersionTrackingNamespace(Path root) {
       Map<String, String> dirProps = new HashMap<>();
@@ -413,6 +414,10 @@ public class DirectoryNamespaceTest {
 
     public int getDescribeTableVersionCount() {
       return describeTableVersionCount.get();
+    }
+
+    public int getListTableVersionsCount() {
+      return listTableVersionsCount.get();
     }
 
     public long getNativeHandle() {
@@ -458,6 +463,7 @@ public class DirectoryNamespaceTest {
 
     @Override
     public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+      listTableVersionsCount.incrementAndGet();
       return inner.listTableVersions(request);
     }
 
@@ -562,8 +568,8 @@ public class DirectoryNamespaceTest {
           descResp.getManagedVersioning(),
           "Expected managedVersioning=true when table_version_tracking_enabled");
 
-      // Open dataset through namespace - this should call describe_table_version for latest
-      int initialDescribeCount = namespace.getDescribeTableVersionCount();
+      // Open dataset through namespace - this should call list_table_versions for latest
+      int initialListCount = namespace.getListTableVersionsCount();
       try (Dataset dsFromNamespace =
           Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
 
@@ -571,15 +577,16 @@ public class DirectoryNamespaceTest {
         assertEquals(1, dsFromNamespace.version());
       }
       assertEquals(
-          initialDescribeCount + 1,
-          namespace.getDescribeTableVersionCount(),
-          "describe_table_version should have been called once when opening latest version");
+          initialListCount + 1,
+          namespace.getListTableVersionsCount(),
+          "list_table_versions should have been called once when opening latest version");
 
-      // Append data - this should call create_table_version exactly once
+      // Append data - this should call create_table_version again (once more for version 2)
+      // Note: create_table_version was already called once during CREATE for version 1
       assertEquals(
-          0,
+          1,
           namespace.getCreateTableVersionCount(),
-          "create_table_version should not have been called yet");
+          "create_table_version should have been called once during CREATE");
 
       try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
         IntVector aVector = (IntVector) appendRoot.getVector("a");
@@ -644,12 +651,12 @@ public class DirectoryNamespaceTest {
       }
 
       assertEquals(
-          1,
+          2,
           namespace.getCreateTableVersionCount(),
-          "create_table_version should have been called exactly once during append");
+          "create_table_version should have been called twice (once for CREATE, once for APPEND)");
 
-      // Open latest version - should call describe_table_version
-      int describeCountBeforeLatest = namespace.getDescribeTableVersionCount();
+      // Open latest version - should call list_table_versions
+      int listCountBeforeLatest = namespace.getListTableVersionsCount();
       try (Dataset latestDs =
           Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
 
@@ -657,9 +664,9 @@ public class DirectoryNamespaceTest {
         assertEquals(2, latestDs.version());
       }
       assertEquals(
-          describeCountBeforeLatest + 1,
-          namespace.getDescribeTableVersionCount(),
-          "describe_table_version should have been called once when opening latest version");
+          listCountBeforeLatest + 1,
+          namespace.getListTableVersionsCount(),
+          "list_table_versions should have been called once when opening latest version");
 
       // Open specific version (version 1) - should call describe_table_version
       int describeCountBeforeV1 = namespace.getDescribeTableVersionCount();

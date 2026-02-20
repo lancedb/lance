@@ -436,6 +436,7 @@ fn inner_create_with_ffi_schema<'local>(
         initial_bases,
         target_bases,
         reader,
+        None, // No namespace for schema-only creation
     )
 }
 
@@ -499,17 +500,20 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
-            enable_v2_manifest_paths,
             data_storage_version,
+            enable_v2_manifest_paths,
             storage_options_obj,
             JObject::null(),
             initial_bases,
-            target_bases
+            target_bases,
+            JObject::null(), // No namespace
+            JObject::null(), // No table_id
         )
     )
 }
 
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -526,6 +530,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     initial_bases: JObject,                // Optional<List<BasePath>>
     target_bases: JObject,                 // Optional<List<String>>
+    namespace_obj: JObject,                // LanceNamespace (can be null)
+    table_id_obj: JObject,                 // List<String> (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -543,7 +549,9 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
             storage_options_obj,
             storage_options_provider_obj,
             initial_bases,
-            target_bases
+            target_bases,
+            namespace_obj,
+            table_id_obj,
         )
     )
 }
@@ -564,9 +572,38 @@ fn inner_create_with_ffi_stream<'local>(
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     initial_bases: JObject,                // Optional<List<BasePath>>
     target_bases: JObject,                 // Optional<List<String>>
+    namespace_obj: JObject,                // LanceNamespace (can be null)
+    table_id_obj: JObject,                 // List<String> (can be null)
 ) -> Result<JObject<'local>> {
+    use crate::namespace::{
+        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+    };
+
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+
+    // Create the namespace wrapper for commit handling (if provided)
+    let namespace_info = if namespace_obj.is_null() {
+        None
+    } else {
+        let namespace: Arc<dyn LanceNamespace> = if is_directory_namespace(env, &namespace_obj)? {
+            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
+            let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
+            ns.inner.clone()
+        } else if is_rest_namespace(env, &namespace_obj)? {
+            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
+            let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
+            ns.inner.clone()
+        } else {
+            // Custom Java implementation, create a Java bridge wrapper
+            create_java_lance_namespace(env, &namespace_obj)?
+        };
+
+        // Extract table_id from Java List<String>
+        let table_id = env.get_strings(&table_id_obj)?;
+        Some((namespace, table_id))
+    };
+
     create_dataset(
         env,
         path,
@@ -582,6 +619,7 @@ fn inner_create_with_ffi_stream<'local>(
         initial_bases,
         target_bases,
         reader,
+        namespace_info,
     )
 }
 
@@ -601,10 +639,11 @@ fn create_dataset<'local>(
     initial_bases: JObject,
     target_bases: JObject,
     reader: impl RecordBatchReader + Send + 'static,
+    namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
-    let write_params = extract_write_params(
+    let mut write_params = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -618,6 +657,15 @@ fn create_dataset<'local>(
         &initial_bases,
         &target_bases,
     )?;
+
+    // Set up namespace commit handler if provided
+    if let Some((namespace, table_id)) = namespace_info {
+        let external_store = LanceNamespaceExternalManifestStore::new(namespace, table_id);
+        let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        write_params.commit_handler = Some(commit_handler);
+    }
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
     dataset.into_java(env)
