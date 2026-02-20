@@ -581,8 +581,7 @@ public class DirectoryNamespaceTest {
           namespace.getListTableVersionsCount(),
           "list_table_versions should have been called once when opening latest version");
 
-      // Append data - this should call create_table_version again (once more for version 2)
-      // Note: create_table_version was already called once during CREATE for version 1
+      // Verify create_table_version was called once during CREATE
       assertEquals(
           1,
           namespace.getCreateTableVersionCount(),

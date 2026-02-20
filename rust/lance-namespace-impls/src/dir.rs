@@ -1447,6 +1447,10 @@ impl LanceNamespace for DirectoryNamespace {
             } else if request.vend_credentials == Some(false) {
                 response.storage_options = None;
             }
+            // Set managed_versioning when table_version_tracking_enabled
+            if self.table_version_tracking_enabled {
+                response.managed_versioning = Some(true);
+            }
             return Ok(response);
         }
 
