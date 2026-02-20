@@ -30,6 +30,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
@@ -328,7 +329,7 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
-    return open(allocator, selfManagedAllocator, path, options, session, 0, null, null);
+    return open(allocator, selfManagedAllocator, path, options, session, null, null);
   }
 
   /**
@@ -336,8 +337,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param options the open options
-   * @param namespaceHandle native namespace handle (0 if not using namespace)
-   * @param namespaceType "directory" or "rest" (null if not using namespace)
+   * @param namespace the LanceNamespace to use for managed versioning (null if not using namespace)
    * @param tableId table identifier (null if not using namespace)
    * @return Dataset
    */
@@ -347,8 +347,7 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session,
-      long namespaceHandle,
-      String namespaceType,
+      LanceNamespace namespace,
       List<String> tableId) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
@@ -371,8 +370,7 @@ public class Dataset implements Closeable {
             options.getSerializedManifest(),
             options.getStorageOptionsProvider(),
             sessionHandle,
-            namespaceHandle,
-            namespaceType,
+            namespace,
             tableId);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
@@ -395,8 +393,7 @@ public class Dataset implements Closeable {
       Optional<ByteBuffer> serializedManifest,
       Optional<StorageOptionsProvider> storageOptionsProvider,
       long sessionHandle,
-      long namespaceHandle,
-      String namespaceType,
+      LanceNamespace namespace,
       List<String> tableId);
 
   /**

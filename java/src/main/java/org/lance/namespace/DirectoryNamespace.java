@@ -436,6 +436,16 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
+      BatchDeleteTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson =
+        batchDeleteTableVersionsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, BatchDeleteTableVersionsResponse.class);
+  }
+
+  @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
@@ -546,6 +556,8 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String createTableVersionNative(long handle, String requestJson);
 
   private native String describeTableVersionNative(long handle, String requestJson);
+
+  private native String batchDeleteTableVersionsNative(long handle, String requestJson);
 
   // ==========================================================================
   // Provider loading helpers

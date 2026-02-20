@@ -1065,8 +1065,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
-    namespace_handle: jlong,               // Namespace handle, 0 means no namespace
-    namespace_type: JString,               // "directory" or "rest", null if no namespace
+    namespace_obj: JObject,                // LanceNamespace object, null if no namespace
     table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -1082,8 +1081,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             serialized_manifest,
             storage_options_provider_obj,
             session_handle,
-            namespace_handle,
-            namespace_type,
+            namespace_obj,
             table_id_obj,
         )
     )
@@ -1101,11 +1099,12 @@ fn inner_open_native<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
-    namespace_handle: jlong,               // Namespace handle, 0 means no namespace
-    namespace_type: JString,               // "directory" or "rest", null if no namespace
+    namespace_obj: JObject,                // LanceNamespace object, null if no namespace
     table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> Result<JObject<'local>> {
-    use crate::namespace::{BlockingDirectoryNamespace, BlockingRestNamespace};
+    use crate::namespace::{
+        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+    };
 
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
@@ -1123,20 +1122,26 @@ fn inner_open_native<'local>(
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
-    let (namespace, table_id) = if namespace_handle != 0 && !namespace_type.is_null() {
-        let ns_type: String = namespace_type.extract(env)?;
-        let ns_arc: Arc<dyn LanceNamespace> = if ns_type == "directory" {
-            let ns = unsafe { &*(namespace_handle as *const BlockingDirectoryNamespace) };
-            ns.inner.clone()
-        } else if ns_type == "rest" {
-            let ns = unsafe { &*(namespace_handle as *const BlockingRestNamespace) };
-            ns.inner.clone()
-        } else {
-            return Err(Error::input_error(format!(
-                "Unknown namespace type: {}",
-                ns_type
-            )));
-        };
+    let (namespace, table_id) = if !namespace_obj.is_null() {
+        // Check if it's a native implementation by trying to get getNativeHandle
+        let ns_arc: Arc<dyn LanceNamespace> =
+            if let Ok(native_handle) = get_native_namespace_handle(env, &namespace_obj) {
+                // Get the namespace type to determine which native implementation it is
+                let ns_type = get_namespace_type(env, &namespace_obj)?;
+                if ns_type == "directory" {
+                    let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
+                    ns.inner.clone()
+                } else if ns_type == "rest" {
+                    let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
+                    ns.inner.clone()
+                } else {
+                    // Unknown native type, fall back to Java bridge
+                    create_java_lance_namespace(env, &namespace_obj)?
+                }
+            } else {
+                // Not a native implementation, create a Java bridge wrapper
+                create_java_lance_namespace(env, &namespace_obj)?
+            };
 
         // Extract table_id from List<String>
         let table_id = if !table_id_obj.is_null() {
@@ -1169,6 +1174,53 @@ fn inner_open_native<'local>(
         table_id,
     )?;
     dataset.into_java(env)
+}
+
+/// Try to get the native handle from a Java LanceNamespace object.
+/// Returns Ok(handle) if the object has a getNativeHandle method, Err otherwise.
+fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
+    let result = env.call_method(namespace_obj, "getNativeHandle", "()J", &[]);
+    match result {
+        Ok(value) => value.j().map_err(|e| {
+            Error::runtime_error(format!("getNativeHandle did not return a long: {}", e))
+        }),
+        Err(_) => Err(Error::runtime_error(
+            "Namespace does not have getNativeHandle method".to_string(),
+        )),
+    }
+}
+
+/// Get the namespace type from a Java LanceNamespace object.
+fn get_namespace_type(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<String> {
+    let result = env.call_method(
+        namespace_obj,
+        "getNamespaceType",
+        "()Ljava/lang/String;",
+        &[],
+    );
+    match result {
+        Ok(value) => {
+            let jstring = value.l().map_err(|e| {
+                Error::runtime_error(format!("getNamespaceType did not return an object: {}", e))
+            })?;
+            if jstring.is_null() {
+                return Err(Error::runtime_error(
+                    "getNamespaceType returned null".to_string(),
+                ));
+            }
+            let jstring_ref = JString::from(jstring);
+            let java_string = env.get_string(&jstring_ref).map_err(|e| {
+                Error::runtime_error(format!(
+                    "Failed to convert getNamespaceType result to string: {}",
+                    e
+                ))
+            })?;
+            Ok(java_string.into())
+        }
+        Err(_) => Err(Error::runtime_error(
+            "Namespace does not have getNamespaceType method".to_string(),
+        )),
+    }
 }
 
 #[no_mangle]

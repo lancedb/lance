@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
@@ -124,6 +125,382 @@ pub struct BlockingDirectoryNamespace {
 /// Blocking wrapper for RestNamespace
 pub struct BlockingRestNamespace {
     pub(crate) inner: Arc<dyn LanceNamespaceTrait>,
+}
+
+// ============================================================================
+// JavaLanceNamespace - Generic wrapper for any Java LanceNamespace implementation
+// ============================================================================
+
+/// Java-implemented LanceNamespace wrapper.
+///
+/// This wraps any Java object that implements the LanceNamespace interface
+/// and forwards calls to the Java implementation via JNI.
+pub struct JavaLanceNamespace {
+    java_namespace: GlobalRef,
+    jvm: Arc<jni::JavaVM>,
+    namespace_id: String,
+}
+
+impl std::fmt::Debug for JavaLanceNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JavaLanceNamespace({})", self.namespace_id)
+    }
+}
+
+impl JavaLanceNamespace {
+    /// Create a new wrapper for a Java LanceNamespace object.
+    pub fn new(env: &mut JNIEnv, java_namespace: &JObject) -> Result<Self> {
+        let java_namespace = env.new_global_ref(java_namespace)?;
+        let jvm = Arc::new(env.get_java_vm()?);
+
+        // Cache namespace_id since it's called frequently and won't change
+        let namespace_id = Self::call_namespace_id_internal(env, &java_namespace)?;
+
+        Ok(Self {
+            java_namespace,
+            jvm,
+            namespace_id,
+        })
+    }
+
+    fn call_namespace_id_internal(env: &mut JNIEnv, java_namespace: &GlobalRef) -> Result<String> {
+        let result = env
+            .call_method(java_namespace, "namespaceId", "()Ljava/lang/String;", &[])
+            .map_err(|e| {
+                Error::runtime_error(format!(
+                    "Failed to call namespaceId on Java namespace: {}",
+                    e
+                ))
+            })?;
+
+        let jstring = result.l().map_err(|e| {
+            Error::runtime_error(format!("namespaceId did not return an object: {}", e))
+        })?;
+
+        if jstring.is_null() {
+            return Err(Error::runtime_error(
+                "namespaceId returned null".to_string(),
+            ));
+        }
+
+        let jstring_ref = JString::from(jstring);
+        let java_string = env.get_string(&jstring_ref).map_err(|e| {
+            Error::runtime_error(format!(
+                "Failed to convert namespaceId to Rust string: {}",
+                e
+            ))
+        })?;
+
+        Ok(java_string.into())
+    }
+
+    /// Call a namespace method that takes a JSON request and returns a JSON response.
+    fn call_json_method<Req, Resp>(
+        &self,
+        method_name: &str,
+        request: Req,
+    ) -> lance_core::Result<Resp>
+    where
+        Req: Serialize,
+        Resp: for<'de> Deserialize<'de>,
+    {
+        let java_namespace = self.java_namespace.clone();
+        let jvm = self.jvm.clone();
+        let method_name = method_name.to_string();
+        let request_json = serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "Failed to serialize request: {}",
+                e
+            ))),
+            location: snafu::location!(),
+        })?;
+
+        let mut env = jvm
+            .attach_current_thread()
+            .map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        // Create Java string for request
+        let jrequest = env
+            .new_string(&request_json)
+            .map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to create request string: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        // Call the method
+        let result = env
+            .call_method(
+                &java_namespace,
+                &method_name,
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&jrequest)],
+            )
+            .map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to call {}: {}",
+                    method_name, e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+        let response_obj = result.l().map_err(|e| lance_core::Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "{} did not return an object: {}",
+                method_name, e
+            ))),
+            location: snafu::location!(),
+        })?;
+
+        if response_obj.is_null() {
+            return Err(lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "{} returned null",
+                    method_name
+                ))),
+                location: snafu::location!(),
+            });
+        }
+
+        let response_str: String = env
+            .get_string(&JString::from(response_obj))
+            .map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to convert response to string: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?
+            .into();
+
+        serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "Failed to deserialize response: {}",
+                e
+            ))),
+            location: snafu::location!(),
+        })
+    }
+}
+
+#[async_trait]
+impl LanceNamespaceTrait for JavaLanceNamespace {
+    fn namespace_id(&self) -> String {
+        self.namespace_id.clone()
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> lance_core::Result<DescribeTableVersionResponse> {
+        let java_namespace = self.java_namespace.clone();
+        let jvm = self.jvm.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut env = jvm
+                .attach_current_thread()
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to attach to JVM: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let request_json =
+                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to serialize request: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let jrequest = env
+                .new_string(&request_json)
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to create request string: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let result = env
+                .call_method(
+                    &java_namespace,
+                    "describeTableVersionJson",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&jrequest)],
+                )
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to call describeTableVersionJson: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let response_obj = result.l().map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "describeTableVersionJson did not return an object: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+            if response_obj.is_null() {
+                return Err(lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(
+                        "describeTableVersionJson returned null",
+                    )),
+                    location: snafu::location!(),
+                });
+            }
+
+            let response_str: String = env
+                .get_string(&JString::from(response_obj))
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to convert response to string: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?
+                .into();
+
+            serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to deserialize response: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })
+        })
+        .await
+        .map_err(|e| lance_core::Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "Failed to spawn blocking task: {}",
+                e
+            ))),
+            location: snafu::location!(),
+        })?
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> lance_core::Result<CreateTableVersionResponse> {
+        let java_namespace = self.java_namespace.clone();
+        let jvm = self.jvm.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut env = jvm
+                .attach_current_thread()
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to attach to JVM: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let request_json =
+                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to serialize request: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let jrequest = env
+                .new_string(&request_json)
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to create request string: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let result = env
+                .call_method(
+                    &java_namespace,
+                    "createTableVersionJson",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&jrequest)],
+                )
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to call createTableVersionJson: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?;
+
+            let response_obj = result.l().map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "createTableVersionJson did not return an object: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
+
+            if response_obj.is_null() {
+                return Err(lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(
+                        "createTableVersionJson returned null",
+                    )),
+                    location: snafu::location!(),
+                });
+            }
+
+            let response_str: String = env
+                .get_string(&JString::from(response_obj))
+                .map_err(|e| lance_core::Error::IO {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to convert response to string: {}",
+                        e
+                    ))),
+                    location: snafu::location!(),
+                })?
+                .into();
+
+            serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to deserialize response: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })
+        })
+        .await
+        .map_err(|e| lance_core::Error::IO {
+            source: Box::new(std::io::Error::other(format!(
+                "Failed to spawn blocking task: {}",
+                e
+            ))),
+            location: snafu::location!(),
+        })?
+    }
+}
+
+/// Create a JavaLanceNamespace wrapper from a JNI environment and Java object.
+pub fn create_java_lance_namespace(
+    env: &mut JNIEnv,
+    java_namespace: &JObject,
+) -> Result<Arc<dyn LanceNamespaceTrait>> {
+    let wrapper = JavaLanceNamespace::new(env, java_namespace)?;
+    Ok(Arc::new(wrapper))
 }
 
 // ============================================================================
@@ -697,6 +1074,23 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTable
         env,
         call_namespace_method(&mut env, handle, request_json, |ns, req| {
             RT.block_on(ns.inner.describe_table_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_batchDeleteTableVersionsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.batch_delete_table_versions(req))
         }),
         std::ptr::null_mut()
     )
@@ -1288,6 +1682,23 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableVersi
         env,
         call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
             RT.block_on(ns.inner.describe_table_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_batchDeleteTableVersionsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.batch_delete_table_versions(req))
         }),
         std::ptr::null_mut()
     )

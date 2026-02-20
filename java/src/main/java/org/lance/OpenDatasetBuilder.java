@@ -13,10 +13,8 @@
  */
 package org.lance;
 
-import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
-import org.lance.namespace.RestNamespace;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -237,54 +235,19 @@ public class OpenDatasetBuilder {
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
-    // If managed_versioning is true, pass namespace info for commit handler setup
+    // If managed_versioning is true, pass namespace for commit handler setup
     if (Boolean.TRUE.equals(managedVersioning)) {
-      long namespaceHandle = getNamespaceHandle(namespace);
-      String namespaceType = getNamespaceType(namespace);
       return Dataset.open(
           allocator,
           selfManagedAllocator,
           location,
           optionsBuilder.build(),
           session,
-          namespaceHandle,
-          namespaceType,
+          namespace,
           tableId);
     }
 
     // Open dataset with regular open method (no namespace commit handler)
     return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build(), session);
-  }
-
-  private static long getNamespaceHandle(LanceNamespace namespace) {
-    if (namespace instanceof DirectoryNamespace) {
-      return ((DirectoryNamespace) namespace).getNativeHandle();
-    } else if (namespace instanceof RestNamespace) {
-      return ((RestNamespace) namespace).getNativeHandle();
-    }
-    // Try reflection for custom namespace implementations that have getNativeHandle
-    try {
-      java.lang.reflect.Method method = namespace.getClass().getMethod("getNativeHandle");
-      return (long) method.invoke(namespace);
-    } catch (Exception e) {
-      throw new IllegalArgumentException(
-          "Unknown namespace type: " + namespace.getClass().getName(), e);
-    }
-  }
-
-  private static String getNamespaceType(LanceNamespace namespace) {
-    if (namespace instanceof DirectoryNamespace) {
-      return ((DirectoryNamespace) namespace).getNamespaceType();
-    } else if (namespace instanceof RestNamespace) {
-      return ((RestNamespace) namespace).getNamespaceType();
-    }
-    // Try reflection for custom namespace implementations that have getNamespaceType
-    try {
-      java.lang.reflect.Method method = namespace.getClass().getMethod("getNamespaceType");
-      return (String) method.invoke(namespace);
-    } catch (Exception e) {
-      throw new IllegalArgumentException(
-          "Unknown namespace type: " + namespace.getClass().getName(), e);
-    }
   }
 }
