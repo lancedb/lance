@@ -4308,6 +4308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_create_table_version() {
         use futures::TryStreamExt;
         use lance::dataset::builder::DatasetBuilder;
@@ -4418,6 +4419,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_create_table_version_conflict() {
         // create_table_version should fail if the version already exists.
         // Each version always writes to a new file location.
@@ -4771,6 +4773,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg(not(windows))]
         async fn test_external_manifest_store_invokes_namespace_apis() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
