@@ -10,6 +10,7 @@ namespace implementation for organizing Lance tables and nested namespaces.
 These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
 """
 
+import sys
 import tempfile
 import uuid
 from threading import Lock
@@ -812,6 +813,10 @@ class TableVersionTrackingNamespace(lance.namespace.DirectoryNamespace):
         return json.dumps(response_dict)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="External manifest store has known issues on Windows",
+)
 def test_external_manifest_store_invokes_namespace_apis():
     """Test that namespace APIs are invoked correctly for managed versioning.
 

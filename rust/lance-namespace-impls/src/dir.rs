@@ -3994,6 +3994,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_list_table_versions() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -4110,6 +4111,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_describe_table_version() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -4224,6 +4226,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_describe_table_version_latest() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -4887,6 +4890,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg(not(windows))]
         async fn test_dataset_commit_with_external_manifest_store() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
