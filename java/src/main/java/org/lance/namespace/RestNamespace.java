@@ -385,11 +385,6 @@ public class RestNamespace implements LanceNamespace, Closeable {
     return nativeRestNamespaceHandle;
   }
 
-  /** Returns the namespace type identifier. */
-  public String getNamespaceType() {
-    return "rest";
-  }
-
   private void ensureInitialized() {
     if (nativeRestNamespaceHandle == 0) {
       throw new IllegalStateException("RestNamespace not initialized. Call initialize() first.");

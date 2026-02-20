@@ -1123,25 +1123,19 @@ fn inner_open_native<'local>(
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
     let (namespace, table_id) = if !namespace_obj.is_null() {
-        // Check if it's a native implementation by trying to get getNativeHandle
-        let ns_arc: Arc<dyn LanceNamespace> =
-            if let Ok(native_handle) = get_native_namespace_handle(env, &namespace_obj) {
-                // Get the namespace type to determine which native implementation it is
-                let ns_type = get_namespace_type(env, &namespace_obj)?;
-                if ns_type == "directory" {
-                    let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
-                    ns.inner.clone()
-                } else if ns_type == "rest" {
-                    let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
-                    ns.inner.clone()
-                } else {
-                    // Unknown native type, fall back to Java bridge
-                    create_java_lance_namespace(env, &namespace_obj)?
-                }
-            } else {
-                // Not a native implementation, create a Java bridge wrapper
-                create_java_lance_namespace(env, &namespace_obj)?
-            };
+        // Check if it's a native implementation using instanceof checks
+        let ns_arc: Arc<dyn LanceNamespace> = if is_directory_namespace(env, &namespace_obj)? {
+            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
+            let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
+            ns.inner.clone()
+        } else if is_rest_namespace(env, &namespace_obj)? {
+            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
+            let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
+            ns.inner.clone()
+        } else {
+            // Custom Java implementation, create a Java bridge wrapper
+            create_java_lance_namespace(env, &namespace_obj)?
+        };
 
         // Extract table_id from List<String>
         let table_id = if !table_id_obj.is_null() {
@@ -1176,51 +1170,32 @@ fn inner_open_native<'local>(
     dataset.into_java(env)
 }
 
-/// Try to get the native handle from a Java LanceNamespace object.
-/// Returns Ok(handle) if the object has a getNativeHandle method, Err otherwise.
-fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
-    let result = env.call_method(namespace_obj, "getNativeHandle", "()J", &[]);
-    match result {
-        Ok(value) => value.j().map_err(|e| {
-            Error::runtime_error(format!("getNativeHandle did not return a long: {}", e))
-        }),
-        Err(_) => Err(Error::runtime_error(
-            "Namespace does not have getNativeHandle method".to_string(),
-        )),
-    }
+/// Check if the Java object is an instance of DirectoryNamespace.
+fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+    let class = env
+        .find_class("org/lance/namespace/DirectoryNamespace")
+        .map_err(|e| {
+            Error::runtime_error(format!("Failed to find DirectoryNamespace class: {}", e))
+        })?;
+    env.is_instance_of(namespace_obj, class)
+        .map_err(|e| Error::runtime_error(format!("Failed to check instanceof: {}", e)))
 }
 
-/// Get the namespace type from a Java LanceNamespace object.
-fn get_namespace_type(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<String> {
-    let result = env.call_method(
-        namespace_obj,
-        "getNamespaceType",
-        "()Ljava/lang/String;",
-        &[],
-    );
-    match result {
-        Ok(value) => {
-            let jstring = value.l().map_err(|e| {
-                Error::runtime_error(format!("getNamespaceType did not return an object: {}", e))
-            })?;
-            if jstring.is_null() {
-                return Err(Error::runtime_error(
-                    "getNamespaceType returned null".to_string(),
-                ));
-            }
-            let jstring_ref = JString::from(jstring);
-            let java_string = env.get_string(&jstring_ref).map_err(|e| {
-                Error::runtime_error(format!(
-                    "Failed to convert getNamespaceType result to string: {}",
-                    e
-                ))
-            })?;
-            Ok(java_string.into())
-        }
-        Err(_) => Err(Error::runtime_error(
-            "Namespace does not have getNamespaceType method".to_string(),
-        )),
-    }
+/// Check if the Java object is an instance of RestNamespace.
+fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+    let class = env
+        .find_class("org/lance/namespace/RestNamespace")
+        .map_err(|e| Error::runtime_error(format!("Failed to find RestNamespace class: {}", e)))?;
+    env.is_instance_of(namespace_obj, class)
+        .map_err(|e| Error::runtime_error(format!("Failed to check instanceof: {}", e)))
+}
+
+/// Get the native handle from a Java LanceNamespace object.
+fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
+    env.call_method(namespace_obj, "getNativeHandle", "()J", &[])
+        .map_err(|e| Error::runtime_error(format!("Failed to call getNativeHandle: {}", e)))?
+        .j()
+        .map_err(|e| Error::runtime_error(format!("getNativeHandle did not return a long: {}", e)))
 }
 
 #[no_mangle]

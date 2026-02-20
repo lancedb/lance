@@ -19,7 +19,6 @@ import org.lance.namespace.model.*;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
@@ -148,7 +147,6 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private static ObjectMapper createObjectMapper() {
     ObjectMapper mapper = new ObjectMapper();
-    mapper.registerModule(new JavaTimeModule());
     mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     return mapper;
   }
@@ -460,11 +458,6 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   public long getNativeHandle() {
     ensureInitialized();
     return nativeDirectoryNamespaceHandle;
-  }
-
-  /** Returns the namespace type identifier. */
-  public String getNamespaceType() {
-    return "directory";
   }
 
   private void ensureInitialized() {

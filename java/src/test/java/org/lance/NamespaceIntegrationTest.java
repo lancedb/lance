@@ -16,12 +16,20 @@ package org.lance;
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
+import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
+import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.CreateTableVersionRequest;
+import org.lance.namespace.model.CreateTableVersionResponse;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
+import org.lance.namespace.model.DescribeTableVersionRequest;
+import org.lance.namespace.model.DescribeTableVersionResponse;
+import org.lance.namespace.model.ListTableVersionsRequest;
+import org.lance.namespace.model.ListTableVersionsResponse;
 import org.lance.operation.Append;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -1315,7 +1323,7 @@ public class NamespaceIntegrationTest {
    * <p>This namespace wraps DirectoryNamespace with table_version_tracking_enabled and
    * manifest_enabled flags, and tracks create_table_version and describe_table_version calls.
    */
-  static class TableVersionTrackingNamespace implements LanceNamespace {
+  static class TableVersionTrackingNamespace implements LanceNamespace, java.io.Closeable {
     private final DirectoryNamespace inner;
     private final AtomicInteger createTableVersionCount = new AtomicInteger(0);
     private final AtomicInteger describeTableVersionCount = new AtomicInteger(0);
@@ -1353,10 +1361,6 @@ public class NamespaceIntegrationTest {
       return inner.getNativeHandle();
     }
 
-    public String getNamespaceType() {
-      return inner.getNamespaceType();
-    }
-
     @Override
     public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
       // Already initialized in constructor
@@ -1381,6 +1385,34 @@ public class NamespaceIntegrationTest {
     public DescribeTableResponse describeTable(DescribeTableRequest request) {
       return inner.describeTable(request);
     }
+
+    @Override
+    public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
+      createTableVersionCount.incrementAndGet();
+      return inner.createTableVersion(request);
+    }
+
+    @Override
+    public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
+      describeTableVersionCount.incrementAndGet();
+      return inner.describeTableVersion(request);
+    }
+
+    @Override
+    public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+      return inner.listTableVersions(request);
+    }
+
+    @Override
+    public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
+        BatchDeleteTableVersionsRequest request) {
+      return inner.batchDeleteTableVersions(request);
+    }
+
+    @Override
+    public void close() {
+      inner.close();
+    }
   }
 
   @Test
@@ -1399,6 +1431,7 @@ public class NamespaceIntegrationTest {
           new TableVersionTrackingNamespace(
               "s3://" + BUCKET_NAME + "/managed_versioning_test", storageOptions);
       String tableName = UUID.randomUUID().toString();
+      List<String> tableId = Arrays.asList(tableName);
 
       // Create schema and data
       Schema schema =
@@ -1461,16 +1494,17 @@ public class NamespaceIntegrationTest {
                 .allocator(allocator)
                 .reader(testReader)
                 .namespace(namespace)
-                .tableId(Arrays.asList(tableName))
+                .tableId(tableId)
                 .mode(WriteParams.WriteMode.CREATE)
                 .execute()) {
           assertEquals(2, dataset.countRows());
+          assertEquals(1, dataset.version());
         }
       }
 
       // Verify describe_table returns managed_versioning=true
       DescribeTableRequest descReq = new DescribeTableRequest();
-      descReq.setId(Arrays.asList(tableName));
+      descReq.setId(tableId);
       DescribeTableResponse descResp = namespace.describeTable(descReq);
 
       assertEquals(
@@ -1478,20 +1512,122 @@ public class NamespaceIntegrationTest {
           descResp.getManagedVersioning(),
           "Expected managedVersioning=true when table_version_tracking_enabled");
 
-      // Open dataset through namespace with managed_versioning support
+      // Open dataset through namespace - this should call describe_table_version for latest
+      int initialDescribeCount = namespace.getDescribeTableVersionCount();
       try (Dataset dsFromNamespace =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+
+        assertEquals(2, dsFromNamespace.countRows());
+        assertEquals(1, dsFromNamespace.version());
+      }
+      assertEquals(
+          initialDescribeCount + 1,
+          namespace.getDescribeTableVersionCount(),
+          "describe_table_version should have been called once when opening latest version");
+
+      // Append data - this should call create_table_version exactly once
+      assertEquals(
+          0,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should not have been called yet");
+
+      try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector aVector = (IntVector) appendRoot.getVector("a");
+        IntVector bVector = (IntVector) appendRoot.getVector("b");
+
+        aVector.allocateNew(2);
+        bVector.allocateNew(2);
+
+        aVector.set(0, 100);
+        bVector.set(0, 200);
+        aVector.set(1, 1000);
+        bVector.set(1, 2000);
+
+        aVector.setValueCount(2);
+        bVector.setValueCount(2);
+        appendRoot.setRowCount(2);
+
+        ArrowReader appendReader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return appendRoot;
+              }
+            };
+
+        // Append through namespace
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(appendReader)
+                .namespace(namespace)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.APPEND)
+                .execute()) {
+          assertEquals(4, dataset.countRows());
+          assertEquals(2, dataset.version());
+        }
+      }
+
+      assertEquals(
+          1,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should have been called exactly once during append");
+
+      // Open latest version - should call describe_table_version
+      int describeCountBeforeLatest = namespace.getDescribeTableVersionCount();
+      try (Dataset latestDs =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+
+        assertEquals(4, latestDs.countRows());
+        assertEquals(2, latestDs.version());
+      }
+      assertEquals(
+          describeCountBeforeLatest + 1,
+          namespace.getDescribeTableVersionCount(),
+          "describe_table_version should have been called once when opening latest version");
+
+      // Open specific version (version 1) - should call describe_table_version
+      int describeCountBeforeV1 = namespace.getDescribeTableVersionCount();
+      try (Dataset v1Ds =
           Dataset.open()
               .allocator(allocator)
               .namespace(namespace)
-              .tableId(Arrays.asList(tableName))
+              .tableId(tableId)
+              .readOptions(new ReadOptions.Builder().setVersion(1L).build())
               .build()) {
 
-        assertEquals(2, dsFromNamespace.countRows());
-
-        // Verify we can read the data
-        List<Version> versions = dsFromNamespace.listVersions();
-        assertEquals(1, versions.size(), "Should have 1 version after create");
+        assertEquals(2, v1Ds.countRows());
+        assertEquals(1, v1Ds.version());
       }
+      assertEquals(
+          describeCountBeforeV1 + 1,
+          namespace.getDescribeTableVersionCount(),
+          "describe_table_version should have been called once when opening version 1");
     }
   }
 

@@ -1635,7 +1635,7 @@ impl LanceNamespace for DirectoryNamespace {
                     manifest_path: meta.location.to_string(),
                     manifest_size: Some(meta.size as i64),
                     e_tag: meta.e_tag,
-                    timestamp: Some(meta.last_modified.to_rfc3339()),
+                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
                     metadata: None,
                 })
             })
@@ -1767,7 +1767,7 @@ impl LanceNamespace for DirectoryNamespace {
                 manifest_path: final_path.to_string(),
                 manifest_size: Some(manifest_size),
                 e_tag: put_result.e_tag,
-                timestamp: None,
+                timestamp_millis: None,
                 metadata: None,
             })),
         })
@@ -1810,7 +1810,7 @@ impl LanceNamespace for DirectoryNamespace {
             manifest_path: manifest_location.path.to_string(),
             manifest_size: manifest_location.size.map(|s| s as i64),
             e_tag: manifest_location.e_tag.clone(),
-            timestamp: Some(version_info.timestamp.to_rfc3339()),
+            timestamp_millis: Some(version_info.timestamp.timestamp_millis()),
             metadata: if metadata.is_empty() {
                 None
             } else {
