@@ -4747,6 +4747,8 @@ mod tests {
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
             use arrow::record_batch::RecordBatch;
             use lance::dataset::builder::DatasetBuilder;
+            use lance::dataset::{WriteMode, WriteParams};
+            use lance::Dataset;
             use lance_namespace::models::CreateNamespaceRequest;
 
             let temp_dir = TempStdDir::default();
@@ -4770,24 +4772,8 @@ mod tests {
 
             // Create a table with multi-level ID (namespace + table)
             let table_id = vec!["workspace".to_string(), "test_table".to_string()];
-            let schema = create_test_schema();
-            let ipc_data = create_test_ipc_data(&schema);
-            let mut create_req = CreateTableRequest::new();
-            create_req.id = Some(table_id.clone());
-            ns.create_table(create_req, bytes::Bytes::from(ipc_data))
-                .await
-                .unwrap();
 
-            // Open the dataset using from_namespace
-            let mut dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
-                .await
-                .unwrap()
-                .load()
-                .await
-                .unwrap();
-            assert_eq!(dataset.version().version, 1);
-
-            // Create some data to append
+            // Create some initial data
             let arrow_schema = Arc::new(ArrowSchema::new(vec![
                 Field::new("id", DataType::Int32, false),
                 Field::new("name", DataType::Utf8, true),
@@ -4801,20 +4787,45 @@ mod tests {
             )
             .unwrap();
 
-            // Append data - this should call create_table_version exactly once
-            assert_eq!(
-                tracking_ns.create_table_version_calls(),
-                0,
-                "create_table_version should not have been called yet"
-            );
+            // Create a table using write_into_namespace
+            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            };
+            let mut dataset = Dataset::write_into_namespace(
+                batches,
+                ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.version().version, 1);
 
-            let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-            dataset.append(batches, None).await.unwrap();
-
+            // Verify create_table_version was called once during initial write_into_namespace
             assert_eq!(
                 tracking_ns.create_table_version_calls(),
                 1,
-                "create_table_version should have been called exactly once during commit"
+                "create_table_version should have been called once during initial write_into_namespace"
+            );
+
+            // Append data - this should call create_table_version again
+            let append_batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let append_batches = RecordBatchIterator::new(vec![Ok(append_batch)], arrow_schema);
+            dataset.append(append_batches, None).await.unwrap();
+
+            assert_eq!(
+                tracking_ns.create_table_version_calls(),
+                2,
+                "create_table_version should have been called twice (once for create, once for append)"
             );
 
             // checkout_latest should call list_table_versions exactly once

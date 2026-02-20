@@ -41,9 +41,12 @@ use lance_table::format::{
     pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
-    CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
+    external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
+    write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler, CommitLock,
+    ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
 };
+
+use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
@@ -825,6 +828,19 @@ impl Dataset {
                     location: location!(),
                 })?;
 
+                // Set up commit handler when managed_versioning is enabled
+                if response.managed_versioning == Some(true) {
+                    let external_store = LanceNamespaceExternalManifestStore::new(
+                        namespace.clone(),
+                        table_id.clone(),
+                    );
+                    let commit_handler: Arc<dyn CommitHandler> =
+                        Arc::new(ExternalManifestCommitHandler {
+                            external_manifest_store: Arc::new(external_store),
+                        });
+                    write_params.commit_handler = Some(commit_handler);
+                }
+
                 // Set initial credentials and provider from namespace
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
@@ -873,6 +889,19 @@ impl Dataset {
                     )),
                     location: location!(),
                 })?;
+
+                // Set up commit handler when managed_versioning is enabled
+                if response.managed_versioning == Some(true) {
+                    let external_store = LanceNamespaceExternalManifestStore::new(
+                        namespace.clone(),
+                        table_id.clone(),
+                    );
+                    let commit_handler: Arc<dyn CommitHandler> =
+                        Arc::new(ExternalManifestCommitHandler {
+                            external_manifest_store: Arc::new(external_store),
+                        });
+                    write_params.commit_handler = Some(commit_handler);
+                }
 
                 // Set initial credentials and provider from namespace
                 if let Some(namespace_storage_options) = response.storage_options {
