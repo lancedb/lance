@@ -90,27 +90,16 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         })
     }
 
-    /// Commit a manifest version to the external store.
+    /// Put the manifest to the external store.
     ///
     /// The staging manifest has been written to `staging_path` on the object store.
     /// This method should atomically claim the version and return the final manifest location.
     ///
-    /// # For staging-based stores (e.g., DynamoDB)
-    /// The default implementation:
-    /// 1. Records the staging path atomically (fails if version exists)
-    /// 2. Copies staging to final path on object store
-    /// 3. Updates external store to point to final path
-    /// 4. Deletes staging manifest
-    ///
-    /// # For direct-write stores (e.g., Namespace)
-    /// Override this method to:
-    /// 1. Read staging manifest data from object store
-    /// 2. Write directly to final location with conditional put
-    /// 3. Delete staging manifest
-    ///
-    /// Returns the final manifest location after successful commit.
+    /// The default implementation uses put_if_not_exists and put_if_exists to
+    /// implement a staging-based workflow. Implementations that can write directly
+    /// (e.g., namespace-backed stores) should override this method.
     #[allow(clippy::too_many_arguments)]
-    async fn commit(
+    async fn put(
         &self,
         base_path: &Path,
         version: u64,
@@ -184,8 +173,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         Ok(location)
     }
 
-    /// Record staging manifest path. Used by default commit implementation.
-    /// Should fail if the version already exists.
+    /// Put the manifest path for a given base_uri and version, should fail if the version already exists
     async fn put_if_not_exists(
         &self,
         base_uri: &str,
@@ -195,8 +183,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         e_tag: Option<String>,
     ) -> Result<()>;
 
-    /// Update to final manifest path. Used by default commit implementation.
-    /// Should fail if the version does not already exist.
+    /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
     async fn put_if_exists(
         &self,
         base_uri: &str,
@@ -236,10 +223,15 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
-    /// Finalize a manifest that may be in staging state.
+    /// The manifest is considered committed once the staging manifest is written
+    /// to object store and that path is committed to the external store.
     ///
-    /// This is used by read paths when they encounter a staging manifest.
-    /// Write paths use `ExternalManifestStore::commit` directly.
+    /// However, to fully complete this, the staging manifest should be materialized
+    /// into the final path, the final path should be committed to the external store
+    /// and the staging manifest should be deleted. These steps may be completed
+    /// by any number of readers or writers, so care should be taken to ensure
+    /// that the manifest is not lost nor any errors occur due to duplicate
+    /// operations.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_manifest(
         &self,
@@ -251,7 +243,7 @@ impl ExternalManifestCommitHandler {
         store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
-        // Copy the manifest to the final location
+        // step 1: copy the manifest to the final location
         let final_manifest_path = naming_scheme.manifest_path(base_path, version);
 
         let copied = match store
@@ -267,6 +259,11 @@ impl ExternalManifestCommitHandler {
         }
 
         // On S3, the etag can change if originally was MultipartUpload and later was Copy
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
+        // We only do MultipartUpload for > 5MB files, so we can skip this check
+        // if size < 5MB. However, we need to double check the final_manifest_path
+        // exists before we change the external store, otherwise we may point to a
+        // non-existing manifest.
         let e_tag = if copied && size < 5 * 1024 * 1024 {
             e_tag
         } else {
@@ -286,7 +283,7 @@ impl ExternalManifestCommitHandler {
             return Ok(location);
         }
 
-        // Update the external store to point to the final location
+        // step 2: flip the external store to point to the final location
         self.external_manifest_store
             .put_if_exists(
                 base_path.as_ref(),
@@ -297,7 +294,7 @@ impl ExternalManifestCommitHandler {
             )
             .await?;
 
-        // Delete the staging manifest
+        // step 3: delete the staging manifest
         match store.delete(staging_manifest_path).await {
             Ok(_) => {}
             Err(ObjectStoreError::NotFound { .. }) => {}
@@ -476,16 +473,19 @@ impl CommitHandler for ExternalManifestCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        // Write the manifest to object store with a temporary name
+        // path we get here is the path to the manifest we want to write
+        // use object_store.base_path.as_ref() for getting the root of the dataset
+
+        // step 1: Write the manifest we want to commit to object store with a temporary name
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
         let write_res =
             manifest_writer(object_store, manifest, indices, &staging_path, transaction).await?;
 
-        // Commit via external store (handles atomic claim, finalization, and cleanup)
+        // step 2 & 3: Put the manifest to external store
         let result = self
             .external_manifest_store
-            .commit(
+            .put(
                 base_path,
                 manifest.version,
                 &staging_path,
@@ -499,7 +499,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         match result {
             Ok(location) => Ok(location),
             Err(_) => {
-                // On conflict, try to delete the staging manifest
+                // delete the staging manifest
                 match object_store.inner.delete(&staging_path).await {
                     Ok(_) => {}
                     Err(ObjectStoreError::NotFound { .. }) => {}

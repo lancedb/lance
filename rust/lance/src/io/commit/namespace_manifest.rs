@@ -67,8 +67,8 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         )))
     }
 
-    /// Direct-write commit: reads staging manifest and writes directly to final location.
-    async fn commit(
+    /// Put the manifest to the namespace store.
+    async fn put(
         &self,
         _base_path: &Path,
         version: u64,
@@ -113,7 +113,6 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         })
     }
 
-    /// Not used when commit() is overridden.
     async fn put_if_not_exists(
         &self,
         _base_uri: &str,
@@ -122,10 +121,12 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        Ok(())
+        Err(lance_core::Error::NotSupported {
+            source: "put_if_not_exists is not supported for namespace-backed stores".into(),
+            location: snafu::location!(),
+        })
     }
 
-    /// Not used when commit() is overridden.
     async fn put_if_exists(
         &self,
         _base_uri: &str,
@@ -134,6 +135,9 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        Ok(())
+        Err(lance_core::Error::NotSupported {
+            source: "put_if_exists is not supported for namespace-backed stores".into(),
+            location: snafu::location!(),
+        })
     }
 }
