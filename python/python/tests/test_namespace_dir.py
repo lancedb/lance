@@ -866,7 +866,7 @@ def test_external_manifest_store_invokes_namespace_apis():
         assert len(ds.versions()) == 2
 
         assert namespace.create_table_version_count == 2, (
-            "create_table_version should be called twice (once for CREATE, once for APPEND)"
+            "create_table_version should be called twice (CREATE + APPEND)"
         )
 
         # Open latest version - should call list_table_versions
