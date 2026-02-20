@@ -852,11 +852,12 @@ def test_external_manifest_store_invokes_namespace_apis():
             "list_table_versions should be called once when opening latest version"
         )
 
-        # Append data - should call create_table_version exactly once
-        assert namespace.create_table_version_count == 0, (
-            "create_table_version should not have been called yet"
+        # Verify create_table_version was called once during CREATE
+        assert namespace.create_table_version_count == 1, (
+            "create_table_version should have been called once during CREATE"
         )
 
+        # Append data - should call create_table_version again
         table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
         ds = lance.write_dataset(
             table2, namespace=namespace, table_id=table_id, mode="append"
@@ -864,8 +865,8 @@ def test_external_manifest_store_invokes_namespace_apis():
         assert ds.count_rows() == 4
         assert len(ds.versions()) == 2
 
-        assert namespace.create_table_version_count == 1, (
-            "create_table_version should be called exactly once during append"
+        assert namespace.create_table_version_count == 2, (
+            "create_table_version should be called twice (once for CREATE, once for APPEND)"
         )
 
         # Open latest version - should call list_table_versions
