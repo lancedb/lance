@@ -826,8 +826,11 @@ def test_external_manifest_store_invokes_namespace_apis():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         namespace = TableVersionTrackingNamespace(root=f"file://{tmpdir}")
-        table_name = "test_table"
-        table_id = [table_name]
+
+        # Create parent namespace first (like Rust/Java tests)
+        namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+
+        table_id = ["workspace", "test_table"]
 
         # Create initial table
         table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
