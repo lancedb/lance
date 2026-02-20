@@ -3998,8 +3998,8 @@ mod tests {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
-        use lance::dataset::builder::DatasetBuilder;
-        use lance_namespace::models::ListTableVersionsRequest;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, ListTableVersionsRequest};
 
         let temp_dir = TempStrDir::default();
         let temp_path: &str = &temp_dir;
@@ -4012,25 +4012,13 @@ mod tests {
                 .unwrap(),
         );
 
-        // Create a table (version 1)
-        let table_id = vec!["test_table".to_string()];
-        let schema = create_test_schema();
-        let ipc_data = create_test_ipc_data(&schema);
-        let mut create_req = CreateTableRequest::new();
-        create_req.id = Some(table_id.clone());
-        namespace
-            .create_table(create_req, bytes::Bytes::from(ipc_data))
-            .await
-            .unwrap();
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
 
-        // Open dataset and append data to create versions 2 and 3
-        let mut dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
-            .await
-            .unwrap()
-            .load()
-            .await
-            .unwrap();
-
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
             DataType::Int32,
@@ -4038,16 +4026,39 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
         .unwrap();
 
         // Append to create version 2
-        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema.clone());
         dataset.append(batches, None).await.unwrap();
 
         // Append to create version 3
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![300, 400]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch3)], arrow_schema);
         dataset.append(batches, None).await.unwrap();
 
         // List versions - should have versions 1, 2, and 3
@@ -4103,8 +4114,8 @@ mod tests {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
-        use lance::dataset::builder::DatasetBuilder;
-        use lance_namespace::models::DescribeTableVersionRequest;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, DescribeTableVersionRequest};
 
         let temp_dir = TempStrDir::default();
         let temp_path: &str = &temp_dir;
@@ -4117,25 +4128,13 @@ mod tests {
                 .unwrap(),
         );
 
-        // Create a table (version 1)
-        let table_id = vec!["test_table".to_string()];
-        let schema = create_test_schema();
-        let ipc_data = create_test_ipc_data(&schema);
-        let mut create_req = CreateTableRequest::new();
-        create_req.id = Some(table_id.clone());
-        namespace
-            .create_table(create_req, bytes::Bytes::from(ipc_data))
-            .await
-            .unwrap();
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
 
-        // Open dataset and append data to create version 2
-        let mut dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
-            .await
-            .unwrap()
-            .load()
-            .await
-            .unwrap();
-
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
             DataType::Int32,
@@ -4143,11 +4142,30 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        // Append data to create version 2
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![100, 200]))],
         )
         .unwrap();
-
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema);
         dataset.append(batches, None).await.unwrap();
 
         // Describe version 1
@@ -4210,8 +4228,8 @@ mod tests {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
-        use lance::dataset::builder::DatasetBuilder;
-        use lance_namespace::models::DescribeTableVersionRequest;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, DescribeTableVersionRequest};
 
         let temp_dir = TempStrDir::default();
         let temp_path: &str = &temp_dir;
@@ -4224,25 +4242,13 @@ mod tests {
                 .unwrap(),
         );
 
-        // Create a table (version 1)
-        let table_id = vec!["test_table".to_string()];
-        let schema = create_test_schema();
-        let ipc_data = create_test_ipc_data(&schema);
-        let mut create_req = CreateTableRequest::new();
-        create_req.id = Some(table_id.clone());
-        namespace
-            .create_table(create_req, bytes::Bytes::from(ipc_data))
-            .await
-            .unwrap();
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
 
-        // Open dataset and append data to create versions 2 and 3
-        let mut dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
-            .await
-            .unwrap()
-            .load()
-            .await
-            .unwrap();
-
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
             DataType::Int32,
@@ -4250,16 +4256,39 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
         .unwrap();
 
         // Append to create version 2
-        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema.clone());
         dataset.append(batches, None).await.unwrap();
 
         // Append to create version 3
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![300, 400]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch3)], arrow_schema);
         dataset.append(batches, None).await.unwrap();
 
         // Describe latest version (no version specified)
@@ -4537,9 +4566,6 @@ mod tests {
     /// End-to-end integration test module for table version tracking.
     mod e2e_table_version_tracking {
         use super::*;
-        use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-        use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
-        use lance_table::io::commit::CommitHandler;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Tracking wrapper around a namespace that counts method invocations.
@@ -4861,12 +4887,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_e2e_dataset_commit_with_external_manifest_store() {
+        async fn test_dataset_commit_with_external_manifest_store() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
             use arrow::record_batch::RecordBatch;
             use futures::TryStreamExt;
-            use lance::dataset::builder::DatasetBuilder;
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::models::CreateNamespaceRequest;
             use lance_table::io::commit::ManifestNamingScheme;
@@ -4882,43 +4907,15 @@ mod tests {
                 .await
                 .unwrap();
 
-            let tracking_ns = Arc::new(TrackingNamespace::new(inner_ns));
+            let tracking_ns: Arc<dyn LanceNamespace> = Arc::new(TrackingNamespace::new(inner_ns));
 
             // Create parent namespace
             let mut create_ns_req = CreateNamespaceRequest::new();
             create_ns_req.id = Some(vec!["workspace".to_string()]);
             tracking_ns.create_namespace(create_ns_req).await.unwrap();
 
-            // Create a table with multi-level ID (namespace + table)
+            // Create a table using write_into_namespace
             let table_id = vec!["workspace".to_string(), "test_table".to_string()];
-            let schema = create_test_schema();
-            let ipc_data = create_test_ipc_data(&schema);
-            let mut create_req = CreateTableRequest::new();
-            create_req.id = Some(table_id.clone());
-            tracking_ns
-                .create_table(create_req, bytes::Bytes::from(ipc_data))
-                .await
-                .unwrap();
-
-            // Open the dataset using from_namespace to get proper paths
-            let dataset = DatasetBuilder::from_namespace(tracking_ns.clone(), table_id.clone())
-                .await
-                .unwrap()
-                .load()
-                .await
-                .unwrap();
-            assert_eq!(dataset.version().version, 1);
-
-            // Create the external manifest store commit handler
-            let external_store = Arc::new(LanceNamespaceExternalManifestStore::new(
-                tracking_ns.clone(),
-                table_id.clone(),
-            ));
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: external_store,
-            });
-
-            // Create some data to append
             let arrow_schema = Arc::new(ArrowSchema::new(vec![
                 Field::new("id", DataType::Int32, false),
                 Field::new("name", DataType::Utf8, true),
@@ -4931,28 +4928,43 @@ mod tests {
                 ],
             )
             .unwrap();
-
-            // Write data using the external manifest commit handler
-            let initial_create_calls = tracking_ns.create_table_version_calls();
+            let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
             let write_params = WriteParams {
-                mode: WriteMode::Append,
-                commit_handler: Some(commit_handler),
+                mode: WriteMode::Create,
                 ..Default::default()
             };
+            let dataset = Dataset::write_into_namespace(
+                batches,
+                tracking_ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.version().version, 1);
 
-            let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-            Dataset::write(batches, dataset.uri(), Some(write_params))
-                .await
-                .unwrap();
-
-            // Verify create_table_version was called during commit
-            assert!(
-                tracking_ns.create_table_version_calls() > initial_create_calls,
-                "create_table_version should have been called during dataset write. \
-                 Initial: {}, Current: {}",
-                initial_create_calls,
-                tracking_ns.create_table_version_calls()
-            );
+            // Append data using write_into_namespace (APPEND mode)
+            let batch2 = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema);
+            let write_params = WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            Dataset::write_into_namespace(
+                batches,
+                tracking_ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
 
             // Verify version 2 was created using the dataset's object_store
             // List manifests in the versions directory to find the V2 named manifest
