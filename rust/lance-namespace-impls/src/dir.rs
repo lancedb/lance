@@ -1505,6 +1505,11 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DeclareTableResponse {
             location: Some(table_uri),
             storage_options,
+            managed_versioning: if self.table_version_tracking_enabled {
+                Some(true)
+            } else {
+                None
+            },
             ..Default::default()
         })
     }

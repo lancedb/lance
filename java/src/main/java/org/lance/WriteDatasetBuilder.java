@@ -364,6 +364,7 @@ public class WriteDatasetBuilder {
   private Dataset executeWithNamespace() {
     String tableUri;
     Map<String, String> namespaceStorageOptions = null;
+    boolean managedVersioning = false;
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
@@ -379,13 +380,16 @@ public class WriteDatasetBuilder {
         DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
         location = declareResponse.getLocation();
         responseStorageOptions = declareResponse.getStorageOptions();
+        managedVersioning = Boolean.TRUE.equals(declareResponse.getManagedVersioning());
       } catch (UnsupportedOperationException e) {
         // Fall back to deprecated createEmptyTable
+        // Note: createEmptyTable doesn't support managedVersioning
         CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
         fallbackRequest.setId(tableId);
         CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
         location = fallbackResponse.getLocation();
         responseStorageOptions = fallbackResponse.getStorageOptions();
+        managedVersioning = false;
       }
 
       tableUri = location;
@@ -407,6 +411,7 @@ public class WriteDatasetBuilder {
       }
 
       namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      managedVersioning = Boolean.TRUE.equals(response.getManagedVersioning());
     }
 
     // Merge storage options (namespace options + user options, with namespace taking precedence)
@@ -436,9 +441,13 @@ public class WriteDatasetBuilder {
             ? null
             : new LanceNamespaceStorageOptionsProvider(namespace, tableId);
 
-    // Use Dataset.create() with namespace for managed versioning support
-    return createDatasetWithStreamAndNamespace(
-        tableUri, params, storageOptionsProvider, namespace, tableId);
+    // Only use namespace for commit handling if managedVersioning is enabled
+    if (managedVersioning) {
+      return createDatasetWithStreamAndNamespace(
+          tableUri, params, storageOptionsProvider, namespace, tableId);
+    } else {
+      return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    }
   }
 
   private Dataset executeWithUri() {
