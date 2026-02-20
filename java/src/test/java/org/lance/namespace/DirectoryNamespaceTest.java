@@ -480,7 +480,7 @@ public class DirectoryNamespaceTest {
   }
 
   @Test
-  void testManagedVersioningWithDirectoryNamespace(@TempDir Path managedVersioningTempDir)
+  void testExternalManifestStoreInvokesNamespaceApis(@TempDir Path managedVersioningTempDir)
       throws Exception {
     try (BufferAllocator allocator = new RootAllocator()) {
       // Create namespace with table_version_tracking_enabled

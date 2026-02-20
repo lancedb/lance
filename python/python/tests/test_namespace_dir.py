@@ -812,12 +812,12 @@ class TableVersionTrackingNamespace(lance.namespace.DirectoryNamespace):
         return json.dumps(response_dict)
 
 
-def test_e2e_external_manifest_store_invokes_namespace_apis():
+def test_external_manifest_store_invokes_namespace_apis():
     """Test that namespace APIs are invoked correctly for managed versioning.
 
     This test mirrors:
-    - Rust: test_e2e_external_manifest_store_invokes_namespace_apis
-    - Java: testManagedVersioningWithDirectoryNamespace
+    - Rust: test_external_manifest_store_invokes_namespace_apis
+    - Java: testExternalManifestStoreInvokesNamespaceApis
 
     It verifies:
     1. list_table_versions is called when opening dataset (latest version)

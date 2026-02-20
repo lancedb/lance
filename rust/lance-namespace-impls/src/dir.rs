@@ -4733,7 +4733,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_e2e_external_manifest_store_invokes_namespace_apis() {
+        async fn test_external_manifest_store_invokes_namespace_apis() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
             use arrow::record_batch::RecordBatch;
