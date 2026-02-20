@@ -90,7 +90,7 @@ use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
-use crate::namespace::{PyDirectoryNamespace, PyRestNamespace};
+use crate::namespace::{PyDirectoryNamespace, PyLanceNamespace, PyRestNamespace};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -601,16 +601,19 @@ impl Dataset {
 
         // Set up namespace commit handler if namespace and table_id are provided
         if let (Some(ns), Some(tid)) = (namespace, table_id) {
-            // Extract the inner namespace Arc from either PyDirectoryNamespace or PyRestNamespace
+            // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
+            // or create a PyLanceNamespace wrapper for custom Python implementations
             let ns_arc: Arc<dyn LanceNamespace> =
                 if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+                    // Native DirectoryNamespace - use inner directly (bypass Python layer)
                     dir_ns.borrow().inner.clone()
                 } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+                    // Native RestNamespace - use inner directly (bypass Python layer)
                     rest_ns.borrow().inner.clone()
                 } else {
-                    return Err(PyValueError::new_err(
-                        "namespace must be either PyDirectoryNamespace or PyRestNamespace",
-                    ));
+                    // Custom Python implementation - wrap with PyLanceNamespace
+                    // This calls back into Python for namespace methods
+                    PyLanceNamespace::create_arc(py, ns)?
                 };
 
             let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
@@ -3157,6 +3160,37 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 new_props.insert(key, value);
             }
             p.transaction_properties = Some(Arc::new(new_props));
+        }
+
+        // Handle namespace and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user
+        if p.commit_handler.is_none() {
+            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
+            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
+                let py = options.py();
+                // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
+                // or create a PyLanceNamespace wrapper for custom Python implementations
+                let ns_arc: Arc<dyn LanceNamespace> =
+                    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+                        // Native DirectoryNamespace - use inner directly (bypass Python layer)
+                        dir_ns.borrow().inner.clone()
+                    } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+                        // Native RestNamespace - use inner directly (bypass Python layer)
+                        rest_ns.borrow().inner.clone()
+                    } else {
+                        // Custom Python implementation - wrap with PyLanceNamespace
+                        PyLanceNamespace::create_arc(py, &ns)?
+                    };
+
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                p.commit_handler = Some(commit_handler);
+            }
         }
 
         Some(p)

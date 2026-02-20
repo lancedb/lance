@@ -243,7 +243,7 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
-        namespace=namespace._inner if managed_versioning else None,
+        namespace=namespace if managed_versioning else None,
         table_id=table_id if managed_versioning else None,
     )
     if version is None and asof is not None:

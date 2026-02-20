@@ -4082,8 +4082,8 @@ mod tests {
                 expected_version
             );
             assert!(
-                version.timestamp.is_some(),
-                "timestamp should be set for version {}",
+                version.timestamp_millis.is_some(),
+                "timestamp_millis should be set for version {}",
                 expected_version
             );
         }
@@ -4152,7 +4152,7 @@ mod tests {
 
         let version = &describe_resp.version;
         assert_eq!(version.version, 1);
-        assert!(version.timestamp.is_some());
+        assert!(version.timestamp_millis.is_some());
         assert!(
             !version.manifest_path.is_empty(),
             "manifest_path should be set"
@@ -4181,7 +4181,7 @@ mod tests {
 
         let version = &describe_resp.version;
         assert_eq!(version.version, 2);
-        assert!(version.timestamp.is_some());
+        assert!(version.timestamp_millis.is_some());
         assert!(
             !version.manifest_path.is_empty(),
             "manifest_path should be set"
