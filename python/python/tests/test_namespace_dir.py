@@ -825,7 +825,7 @@ def test_external_manifest_store_invokes_namespace_apis():
     3. describe_table_version is called when opening specific version
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        namespace = TableVersionTrackingNamespace(root=f"file://{tmpdir}")
+        namespace = TableVersionTrackingNamespace(root=tmpdir)
 
         # Create parent namespace first (like Rust/Java tests)
         namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
