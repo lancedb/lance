@@ -49,7 +49,7 @@ pub fn table_identifier_from_dataset(dataset: &Dataset) -> pb::TableIdentifier {
         manifest_etag: dataset.manifest_location.e_tag.clone(),
         serialized_manifest: None,
         storage_options: dataset
-            .initial_storage_options()
+            .latest_storage_options()
             .cloned()
             .unwrap_or_default(),
     }
@@ -66,7 +66,7 @@ pub fn table_identifier_from_dataset_with_manifest(dataset: &Dataset) -> pb::Tab
         manifest_etag: dataset.manifest_location.e_tag.clone(),
         serialized_manifest: Some(manifest_proto.encode_to_vec()),
         storage_options: dataset
-            .initial_storage_options()
+            .latest_storage_options()
             .cloned()
             .unwrap_or_default(),
     }
