@@ -20,8 +20,8 @@ use snafu::location;
 use tracing::info;
 
 use super::{
-    current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
-    ManifestNamingScheme, MANIFEST_EXTENSION,
+    current_manifest_path, default_resolve_version, make_staging_manifest_path, write_version_hint,
+    ManifestLocation, ManifestNamingScheme, MANIFEST_EXTENSION,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
@@ -497,7 +497,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await;
 
         match result {
-            Ok(location) => Ok(location),
+            Ok(location) => {
+                // Write version hint (optimistic, failures are ignored)
+                write_version_hint(object_store, base_path, manifest.version).await;
+                Ok(location)
+            }
             Err(_) => {
                 // delete the staging manifest
                 match object_store.inner.delete(&staging_path).await {

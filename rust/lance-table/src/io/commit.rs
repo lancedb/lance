@@ -70,6 +70,23 @@ use {
 pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
+/// File name for the version hint file.
+/// The file size in bytes indicates the latest version number.
+/// This enables O(1) latest version lookup via HEAD request on object stores
+/// where listing is not lexicographically ordered (e.g., S3 Express).
+const VERSION_HINT_FILE: &str = "latest_version_hint.bin";
+
+/// Environment variable to enable/disable version hint optimization.
+/// Set to "0" or "false" to disable, any other value (or unset) to enable.
+const VERSION_HINT_ENV_VAR: &str = "LANCE_USE_VERSION_HINT";
+
+/// Check if version hint optimization is enabled via environment variable.
+fn is_version_hint_enabled() -> bool {
+    match std::env::var(VERSION_HINT_ENV_VAR) {
+        Ok(val) => !matches!(val.to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true, // Enabled by default
+    }
+}
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,17 +272,214 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     }
 }
 
-/// Get the latest manifest path
+/// Get the latest manifest path.
+///
+/// This function uses two strategies in parallel:
+/// 1. Version hint: HEAD request on hint file + probing higher versions
+/// 2. Listing: Traditional directory listing
+///
+/// The hint-based approach is significantly faster on all object stores:
+/// - S3 Express: ~10ms (HEAD) vs ~200ms+ (LIST at scale)
+/// - S3 Standard: ~20ms (HEAD + probe) vs ~200ms+ (LIST at scale)
+///
+/// Even with lexicographic ordering (V2 naming), LIST still requires a full
+/// request that takes hundreds of milliseconds, while HEAD is much faster.
+///
+/// The version hint optimization can be disabled by setting the environment
+/// variable `LANCE_USE_VERSION_HINT=0` (or "false", "no", "off").
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    // Fast path for local filesystem
     if object_store.is_local() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
     }
 
+    // Check if version hint is disabled via environment variable
+    if !is_version_hint_enabled() {
+        return resolve_version_from_listing(object_store, base).await;
+    }
+
+    // Race hint-based and listing-based approaches
+    // Use tokio::select! to return whichever completes first
+    tokio::select! {
+        biased;
+
+        // Try hint-based approach first (biased because it's usually faster)
+        hint_result = read_version_hint_and_probe(object_store, base) => {
+            if let Some(location) = hint_result {
+                return Ok(location);
+            }
+            // Hint failed, fall back to listing
+            resolve_version_from_listing(object_store, base).await
+        }
+
+        // Listing approach as backup
+        list_result = resolve_version_from_listing(object_store, base) => {
+            list_result
+        }
+    }
+}
+
+// This is an optimized function that searches for the latest manifest. In
+// object_store, list operations lookup metadata for each file listed. This
+// method only gets the metadata for the found latest manifest.
+fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
+    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
+    let entries = std::fs::read_dir(path)?;
+
+    let mut latest_entry: Option<(u64, DirEntry)> = None;
+
+    let mut scheme: Option<ManifestNamingScheme> = None;
+
+    for entry in entries {
+        let entry = entry?;
+        let filename_raw = entry.file_name();
+        let filename = filename_raw.to_string_lossy();
+
+        let Some(entry_scheme) = ManifestNamingScheme::detect_scheme(&filename) else {
+            // Need to ignore temporary files, such as
+            // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
+            continue;
+        };
+
+        if let Some(scheme) = scheme {
+            if scheme != entry_scheme {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}",
+                        scheme, entry_scheme
+                    ),
+                ));
+            }
+        } else {
+            scheme = Some(entry_scheme);
+        }
+
+        let Some(version) = entry_scheme.parse_version(&filename) else {
+            continue;
+        };
+
+        if let Some((latest_version, _)) = &latest_entry {
+            if version > *latest_version {
+                latest_entry = Some((version, entry));
+            }
+        } else {
+            latest_entry = Some((version, entry));
+        }
+    }
+
+    if let Some((version, entry)) = latest_entry {
+        let path = Path::from_filesystem_path(entry.path())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        let metadata = entry.metadata()?;
+        Ok(Some(ManifestLocation {
+            version,
+            path,
+            size: Some(metadata.len()),
+            naming_scheme: scheme.unwrap(),
+            e_tag: Some(get_etag(&metadata)),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get the path to the version hint file.
+fn version_hint_path(base: &Path) -> Path {
+    base.child(VERSIONS_DIR).child(VERSION_HINT_FILE)
+}
+
+/// Write the version hint file after a successful commit.
+///
+/// The file size in bytes indicates the latest version number.
+/// This write is optimistic and failures are logged but ignored,
+/// as the hint is only used to accelerate reads, not for correctness.
+pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
+    let hint_path = version_hint_path(base);
+    // Create a file with `version` bytes (all zeros)
+    let content = vec![0u8; version as usize];
+    if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
+        // Log but don't fail - the hint is optional for correctness
+        warn!(
+            "Failed to write version hint file for version {}: {}",
+            version, e
+        );
+    }
+}
+
+/// Read the version hint and probe for higher versions.
+///
+/// Returns the latest version found and its manifest path, or None if the hint
+/// file doesn't exist or an error occurred.
+///
+/// This function:
+/// 1. HEAD request on the hint file to get the version hint (file size)
+/// 2. Probes version+1, version+2, etc. with HEAD requests until not found
+/// 3. Returns the highest version found
+async fn read_version_hint_and_probe(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Option<ManifestLocation> {
+    let hint_path = version_hint_path(base);
+
+    // Get the hint version from file size
+    let hint_meta = object_store.inner.head(&hint_path).await.ok()?;
+    let mut current_version = hint_meta.size as u64;
+
+    // Try V2 scheme first (more likely for newer datasets)
+    let mut scheme = ManifestNamingScheme::V2;
+
+    // Verify the hinted version exists
+    let manifest_path = scheme.manifest_path(base, current_version);
+    let manifest_meta = match object_store.inner.head(&manifest_path).await {
+        Ok(meta) => Some(meta),
+        Err(ObjectStoreError::NotFound { .. }) => {
+            // Try V1 scheme
+            scheme = ManifestNamingScheme::V1;
+            let manifest_path = scheme.manifest_path(base, current_version);
+            object_store.inner.head(&manifest_path).await.ok()
+        }
+        Err(_) => None,
+    };
+
+    // If the hinted version doesn't exist, the hint is stale/invalid
+    let mut last_meta = manifest_meta?;
+
+    // Probe for higher versions
+    loop {
+        let next_version = current_version + 1;
+        let next_path = scheme.manifest_path(base, next_version);
+        match object_store.inner.head(&next_path).await {
+            Ok(meta) => {
+                current_version = next_version;
+                last_meta = meta;
+            }
+            Err(ObjectStoreError::NotFound { .. }) => break,
+            Err(_) => break,
+        }
+    }
+
+    Some(ManifestLocation {
+        version: current_version,
+        path: scheme.manifest_path(base, current_version),
+        size: Some(last_meta.size),
+        naming_scheme: scheme,
+        e_tag: last_meta.e_tag,
+    })
+}
+
+/// Resolve the latest version from listing.
+///
+/// This is the traditional approach that lists all manifests and finds the highest version.
+async fn resolve_version_from_listing(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Result<ManifestLocation> {
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
@@ -358,71 +572,6 @@ async fn current_manifest_path(
             uri: base.child(VERSIONS_DIR).to_string(),
             location: location!(),
         }),
-    }
-}
-
-// This is an optimized function that searches for the latest manifest. In
-// object_store, list operations lookup metadata for each file listed. This
-// method only gets the metadata for the found latest manifest.
-fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
-    let entries = std::fs::read_dir(path)?;
-
-    let mut latest_entry: Option<(u64, DirEntry)> = None;
-
-    let mut scheme: Option<ManifestNamingScheme> = None;
-
-    for entry in entries {
-        let entry = entry?;
-        let filename_raw = entry.file_name();
-        let filename = filename_raw.to_string_lossy();
-
-        let Some(entry_scheme) = ManifestNamingScheme::detect_scheme(&filename) else {
-            // Need to ignore temporary files, such as
-            // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
-            continue;
-        };
-
-        if let Some(scheme) = scheme {
-            if scheme != entry_scheme {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}",
-                        scheme, entry_scheme
-                    ),
-                ));
-            }
-        } else {
-            scheme = Some(entry_scheme);
-        }
-
-        let Some(version) = entry_scheme.parse_version(&filename) else {
-            continue;
-        };
-
-        if let Some((latest_version, _)) = &latest_entry {
-            if version > *latest_version {
-                latest_entry = Some((version, entry));
-            }
-        } else {
-            latest_entry = Some((version, entry));
-        }
-    }
-
-    if let Some((version, entry)) = latest_entry {
-        let path = Path::from_filesystem_path(entry.path())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        let metadata = entry.metadata()?;
-        Ok(Some(ManifestLocation {
-            version,
-            path,
-            size: Some(metadata.len()),
-            naming_scheme: scheme.unwrap(),
-            e_tag: Some(get_etag(&metadata)),
-        }))
-    } else {
-        Ok(None)
     }
 }
 
@@ -839,6 +988,9 @@ impl CommitHandler for UnsafeCommitHandler {
         let res =
             manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
 
+        // Write version hint (optimistic, failures are ignored)
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             size: Some(res.size as u64),
@@ -922,6 +1074,10 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         lease.release(res.is_ok()).await?;
 
         let res = res?;
+
+        // Write version hint (optimistic, failures are ignored)
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             size: Some(res.size as u64),
@@ -989,6 +1145,9 @@ impl CommitHandler for RenameCommitHandler {
             .await
         {
             Ok(_) => {
+                // Write version hint (optimistic, failures are ignored)
+                write_version_hint(object_store, base_path, manifest.version).await;
+
                 // Successfully committed
                 Ok(ManifestLocation {
                     version: manifest.version,
@@ -1064,6 +1223,9 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 }
                 _ => CommitError::OtherError(err.into()),
             })?;
+
+        // Write version hint (optimistic, failures are ignored)
+        write_version_hint(object_store, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1242,5 +1404,117 @@ mod tests {
         assert_eq!(location.version, 11);
         assert_eq!(location.naming_scheme, naming_scheme);
         assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
+    }
+
+    #[tokio::test]
+    async fn test_write_version_hint() {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+
+        // Write version hint for version 42
+        write_version_hint(&object_store, &base, 42).await;
+
+        // Verify the hint file exists with correct size
+        let hint_path = version_hint_path(&base);
+        let meta = object_store.inner.head(&hint_path).await.unwrap();
+        assert_eq!(meta.size, 42);
+
+        // Write version hint for version 100 (overwrites previous)
+        write_version_hint(&object_store, &base, 100).await;
+        let meta = object_store.inner.head(&hint_path).await.unwrap();
+        assert_eq!(meta.size, 100);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_read_version_hint_and_probe(
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+
+        // No hint file - should return None
+        let result = read_version_hint_and_probe(&object_store, &base).await;
+        assert!(result.is_none());
+
+        // Create manifests for versions 1-5
+        for version in 1..=5 {
+            let path = naming_scheme.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // Write hint pointing to version 3 (stale hint)
+        write_version_hint(&object_store, &base, 3).await;
+
+        // Should probe and find version 5
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+        assert_eq!(location.naming_scheme, naming_scheme);
+
+        // Update hint to current version
+        write_version_hint(&object_store, &base, 5).await;
+
+        // Should return version 5 directly
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+    }
+
+    #[tokio::test]
+    async fn test_current_manifest_path_with_hint_non_lexical() {
+        // Test that hint-based lookup works for non-lexicographic stores
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = false;
+        let object_store = Box::new(object_store);
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        // Create many manifest files (simulating S3 Express with many versions)
+        for version in 1..=100 {
+            let path = naming_scheme.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // Write hint pointing to version 98 (slightly stale)
+        write_version_hint(&object_store, &base, 98).await;
+
+        // Should find version 100 (probing from 98)
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 100);
+    }
+
+    #[tokio::test]
+    async fn test_version_hint_invalid_version() {
+        // Test behavior when hint points to non-existent version
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        // Create manifest for version 5 only
+        let path = naming_scheme.manifest_path(&base, 5);
+        object_store.put(&path, b"".as_slice()).await.unwrap();
+
+        // Write hint pointing to version 10 (invalid - doesn't exist)
+        write_version_hint(&object_store, &base, 10).await;
+
+        // Hint should be ignored, should fall back to listing
+        let mut object_store_clone = ObjectStore::memory();
+        object_store_clone.list_is_lexically_ordered = false;
+
+        // Copy the manifest to the new store
+        object_store_clone.put(&path, b"".as_slice()).await.unwrap();
+
+        // Write the invalid hint
+        write_version_hint(&object_store_clone, &base, 10).await;
+
+        // Should find version 5 via listing fallback
+        let location = current_manifest_path(&object_store_clone, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
     }
 }
