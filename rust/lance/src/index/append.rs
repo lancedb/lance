@@ -7,6 +7,7 @@ use futures::FutureExt;
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
@@ -160,6 +161,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     true,
                     None,
                     Some(new_data_stream),
+                    Arc::new(NoopIndexBuildProgress::default()),
                 )
                 .await?
             } else {
