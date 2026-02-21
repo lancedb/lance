@@ -12,12 +12,13 @@ fn fwht_in_place(values: &mut [f32]) {
     let mut half = 1usize;
     while half < values.len() {
         let step = half * 2;
-        for i in (0..values.len()).step_by(step) {
-            for j in i..(i + half) {
-                let x = values[j];
-                let y = values[j + half];
-                values[j] = x + y;
-                values[j + half] = x - y;
+        for block in values.chunks_exact_mut(step) {
+            let (left, right) = block.split_at_mut(half);
+            for (x, y) in left.iter_mut().zip(right.iter_mut()) {
+                let lx = *x;
+                let ry = *y;
+                *x = lx + ry;
+                *y = lx - ry;
             }
         }
         half = step;
@@ -25,29 +26,83 @@ fn fwht_in_place(values: &mut [f32]) {
 }
 
 #[inline]
-fn flip_signs(values: &mut [f32], signs: &[u8]) {
-    debug_assert!(signs.len() * 8 >= values.len());
-    for (idx, value) in values.iter_mut().enumerate() {
-        if (signs[idx / 8] >> (idx % 8)) & 1 == 1 {
-            *value = -*value;
+fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
+    for (byte_idx, &mask) in signs.iter().enumerate() {
+        let start = byte_idx * 8;
+        if start >= values.len() {
+            break;
+        }
+        let end = (start + 8).min(values.len());
+        for (bit_idx, value) in values[start..end].iter_mut().enumerate() {
+            let sign_mask = (((mask >> bit_idx) & 1) as u32) << 31;
+            *value = f32::from_bits(value.to_bits() ^ sign_mask);
         }
     }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let full_chunks = values.len() / 8;
+    let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
+    let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
+
+    for chunk_idx in 0..full_chunks {
+        let mask = signs[chunk_idx] as i32;
+        let mask_bits = _mm256_set1_epi32(mask);
+        let test = _mm256_and_si256(mask_bits, bit_select);
+        let cmp = _mm256_cmpeq_epi32(test, bit_select);
+        let xor_mask = _mm256_and_si256(cmp, sign_flip);
+
+        let ptr = unsafe { values.as_mut_ptr().add(chunk_idx * 8) };
+        let vec = unsafe { _mm256_loadu_ps(ptr) };
+        let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
+        unsafe { _mm256_storeu_ps(ptr, out) };
+    }
+
+    if full_chunks * 8 < values.len() {
+        flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
+    }
+}
+
+#[inline]
+fn flip_signs(values: &mut [f32], signs: &[u8]) {
+    debug_assert!(signs.len() * 8 >= values.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime feature detection.
+            unsafe {
+                flip_signs_avx2(values, signs);
+            }
+            return;
+        }
+    }
+    flip_signs_scalar(values, signs);
 }
 
 #[inline]
 fn kacs_walk(values: &mut [f32]) {
     let half = values.len() / 2;
-    for i in 0..half {
-        let x = values[i];
-        let y = values[i + half];
-        values[i] = x + y;
-        values[i + half] = x - y;
+    let (left, right) = values.split_at_mut(half);
+    for (x, y) in left.iter_mut().zip(right.iter_mut()) {
+        let lx = *x;
+        let ry = *y;
+        *x = lx + ry;
+        *y = lx - ry;
     }
 }
 
 #[inline]
 fn rescale(values: &mut [f32], factor: f32) {
-    values.iter_mut().for_each(|v| *v *= factor);
+    for value in values.iter_mut() {
+        *value *= factor;
+    }
 }
 
 #[inline]
@@ -65,11 +120,14 @@ pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32],
     let dim = output.len();
     let bytes_per_round = sign_bytes_per_round(dim);
     debug_assert_eq!(signs.len(), FAST_ROTATION_ROUNDS * bytes_per_round);
-    output.fill(0.0);
-    output
+    let input_len = input.len().min(dim);
+    output[..input_len]
         .iter_mut()
-        .zip(input.iter())
+        .zip(input[..input_len].iter())
         .for_each(|(dst, src)| *dst = src.as_());
+    if input_len < dim {
+        output[input_len..].fill(0.0);
+    }
 
     if dim == 0 {
         return;

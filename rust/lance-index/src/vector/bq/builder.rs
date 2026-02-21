@@ -11,9 +11,10 @@ use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
-use ndarray::{s, Axis};
+use ndarray::{s, Axis, ShapeBuilder};
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
+use rayon::prelude::*;
 use snafu::location;
 
 use crate::vector::bq::storage::{
@@ -53,6 +54,16 @@ impl QuantizerBuildParams for RabitBuildParams {
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct RabitQuantizer {
     metadata: RabitQuantizationMetadata,
+}
+
+#[inline]
+fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
+    codes.fill(0);
+    for (bit_idx, value) in rotated.iter().enumerate() {
+        if value.is_sign_positive() {
+            codes[bit_idx / u8::BITS as usize] |= 1u8 << (bit_idx % u8::BITS as usize);
+        }
+    }
 }
 
 impl RabitQuantizer {
@@ -111,6 +122,15 @@ impl RabitQuantizer {
     }
 
     #[inline]
+    fn fast_rotation_signs(&self) -> &[u8] {
+        self.metadata
+            .fast_rotation_signs
+            .as_ref()
+            .expect("RabitQ fast rotation signs missing")
+            .as_slice()
+    }
+
+    #[inline]
     fn rotate_mat_flat<T: ArrowFloatType>(&self) -> &[T::Native] {
         let rotate_mat = self.metadata.rotate_mat.as_ref().unwrap();
         rotate_mat
@@ -143,23 +163,25 @@ impl RabitQuantizer {
                 rotate_mat.dot(&vectors).mapv(|v| v.as_())
             }
             RQRotationType::Fast => {
-                let signs = self
-                    .metadata
-                    .fast_rotation_signs
-                    .as_ref()
-                    .expect("RabitQ fast rotation signs missing");
-                let mut rotated = ndarray::Array2::<f32>::zeros((code_dim, vectors.ncols()));
-                let mut scratch = vec![0.0f32; code_dim];
-                for (col_idx, vector) in vectors.axis_iter(Axis(1)).enumerate() {
-                    let input = vector
-                        .as_slice()
-                        .expect("RabitQ input vectors should be contiguous");
-                    apply_fast_rotation(input, &mut scratch, signs);
-                    for (row_idx, value) in scratch.iter().enumerate() {
-                        rotated[[row_idx, col_idx]] = *value;
-                    }
-                }
-                rotated
+                let signs = self.fast_rotation_signs();
+                let ncols = vectors.ncols();
+                let mut rotated_data = vec![0.0f32; code_dim * ncols];
+                rotated_data
+                    .par_chunks_mut(code_dim)
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0.0f32; code_dim],
+                        |scratch, (col_idx, dst)| {
+                            let column = vectors.column(col_idx);
+                            let input = column
+                                .as_slice()
+                                .expect("RabitQ input vectors should be contiguous");
+                            apply_fast_rotation(input, scratch, signs);
+                            dst.copy_from_slice(scratch);
+                        },
+                    );
+
+                ndarray::Array2::from_shape_vec((code_dim, ncols).f(), rotated_data).unwrap()
             }
         }
     }
@@ -174,7 +196,7 @@ impl RabitQuantizer {
         residual_vectors: &FixedSizeListArray,
     ) -> Result<Vec<f32>>
     where
-        T::Native: AsPrimitive<f32>,
+        T::Native: AsPrimitive<f32> + Sync,
     {
         let dim = self.dim();
         if residual_vectors.value_length() as usize != dim {
@@ -188,24 +210,43 @@ impl RabitQuantizer {
             ));
         }
 
-        // convert the vector to a dxN matrix
-        let vec_mat = ndarray::ArrayView2::from_shape(
-            (residual_vectors.len(), dim),
-            residual_vectors
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-        )
-        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vec_mat = vec_mat.t();
-
-        let rotated_vectors = self.rotate_vectors::<T>(vec_mat);
         let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
-        let norm_dists = rotated_vectors.mapv(f32::abs).sum_axis(Axis(0)) / sqrt_dim;
-        debug_assert_eq!(norm_dists.len(), residual_vectors.len());
-        Ok(norm_dists.to_vec())
+        let values = residual_vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+
+        match self.rotation_type() {
+            RQRotationType::Matrix => {
+                // convert the vector to a dxN matrix
+                let vec_mat =
+                    ndarray::ArrayView2::from_shape((residual_vectors.len(), dim), values)
+                        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                let vec_mat = vec_mat.t();
+                let rotated_vectors = self.rotate_vectors::<T>(vec_mat);
+                let norm_dists = rotated_vectors.mapv(f32::abs).sum_axis(Axis(0)) / sqrt_dim;
+                debug_assert_eq!(norm_dists.len(), residual_vectors.len());
+                Ok(norm_dists.to_vec())
+            }
+            RQRotationType::Fast => {
+                let code_dim = self.code_dim();
+                let signs = self.fast_rotation_signs();
+                let mut norm_dists = vec![0.0f32; residual_vectors.len()];
+                norm_dists
+                    .par_iter_mut()
+                    .zip(values.par_chunks_exact(dim))
+                    .for_each_init(
+                        || vec![0.0f32; code_dim],
+                        |scratch, (dst, input)| {
+                            apply_fast_rotation(input, scratch, signs);
+                            *dst = scratch.iter().map(|v| v.abs()).sum::<f32>() / sqrt_dim;
+                        },
+                    );
+                Ok(norm_dists)
+            }
+        }
     }
 
     fn transform<T: ArrowFloatType>(
@@ -213,36 +254,60 @@ impl RabitQuantizer {
         residual_vectors: &FixedSizeListArray,
     ) -> Result<ArrayRef>
     where
-        T::Native: AsPrimitive<f32>,
+        T::Native: AsPrimitive<f32> + Sync,
     {
         // we don't need to normalize the residual vectors,
         // because the sign of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
         let n = residual_vectors.len();
         let dim = self.dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
+        let values = residual_vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+        let code_dim = self.code_dim();
+        let code_bytes = code_dim / u8::BITS as usize;
 
-        let vectors = ndarray::ArrayView2::from_shape(
-            (n, dim),
-            residual_vectors
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-        )
-        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vectors = vectors.t();
-        let rotated_vectors = self.rotate_vectors::<T>(vectors);
+        match self.rotation_type() {
+            RQRotationType::Matrix => {
+                let vectors = ndarray::ArrayView2::from_shape((n, dim), values)
+                    .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                let vectors = vectors.t();
+                let rotated_vectors = self.rotate_vectors::<T>(vectors);
 
-        let quantized_vectors = rotated_vectors.t().mapv(|v| v.is_sign_positive());
-        let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
+                let quantized_vectors = rotated_vectors.t().mapv(|v| v.is_sign_positive());
+                let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
 
-        let codes = UInt8Array::from(bv.into_vec());
-        debug_assert_eq!(codes.len(), n * self.code_dim() / u8::BITS as usize);
-        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            codes,
-            self.code_dim() as i32 / u8::BITS as i32, // num_bits -> num_bytes
-        )?))
+                let codes = UInt8Array::from(bv.into_vec());
+                debug_assert_eq!(codes.len(), n * code_bytes);
+                Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+                    codes,
+                    code_bytes as i32, // num_bits -> num_bytes
+                )?))
+            }
+            RQRotationType::Fast => {
+                let signs = self.fast_rotation_signs();
+                let mut encoded_codes = vec![0u8; n * code_bytes];
+                encoded_codes
+                    .par_chunks_mut(code_bytes)
+                    .zip(values.par_chunks_exact(dim))
+                    .for_each_init(
+                        || vec![0.0f32; code_dim],
+                        |scratch, (code_dst, input)| {
+                            apply_fast_rotation(input, scratch, signs);
+                            pack_sign_bits(code_dst, scratch);
+                        },
+                    );
+                let codes = UInt8Array::from(encoded_codes);
+                debug_assert_eq!(codes.len(), n * code_bytes);
+                Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+                    codes,
+                    code_bytes as i32,
+                )?))
+            }
+        }
     }
 }
 
