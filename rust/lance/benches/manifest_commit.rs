@@ -5,8 +5,14 @@
 //!
 //! This benchmark tests how performance degrades as the number of small fragments
 //! grows. Each fragment contains only 10 rows, and we measure both:
-//! - Commit time (write + manifest update)
-//! - Dataset load time (opening the manifest)
+//! - Commit time (manifest write only, excludes fragment data writing)
+//! - Load time (manifest read from storage, no caching)
+//!
+//! Key optimizations:
+//! - Uses shared session for commits to avoid re-reading old manifests
+//! - Disables auto-cleanup to avoid background cleanup overhead
+//! - Separates fragment writing from commit measurement
+//! - Uses fresh session (no cache) for load measurement to force actual storage read
 //!
 //! ## Running against S3
 //!
@@ -36,13 +42,17 @@
 //! - `DATASET_PREFIX`: Base URI for datasets (optional, e.g. s3://bucket/prefix or /tmp/bench). If not set, uses a temporary directory.
 //! - `NUM_ITERATIONS`: Number of small fragment writes to perform (default: 100).
 //! - `ROWS_PER_FRAGMENT`: Number of rows per fragment (default: 10).
+//! - `DIRECT_CHECKOUT`: When "true", use checkout_version which bypasses listing. When "false" (default), use load() which includes listing.
+//! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes. When "false" (default), keep the dataset for inspection.
 
 #![allow(clippy::print_stdout)]
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
+use lance::session::Session;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -63,6 +73,18 @@ fn get_num_iterations() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_NUM_ITERATIONS)
+}
+
+fn get_direct_checkout() -> bool {
+    std::env::var("DIRECT_CHECKOUT")
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn get_delete_dataset() -> bool {
+    std::env::var("DELETE_DATASET")
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false)
 }
 
 fn get_dataset_prefix() -> String {
@@ -87,7 +109,11 @@ fn get_storage_label(prefix: &str) -> &'static str {
     }
 }
 
-async fn create_initial_dataset(uri: &str, rows_per_fragment: usize) -> Dataset {
+async fn create_initial_dataset(
+    uri: &str,
+    rows_per_fragment: usize,
+    session: Arc<Session>,
+) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
@@ -98,7 +124,13 @@ async fn create_initial_dataset(uri: &str, rows_per_fragment: usize) -> Dataset 
 
     std::fs::remove_dir_all(uri).ok();
 
-    Dataset::write(reader, uri, None)
+    let params = WriteParams {
+        session: Some(session),
+        skip_auto_cleanup: true,
+        ..Default::default()
+    };
+
+    Dataset::write(reader, uri, Some(params))
         .await
         .expect("failed to create initial dataset")
 }
@@ -132,6 +164,8 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let dataset_prefix = get_dataset_prefix();
     let num_iterations = get_num_iterations();
     let rows_per_fragment = get_rows_per_fragment();
+    let direct_checkout = get_direct_checkout();
+    let delete_dataset = get_delete_dataset();
     let storage_label = get_storage_label(&dataset_prefix);
 
     let short_id = &Uuid::new_v4().to_string()[..8];
@@ -145,47 +179,107 @@ fn bench_manifest_commit(c: &mut Criterion) {
     println!("Storage: {} ({})", uri, storage_label);
     println!("Rows per fragment: {}", rows_per_fragment);
     println!("Number of iterations: {}", num_iterations);
-    println!("Total fragments (including initial): {}", num_iterations + 1);
+    println!(
+        "Total fragments (including initial): {}",
+        num_iterations + 1
+    );
+    println!(
+        "Direct checkout: {} ({})",
+        direct_checkout,
+        if direct_checkout {
+            "checkout_version - bypasses listing"
+        } else {
+            "load() - includes listing"
+        }
+    );
+    println!("Delete dataset: {}", delete_dataset);
     println!();
 
-    runtime.block_on(create_initial_dataset(&uri, rows_per_fragment));
+    // Create a shared session to avoid re-opening old manifests
+    let session = Arc::new(Session::default());
 
-    let mut write_latencies = Vec::with_capacity(num_iterations);
+    let initial_dataset = runtime.block_on(create_initial_dataset(
+        &uri,
+        rows_per_fragment,
+        session.clone(),
+    ));
+
+    // Keep a mutable dataset reference that we update after each commit
+    let mut current_dataset = Arc::new(initial_dataset);
+
+    let mut commit_latencies = Vec::with_capacity(num_iterations);
     let mut load_latencies = Vec::with_capacity(num_iterations);
 
-    println!("Running write and load benchmarks...");
-    println!("fragments,write_ms,load_ms");
+    println!("Running commit and load benchmarks...");
+    println!("fragments,commit_ms,load_ms");
 
     for i in 1..=num_iterations {
         let num_fragments = i + 1;
 
-        let write_time = {
-            let uri_ref = uri.as_str();
+        let (commit_time, new_dataset) = {
+            let dataset = current_dataset.clone();
+            let session_clone = session.clone();
             runtime.block_on(async move {
-                let dataset = Dataset::open(uri_ref).await.expect("failed to open dataset");
                 let schema: Arc<ArrowSchema> = Arc::new((&dataset.schema().clone()).into());
                 let start_id = dataset.count_rows(None).await.unwrap() as usize;
                 let batch = create_batch(schema.clone(), start_id, rows_per_fragment);
-                let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
 
                 let write_params = WriteParams {
                     mode: WriteMode::Append,
+                    session: Some(session_clone.clone()),
+                    skip_auto_cleanup: true,
                     ..Default::default()
                 };
 
-                let start = Instant::now();
-                Dataset::write(reader, uri_ref, Some(write_params))
+                // Write fragments without committing (not measured)
+                let transaction = InsertBuilder::new(dataset.clone())
+                    .with_params(&write_params)
+                    .execute_uncommitted(vec![batch])
                     .await
-                    .expect("failed to append");
-                start.elapsed()
+                    .expect("failed to write fragment");
+
+                // Measure only the commit time
+                let start = Instant::now();
+                let new_ds = CommitBuilder::new(dataset)
+                    .with_session(session_clone)
+                    .with_skip_auto_cleanup(true)
+                    .execute(transaction)
+                    .await
+                    .expect("failed to commit");
+                (start.elapsed(), Arc::new(new_ds))
             })
         };
 
-        let load_time = {
+        // Measure load time
+        let load_time = if direct_checkout {
+            // Direct checkout: use checkout_version which bypasses listing
+            let dataset = current_dataset.clone();
+            let new_version = (i + 1) as u64;
+            runtime.block_on(async move {
+                let start = Instant::now();
+                let checked_out = dataset
+                    .checkout_version(new_version)
+                    .await
+                    .expect("failed to checkout");
+                let elapsed = start.elapsed();
+
+                assert_eq!(
+                    checked_out.manifest().fragments.len(),
+                    num_fragments,
+                    "Expected {} fragments",
+                    num_fragments
+                );
+                elapsed
+            })
+        } else {
+            // Load with listing: use load() without session to force actual storage read
             let uri_ref = uri.as_str();
             runtime.block_on(async move {
                 let start = Instant::now();
-                let dataset = Dataset::open(uri_ref).await.expect("failed to open");
+                let dataset = DatasetBuilder::from_uri(uri_ref)
+                    .load()
+                    .await
+                    .expect("failed to load");
                 let elapsed = start.elapsed();
 
                 assert_eq!(
@@ -198,13 +292,16 @@ fn bench_manifest_commit(c: &mut Criterion) {
             })
         };
 
-        write_latencies.push(write_time);
+        // Update current_dataset for next iteration
+        current_dataset = new_dataset;
+
+        commit_latencies.push(commit_time);
         load_latencies.push(load_time);
 
         println!(
             "{},{:.2},{:.2}",
             num_fragments,
-            write_time.as_secs_f64() * 1000.0,
+            commit_time.as_secs_f64() * 1000.0,
             load_time.as_secs_f64() * 1000.0
         );
     }
@@ -212,72 +309,126 @@ fn bench_manifest_commit(c: &mut Criterion) {
     println!();
     println!("=== Summary Statistics ===");
 
-    let avg_write: f64 = write_latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>()
-        / write_latencies.len() as f64;
-    let avg_load: f64 = load_latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>()
-        / load_latencies.len() as f64;
+    let avg_commit: f64 = commit_latencies
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / commit_latencies.len() as f64;
+    let avg_load: f64 =
+        load_latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / load_latencies.len() as f64;
 
-    let min_write = write_latencies.iter().min().unwrap();
-    let max_write = write_latencies.iter().max().unwrap();
+    let min_commit = commit_latencies.iter().min().unwrap();
+    let max_commit = commit_latencies.iter().max().unwrap();
     let min_load = load_latencies.iter().min().unwrap();
     let max_load = load_latencies.iter().max().unwrap();
 
-    println!("Write latency: avg={:.2}ms, min={:.2}ms, max={:.2}ms",
-        avg_write * 1000.0, min_write.as_secs_f64() * 1000.0, max_write.as_secs_f64() * 1000.0);
-    println!("Load latency:  avg={:.2}ms, min={:.2}ms, max={:.2}ms",
-        avg_load * 1000.0, min_load.as_secs_f64() * 1000.0, max_load.as_secs_f64() * 1000.0);
+    println!(
+        "Commit latency: avg={:.2}ms, min={:.2}ms, max={:.2}ms",
+        avg_commit * 1000.0,
+        min_commit.as_secs_f64() * 1000.0,
+        max_commit.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Load latency:   avg={:.2}ms, min={:.2}ms, max={:.2}ms",
+        avg_load * 1000.0,
+        min_load.as_secs_f64() * 1000.0,
+        max_load.as_secs_f64() * 1000.0
+    );
 
     let fragment_counts: Vec<f64> = (2..=(num_iterations + 1)).map(|x| x as f64).collect();
-    let write_ms: Vec<f64> = write_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-    let load_ms: Vec<f64> = load_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    let commit_ms: Vec<f64> = commit_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    let load_ms: Vec<f64> = load_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
 
-    let (write_slope, write_intercept) = linear_regression(&fragment_counts, &write_ms);
+    let (commit_slope, commit_intercept) = linear_regression(&fragment_counts, &commit_ms);
     let (load_slope, load_intercept) = linear_regression(&fragment_counts, &load_ms);
 
     println!();
     println!("=== Linear Regression Analysis ===");
-    println!("Write latency = {:.4}ms + {:.4}ms * fragments", write_intercept, write_slope);
-    println!("Load latency  = {:.4}ms + {:.4}ms * fragments", load_intercept, load_slope);
+    println!(
+        "Commit latency = {:.4}ms + {:.4}ms * fragments",
+        commit_intercept, commit_slope
+    );
+    println!(
+        "Load latency   = {:.4}ms + {:.4}ms * fragments",
+        load_intercept, load_slope
+    );
     println!();
     println!("Per-fragment overhead:");
-    println!("  Write: {:.4}ms per additional fragment", write_slope);
-    println!("  Load:  {:.4}ms per additional fragment", load_slope);
+    println!("  Commit: {:.4}ms per additional fragment", commit_slope);
+    println!("  Load:   {:.4}ms per additional fragment", load_slope);
 
-    let first_10_avg_write = write_latencies.iter().take(10).map(|d| d.as_secs_f64()).sum::<f64>() / 10.0;
-    let last_10_avg_write = write_latencies.iter().rev().take(10).map(|d| d.as_secs_f64()).sum::<f64>() / 10.0;
-    let first_10_avg_load = load_latencies.iter().take(10).map(|d| d.as_secs_f64()).sum::<f64>() / 10.0;
-    let last_10_avg_load = load_latencies.iter().rev().take(10).map(|d| d.as_secs_f64()).sum::<f64>() / 10.0;
+    let first_10_avg_commit = commit_latencies
+        .iter()
+        .take(10)
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / 10.0;
+    let last_10_avg_commit = commit_latencies
+        .iter()
+        .rev()
+        .take(10)
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / 10.0;
+    let first_10_avg_load = load_latencies
+        .iter()
+        .take(10)
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / 10.0;
+    let last_10_avg_load = load_latencies
+        .iter()
+        .rev()
+        .take(10)
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / 10.0;
 
     println!();
-    println!("First 10 iterations avg: write={:.2}ms, load={:.2}ms",
-        first_10_avg_write * 1000.0, first_10_avg_load * 1000.0);
-    println!("Last 10 iterations avg:  write={:.2}ms, load={:.2}ms",
-        last_10_avg_write * 1000.0, last_10_avg_load * 1000.0);
-    println!("Degradation ratio: write={:.2}x, load={:.2}x",
-        last_10_avg_write / first_10_avg_write,
-        last_10_avg_load / first_10_avg_load);
+    println!(
+        "First 10 iterations avg: commit={:.2}ms, load={:.2}ms",
+        first_10_avg_commit * 1000.0,
+        first_10_avg_load * 1000.0
+    );
+    println!(
+        "Last 10 iterations avg:  commit={:.2}ms, load={:.2}ms",
+        last_10_avg_commit * 1000.0,
+        last_10_avg_load * 1000.0
+    );
+    println!(
+        "Degradation ratio: commit={:.2}x, load={:.2}x",
+        last_10_avg_commit / first_10_avg_commit,
+        last_10_avg_load / first_10_avg_load
+    );
 
     let mut group = c.benchmark_group("manifest_commit");
 
-    group.bench_function("avg_write_latency", |b| {
-        b.iter(|| std::time::Duration::from_secs_f64(avg_write))
+    group.bench_function("avg_commit_latency", |b| {
+        b.iter(|| std::time::Duration::from_secs_f64(avg_commit))
     });
 
     group.bench_function("avg_load_latency", |b| {
         b.iter(|| std::time::Duration::from_secs_f64(avg_load))
     });
 
-    group.bench_function("write_slope_per_fragment", |b| {
-        b.iter(|| write_slope)
-    });
+    group.bench_function("commit_slope_per_fragment", |b| b.iter(|| commit_slope));
 
-    group.bench_function("load_slope_per_fragment", |b| {
-        b.iter(|| load_slope)
-    });
+    group.bench_function("load_slope_per_fragment", |b| b.iter(|| load_slope));
 
     group.finish();
 
-    std::fs::remove_dir_all(&uri).ok();
+    if delete_dataset {
+        std::fs::remove_dir_all(&uri).ok();
+        println!("Dataset deleted: {}", uri);
+    } else {
+        println!("Dataset preserved: {}", uri);
+    }
 }
 
 criterion_group!(benches, bench_manifest_commit);
