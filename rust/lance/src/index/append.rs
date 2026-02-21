@@ -161,7 +161,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     true,
                     None,
                     Some(new_data_stream),
-                    Arc::new(NoopIndexBuildProgress::default()),
+                    Arc::new(NoopIndexBuildProgress),
                 )
                 .await?
             } else {
