@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
-use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -3330,6 +3330,20 @@ fn prepare_vector_index_params(
             pq_params.num_bits = num_bits as usize;
             rq_params.num_bits = num_bits;
         };
+
+        let rq_rotation_type = if let Some(rotation_type) = kwargs.get_item("rq_rotation_type")? {
+            Some(rotation_type.extract::<String>()?)
+        } else if let Some(rotation_type) = kwargs.get_item("rabitq_rotation_type")? {
+            Some(rotation_type.extract::<String>()?)
+        } else {
+            None
+        };
+        if let Some(rotation_type) = rq_rotation_type {
+            rq_params.rotation_type =
+                rotation_type
+                    .parse::<RQRotationType>()
+                    .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        }
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
             pq_params.num_sub_vectors = n.extract()?
