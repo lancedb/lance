@@ -604,6 +604,158 @@ async fn read_version_hint_and_probe(
     })
 }
 
+/// Probe upward from hint_version to find the true latest version.
+///
+/// Returns (true_latest_version, naming_scheme, Vec of (version, ObjectMeta) for probed versions).
+/// The Vec contains metadata for all versions from hint_version to true_latest.
+async fn probe_versions_upward(
+    object_store: &ObjectStore,
+    base: &Path,
+    hint_version: u64,
+) -> Option<(
+    u64,
+    ManifestNamingScheme,
+    Vec<(u64, object_store::ObjectMeta)>,
+)> {
+    // Try V2 scheme first (more likely for newer datasets)
+    let mut scheme = ManifestNamingScheme::V2;
+
+    // Verify the hinted version exists
+    let manifest_path = scheme.manifest_path(base, hint_version);
+    let hint_meta = match object_store.inner.head(&manifest_path).await {
+        Ok(meta) => Some(meta),
+        Err(ObjectStoreError::NotFound { .. }) => {
+            // Try V1 scheme
+            scheme = ManifestNamingScheme::V1;
+            let manifest_path = scheme.manifest_path(base, hint_version);
+            object_store.inner.head(&manifest_path).await.ok()
+        }
+        Err(_) => None,
+    }?;
+
+    let mut probed_versions = vec![(hint_version, hint_meta)];
+    let mut current_version = hint_version;
+
+    // Probe for higher versions sequentially
+    loop {
+        let next_version = current_version + 1;
+        let next_path = scheme.manifest_path(base, next_version);
+        match object_store.inner.head(&next_path).await {
+            Ok(meta) => {
+                probed_versions.push((next_version, meta));
+                current_version = next_version;
+            }
+            Err(ObjectStoreError::NotFound { .. }) => break,
+            Err(_) => break,
+        }
+    }
+
+    Some((current_version, scheme, probed_versions))
+}
+
+/// List manifest locations since a given version using version hint optimization.
+///
+/// This is optimized for non-lexically ordered stores (e.g., S3 Express).
+/// Instead of listing all manifests, it:
+/// 1. Reads the version hint to get approximate latest
+/// 2. Probes upward from hint to find true latest
+/// 3. Parallel HEADs for versions between since_version and hint
+/// 4. Returns all found manifests in descending order
+async fn list_manifests_since_version_with_hint(
+    object_store: &ObjectStore,
+    base: &Path,
+    since_version: u64,
+) -> Option<Vec<ManifestLocation>> {
+    // Read version hint
+    let hint_version = read_version_from_hint(object_store, base).await?;
+
+    // If hint is not newer than since_version, no new manifests
+    if hint_version <= since_version {
+        // But there might be newer versions, so probe upward from since_version
+        let (_true_latest, scheme, probed) =
+            probe_versions_upward(object_store, base, since_version + 1).await?;
+
+        // Filter to only versions > since_version and convert to ManifestLocations
+        let locations: Vec<ManifestLocation> = probed
+            .into_iter()
+            .filter(|(v, _)| *v > since_version)
+            .map(|(version, meta)| ManifestLocation {
+                version,
+                path: scheme.manifest_path(base, version),
+                size: Some(meta.size),
+                naming_scheme: scheme,
+                e_tag: meta.e_tag,
+            })
+            .collect();
+
+        // Sort descending
+        let mut locations = locations;
+        locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+        return Some(locations);
+    }
+
+    // Probe upward from hint to find true latest and collect metadata
+    let (_true_latest, scheme, probed_above_hint) =
+        probe_versions_upward(object_store, base, hint_version).await?;
+
+    // Now parallel HEAD for versions between since_version+1 and hint_version-1
+    // (we already have hint_version and above from probing)
+    let versions_to_head: Vec<u64> = ((since_version + 1)..hint_version).collect();
+
+    let head_futures: Vec<_> = versions_to_head
+        .iter()
+        .map(|&version| {
+            let path = scheme.manifest_path(base, version);
+            let store = &object_store.inner;
+            async move {
+                match store.head(&path).await {
+                    Ok(meta) => Some((version, meta)),
+                    Err(_) => None,
+                }
+            }
+        })
+        .collect();
+
+    // Execute all HEADs in parallel
+    let head_results: Vec<Option<(u64, object_store::ObjectMeta)>> =
+        futures::future::join_all(head_futures).await;
+
+    // Combine results: probed versions + parallel HEAD results
+    let mut all_locations: Vec<ManifestLocation> = Vec::new();
+
+    // Add probed versions (hint and above)
+    for (version, meta) in probed_above_hint {
+        if version > since_version {
+            all_locations.push(ManifestLocation {
+                version,
+                path: scheme.manifest_path(base, version),
+                size: Some(meta.size),
+                naming_scheme: scheme,
+                e_tag: meta.e_tag,
+            });
+        }
+    }
+
+    // Add parallel HEAD results
+    for result in head_results.into_iter().flatten() {
+        let (version, meta) = result;
+        if version > since_version {
+            all_locations.push(ManifestLocation {
+                version,
+                path: scheme.manifest_path(base, version),
+                size: Some(meta.size),
+                naming_scheme: scheme,
+                e_tag: meta.e_tag,
+            });
+        }
+    }
+
+    // Sort descending by version
+    all_locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+
+    Some(all_locations)
+}
+
 /// Resolve the latest version from listing.
 ///
 /// This is the traditional approach that lists all manifests and finds the highest version.
@@ -820,6 +972,66 @@ pub trait CommitHandler: Debug + Send + Sync {
                 .try_flatten()
                 .boxed()
         }
+    }
+
+    /// List manifest locations since a given version, in descending order.
+    ///
+    /// This is optimized for finding new transactions during commit.
+    /// For non-lexically ordered stores (e.g., S3 Express), it uses the version
+    /// hint to avoid O(n) full listing.
+    ///
+    /// Returns manifests with version > since_version, sorted descending.
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        // For lexically ordered stores, use the standard approach with early termination
+        if object_store.list_is_lexically_ordered {
+            return self
+                .list_manifest_locations(base_path, object_store, true)
+                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+                .boxed();
+        }
+
+        // For non-lexically ordered stores, try version hint optimization if enabled
+        if !is_version_hint_enabled() {
+            // Fall back to full listing with filter
+            return self
+                .list_manifest_locations(base_path, object_store, true)
+                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+                .boxed();
+        }
+
+        // Use version hint optimization
+        let base_path = base_path.clone();
+        let object_store_clone = object_store.clone();
+
+        futures::stream::once(async move {
+            let locations: Vec<ManifestLocation> = match list_manifests_since_version_with_hint(
+                &object_store_clone,
+                &base_path,
+                since_version,
+            )
+            .await
+            {
+                Some(locs) => locs,
+                None => {
+                    // Fall back to full listing if hint-based approach fails
+                    let underlying_stream = list_manifests(&base_path, &object_store_clone.inner);
+                    let mut locs = underlying_stream.try_collect::<Vec<_>>().await?;
+                    locs.retain(|loc| loc.version > since_version);
+                    locs.sort_by_key(|m| std::cmp::Reverse(m.version));
+                    locs
+                }
+            };
+            Ok::<_, Error>(futures::stream::iter(
+                locations.into_iter().map(Ok::<_, Error>),
+            ))
+        })
+        .try_flatten()
+        .boxed()
     }
 
     /// Commit a manifest.

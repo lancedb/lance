@@ -568,7 +568,13 @@ mod tests {
             // Should see 2 IOPs:
             // 1. Write the transaction files
             // 2. Write (conditional put) the manifest
-            assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest, i = {}", i);
+            assert_io_eq!(
+                io_stats,
+                write_iops,
+                3,
+                "write txn + manifest + version_hint, i = {}",
+                i
+            );
         }
 
         // Commit transaction with URI and session
@@ -582,8 +588,19 @@ mod tests {
         // However, the dataset needs to be loaded and the read version checked out,
         // so an additional 4 IOPs are needed.
         let io_stats = dataset.object_store().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
-        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
+        // read_iops increased due to version hint probing (HEAD for hint + probing versions)
+        assert_io_eq!(
+            io_stats,
+            read_iops,
+            8,
+            "load dataset + check version + version hint probing"
+        );
+        assert_io_eq!(
+            io_stats,
+            write_iops,
+            3,
+            "write txn + manifest + version_hint"
+        );
 
         // Commit transaction with URI and new session. Re-use the store
         // registry so we see the same store.
@@ -598,7 +615,12 @@ mod tests {
 
         let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
-        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
+        assert_io_eq!(
+            io_stats,
+            write_iops,
+            3,
+            "write txn + manifest + version_hint"
+        );
     }
 
     #[tokio::test]
@@ -636,13 +658,14 @@ mod tests {
         // Assert io requests
         let io_stats = new_ds.object_store().io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
-        // would mean two wasted write requests (txn + manifest) if there was
+        // would mean wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
         assert_io_eq!(io_stats, read_iops, 1);
-        assert_io_eq!(io_stats, write_iops, 2);
+        // write txn + manifest + version_hint
+        assert_io_eq!(io_stats, write_iops, 3);
         // We can't write them in parallel. The transaction file must exist before
-        // we can write the manifest.
-        assert_io_eq!(io_stats, num_stages, 3);
+        // we can write the manifest. Version hint is async/fire-and-forget (spawned task).
+        assert_io_eq!(io_stats, num_stages, 4);
     }
 
     #[tokio::test]
@@ -711,7 +734,8 @@ mod tests {
         // of those. We should be able to read in 5 hops.
         if use_cache {
             assert_io_eq!(io_stats, read_iops, 1); // Just list versions
-            assert_io_eq!(io_stats, num_stages, 3);
+                                                   // num_stages increased by 1 due to async version hint write (fire-and-forget spawned task)
+            assert_io_eq!(io_stats, num_stages, 4);
         } else {
             // We need to read the other manifests and transactions.
 
@@ -722,7 +746,7 @@ mod tests {
             // and txs" may appear as 1 hop instead of 2.
             assert_io_lt!(io_stats, num_stages, 6);
         }
-        assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
+        assert_io_eq!(io_stats, write_iops, 3); // txn + manifest + version_hint
     }
 
     #[tokio::test]

@@ -278,6 +278,20 @@ mod test {
                         .to_string_lossy()
                         .contains(".manifest#")
                 })
+                // Version hint files are expected
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with("latest_version_hint")
+                })
+                // Temporary files from concurrent file system operations
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with(".tmp")
+                })
                 .collect::<Vec<_>>();
             assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
         }
@@ -382,6 +396,13 @@ mod test {
                     .as_os_str()
                     .to_string_lossy()
                     .ends_with(".manifest")
+            })
+            // Version hint files are expected
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with("latest_version_hint")
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
