@@ -22,13 +22,15 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
-    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
-    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
-    DropTableResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -1185,6 +1187,36 @@ impl LanceNamespace for RestNamespace {
             query.push(("limit", limit_str.as_str()));
         }
         self.get_json(&path, &query, "list_table_versions", &id)
+            .await
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> Result<CreateTableVersionResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/version/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_version", &id)
+            .await
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let version_str;
+        let path = if let Some(version) = request.version {
+            version_str = version.to_string();
+            format!("/v1/table/{}/version/{}", encoded_id, version_str)
+        } else {
+            format!("/v1/table/{}/version/latest", encoded_id)
+        };
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.get_json(&path, &query, "describe_table_version", &id)
             .await
     }
 

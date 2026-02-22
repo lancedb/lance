@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{cache::LanceCache, Result};
 
+use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -114,6 +115,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex>;
 
     /// A short name for the index

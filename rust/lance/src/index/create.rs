@@ -251,6 +251,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     preprocesssed_data,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -272,6 +273,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -296,6 +298,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }

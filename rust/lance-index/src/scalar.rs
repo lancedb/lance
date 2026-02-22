@@ -22,6 +22,7 @@ use futures::{future::BoxFuture, FutureExt, Stream};
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 
@@ -888,10 +889,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    ///
+    /// If `valid_old_fragments` is provided, old index data for fragments not in the bitmap
+    /// will be filtered out during the merge.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index

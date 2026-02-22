@@ -46,7 +46,7 @@ The key features of Lance include:
 
 * **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
 
-* **Zero-copy versioning:** ACID transactions, time travel, and automatic versioning without needing extra infrastructure.
+* **Zero-copy versioning:** Automatic versioning with ACID transactions, time travel, tags, and branches—no extra infrastructure needed.
 
 * **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
 

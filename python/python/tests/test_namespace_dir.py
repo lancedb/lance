@@ -10,8 +10,10 @@ namespace implementation for organizing Lance tables and nested namespaces.
 These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
 """
 
+import sys
 import tempfile
 import uuid
+from threading import Lock
 
 import lance
 import lance.namespace
@@ -21,13 +23,19 @@ from lance_namespace import (
     CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
+    CreateTableVersionRequest,
+    CreateTableVersionResponse,
     DeregisterTableRequest,
     DescribeNamespaceRequest,
     DescribeTableRequest,
+    DescribeTableVersionRequest,
+    DescribeTableVersionResponse,
     DropNamespaceRequest,
     DropTableRequest,
     ListNamespacesRequest,
     ListTablesRequest,
+    ListTableVersionsRequest,
+    ListTableVersionsResponse,
     NamespaceExistsRequest,
     RegisterTableRequest,
     TableExistsRequest,
@@ -720,3 +728,169 @@ class TestLanceNamespaceConnect:
         # This should work without errors
         ns = connect("dir", properties)
         assert isinstance(ns, lance.namespace.DirectoryNamespace)
+
+
+class TableVersionTrackingNamespace(lance.namespace.DirectoryNamespace):
+    """Namespace wrapper that tracks table version API calls.
+
+    Similar to the Rust TrackingNamespace and Java TableVersionTrackingNamespace,
+    this extends DirectoryNamespace with table_version_tracking_enabled=true and
+    counts create_table_version and describe_table_version calls.
+
+    This class implements the JSON bridge methods that PyLanceNamespace calls,
+    allowing API call tracking to work even when the calls go through Rust.
+
+    Unlike a wrapper approach, this extends DirectoryNamespace directly so that
+    Rust can detect it as a DirectoryNamespace subclass and use the native handle.
+    """
+
+    def __init__(self, root: str):
+        dir_props = {
+            "root": root,
+            "table_version_tracking_enabled": "true",
+            "manifest_enabled": "true",
+        }
+        super().__init__(**dir_props)
+        self.create_table_version_count = 0
+        self.describe_table_version_count = 0
+        self.list_table_versions_count = 0
+        self._lock = Lock()
+
+    def namespace_id(self) -> str:
+        return f"TableVersionTrackingNamespace {{ inner: {super().namespace_id()} }}"
+
+    def create_table_version(
+        self, request: CreateTableVersionRequest
+    ) -> CreateTableVersionResponse:
+        with self._lock:
+            self.create_table_version_count += 1
+        return super().create_table_version(request)
+
+    def describe_table_version(
+        self, request: DescribeTableVersionRequest
+    ) -> DescribeTableVersionResponse:
+        with self._lock:
+            self.describe_table_version_count += 1
+        return super().describe_table_version(request)
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        with self._lock:
+            self.list_table_versions_count += 1
+        return super().list_table_versions(request)
+
+    # JSON bridge methods for Rust PyLanceNamespace callbacks
+    # These call the parent's _inner (PyDirectoryNamespace) directly with dict API
+    def describe_table_version_json(self, request_json: str) -> str:
+        """JSON bridge that increments counter before delegating."""
+        import json
+
+        with self._lock:
+            self.describe_table_version_count += 1
+        request_dict = json.loads(request_json)
+        response_dict = self._inner.describe_table_version(request_dict)
+        return json.dumps(response_dict)
+
+    def create_table_version_json(self, request_json: str) -> str:
+        """JSON bridge that increments counter before delegating."""
+        import json
+
+        with self._lock:
+            self.create_table_version_count += 1
+        request_dict = json.loads(request_json)
+        response_dict = self._inner.create_table_version(request_dict)
+        return json.dumps(response_dict)
+
+    def list_table_versions_json(self, request_json: str) -> str:
+        """JSON bridge that increments counter before delegating."""
+        import json
+
+        with self._lock:
+            self.list_table_versions_count += 1
+        request_dict = json.loads(request_json)
+        response_dict = self._inner.list_table_versions(request_dict)
+        return json.dumps(response_dict)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="External manifest store has known issues on Windows",
+)
+def test_external_manifest_store_invokes_namespace_apis():
+    """Test that namespace APIs are invoked correctly for managed versioning.
+
+    This test mirrors:
+    - Rust: test_external_manifest_store_invokes_namespace_apis
+    - Java: testExternalManifestStoreInvokesNamespaceApis
+
+    It verifies:
+    1. list_table_versions is called when opening dataset (latest version)
+    2. create_table_version is called exactly once during append
+    3. describe_table_version is called when opening specific version
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        namespace = TableVersionTrackingNamespace(root=tmpdir)
+
+        # Create parent namespace first (like Rust/Java tests)
+        namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+
+        table_id = ["workspace", "test_table"]
+
+        # Create initial table
+        table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+        ds = lance.write_dataset(
+            table1, namespace=namespace, table_id=table_id, mode="create"
+        )
+        assert ds.count_rows() == 2
+        assert len(ds.versions()) == 1
+
+        # Verify describe_table returns managed_versioning=True
+        describe_resp = namespace.describe_table(DescribeTableRequest(id=table_id))
+        assert describe_resp.managed_versioning is True, (
+            f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
+        )
+
+        # Open dataset through namespace - should call list_table_versions for latest
+        initial_list_count = namespace.list_table_versions_count
+        ds_from_namespace = lance.dataset(namespace=namespace, table_id=table_id)
+        assert ds_from_namespace.count_rows() == 2
+        assert ds_from_namespace.version == 1
+        assert namespace.list_table_versions_count == initial_list_count + 1, (
+            "list_table_versions should be called once when opening latest version"
+        )
+
+        # Verify create_table_version was called once during CREATE
+        assert namespace.create_table_version_count == 1, (
+            "create_table_version should have been called once during CREATE"
+        )
+
+        # Append data - should call create_table_version again
+        table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
+        ds = lance.write_dataset(
+            table2, namespace=namespace, table_id=table_id, mode="append"
+        )
+        assert ds.count_rows() == 4
+        assert len(ds.versions()) == 2
+
+        assert namespace.create_table_version_count == 2, (
+            "create_table_version should be called twice (CREATE + APPEND)"
+        )
+
+        # Open latest version - should call list_table_versions
+        list_count_before_latest = namespace.list_table_versions_count
+        latest_ds = lance.dataset(namespace=namespace, table_id=table_id)
+        assert latest_ds.count_rows() == 4
+        assert latest_ds.version == 2
+        assert namespace.list_table_versions_count == list_count_before_latest + 1, (
+            "list_table_versions should be called once when opening latest version"
+        )
+
+        # Open specific version (v1) - should call describe_table_version
+        describe_count_before_v1 = namespace.describe_table_version_count
+        v1_ds = lance.dataset(namespace=namespace, table_id=table_id, version=1)
+        assert v1_ds.count_rows() == 2
+        assert v1_ds.version == 1
+        assert namespace.describe_table_version_count == describe_count_before_v1 + 1, (
+            "describe_table_version should be called once when opening version 1"
+        )
