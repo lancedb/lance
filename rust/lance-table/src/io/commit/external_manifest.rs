@@ -498,8 +498,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         match result {
             Ok(location) => {
-                // Write version hint (optimistic, failures are ignored)
-                write_version_hint(object_store, base_path, manifest.version).await;
+                // Write version hint (fire-and-forget, spawned as background task)
+                write_version_hint(object_store, base_path, manifest.version);
                 Ok(location)
             }
             Err(_) => {

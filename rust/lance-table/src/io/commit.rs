@@ -70,15 +70,44 @@ use {
 pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
-/// File name for the version hint file.
+/// File name for the version hint file (file-size encoding).
 /// The file size in bytes indicates the latest version number.
 /// This enables O(1) latest version lookup via HEAD request on object stores
 /// where listing is not lexicographically ordered (e.g., S3 Express).
 const VERSION_HINT_FILE: &str = "latest_version_hint.bin";
 
+/// File name for the JSON-based version hint file.
+const VERSION_HINT_JSON_FILE: &str = "latest_version_hint.json";
+
 /// Environment variable to enable/disable version hint optimization.
 /// Set to "0" or "false" to disable, any other value (or unset) to enable.
 const VERSION_HINT_ENV_VAR: &str = "LANCE_USE_VERSION_HINT";
+
+/// Environment variable to control version hint write mode.
+/// Set to "sync" to wait for the write to complete (adds latency but guarantees write).
+/// Set to "async" (default) to spawn a background task and return immediately.
+const VERSION_HINT_WRITE_MODE_ENV_VAR: &str = "LANCE_VERSION_HINT_WRITE_MODE";
+
+/// Environment variable to control version hint encoding format.
+/// Set to "json" to use JSON encoding (writes version number as JSON).
+/// Set to "file_size" (default) to use file-size encoding (file size = version number).
+const VERSION_HINT_FORMAT_ENV_VAR: &str = "LANCE_VERSION_HINT_FORMAT";
+
+/// Check if version hint writes should be synchronous (blocking).
+fn is_version_hint_sync_write() -> bool {
+    match std::env::var(VERSION_HINT_WRITE_MODE_ENV_VAR) {
+        Ok(val) => val.to_lowercase() == "sync",
+        Err(_) => false, // Default to async (fire-and-forget)
+    }
+}
+
+/// Check if version hint should use JSON format.
+fn is_version_hint_json_format() -> bool {
+    match std::env::var(VERSION_HINT_FORMAT_ENV_VAR) {
+        Ok(val) => val.to_lowercase() == "json",
+        Err(_) => false, // Default to file-size encoding
+    }
+}
 
 /// Check if version hint optimization is enabled via environment variable.
 fn is_version_hint_enabled() -> bool {
@@ -391,19 +420,72 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
 
 /// Get the path to the version hint file.
 fn version_hint_path(base: &Path) -> Path {
-    base.child(VERSIONS_DIR).child(VERSION_HINT_FILE)
+    let filename = if is_version_hint_json_format() {
+        VERSION_HINT_JSON_FILE
+    } else {
+        VERSION_HINT_FILE
+    };
+    base.child(VERSIONS_DIR).child(filename)
 }
 
 /// Write the version hint file after a successful commit.
 ///
-/// The file size in bytes indicates the latest version number.
+/// The encoding format depends on `LANCE_VERSION_HINT_FORMAT`:
+/// - "file_size" (default): File size in bytes indicates the version number
+/// - "json": JSON file containing `{"version": N}`
+///
+/// The write mode depends on `LANCE_VERSION_HINT_WRITE_MODE`:
+/// - "async" (default): Spawns a background task and returns immediately (fire-and-forget)
+/// - "sync": Spawns a background task and waits for it to complete before returning
+///
 /// This write is optimistic and failures are logged but ignored,
 /// as the hint is only used to accelerate reads, not for correctness.
-pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
+pub fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
+    if !is_version_hint_enabled() {
+        return;
+    }
     let hint_path = version_hint_path(base);
-    // Create a file with `version` bytes (all zeros)
-    let content = vec![0u8; version as usize];
-    if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
+    let use_json = is_version_hint_json_format();
+    let object_store = object_store.clone();
+
+    let handle = tokio::spawn(async move {
+        write_version_hint_inner(&object_store, &hint_path, version, use_json).await;
+    });
+
+    if is_version_hint_sync_write() {
+        // Synchronous write - block until the spawned task completes
+        // Use block_in_place to avoid blocking the async runtime
+        let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(handle));
+    }
+    // Otherwise fire-and-forget: the spawned task runs in the background
+}
+
+/// Async version of write_version_hint that can be awaited.
+/// Use this when you need to ensure the write completes before proceeding.
+pub async fn write_version_hint_async(object_store: &ObjectStore, base: &Path, version: u64) {
+    if !is_version_hint_enabled() {
+        return;
+    }
+    let hint_path = version_hint_path(base);
+    let use_json = is_version_hint_json_format();
+    write_version_hint_inner(object_store, &hint_path, version, use_json).await;
+}
+
+async fn write_version_hint_inner(
+    object_store: &ObjectStore,
+    hint_path: &Path,
+    version: u64,
+    use_json: bool,
+) {
+    let content = if use_json {
+        // JSON format: {"version": N}
+        format!("{{\"version\":{}}}", version).into_bytes()
+    } else {
+        // File-size format: file with `version` zero bytes
+        vec![0u8; version as usize]
+    };
+
+    if let Err(e) = object_store.put(hint_path, content.as_slice()).await {
         // Log but don't fail - the hint is optional for correctness
         warn!(
             "Failed to write version hint file for version {}: {}",
@@ -412,24 +494,73 @@ pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version
     }
 }
 
+/// Blocking version of write_version_hint for tests.
+/// This waits for the write to complete before returning.
+#[cfg(test)]
+pub async fn write_version_hint_blocking(object_store: &ObjectStore, base: &Path, version: u64) {
+    let hint_path = version_hint_path(base);
+    let use_json = is_version_hint_json_format();
+    write_version_hint_inner(object_store, &hint_path, version, use_json).await;
+}
+
+/// Read the version from the hint file.
+///
+/// The format is determined by `LANCE_VERSION_HINT_FORMAT` env var:
+/// - "json": Reads from latest_version_hint.json
+/// - "file_size" (default): Reads from latest_version_hint.bin (file size = version)
+async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
+    let hint_path = version_hint_path(base);
+
+    if is_version_hint_json_format() {
+        // JSON format: read and parse the file content
+        let bytes = object_store.inner.get(&hint_path).await.ok()?;
+        let bytes = bytes.bytes().await.ok()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        parse_version_from_json(text)
+    } else {
+        // File-size format: version = file size in bytes
+        let meta = object_store.inner.head(&hint_path).await.ok()?;
+        Some(meta.size as u64)
+    }
+}
+
+/// Parse version number from JSON string like {"version": 123}
+fn parse_version_from_json(json: &str) -> Option<u64> {
+    // Simple parsing: find "version": and extract the number
+    let trimmed = json.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        // Look for "version" key
+        if let Some(idx) = trimmed.find("\"version\"") {
+            let after_key = &trimmed[idx + 9..]; // Skip "version"
+                                                 // Skip whitespace and colon
+            let after_colon = after_key.trim_start().strip_prefix(':')?;
+            let num_start = after_colon.trim_start();
+            // Extract digits
+            let num_end = num_start
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(num_start.len());
+            let num_str = &num_start[..num_end];
+            return num_str.parse().ok();
+        }
+    }
+    None
+}
+
 /// Read the version hint and probe for higher versions.
 ///
 /// Returns the latest version found and its manifest path, or None if the hint
 /// file doesn't exist or an error occurred.
 ///
 /// This function:
-/// 1. HEAD request on the hint file to get the version hint (file size)
+/// 1. Reads the hint file to get the version hint (file size or JSON content)
 /// 2. Probes version+1, version+2, etc. with HEAD requests until not found
 /// 3. Returns the highest version found
 async fn read_version_hint_and_probe(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Option<ManifestLocation> {
-    let hint_path = version_hint_path(base);
-
-    // Get the hint version from file size
-    let hint_meta = object_store.inner.head(&hint_path).await.ok()?;
-    let mut current_version = hint_meta.size as u64;
+    // Read version from hint file (format determined by env var)
+    let mut current_version = read_version_from_hint(object_store, base).await?;
 
     // Try V2 scheme first (more likely for newer datasets)
     let mut scheme = ManifestNamingScheme::V2;
@@ -988,8 +1119,8 @@ impl CommitHandler for UnsafeCommitHandler {
         let res =
             manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
 
-        // Write version hint (optimistic, failures are ignored)
-        write_version_hint(object_store, base_path, manifest.version).await;
+        // Write version hint (fire-and-forget, spawned as background task)
+        write_version_hint(object_store, base_path, manifest.version);
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1075,8 +1206,8 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
 
         let res = res?;
 
-        // Write version hint (optimistic, failures are ignored)
-        write_version_hint(object_store, base_path, manifest.version).await;
+        // Write version hint (fire-and-forget, spawned as background task)
+        write_version_hint(object_store, base_path, manifest.version);
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1145,8 +1276,8 @@ impl CommitHandler for RenameCommitHandler {
             .await
         {
             Ok(_) => {
-                // Write version hint (optimistic, failures are ignored)
-                write_version_hint(object_store, base_path, manifest.version).await;
+                // Write version hint (fire-and-forget, spawned as background task)
+                write_version_hint(object_store, base_path, manifest.version);
 
                 // Successfully committed
                 Ok(ManifestLocation {
@@ -1224,8 +1355,8 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 _ => CommitError::OtherError(err.into()),
             })?;
 
-        // Write version hint (optimistic, failures are ignored)
-        write_version_hint(object_store, base_path, manifest.version).await;
+        // Write version hint (fire-and-forget, spawned as background task)
+        write_version_hint(object_store, base_path, manifest.version);
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1412,7 +1543,7 @@ mod tests {
         let base = Path::from("base");
 
         // Write version hint for version 42
-        write_version_hint(&object_store, &base, 42).await;
+        write_version_hint_blocking(&object_store, &base, 42).await;
 
         // Verify the hint file exists with correct size
         let hint_path = version_hint_path(&base);
@@ -1420,7 +1551,7 @@ mod tests {
         assert_eq!(meta.size, 42);
 
         // Write version hint for version 100 (overwrites previous)
-        write_version_hint(&object_store, &base, 100).await;
+        write_version_hint_blocking(&object_store, &base, 100).await;
         let meta = object_store.inner.head(&hint_path).await.unwrap();
         assert_eq!(meta.size, 100);
     }
@@ -1445,7 +1576,7 @@ mod tests {
         }
 
         // Write hint pointing to version 3 (stale hint)
-        write_version_hint(&object_store, &base, 3).await;
+        write_version_hint_blocking(&object_store, &base, 3).await;
 
         // Should probe and find version 5
         let location = read_version_hint_and_probe(&object_store, &base)
@@ -1455,7 +1586,7 @@ mod tests {
         assert_eq!(location.naming_scheme, naming_scheme);
 
         // Update hint to current version
-        write_version_hint(&object_store, &base, 5).await;
+        write_version_hint_blocking(&object_store, &base, 5).await;
 
         // Should return version 5 directly
         let location = read_version_hint_and_probe(&object_store, &base)
@@ -1480,7 +1611,7 @@ mod tests {
         }
 
         // Write hint pointing to version 98 (slightly stale)
-        write_version_hint(&object_store, &base, 98).await;
+        write_version_hint_blocking(&object_store, &base, 98).await;
 
         // Should find version 100 (probing from 98)
         let location = current_manifest_path(&object_store, &base).await.unwrap();
@@ -1499,7 +1630,7 @@ mod tests {
         object_store.put(&path, b"".as_slice()).await.unwrap();
 
         // Write hint pointing to version 10 (invalid - doesn't exist)
-        write_version_hint(&object_store, &base, 10).await;
+        write_version_hint_blocking(&object_store, &base, 10).await;
 
         // Hint should be ignored, should fall back to listing
         let mut object_store_clone = ObjectStore::memory();
@@ -1509,12 +1640,28 @@ mod tests {
         object_store_clone.put(&path, b"".as_slice()).await.unwrap();
 
         // Write the invalid hint
-        write_version_hint(&object_store_clone, &base, 10).await;
+        write_version_hint_blocking(&object_store_clone, &base, 10).await;
 
         // Should find version 5 via listing fallback
         let location = current_manifest_path(&object_store_clone, &base)
             .await
             .unwrap();
         assert_eq!(location.version, 5);
+    }
+
+    #[test]
+    fn test_parse_version_from_json() {
+        // Valid JSON formats
+        assert_eq!(parse_version_from_json(r#"{"version":42}"#), Some(42));
+        assert_eq!(parse_version_from_json(r#"{"version": 42}"#), Some(42));
+        assert_eq!(parse_version_from_json(r#"{ "version" : 42 }"#), Some(42));
+        assert_eq!(parse_version_from_json(r#"{"version":12345}"#), Some(12345));
+        assert_eq!(parse_version_from_json(r#"{"version": 0}"#), Some(0));
+
+        // Invalid JSON formats
+        assert_eq!(parse_version_from_json("not json"), None);
+        assert_eq!(parse_version_from_json(r#"{"other":42}"#), None);
+        assert_eq!(parse_version_from_json(""), None);
+        assert_eq!(parse_version_from_json(r#"{"version":"abc"}"#), None);
     }
 }
