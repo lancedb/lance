@@ -4889,6 +4889,7 @@ dependencies = [
  "rstest 0.23.0",
  "serde_json",
  "snafu",
+ "strsim 0.11.1",
  "tempfile",
  "tokio",
  "tokio-stream",
