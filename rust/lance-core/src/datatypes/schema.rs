@@ -8,7 +8,6 @@ use std::{
     fmt::{self, Debug, Formatter},
     sync::Arc,
 };
-
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
@@ -54,9 +53,16 @@ impl FieldRef<'_> {
                 Ok(id)
             }
             FieldRef::ByPath(path) => {
-                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
-                    source: format!("Field '{}' not found in schema", path).into(),
-                    location: location!(),
+                let field = schema.field(path).ok_or_else(|| {
+                    let suggestion = suggest_closest_column(path, &schema.fields);
+                    let message = match suggestion {
+                        Some(s) => format!("Field '{}' not found in schema. Did you mean '{}'?", path, s),
+                        None => format!("Field '{}' not found in schema", path),
+                    };
+                    Error::InvalidInput {
+                        source: message.into(),
+                        location: location!(),
+                    }
                 })?;
                 Ok(field.id)
             }
@@ -267,8 +273,15 @@ impl Schema {
                     }
                 }
             } else if err_on_missing {
+                let typo = col.as_ref();
+                let suggestion = suggest_closest_column(typo, &self.fields);
+                let message = match suggestion {
+                    Some(s) => format!("Column '{}' does not exist. Did you mean '{}'?", typo, s),
+                    None => format!("Column '{}' does not exist", typo),
+                };
+
                 return Err(Error::Schema {
-                    message: format!("Column {} does not exist", col.as_ref()),
+                    message,
                     location: location!(),
                 });
             }
@@ -2772,4 +2785,38 @@ mod tests {
         assert_eq!(pk_fields[1].name, "e");
         assert_eq!(pk_fields[2].name, "g");
     }
+
+    #[test]
+    fn test_schema_typo_suggestion() {
+        // Using DataType directly to match how the rest of their tests are written
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("vector", DataType::Int32, false),
+            ArrowField::new("timestamp", DataType::Int64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // 1. Test the project() suggestion
+        let err = schema.project(&["vctor"]).unwrap_err();
+        assert!(
+            err.to_string().contains("Did you mean 'vector'?"),
+            "Error did not contain suggestion. Got: {}", err
+        );
+
+        // 2. Test the FieldRef::into_id() suggestion
+        let field_ref = FieldRef::ByPath("timstamp");
+        let err = field_ref.into_id(&schema).unwrap_err();
+        assert!(
+            err.to_string().contains("Did you mean 'timestamp'?"),
+            "Error did not contain suggestion. Got: {}", err
+        );
+    }
+}
+
+// Helper to find the closest matching column name for typos
+fn suggest_closest_column(typo: &str, fields: &[crate::datatypes::Field]) -> Option<String> {
+    fields.iter()
+        .map(|f| f.name.as_str())
+        .filter(|&name| strsim::levenshtein(typo, name) <= 2) // Max edit distance of 2
+        .min_by_key(|&name| strsim::levenshtein(typo, name))
+        .map(|name| name.to_string())
 }
