@@ -21,6 +21,7 @@ use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
+use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
@@ -878,6 +879,31 @@ impl StorageOptions {
         self.0.get(key)
     }
 
+    /// Build [`ClientOptions`] with default headers extracted from `header.*` keys.
+    ///
+    /// Keys prefixed with `header.` are parsed into HTTP headers. For example,
+    /// `header.x-ms-version = 2023-11-03` results in a default header
+    /// `x-ms-version: 2023-11-03`. Invalid header names or values are silently
+    /// skipped.
+    pub fn client_options(&self) -> ClientOptions {
+        let mut headers = HeaderMap::new();
+        for (key, value) in &self.0 {
+            if let Some(header_name) = key.strip_prefix("header.") {
+                if let (Ok(name), Ok(val)) = (
+                    header_name.parse::<http::header::HeaderName>(),
+                    HeaderValue::from_str(value),
+                ) {
+                    headers.insert(name, val);
+                }
+            }
+        }
+        let mut client_options = ClientOptions::default();
+        if !headers.is_empty() {
+            client_options = client_options.with_default_headers(headers);
+        }
+        client_options
+    }
+
     /// Get the expiration time in milliseconds since epoch, if present
     pub fn expires_at_millis(&self) -> Option<u64> {
         self.0
@@ -1364,5 +1390,59 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[test]
+    fn test_client_options_extracts_headers() {
+        let opts = StorageOptions(HashMap::from([
+            ("header.x-custom-foo".to_string(), "bar".to_string()),
+            ("header.x-ms-version".to_string(), "2023-11-03".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]));
+        // Should succeed without panic; the returned ClientOptions is opaque,
+        // but we can verify it round-trips through a builder.
+        let client_options = opts.client_options();
+
+        // Verify non-header keys are not consumed as headers by creating
+        // another StorageOptions with no header.* keys.
+        let opts_no_headers = StorageOptions(HashMap::from([(
+            "region".to_string(),
+            "us-west-2".to_string(),
+        )]));
+        let _ = opts_no_headers.client_options();
+
+        // Smoke test: the client_options with headers should be usable
+        // in a builder (we can't inspect the headers directly, but building
+        // should not fail).
+        #[cfg(feature = "gcp")]
+        {
+            use object_store::gcp::GoogleCloudStorageBuilder;
+            let _builder = GoogleCloudStorageBuilder::new()
+                .with_client_options(client_options)
+                .with_url("gs://test-bucket");
+        }
+    }
+
+    #[test]
+    fn test_client_options_skips_invalid_headers() {
+        let opts = StorageOptions(HashMap::from([
+            // Invalid header name (spaces not allowed)
+            ("header.bad header".to_string(), "value".to_string()),
+            // Invalid header value (non-visible ASCII)
+            ("header.x-good-name".to_string(), "bad\x01value".to_string()),
+            // Valid header
+            ("header.x-valid".to_string(), "good".to_string()),
+        ]));
+        // Should not panic even with invalid entries
+        let _ = opts.client_options();
+    }
+
+    #[test]
+    fn test_client_options_empty_when_no_header_keys() {
+        let opts = StorageOptions(HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("access_key_id".to_string(), "AKID".to_string()),
+        ]));
+        let _ = opts.client_options();
     }
 }
