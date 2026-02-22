@@ -423,18 +423,6 @@ class DirectoryNamespace(LanceNamespace):
         """
         return self._inner.create_table_version(request)
 
-    def create_table_version_json(self, request_json: str) -> str:
-        """Create a table version (JSON variant for Rust FFI).
-
-        This method is used by the Rust PyLanceNamespace wrapper which
-        communicates via JSON serialization for async compatibility.
-        """
-        import json
-
-        request = json.loads(request_json)
-        response = self._inner.create_table_version(request)
-        return json.dumps(response)
-
     def describe_table_version(self, request: dict) -> dict:
         """Describe a specific table version.
 
@@ -647,18 +635,6 @@ class RestNamespace(LanceNamespace):
             Response dictionary with optional transaction_id
         """
         return self._inner.create_table_version(request)
-
-    def create_table_version_json(self, request_json: str) -> str:
-        """Create a table version (JSON variant for Rust FFI).
-
-        This method is used by the Rust PyLanceNamespace wrapper which
-        communicates via JSON serialization for async compatibility.
-        """
-        import json
-
-        request = json.loads(request_json)
-        response = self._inner.create_table_version(request)
-        return json.dumps(response)
 
     def describe_table_version(self, request: dict) -> dict:
         """Describe a specific table version.
