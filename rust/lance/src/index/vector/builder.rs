@@ -32,6 +32,7 @@ use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -88,6 +89,26 @@ use super::{
     utils::{self, get_vector_type},
 };
 
+/// Stably sort a RecordBatch by the ROW_ID column in ascending order.
+///
+/// If the batch has no ROW_ID column or has fewer than 2 rows, it is
+/// returned unchanged. When sorting, the relative order of rows with the
+/// same ROW_ID is preserved.
+fn stable_sort_batch_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
+    if let Some(row_id_col) = batch.column_by_name(ROW_ID) {
+        let row_ids = row_id_col.as_primitive::<UInt64Type>();
+        if row_ids.len() > 1 {
+            let mut order: Vec<usize> = (0..row_ids.len()).collect();
+            // Vec::sort_by is stable, so equal ROW_IDs keep their
+            // original relative order.
+            order.sort_by(|&i, &j| row_ids.value(i).cmp(&row_ids.value(j)));
+            let indices = UInt32Array::from_iter_values(order.into_iter().map(|i| i as u32));
+            return Ok(batch.take(&indices)?);
+        }
+    }
+    Ok(batch.clone())
+}
+
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
 
@@ -128,6 +149,10 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     optimize_options: Option<OptimizeOptions>,
     // number of indices merged
     merged_num: usize,
+    // whether to transpose codes when building storage
+    transpose_codes: bool,
+
+    progress: Arc<dyn IndexBuildProgress>,
 }
 
 type BuildStream<S, Q> =
@@ -169,6 +194,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             fragment_filter: None,
             optimize_options: None,
             merged_num: 0,
+            transpose_codes: true,
+            progress: Arc::new(NoopIndexBuildProgress),
         })
     }
 
@@ -235,27 +262,45 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             fragment_filter: None,
             optimize_options: None,
             merged_num: 0,
+            transpose_codes: true,
+            progress: Arc::new(NoopIndexBuildProgress),
         })
     }
 
     // build the index with the all data in the dataset,
     // return the number of indices merged
     pub async fn build(&mut self) -> Result<usize> {
-        // step 1. train IVF & quantizer
-        self.with_ivf(self.load_or_build_ivf().await?);
+        let progress = self.progress.clone();
 
+        // step 1. train IVF & quantizer
+        let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
+        progress
+            .stage_start("train_ivf", max_iters, "iterations")
+            .await?;
+        self.with_ivf(self.load_or_build_ivf().await?);
+        progress.stage_complete("train_ivf").await?;
+
+        progress.stage_start("train_quantizer", None, "").await?;
         self.with_quantizer(self.load_or_build_quantizer().await?);
+        progress.stage_complete("train_quantizer").await?;
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
+            progress.stage_start("shuffle", None, "batches").await?;
             self.shuffle_dataset().await?;
+            progress.stage_complete("shuffle").await?;
         }
 
         // step 3. build partitions
+        let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
+        progress
+            .stage_start("build_partitions", num_partitions, "partitions")
+            .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
 
         // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
+        progress.stage_complete("build_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -334,6 +379,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Control whether codes are transposed when building storage.
+    /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
+    pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
+        self.transpose_codes = transpose;
+        self
+    }
+
+    /// Set progress callback for index building
+    pub fn with_progress(&mut self, progress: Arc<dyn IndexBuildProgress>) -> &mut Self {
+        self.progress = progress;
+        self
+    }
+
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
     async fn load_or_build_ivf(&self) -> Result<IvfModel> {
         match &self.ivf {
@@ -350,8 +408,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     "IVF build params not set",
                     location!(),
                 ))?;
-                super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params)
-                    .await
+                super::build_ivf_model(
+                    dataset,
+                    &self.column,
+                    dim,
+                    self.distance_type,
+                    ivf_params,
+                    self.progress.clone(),
+                )
+                .await
             }
         }
     }
@@ -935,6 +1000,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
                 _ => {}
             }
+
+            // Normalize each batch for this partition to be stably sorted by ROW_ID.
+            for batch in part_batches.iter_mut() {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                *batch = stable_sort_batch_by_row_id(batch)?;
+            }
+
             batches.extend(part_batches);
         }
 
@@ -958,6 +1032,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .map(|s| s.parse::<f64>().unwrap_or(0.0))
                         .unwrap_or(0.0);
                     let batch = batch.drop_column(PART_ID_COLUMN)?;
+                    let batch = stable_sort_batch_by_row_id(&batch)?;
                     batches.push(batch);
                 }
             }
@@ -980,6 +1055,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 location!(),
             ));
         };
+
+        let is_pq = Q::quantization_type() == QuantizationType::Product;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1006,9 +1083,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
+        let progress = self.progress.clone();
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
+            progress.stage_progress("build_partitions", part_id).await?;
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 
@@ -1024,7 +1103,51 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 storage_ivf.add_partition(0);
             } else {
                 let batches = storage.to_batches()?.collect::<Vec<_>>();
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+                let mut batch =
+                    arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+
+                if is_pq && batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+                    // The PQ storage keeps codes in a transposed layout (bytes grouped
+                    // across all rows). Convert them back to per-row layout so that a
+                    // stable ROW_ID sort moves PQ_CODE_COLUMN together with ROW_ID.
+                    let codes_fsl = batch
+                        .column_by_name(PQ_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let num_rows = batch.num_rows();
+                    let bytes_per_code = codes_fsl.value_length() as usize;
+                    let codes = codes_fsl.values().as_primitive::<datatypes::UInt8Type>();
+                    let original_codes = transpose(codes, bytes_per_code, num_rows);
+                    let original_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                        original_codes,
+                        bytes_per_code as i32,
+                    )?);
+                    batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
+                }
+
+                // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
+                // PQ code column moves together with ROW_ID.
+                batch = stable_sort_batch_by_row_id(&batch)?;
+
+                // For PQ storages, optionally convert codes back to transposed layout
+                // in the unified auxiliary file. This keeps final PQ storage column-major
+                // when `transpose_pq_codes` is enabled.
+                if is_pq && self.transpose_codes && batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+                    let codes_fsl = batch
+                        .column_by_name(PQ_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let num_rows = batch.num_rows();
+                    let bytes_per_code = codes_fsl.value_length() as usize;
+                    let codes = codes_fsl.values().as_primitive::<datatypes::UInt8Type>();
+                    let transposed_codes = transpose(codes, num_rows, bytes_per_code);
+                    let transposed_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                        transposed_codes,
+                        bytes_per_code as i32,
+                    )?);
+                    batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
+                }
+
                 storage_writer.write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
@@ -1066,12 +1189,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        let quant_type = Q::quantization_type();
+        let transposed = match quant_type {
+            QuantizationType::Product => self.transpose_codes,
+            QuantizationType::Rabit => true,
+            _ => false,
+        };
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
         let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
             codebook_position: Some(0),
             codebook: None,
-            transposed: true,
+            transposed,
         }));
         if let Some(extra_metadata) = metadata.extra_metadata()? {
             let idx = storage_writer.add_global_buffer(extra_metadata).await?;

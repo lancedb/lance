@@ -214,7 +214,7 @@ mod tests {
             .write(&mut writer, starting_field_id)
             .await
             .unwrap();
-        writer.shutdown().await.unwrap();
+        AsyncWriteExt::shutdown(&mut writer).await.unwrap();
 
         let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await

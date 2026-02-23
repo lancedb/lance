@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -11,6 +13,7 @@ use jni::objects::{JClass, JFloatArray, JObject, JString};
 use jni::sys::jfloatArray;
 use jni::JNIEnv;
 use lance::index::vector::utils::get_vector_dim;
+use lance::index::NoopIndexBuildProgress;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
 use lance_linalg::distance::MetricType;
@@ -114,6 +117,7 @@ fn inner_train_ivf_centroids<'local>(
             dim,
             metric_type,
             &ivf_params,
+            Arc::new(NoopIndexBuildProgress),
         ))?;
 
         let centroids = ivf_model

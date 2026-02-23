@@ -271,9 +271,7 @@ impl LanceStream {
 
         let scan_scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
-            SchedulerConfig {
-                io_buffer_size_bytes: config.io_buffer_size,
-            },
+            SchedulerConfig::new(config.io_buffer_size),
         );
 
         let scan_scheduler_clone = scan_scheduler.clone();

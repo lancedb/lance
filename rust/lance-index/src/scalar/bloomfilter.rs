@@ -490,6 +490,7 @@ impl ScalarIndex for BloomFilterIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         // Re-train bloom filters for the appended data using the shared trainer
         let params = BloomFilterIndexBuilderParams {
@@ -1110,6 +1111,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {

@@ -1302,7 +1302,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
         if indices.is_empty() {
             return;
         }
@@ -1382,6 +1382,7 @@ impl BatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1718,6 +1719,7 @@ impl StructuralBatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1793,15 +1795,7 @@ impl StructuralBatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    // Real decode work happens inside into_batch, which can block the current
-                    // thread for a long time. By spawning it as a new task, we allow Tokio's
-                    // worker threads to keep making progress.
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                    async move { next_task.into_batch(emitted_batch_size_warning) }.await
                 };
                 (task, num_rows)
             });

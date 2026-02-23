@@ -36,11 +36,16 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[build-dependencies]
+prost-build.workspace = true
+protobuf-src = {version = "2.1", optional = true}
+
 [dev-dependencies]
 lance-datagen.workspace = true
 
 [features]
 substrait = ["dep:datafusion-substrait"]
+protoc = ["dep:protobuf-src"]
 
 [lints]
 workspace = true

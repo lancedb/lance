@@ -78,6 +78,7 @@ async fn build_rtree(
             store.as_ref(),
             Box::new(RTreeTrainingRequest::default()),
             None,
+            lance_index::progress::noop_progress(),
         )
         .await?;
 

@@ -979,8 +979,7 @@ async fn check_round_trip_encoding_inner(
     let decode_field = if is_structural_encoding {
         let mut lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
         if lance_field.is_blob() && matches!(lance_field.data_type(), DataType::Struct(_)) {
-            lance_field =
-                lance_field.into_unloaded_with_version(lance_core::datatypes::BlobVersion::V2);
+            lance_field.unloaded_mut();
             let mut arrow_field = ArrowField::from(&lance_field);
             let mut metadata = arrow_field.metadata().clone();
             metadata.insert("lance-encoding:packed".to_string(), "true".to_string());

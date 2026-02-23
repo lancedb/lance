@@ -22,8 +22,8 @@ use arrow_array::RecordBatchReader;
 use arrow_array::{
     cast::as_string_array,
     types::{Float32Type, Int32Type},
-    ArrayRef, Int32Array, Int64Array, Int8Array, Int8DictionaryArray, RecordBatchIterator,
-    StringArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+    RecordBatchIterator, StringArray,
 };
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_ord::sort::sort_to_indices;
@@ -39,7 +39,8 @@ use lance_table::feature_flags;
 use futures::TryStreamExt;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::{DatasetIndexExt, IndexType};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
@@ -71,6 +72,98 @@ async fn test_truncate_table() {
     ]));
     let actual_schema = ArrowSchema::from(ds.schema());
     assert_eq!(&actual_schema, expected_schema.as_ref());
+}
+
+async fn drain_scan(dataset: &Dataset) {
+    dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_with_object_store_clone_preserves_shared_state_and_overrides_store_binding() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+
+    let io_tracker = Arc::new(IOTracker::default());
+    let store_params = ObjectStoreParams {
+        object_store_wrapper: Some(io_tracker),
+        ..Default::default()
+    };
+    let (wrapped_store, _) = ObjectStore::from_uri_and_params(
+        dataset.session().store_registry(),
+        dataset.uri(),
+        &store_params,
+    )
+    .await
+    .unwrap();
+    let wrapped_dataset = dataset.with_object_store(wrapped_store, Some(store_params));
+    assert!(Arc::ptr_eq(&dataset.session(), &wrapped_dataset.session()));
+    assert!(!Arc::ptr_eq(
+        &dataset.object_store().inner,
+        &wrapped_dataset.object_store().inner
+    ));
+}
+
+#[tokio::test]
+async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+
+    let tracker_a = Arc::new(IOTracker::default());
+    let store_params_a = ObjectStoreParams {
+        object_store_wrapper: Some(tracker_a.clone()),
+        ..Default::default()
+    };
+    let (wrapped_store_a, _) = ObjectStore::from_uri_and_params(
+        dataset.session().store_registry(),
+        dataset.uri(),
+        &store_params_a,
+    )
+    .await
+    .unwrap();
+    let wrapped_a = dataset.with_object_store(wrapped_store_a, Some(store_params_a));
+
+    let tracker_b = Arc::new(IOTracker::default());
+    let store_params_b = ObjectStoreParams {
+        object_store_wrapper: Some(tracker_b.clone()),
+        ..Default::default()
+    };
+    let (wrapped_store_b, _) = ObjectStore::from_uri_and_params(
+        dataset.session().store_registry(),
+        dataset.uri(),
+        &store_params_b,
+    )
+    .await
+    .unwrap();
+    let wrapped_b = dataset.with_object_store(wrapped_store_b, Some(store_params_b));
+
+    let _ = tracker_a.incremental_stats(); // reset
+    let _ = tracker_b.incremental_stats(); // reset
+
+    // Request A uses only wrapper A.
+    drain_scan(&wrapped_a).await;
+    assert!(tracker_a.incremental_stats().read_iops > 0);
+    assert_eq!(tracker_b.incremental_stats().read_iops, 0);
+
+    // Request B uses only wrapper B.
+    drain_scan(&wrapped_b).await;
+    assert_eq!(tracker_a.incremental_stats().read_iops, 0);
+    assert!(tracker_b.incremental_stats().read_iops > 0);
+
+    // Base dataset does not use request-specific wrappers.
+    drain_scan(&dataset).await;
+    assert_eq!(tracker_a.incremental_stats().read_iops, 0);
+    assert_eq!(tracker_b.incremental_stats().read_iops, 0);
 }
 
 #[rstest]
@@ -176,6 +269,58 @@ async fn test_create_and_fill_empty_dataset(
     let sorted_arr = arrow_select::take::take(&struct_arr, &sorted_indices, None).unwrap();
     let expected_struct_arr: StructArray = expected_batch.into();
     assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+}
+
+#[tokio::test]
+async fn test_scan_constant_boolean_inline_value_v2_2() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "flag",
+        DataType::Boolean,
+        false,
+    )]));
+
+    let rows = 1024usize;
+    let flags: ArrayRef = Arc::new(BooleanArray::from_iter(std::iter::repeat_n(true, rows)));
+    let batch = RecordBatch::try_new(schema.clone(), vec![flags]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let ds = Dataset::open(&test_uri).await.unwrap();
+    let batches = ds
+        .scan()
+        .project(&["flag"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, rows);
+    for batch in batches {
+        let flags = batch
+            .column_by_name("flag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        for i in 0..flags.len() {
+            assert!(flags.value(i));
+        }
+    }
 }
 
 #[rstest]

@@ -393,6 +393,13 @@ impl AddRowOffsetExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
     ) -> LanceResult<Self> {
+        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
+        Self::internal_new(input, frag_id_to_offset)
+    }
+
+    async fn compute_frag_id_to_offset(
+        dataset: Arc<Dataset>,
+    ) -> LanceResult<Arc<HashMap<u32, FragInfo>>> {
         let mut frag_id_to_offset = HashMap::new();
         let mut row_offset = 0;
         for frag in dataset.get_fragments() {
@@ -408,7 +415,15 @@ impl AddRowOffsetExec {
             row_offset += frag.count_rows(None).await? as u64;
         }
 
-        Self::internal_new(input, Arc::new(frag_id_to_offset))
+        Ok(Arc::new(frag_id_to_offset))
+    }
+
+    pub async fn compute_row_offset_array(
+        row_addr: &ArrayRef,
+        dataset: Arc<Dataset>,
+    ) -> Result<ArrayRef> {
+        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
+        Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())
     }
 
     fn compute_row_offsets(

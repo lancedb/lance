@@ -1376,7 +1376,8 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false).await
+        self.take_rows(&row_ids, projection, false, false, false, false)
+            .await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1424,13 +1425,17 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
                 FragReadConfig::default()
                     .with_row_id(with_row_id)
-                    .with_row_address(with_row_address),
+                    .with_row_address(with_row_address)
+                    .with_row_created_at_version(with_row_created_at_version)
+                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
             )
             .await?;
 
@@ -2611,18 +2616,43 @@ impl FragmentReader {
 
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
     /// batches.  May return an error if the taken rows do not fit into a single batch.
+    ///
+    /// Duplicate indices are allowed and will produce duplicate rows in the output.
     pub async fn take_as_batch(
         &self,
         indices: &[u32],
         take_priority: Option<u32>,
     ) -> Result<RecordBatch> {
+        // The v2 encoding layer requires strictly increasing indices. Deduplicate
+        // here so callers (e.g. FTS with duplicate row matches) don't need to.
+        let has_duplicates = indices.windows(2).any(|w| w[0] == w[1]);
+        let (unique_indices, expand_map) = if has_duplicates {
+            let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
+            let mut mapping: Vec<u32> = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                if unique.last() != Some(&idx) {
+                    unique.push(idx);
+                }
+                mapping.push((unique.len() - 1) as u32);
+            }
+            (Cow::Owned(unique), Some(UInt32Array::from(mapping)))
+        } else {
+            (Cow::Borrowed(indices), None)
+        };
+
         let batches = self
-            .take(indices, u32::MAX, take_priority)
+            .take(&unique_indices, u32::MAX, take_priority)
             .await?
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
+        let mut batch = concat_batches(&Arc::new(self.output_schema.clone()), batches.iter())?;
+
+        if let Some(expand_map) = expand_map {
+            batch = arrow_select::take::take_record_batch(&batch, &expand_map)?;
+        }
+
+        Ok(batch)
     }
 }
 
@@ -3316,7 +3346,14 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3335,7 +3372,14 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3345,7 +3389,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false)
+            .take_rows(&[], dataset.schema(), false, false, false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3355,7 +3399,14 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                true,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(

@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::{execution::SessionState, logical_expr::Expr};
+
+use crate::aggregate::Aggregate;
+use datafusion_common::DFSchema;
+use datafusion_substrait::extensions::Extensions;
+use datafusion_substrait::logical_plan::consumer::{
+    from_substrait_agg_func, from_substrait_rex, from_substrait_sorts, DefaultSubstraitConsumer,
+};
 use datafusion_substrait::substrait::proto::{
     expression::{
         field_reference::{ReferenceType, RootType},
@@ -11,13 +18,41 @@ use datafusion_substrait::substrait::proto::{
     expression_reference::ExprType,
     function_argument::ArgType,
     r#type::{Kind, Struct},
-    Expression, ExpressionReference, ExtendedExpression, NamedStruct, Type,
+    rel::RelType,
+    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
 };
 use lance_core::{Error, Result};
 use prost::Message;
 use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// FixedSizeList has no Substrait producer support in datafusion-substrait.
+/// Other unsupported types (Null, Float16) are encoded as UserDefined and
+/// handled by `remove_extension_types` on the decode side.
+fn is_substrait_compatible(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeList(_, _) => false,
+        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|f| is_substrait_compatible(f.data_type())),
+        _ => true,
+    }
+}
+
+/// Removes top-level fields that contain data types that the Substrait
+/// producer cannot encode (currently only FixedSizeList).
+pub fn prune_schema_for_substrait(schema: &ArrowSchema) -> ArrowSchema {
+    ArrowSchema::new(
+        schema
+            .fields()
+            .iter()
+            .filter(|f| is_substrait_compatible(f.data_type()))
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
 
 /// Convert a DF Expr into a Substrait ExtendedExpressions message
 ///
@@ -324,6 +359,214 @@ pub async fn parse_substrait(
     Ok(expr_container.exprs.pop().unwrap().0)
 }
 
+/// Parse Substrait Plan bytes containing an AggregateRel.
+pub async fn parse_substrait_aggregate(
+    bytes: &[u8],
+    input_schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Aggregate> {
+    let plan = Plan::decode(bytes)?;
+    let (aggregate_rel, output_names) = extract_aggregate_from_plan(&plan)?;
+    let extensions = Extensions::try_from(&plan.extensions)?;
+
+    let mut agg =
+        parse_aggregate_rel_with_extensions(&aggregate_rel, input_schema, state, &extensions)
+            .await?;
+
+    // Apply aliases from RelRoot.names to expressions
+    if !output_names.is_empty() {
+        let num_groups = agg.group_by.len();
+        for (i, expr) in agg.group_by.iter_mut().enumerate() {
+            if i < output_names.len() {
+                *expr = expr.clone().alias(&output_names[i]);
+            }
+        }
+        for (i, expr) in agg.aggregates.iter_mut().enumerate() {
+            let name_idx = num_groups + i;
+            if name_idx < output_names.len() {
+                *expr = expr.clone().alias(&output_names[name_idx]);
+            }
+        }
+    }
+
+    Ok(agg)
+}
+
+fn extract_aggregate_from_plan(plan: &Plan) -> Result<(Box<AggregateRel>, Vec<String>)> {
+    if plan.relations.is_empty() {
+        return Err(Error::invalid_input(
+            "Substrait Plan has no relations",
+            location!(),
+        ));
+    }
+
+    let plan_rel = &plan.relations[0];
+    let (rel, output_names) = match &plan_rel.rel_type {
+        Some(datafusion_substrait::substrait::proto::plan_rel::RelType::Root(root)) => {
+            (root.input.as_ref(), root.names.clone())
+        }
+        Some(datafusion_substrait::substrait::proto::plan_rel::RelType::Rel(rel)) => {
+            (Some(rel), vec![])
+        }
+        None => (None, vec![]),
+    };
+
+    let rel = rel.ok_or_else(|| Error::invalid_input("Plan relation has no input", location!()))?;
+
+    match &rel.rel_type {
+        Some(RelType::Aggregate(agg)) => Ok((agg.clone(), output_names)),
+        Some(other) => Err(Error::invalid_input(
+            format!(
+                "Expected Substrait AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
+            location!(),
+        )),
+        None => Err(Error::invalid_input(
+            "Substrait Rel has no rel_type",
+            location!(),
+        )),
+    }
+}
+
+/// Parse an AggregateRel proto with provided extensions.
+pub async fn parse_aggregate_rel_with_extensions(
+    aggregate_rel: &AggregateRel,
+    input_schema: Arc<ArrowSchema>,
+    state: &SessionState,
+    extensions: &Extensions,
+) -> Result<Aggregate> {
+    let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
+    let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
+
+    Ok(Aggregate::new(group_by, aggregates))
+}
+
+/// Parse an AggregateRel proto with default extensions.
+pub async fn parse_aggregate_rel(
+    aggregate_rel: &AggregateRel,
+    input_schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Aggregate> {
+    let extensions = Extensions::default();
+    parse_aggregate_rel_with_extensions(aggregate_rel, input_schema, state, &extensions).await
+}
+
+async fn parse_groupings(
+    agg_rel: &AggregateRel,
+    schema: &DFSchema,
+    consumer: &DefaultSubstraitConsumer<'_>,
+) -> Result<Vec<Expr>> {
+    let mut group_exprs = Vec::new();
+
+    // First, handle the new-style grouping_expressions + expression_references
+    if !agg_rel.grouping_expressions.is_empty() {
+        for grouping in &agg_rel.groupings {
+            for expr_ref in &grouping.expression_references {
+                let idx = *expr_ref as usize;
+                if idx >= agg_rel.grouping_expressions.len() {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Grouping expression reference {} out of bounds (max: {})",
+                            idx,
+                            agg_rel.grouping_expressions.len()
+                        ),
+                        location!(),
+                    ));
+                }
+                let expr = &agg_rel.grouping_expressions[idx];
+                let df_expr = from_substrait_rex(consumer, expr, schema)
+                    .await
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("Failed to parse grouping expression: {}", e),
+                            location!(),
+                        )
+                    })?;
+                group_exprs.push(df_expr);
+            }
+        }
+    } else {
+        // Fallback to deprecated inline grouping_expressions within each Grouping
+        #[allow(deprecated)]
+        for grouping in &agg_rel.groupings {
+            for expr in &grouping.grouping_expressions {
+                let df_expr = from_substrait_rex(consumer, expr, schema)
+                    .await
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("Failed to parse grouping expression: {}", e),
+                            location!(),
+                        )
+                    })?;
+                group_exprs.push(df_expr);
+            }
+        }
+    }
+
+    Ok(group_exprs)
+}
+
+async fn parse_measures(
+    agg_rel: &AggregateRel,
+    schema: &DFSchema,
+    consumer: &DefaultSubstraitConsumer<'_>,
+) -> Result<Vec<Expr>> {
+    let mut aggregates = Vec::new();
+
+    for measure in &agg_rel.measures {
+        if let Some(agg_func) = &measure.measure {
+            // Parse optional filter
+            let filter = if let Some(filter_expr) = &measure.filter {
+                let df_filter = from_substrait_rex(consumer, filter_expr, schema)
+                    .await
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("Failed to parse measure filter: {}", e),
+                            location!(),
+                        )
+                    })?;
+                Some(Box::new(df_filter))
+            } else {
+                None
+            };
+
+            // Parse ordering (for ordered aggregates like ARRAY_AGG)
+            let order_by = from_substrait_sorts(consumer, &agg_func.sorts, schema)
+                .await
+                .map_err(|e| {
+                    Error::invalid_input(
+                        format!("Failed to parse aggregate sorts: {}", e),
+                        location!(),
+                    )
+                })?;
+
+            // Check for DISTINCT invocation
+            let distinct = matches!(
+                agg_func.invocation,
+                i if i == datafusion_substrait::substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+            );
+
+            // Convert Substrait AggregateFunction to DataFusion Expr
+            let df_expr =
+                from_substrait_agg_func(consumer, agg_func, schema, filter, order_by, distinct)
+                    .await
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("Failed to parse aggregate function: {}", e),
+                            location!(),
+                        )
+                    })?;
+
+            aggregates.push(df_expr.as_ref().clone());
+        }
+    }
+
+    Ok(aggregates)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -606,5 +849,320 @@ mod tests {
         ]);
 
         assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_null_and_float16_columns() {
+        // Float16 and Null are encoded as UserDefined types in Substrait.
+        // The decode side (remove_extension_types) strips them and remaps
+        // field references, so filters on other columns still work.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("embedding", DataType::Float16, true),
+            Field::new("empty", DataType::Null, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_fixed_size_list_column() {
+        // FixedSizeList has no Substrait producer support, so it must be
+        // pruned from the schema before encoding. Verify that a schema with
+        // FSL columns works when the filter references a different column.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+                true,
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        // Encoding with the full schema would fail, but pruning removes the FSL column
+        let pruned = prune_schema_for_substrait(&schema);
+        assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
+    }
+
+    // ==================== Aggregate parsing tests ====================
+
+    use datafusion_substrait::substrait::proto::{
+        aggregate_function::AggregationInvocation,
+        aggregate_rel::{Grouping, Measure},
+        rel::RelType,
+        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
+    };
+
+    /// Helper to create a field reference expression for a column index
+    fn agg_field_ref(field_index: i32) -> Expression {
+        Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        StructField {
+                            field: field_index,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::RootReference(RootReference {})),
+            }))),
+        }
+    }
+
+    /// Create extension declaration for an aggregate function
+    fn agg_extension(anchor: u32, name: &str) -> SimpleExtensionDeclaration {
+        SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                #[allow(deprecated)]
+                extension_uri_reference: 1,
+                extension_urn_reference: 0,
+                function_anchor: anchor,
+                name: name.to_string(),
+            })),
+        }
+    }
+
+    /// Helper to create a Substrait Plan with AggregateRel
+    fn create_aggregate_plan(
+        measures: Vec<Measure>,
+        grouping_expressions: Vec<Expression>,
+        groupings: Vec<Grouping>,
+        extensions: Vec<SimpleExtensionDeclaration>,
+    ) -> Vec<u8> {
+        let aggregate_rel = AggregateRel {
+            common: None,
+            input: None, // Input is ignored for pushdown
+            groupings,
+            measures,
+            grouping_expressions,
+            advanced_extension: None,
+        };
+
+        let rel = Rel {
+            rel_type: Some(RelType::Aggregate(Box::new(aggregate_rel))),
+        };
+
+        // Wrap in a Plan to include extensions
+        let plan = Plan {
+            version: Some(Version {
+                major_number: 0,
+                minor_number: 63,
+                patch_number: 0,
+                git_hash: String::new(),
+                producer: "lance-test".to_string(),
+            }),
+            #[allow(deprecated)]
+            extension_uris: vec![SimpleExtensionUri {
+                extension_uri_anchor: 1,
+                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
+            }],
+            extensions,
+            relations: vec![PlanRel {
+                rel_type: Some(
+                    datafusion_substrait::substrait::proto::plan_rel::RelType::Root(RelRoot {
+                        input: Some(rel),
+                        names: vec![],
+                    }),
+                ),
+            }],
+            advanced_extensions: None,
+            expected_type_urls: vec![],
+            extension_urns: vec![],
+            parameter_bindings: vec![],
+            type_aliases: vec![],
+        };
+
+        plan.encode_to_vec()
+    }
+
+    /// Create a COUNT(*) measure
+    fn count_star_measure(function_ref: u32) -> Measure {
+        Measure {
+            measure: Some(AggregateFunction {
+                function_reference: function_ref,
+                arguments: vec![],
+                options: vec![],
+                output_type: None,
+                phase: 0,
+                sorts: vec![],
+                invocation: AggregationInvocation::All as i32,
+                #[allow(deprecated)]
+                args: vec![],
+            }),
+            filter: None,
+        }
+    }
+
+    /// Create a SUM/AVG/MIN/MAX measure on a column
+    fn simple_agg_measure(function_ref: u32, column_index: i32) -> Measure {
+        Measure {
+            measure: Some(AggregateFunction {
+                function_reference: function_ref,
+                arguments: vec![FunctionArgument {
+                    arg_type: Some(ArgType::Value(agg_field_ref(column_index))),
+                }],
+                options: vec![],
+                output_type: None,
+                phase: 0,
+                sorts: vec![],
+                invocation: AggregationInvocation::All as i32,
+                #[allow(deprecated)]
+                args: vec![],
+            }),
+            filter: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_aggregate_count_star() {
+        let bytes = create_aggregate_plan(
+            vec![count_star_measure(0)],
+            vec![],
+            vec![],
+            vec![agg_extension(0, "count")],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let result =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
+
+        let agg = result.expect("Failed to parse COUNT(*) aggregate");
+        assert!(agg.group_by.is_empty(), "COUNT(*) should have no group by");
+        assert_eq!(agg.aggregates.len(), 1, "Should have exactly one aggregate");
+
+        // Verify it's a COUNT aggregate
+        let agg_expr = &agg.aggregates[0];
+        assert!(
+            agg_expr.schema_name().to_string().contains("count"),
+            "Expected COUNT aggregate, got: {}",
+            agg_expr.schema_name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_aggregate_sum() {
+        let bytes = create_aggregate_plan(
+            vec![simple_agg_measure(0, 1)], // SUM on column index 1 (y)
+            vec![],
+            vec![],
+            vec![agg_extension(0, "sum")],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let result =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
+
+        let agg = result.expect("Failed to parse SUM aggregate");
+        assert!(agg.group_by.is_empty(), "SUM should have no group by");
+        assert_eq!(agg.aggregates.len(), 1, "Should have exactly one aggregate");
+
+        // Verify it's a SUM aggregate
+        let agg_expr = &agg.aggregates[0];
+        assert!(
+            agg_expr.schema_name().to_string().contains("sum"),
+            "Expected SUM aggregate, got: {}",
+            agg_expr.schema_name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_aggregate_sum_with_group_by() {
+        // SUM(y) GROUP BY x
+        let bytes = create_aggregate_plan(
+            vec![simple_agg_measure(0, 1)], // SUM on column index 1 (y)
+            vec![agg_field_ref(0)],         // Group by column index 0 (x)
+            vec![Grouping {
+                #[allow(deprecated)]
+                grouping_expressions: vec![],
+                expression_references: vec![0], // Reference to first grouping_expression
+            }],
+            vec![agg_extension(0, "sum")],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let result =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
+
+        let agg = result.expect("Failed to parse SUM with GROUP BY");
+        assert_eq!(
+            agg.group_by.len(),
+            1,
+            "Should have exactly one group by expression"
+        );
+        assert_eq!(agg.aggregates.len(), 1, "Should have exactly one aggregate");
+
+        // Verify group by is column x
+        let group_expr = &agg.group_by[0];
+        assert!(
+            group_expr.schema_name().to_string().contains('x'),
+            "Expected group by on column x, got: {}",
+            group_expr.schema_name()
+        );
+
+        // Verify it's a SUM aggregate
+        let agg_expr = &agg.aggregates[0];
+        assert!(
+            agg_expr.schema_name().to_string().contains("sum"),
+            "Expected SUM aggregate, got: {}",
+            agg_expr.schema_name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_aggregate_multiple_aggregates() {
+        // COUNT(*) and SUM(y)
+        let bytes = create_aggregate_plan(
+            vec![count_star_measure(0), simple_agg_measure(1, 1)],
+            vec![],
+            vec![],
+            vec![agg_extension(0, "count"), agg_extension(1, "sum")],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let result =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
+
+        let agg = result.expect("Failed to parse multiple aggregates");
+        assert!(agg.group_by.is_empty(), "Should have no group by");
+        assert_eq!(agg.aggregates.len(), 2, "Should have two aggregates");
+
+        // Verify COUNT
+        assert!(
+            agg.aggregates[0]
+                .schema_name()
+                .to_string()
+                .contains("count"),
+            "Expected COUNT aggregate, got: {}",
+            agg.aggregates[0].schema_name()
+        );
+
+        // Verify SUM
+        assert!(
+            agg.aggregates[1].schema_name().to_string().contains("sum"),
+            "Expected SUM aggregate, got: {}",
+            agg.aggregates[1].schema_name()
+        );
     }
 }

@@ -15,8 +15,12 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
+use crate::{
+    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD,
+    ROW_ID, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD,
+    ROW_OFFSET, ROW_OFFSET_FIELD, WILDCARD,
+};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -221,7 +225,12 @@ impl Schema {
         }
     }
 
-    fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
+    fn do_project<T: AsRef<str>>(
+        &self,
+        columns: &[T],
+        err_on_missing: bool,
+        preserve_system_columns: bool,
+    ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = parse_field_path(col.as_ref())?;
@@ -234,7 +243,30 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
+            } else if crate::is_system_column(first) {
+                if preserve_system_columns {
+                    if first == ROW_ID {
+                        candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
+                    } else if first == ROW_ADDR {
+                        candidates.push(Field::try_from(ROW_ADDR_FIELD.clone())?);
+                    } else if first == ROW_OFFSET {
+                        candidates.push(Field::try_from(ROW_OFFSET_FIELD.clone())?);
+                    } else if first == ROW_CREATED_AT_VERSION {
+                        candidates.push(Field::try_from(ROW_CREATED_AT_VERSION_FIELD.clone())?);
+                    } else if first == ROW_LAST_UPDATED_AT_VERSION {
+                        candidates
+                            .push(Field::try_from(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?);
+                    } else {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "System column {} is currently not supported in projection",
+                                first
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            } else if err_on_missing {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
@@ -255,12 +287,17 @@ impl Schema {
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
     pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true)
+        self.do_project(columns, true, false)
     }
 
     /// Project the columns over the schema, dropping unrecognized columns
     pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, false)
+        self.do_project(columns, false, false)
+    }
+
+    /// Project the columns over the schema, preserving system columns.
+    pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, true, true)
     }
 
     /// Check that the top level fields don't contain `.` in their names
@@ -987,7 +1024,7 @@ impl Projectable for Schema {
 }
 
 /// Specifies how to handle blob columns when projecting
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum BlobHandling {
     /// Read all blobs as binary
     AllBinary,
@@ -1024,12 +1061,11 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
+    pub fn unload_if_needed(&self, mut field: Field) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded_with_version(version)
-        } else {
-            field
+            field.unloaded_mut();
         }
+        field
     }
 }
 
@@ -1046,7 +1082,6 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
-    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -1064,7 +1099,6 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
-            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -1080,7 +1114,6 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
-            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1111,11 +1144,6 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
-        self
-    }
-
-    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
-        self.blob_version = blob_version;
         self
     }
 
@@ -1584,19 +1612,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projection_from_schema_defaults_to_v1() {
-        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
-        let schema = Schema {
-            fields: vec![field],
-            metadata: HashMap::new(),
-        };
-
-        let projection = Projection::empty(Arc::new(schema));
-
-        assert_eq!(projection.blob_version, BlobVersion::V1);
-    }
-
-    #[test]
     fn test_resolve_with_quoted_fields() {
         // Create a schema with fields containing dots
         let field_with_dots = Field::try_from(&ArrowField::new(
@@ -1827,6 +1842,41 @@ mod tests {
                 ])),
                 true,
             ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_schema_projection_preserving_system_columns() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let projected = schema
+            .project_preserve_system_columns(&["b.f1", "b.f3", "_rowid", "c"])
+            .unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("_rowid", DataType::UInt64, true),
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);

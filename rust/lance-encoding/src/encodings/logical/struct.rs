@@ -389,7 +389,12 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::new(self.child_fields, children, validity);
+        let array = StructArray::try_new(self.child_fields, children, validity).map_err(|e| {
+            Error::InvalidInput {
+                source: e.to_string().into(),
+                location: location!(),
+            }
+        })?;
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,

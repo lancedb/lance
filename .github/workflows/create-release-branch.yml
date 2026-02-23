@@ -3,6 +3,11 @@ name: Create Release Branch
 on:
   workflow_dispatch:
     inputs:
+      source_release_branch:
+        description: 'Source release branch (optional, e.g., release/v1.3). Leave empty to create from main.'
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: 'Dry run (simulate without pushing)'
         required: true
@@ -25,7 +30,7 @@ jobs:
     - name: Check out repository
       uses: actions/checkout@v4
       with:
-        ref: main
+        ref: ${{ inputs.source_release_branch || 'main' }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         fetch-depth: 0
         lfs: true
@@ -39,16 +44,25 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
-        bash ci/create_release_branch.sh
+        bash ci/create_release_branch.sh "${{ inputs.source_release_branch }}"
 
     - name: Push changes (if not dry run)
       if: ${{ !inputs.dry_run }}
       run: |
         git push origin "${{ steps.create_branch.outputs.RELEASE_BRANCH }}"
-        git push origin main
         git push origin "${{ steps.create_branch.outputs.RC_TAG }}"
-        # Push release root tag (may already exist remotely if created during beta publish)
-        git push origin "${{ steps.create_branch.outputs.RELEASE_ROOT_TAG }}" || echo "Release root tag already exists remotely"
+        # When creating from main: push main and release root tag
+        # When creating from release branch: push minor release root tag
+        if [ -z "${{ inputs.source_release_branch }}" ]; then
+          git push origin main
+          # Push release root tag (may already exist remotely if created during beta publish)
+          git push origin "${{ steps.create_branch.outputs.RELEASE_ROOT_TAG }}" || echo "Release root tag already exists remotely"
+        else
+          # Push minor release root tag if it was created
+          if [ -n "${{ steps.create_branch.outputs.MINOR_RELEASE_ROOT_TAG }}" ]; then
+            git push origin "${{ steps.create_branch.outputs.MINOR_RELEASE_ROOT_TAG }}"
+          fi
+        fi
 
     - name: Generate Release Notes (if not dry run)
       if: ${{ !inputs.dry_run }}
@@ -106,9 +120,18 @@ jobs:
         echo "- **Target Version:** ${{ steps.create_branch.outputs.RC_VERSION }}" >> $GITHUB_STEP_SUMMARY
         echo "- **RC Tag:** ${{ steps.create_branch.outputs.RC_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Release Branch:** ${{ steps.create_branch.outputs.RELEASE_BRANCH }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Release Root Tag:** ${{ steps.create_branch.outputs.RELEASE_ROOT_TAG }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Main Version:** ${{ steps.create_branch.outputs.MAIN_VERSION }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Source Branch:** main (HEAD)" >> $GITHUB_STEP_SUMMARY
+
+        if [ -z "${{ inputs.source_release_branch }}" ]; then
+          echo "- **Release Root Tag:** ${{ steps.create_branch.outputs.RELEASE_ROOT_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Main Version:** ${{ steps.create_branch.outputs.MAIN_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Branch:** main (HEAD)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Source Branch:** ${{ inputs.source_release_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Notes Base:** ${{ steps.create_branch.outputs.PREVIOUS_TAG }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.create_branch.outputs.MINOR_RELEASE_ROOT_TAG }}" ]; then
+            echo "- **Minor Release Root Tag:** ${{ steps.create_branch.outputs.MINOR_RELEASE_ROOT_TAG }}" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
         echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
 
         if [ "${{ inputs.dry_run }}" == "true" ]; then
@@ -122,7 +145,11 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**What happened:**" >> $GITHUB_STEP_SUMMARY
           echo "1. Created release branch ${{ steps.create_branch.outputs.RELEASE_BRANCH }} at ${{ steps.create_branch.outputs.RC_TAG }}" >> $GITHUB_STEP_SUMMARY
-          echo "2. Bumped main to ${{ steps.create_branch.outputs.MAIN_VERSION }} (unreleased)" >> $GITHUB_STEP_SUMMARY
+          if [ -z "${{ inputs.source_release_branch }}" ]; then
+            echo "2. Bumped main to ${{ steps.create_branch.outputs.MAIN_VERSION }} (unreleased)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "2. Created from ${{ inputs.source_release_branch }} (main unchanged)" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Next steps:**" >> $GITHUB_STEP_SUMMARY
           echo "1. Review and vote in the discussion thread" >> $GITHUB_STEP_SUMMARY

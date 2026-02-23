@@ -37,6 +37,10 @@ fn main() -> Result<(), String> {
     if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
+    } else if target_arch == "aarch64" && target_os == "ios" {
+        // Build version with NEON
+        // A13 bionic is the earliest supported iOS SOC
+        build_f16_with_flags("neon", &["-mtune=apple-a13"]).unwrap();
     } else if target_arch == "aarch64" && target_os == "linux" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();

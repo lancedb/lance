@@ -268,12 +268,14 @@ impl Deref for TempStdFile {
     }
 }
 
-/// A temporary file that is exposed as an object store path
+/// A unique path to a temporary file, exposed as an object store path
 ///
-/// This is a wrapper around [`TempFile`] that exposes the path as an object store path.
-/// It is useful when you need to create a temporary file that is only used as an object store path.
+/// Unlike [`TempFile`], this does not create an empty file. We create a
+/// temporary directory and then construct a path inside it, following the
+/// same pattern as [`TempStdPath`]. This avoids holding an open file handle,
+/// which on Windows would prevent atomic renames to the same path.
 pub struct TempObjFile {
-    _tempfile: TempFile,
+    _tempdir: TempDir,
     path: ObjPath,
 }
 
@@ -293,10 +295,10 @@ impl std::ops::Deref for TempObjFile {
 
 impl Default for TempObjFile {
     fn default() -> Self {
-        let tempfile = TempFile::default();
-        let path = tempfile.obj_path();
+        let tempdir = TempDir::default();
+        let path = ObjPath::parse(format!("{}/some_file", tempdir.path_str())).unwrap();
         Self {
-            _tempfile: tempfile,
+            _tempdir: tempdir,
             path,
         }
     }

@@ -400,7 +400,7 @@ pub mod tests {
 
     use crate::{
         format::pb::column_encoding,
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{check_round_trip_encoding_of_data, check_specific_random, TestCases},
         version::LanceFileVersion,
     };
 
@@ -414,7 +414,11 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_basic_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_basic_random(field).await;
+        check_specific_random(
+            field,
+            TestCases::basic().with_max_file_version(LanceFileVersion::V2_1),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -423,6 +427,7 @@ pub mod tests {
         let val2: &[u8] = &[7, 8, 9];
         let array = Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2)]));
         let test_cases = TestCases::default()
+            .with_max_file_version(LanceFileVersion::V2_1)
             .with_expected_encoding("packed_struct")
             .with_verify_encoding(Arc::new(|cols, version| {
                 if version < &LanceFileVersion::V2_1 {

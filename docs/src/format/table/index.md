@@ -33,6 +33,9 @@ Afterwards, field IDs are assigned incrementally for newly added fields.
 Column encoding configurations are specified through field metadata using the `lance-encoding:` prefix.
 See [File Format Encoding Specification](../file/encoding.md) for details on available encodings, compression schemes, and configuration options.
 
+For complete schema specification details including supported data types, field ID assignment, and metadata handling,
+see the [Schema Format Specification](schema.md).
+
 <details>
 <summary>Field protobuf message</summary>
 

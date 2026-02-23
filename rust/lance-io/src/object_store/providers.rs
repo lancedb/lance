@@ -31,6 +31,8 @@ pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
 pub mod oss;
+#[cfg(feature = "tencent")]
+pub mod tencent;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -314,6 +316,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "tencent")]
+        providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         Self {

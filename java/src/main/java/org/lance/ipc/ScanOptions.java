@@ -35,6 +35,7 @@ public class ScanOptions {
   private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
+  private final Optional<ByteBuffer> substraitAggregate;
 
   /**
    * Constructor for LanceScanOptions.
@@ -52,6 +53,8 @@ public class ScanOptions {
    * @param withRowAddress Whether to include the row address in the results.
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
+   * @param columnOrderings (Optional) Column orderings for result sorting.
+   * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
    */
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -66,7 +69,8 @@ public class ScanOptions {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
-      Optional<List<ColumnOrdering>> columnOrderings) {
+      Optional<List<ColumnOrdering>> columnOrderings,
+      Optional<ByteBuffer> substraitAggregate) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -83,6 +87,7 @@ public class ScanOptions {
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
+    this.substraitAggregate = substraitAggregate;
   }
 
   /**
@@ -197,6 +202,15 @@ public class ScanOptions {
     return columnOrderings;
   }
 
+  /**
+   * Get the substrait aggregate expression.
+   *
+   * @return Optional containing the substrait aggregate if specified, otherwise empty.
+   */
+  public Optional<ByteBuffer> getSubstraitAggregate() {
+    return substraitAggregate;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -215,6 +229,9 @@ public class ScanOptions {
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
+        .add(
+            "substraitAggregate",
+            substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
         .toString();
   }
 
@@ -233,6 +250,7 @@ public class ScanOptions {
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
+    private Optional<ByteBuffer> substraitAggregate = Optional.empty();
 
     public Builder() {}
 
@@ -255,6 +273,7 @@ public class ScanOptions {
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
+      this.substraitAggregate = options.getSubstraitAggregate();
     }
 
     /**
@@ -395,6 +414,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set the substrait aggregate expression.
+     *
+     * @param substraitAggregate Substrait aggregate expression.
+     * @return Builder instance for method chaining.
+     */
+    public Builder substraitAggregate(ByteBuffer substraitAggregate) {
+      this.substraitAggregate = Optional.of(substraitAggregate);
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -413,7 +443,8 @@ public class ScanOptions {
           withRowId,
           withRowAddress,
           batchReadahead,
-          columnOrderings);
+          columnOrderings,
+          substraitAggregate);
     }
   }
 }

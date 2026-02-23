@@ -488,7 +488,7 @@ mod tests {
 
         let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
         let pos = encoder.encode(arrs.as_slice()).await.unwrap();
-        writer.shutdown().await.unwrap();
+        AsyncWriteExt::shutdown(&mut writer).await.unwrap();
         Ok(pos)
     }
 
@@ -562,7 +562,7 @@ mod tests {
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&[&data]).await.unwrap();
-        object_writer.shutdown().await.unwrap();
+        AsyncWriteExt::shutdown(&mut object_writer).await.unwrap();
 
         let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
@@ -731,7 +731,7 @@ mod tests {
 
             // let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
             let pos = encoder.encode(&[&data]).await.unwrap();
-            object_writer.shutdown().await.unwrap();
+            AsyncWriteExt::shutdown(&mut object_writer).await.unwrap();
             pos
         };
 

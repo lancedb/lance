@@ -13,6 +13,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
+use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -397,6 +398,20 @@ pub fn get_vector_index_params(
 
             if let Some(sq_params) = sq_params {
                 stages.push(StageParams::SQ(sq_params));
+            }
+
+            // Parse RQBuildParams
+            let rq_params = env.get_optional_from_method(
+                &vector_index_params_obj,
+                "getRqParams",
+                |env, rq_obj| {
+                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
+                    Ok(RQBuildParams { num_bits })
+                },
+            )?;
+
+            if let Some(rq_params) = rq_params {
+                stages.push(StageParams::RQ(rq_params));
             }
 
             Ok(VectorIndexParams {

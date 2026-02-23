@@ -293,6 +293,70 @@ impl BTreeMemIndex {
         Ok(batches)
     }
 
+    /// Export the index data as sorted RecordBatches with reversed row positions.
+    ///
+    /// This is used when flushing MemTable to disk with batches in reverse order.
+    /// Since the flushed data will have rows in reverse order, we need to map
+    /// the row positions accordingly:
+    /// `reversed_position = total_rows - original_position - 1`
+    ///
+    /// # Arguments
+    /// * `batch_size` - Maximum number of entries per batch
+    /// * `total_rows` - Total number of rows in the MemTable (needed for position reversal)
+    pub fn to_training_batches_reversed(
+        &self,
+        batch_size: usize,
+        total_rows: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_core::ROW_ID;
+        use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+        use std::sync::Arc;
+
+        if self.lookup.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Get the data type from the first key
+        let first_entry = self.lookup.front().unwrap();
+        let data_type = first_entry.key().value.0.data_type();
+
+        // Create schema for training data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, data_type, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+
+        let total_rows_u64 = total_rows as u64;
+        let mut batches = Vec::new();
+        let mut values: Vec<ScalarValue> = Vec::with_capacity(batch_size);
+        let mut row_ids: Vec<u64> = Vec::with_capacity(batch_size);
+
+        for entry in self.lookup.iter() {
+            let key = entry.key();
+            values.push(key.value.0.clone());
+            // Reverse the row position: new_pos = total_rows - old_pos - 1
+            let reversed_position = total_rows_u64 - key.row_position - 1;
+            row_ids.push(reversed_position);
+
+            if values.len() >= batch_size {
+                // Build and emit a batch
+                let batch = self.build_training_batch(&schema, &values, &row_ids)?;
+                batches.push(batch);
+                values.clear();
+                row_ids.clear();
+            }
+        }
+
+        // Emit any remaining data
+        if !values.is_empty() {
+            let batch = self.build_training_batch(&schema, &values, &row_ids)?;
+            batches.push(batch);
+        }
+
+        Ok(batches)
+    }
+
     /// Build a single training batch from values and row IDs.
     fn build_training_batch(
         &self,
@@ -448,6 +512,63 @@ mod tests {
         assert_eq!(row_ids.value(3), 3); // id=10 -> row 3
         assert_eq!(row_ids.value(4), 4); // id=11 -> row 4
         assert_eq!(row_ids.value(5), 5); // id=12 -> row 5
+    }
+
+    #[test]
+    fn test_btree_index_to_training_batches_reversed() {
+        use lance_core::ROW_ID;
+        use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+
+        let schema = create_test_schema();
+        let index = BTreeMemIndex::new(0, "id".to_string());
+
+        let batch1 = create_test_batch(&schema, 0); // ids: 0, 1, 2
+        let batch2 = create_test_batch(&schema, 10); // ids: 10, 11, 12
+
+        index.insert(&batch1, 0).unwrap(); // row positions 0, 1, 2
+        index.insert(&batch2, 3).unwrap(); // row positions 3, 4, 5
+
+        // Export as training batches with reversed positions
+        // total_rows = 6, so reversed positions are:
+        // original 0 -> 6-0-1 = 5
+        // original 1 -> 6-1-1 = 4
+        // original 2 -> 6-2-1 = 3
+        // original 3 -> 6-3-1 = 2
+        // original 4 -> 6-4-1 = 1
+        // original 5 -> 6-5-1 = 0
+        let batches = index.to_training_batches_reversed(100, 6).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 6);
+
+        // Check values are still in sorted order (0, 1, 2, 10, 11, 12)
+        let values = batch
+            .column_by_name(VALUE_COLUMN_NAME)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 0);
+        assert_eq!(values.value(1), 1);
+        assert_eq!(values.value(2), 2);
+        assert_eq!(values.value(3), 10);
+        assert_eq!(values.value(4), 11);
+        assert_eq!(values.value(5), 12);
+
+        // Check row IDs are reversed
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.value(0), 5); // id=0 was at row 0 -> reversed to 5
+        assert_eq!(row_ids.value(1), 4); // id=1 was at row 1 -> reversed to 4
+        assert_eq!(row_ids.value(2), 3); // id=2 was at row 2 -> reversed to 3
+        assert_eq!(row_ids.value(3), 2); // id=10 was at row 3 -> reversed to 2
+        assert_eq!(row_ids.value(4), 1); // id=11 was at row 4 -> reversed to 1
+        assert_eq!(row_ids.value(5), 0); // id=12 was at row 5 -> reversed to 0
     }
 
     #[test]

@@ -33,7 +33,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Check glibc version outside docker
@@ -111,7 +111,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Check glibc version outside docker
@@ -192,7 +192,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
       - uses: Swatinem/rust-cache@v2
       - name: Set up Java 11
         uses: actions/setup-java@v4

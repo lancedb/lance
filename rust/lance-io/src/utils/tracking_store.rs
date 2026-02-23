@@ -65,6 +65,27 @@ impl IOTracker {
             range,
         });
     }
+
+    /// Record a write operation for tracking.
+    ///
+    /// This is used by writers that bypass the ObjectStore layer (like LocalWriter)
+    /// to ensure their IO operations are still tracked.
+    pub fn record_write(
+        &self,
+        #[allow(unused_variables)] method: &'static str,
+        #[allow(unused_variables)] path: Path,
+        num_bytes: u64,
+    ) {
+        let mut stats = self.0.lock().unwrap();
+        stats.write_iops += 1;
+        stats.written_bytes += num_bytes;
+        #[cfg(feature = "test-util")]
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range: None,
+        });
+    }
 }
 
 impl WrappingObjectStore for IOTracker {

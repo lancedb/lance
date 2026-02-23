@@ -513,6 +513,9 @@ impl ScalarQueryParser for LabelListQueryParser {
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
+            if list_values.is_empty() {
+                return None;
+            }
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);

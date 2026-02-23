@@ -25,6 +25,9 @@ use futures::stream::{self, StreamExt};
 
 use crate::dataset::mem_wal::write::BatchStore;
 
+/// Column name for row address (consistent with base table scanner).
+pub const ROW_ADDRESS_COLUMN: &str = "_rowaddr";
+
 /// ExecutionPlan node that scans all visible batches from a MemTable.
 ///
 /// This node implements visibility filtering, returning only batches
@@ -42,6 +45,8 @@ pub struct MemTableScanExec {
     metrics: ExecutionPlanMetricsSet,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
+    /// Whether to include _rowaddr column (row position, same as _rowid but different name).
+    with_row_address: bool,
     /// Optional filter predicate (physical expression).
     filter_predicate: Option<PhysicalExprRef>,
     /// Original filter expression for display purposes.
@@ -57,6 +62,7 @@ impl Debug for MemTableScanExec {
             )
             .field("projection", &self.projection)
             .field("with_row_id", &self.with_row_id)
+            .field("with_row_address", &self.with_row_address)
             .field("has_filter", &self.filter_predicate.is_some())
             .finish()
     }
@@ -70,7 +76,7 @@ impl MemTableScanExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
     /// * `projection` - Optional column indices to project
-    /// * `output_schema` - Schema after projection (should include _rowid if with_row_id is true)
+    /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
     pub fn new(
         batch_store: Arc<BatchStore>,
@@ -86,6 +92,7 @@ impl MemTableScanExec {
             output_schema.clone(),
             output_schema,
             with_row_id,
+            false, // with_row_address
             None,
             None,
         )
@@ -98,9 +105,10 @@ impl MemTableScanExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
     /// * `projection` - Optional column indices to project
-    /// * `output_schema` - Schema after projection (should include _rowid if with_row_id is true)
+    /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `source_schema` - Schema of source data (before projection), used for filter evaluation
     /// * `with_row_id` - Whether to include _rowid column (row position)
+    /// * `with_row_address` - Whether to include _rowaddr column (row position, for LSM scanner)
     /// * `filter_predicate` - Optional physical expression for filtering
     /// * `filter_expr` - Optional logical expression for display
     #[allow(clippy::too_many_arguments)]
@@ -111,6 +119,7 @@ impl MemTableScanExec {
         output_schema: SchemaRef,
         source_schema: SchemaRef,
         with_row_id: bool,
+        with_row_address: bool,
         filter_predicate: Option<PhysicalExprRef>,
         filter_expr: Option<Expr>,
     ) -> Self {
@@ -130,6 +139,7 @@ impl MemTableScanExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
+            with_row_address,
             filter_predicate,
             filter_expr,
         }
@@ -149,22 +159,29 @@ impl DisplayAs for MemTableScanExec {
             .as_ref()
             .map(|e| format!(", filter={}", e))
             .unwrap_or_default();
+        let row_addr_str = if self.with_row_address {
+            ", with_row_address=true"
+        } else {
+            ""
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MemTableScanExec: projection=[{}], with_row_id={}{}",
+                    "MemTableScanExec: projection=[{}], with_row_id={}{}{}",
                     projection_names.join(", "),
                     self.with_row_id,
+                    row_addr_str,
                     filter_str
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "MemTableScanExec\nprojection=[{}]\nwith_row_id={}{}",
+                    "MemTableScanExec\nprojection=[{}]\nwith_row_id={}{}{}",
                     projection_names.join(", "),
                     self.with_row_id,
+                    row_addr_str,
                     filter_str
                 )
             }
@@ -215,13 +232,17 @@ impl ExecutionPlan for MemTableScanExec {
         let schema = self.output_schema.clone();
         let source_schema = self.source_schema.clone();
         let with_row_id = self.with_row_id;
+        let with_row_address = self.with_row_address;
         let filter_predicate = self.filter_predicate.clone();
+
+        // We need row offsets if either _rowid or _rowaddr is requested
+        let need_row_offsets = with_row_id || with_row_address;
 
         let projected_batches: Vec<DataFusionResult<RecordBatch>> = batches_with_offsets
             .into_iter()
             .filter_map(|(batch, row_offset)| {
                 // Apply filter first (on unprojected data)
-                let (filtered_batch, filtered_row_ids) = if let Some(ref predicate) =
+                let (filtered_batch, filtered_row_offsets) = if let Some(ref predicate) =
                     filter_predicate
                 {
                     // Evaluate filter predicate
@@ -248,30 +269,30 @@ impl ExecutionPlan for MemTableScanExec {
                             Err(e) => return Some(Err(e.into())),
                         };
 
-                    // Compute filtered row IDs if needed
-                    let row_ids = if with_row_id {
-                        let mut ids = Vec::with_capacity(filtered.num_rows());
+                    // Compute filtered row offsets if needed
+                    let row_offsets = if need_row_offsets {
+                        let mut offsets = Vec::with_capacity(filtered.num_rows());
                         for (i, valid) in filter_array.iter().enumerate() {
                             if valid.unwrap_or(false) {
-                                ids.push(row_offset + i as u64);
+                                offsets.push(row_offset + i as u64);
                             }
                         }
-                        ids
+                        offsets
                     } else {
                         vec![]
                     };
 
-                    (filtered, row_ids)
+                    (filtered, row_offsets)
                 } else {
-                    // No filter - generate sequential row IDs if needed
-                    let row_ids = if with_row_id {
+                    // No filter - generate sequential row offsets if needed
+                    let row_offsets = if need_row_offsets {
                         (0..batch.num_rows() as u64)
                             .map(|i| row_offset + i)
                             .collect()
                     } else {
                         vec![]
                     };
-                    (batch, row_ids)
+                    (batch, row_offsets)
                 };
 
                 // Skip empty batches after filtering
@@ -292,7 +313,12 @@ impl ExecutionPlan for MemTableScanExec {
 
                 // Add _rowid column if requested
                 if with_row_id {
-                    columns.push(Arc::new(UInt64Array::from(filtered_row_ids)));
+                    columns.push(Arc::new(UInt64Array::from(filtered_row_offsets.clone())));
+                }
+
+                // Add _rowaddr column if requested (same value as _rowid, different name)
+                if with_row_address {
+                    columns.push(Arc::new(UInt64Array::from(filtered_row_offsets)));
                 }
 
                 Some(

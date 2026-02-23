@@ -44,6 +44,7 @@ url = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
 lance-io = { workspace = true }
+lance-table = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
@@ -90,6 +91,7 @@ wiremock.workspace = true
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 rstest.workspace = true
+lance-table.workspace = true
 
 [lints]
 workspace = true

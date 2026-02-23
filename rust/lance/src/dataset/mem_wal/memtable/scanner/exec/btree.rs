@@ -41,6 +41,8 @@ pub struct BTreeIndexExec {
     column: String,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
+    /// Whether to include _rowaddr column (same as row position) in output.
+    with_row_address: bool,
 }
 
 impl Debug for BTreeIndexExec {
@@ -52,6 +54,7 @@ impl Debug for BTreeIndexExec {
                 &self.max_visible_batch_position,
             )
             .field("with_row_id", &self.with_row_id)
+            .field("with_row_address", &self.with_row_address)
             .field("column", &self.column)
             .finish()
     }
@@ -67,8 +70,10 @@ impl BTreeIndexExec {
     /// * `predicate` - Scalar predicate to apply
     /// * `max_visible_batch_position` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
-    /// * `output_schema` - Schema after projection (should include _rowid if with_row_id is true)
+    /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
+    /// * `with_row_address` - Whether to include _rowaddr column (same as row position)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
@@ -77,6 +82,7 @@ impl BTreeIndexExec {
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         with_row_id: bool,
+        with_row_address: bool,
     ) -> Result<Self> {
         // Verify the index exists for this column
         let column = predicate.column().to_string();
@@ -105,6 +111,7 @@ impl BTreeIndexExec {
             metrics: ExecutionPlanMetricsSet::new(),
             column,
             with_row_id,
+            with_row_address,
         })
     }
 
@@ -263,6 +270,11 @@ impl BTreeIndexExec {
 
                 // Add _rowid column if requested
                 if self.with_row_id {
+                    final_columns.push(Arc::new(UInt64Array::from(row_positions.clone())));
+                }
+
+                // Add _rowaddr column if requested (same value as row position)
+                if self.with_row_address {
                     final_columns.push(Arc::new(UInt64Array::from(row_positions)));
                 }
 
@@ -281,15 +293,15 @@ impl DisplayAs for BTreeIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "BTreeIndexExec: predicate={:?}, column={}, with_row_id={}",
-                    self.predicate, self.column, self.with_row_id
+                    "BTreeIndexExec: predicate={:?}, column={}, with_row_id={}, with_row_address={}",
+                    self.predicate, self.column, self.with_row_id, self.with_row_address
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "BTreeIndexExec\npredicate={:?}\ncolumn={}\nwith_row_id={}",
-                    self.predicate, self.column, self.with_row_id
+                    "BTreeIndexExec\npredicate={:?}\ncolumn={}\nwith_row_id={}\nwith_row_address={}",
+                    self.predicate, self.column, self.with_row_id, self.with_row_address
                 )
             }
         }
@@ -427,6 +439,7 @@ mod tests {
             None,
             schema,
             false,
+            false,
         )
         .unwrap();
 
@@ -462,8 +475,17 @@ mod tests {
             ],
         };
 
-        let exec =
-            BTreeIndexExec::new(batch_store, indexes, predicate, 0, None, schema, false).unwrap();
+        let exec = BTreeIndexExec::new(
+            batch_store,
+            indexes,
+            predicate,
+            0,
+            None,
+            schema,
+            false,
+            false,
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -506,6 +528,7 @@ mod tests {
             None,
             schema.clone(),
             false,
+            false,
         )
         .unwrap();
 
@@ -517,8 +540,17 @@ mod tests {
         assert_eq!(total_rows, 0);
 
         // Query with max_visible=1 should see both batches
-        let exec =
-            BTreeIndexExec::new(batch_store, indexes, predicate, 1, None, schema, false).unwrap();
+        let exec = BTreeIndexExec::new(
+            batch_store,
+            indexes,
+            predicate,
+            1,
+            None,
+            schema,
+            false,
+            false,
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -565,12 +597,14 @@ mod tests {
             None,
             schema_with_rowid.clone(),
             true,
+            false,
         )
         .unwrap();
 
         // Verify the plan output
         let debug_str = format!("{:?}", exec);
         assert!(debug_str.contains("with_row_id: true"));
+        assert!(debug_str.contains("with_row_address: false"));
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -627,13 +661,14 @@ mod tests {
                 None,
                 schema.clone(),
                 false,
+                false,
             )
             .unwrap(),
         );
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=false",
+            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=false, with_row_address=false",
         )
         .await
         .unwrap();
@@ -654,13 +689,14 @@ mod tests {
                 None,
                 schema_with_rowid,
                 true,
+                false,
             )
             .unwrap(),
         );
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=true",
+            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=true, with_row_address=false",
         )
         .await
         .unwrap();

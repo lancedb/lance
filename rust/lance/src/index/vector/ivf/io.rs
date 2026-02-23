@@ -201,20 +201,26 @@ pub(super) async fn write_pq_partitions(
                             location: location!(),
                         })?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
-                    let original_pq_codes = transpose(
-                        pq_code,
-                        pq_index.pq.num_sub_vectors,
-                        pq_code.len() / pq_index.pq.code_dim(),
-                    );
+                    let row_ids = pq_index.row_ids.as_ref().unwrap();
+                    let num_vectors = row_ids.len();
+                    if num_vectors == 0 || pq_code.is_empty() {
+                        continue;
+                    }
+                    if pq_code.len() % num_vectors != 0 {
+                        continue;
+                    }
+                    let num_bytes_per_code = pq_code.len() / num_vectors;
+                    let original_pq_codes = transpose(pq_code, num_bytes_per_code, num_vectors);
                     let fsl = Arc::new(
                         FixedSizeListArray::try_new_from_values(
                             original_pq_codes,
-                            pq_index.pq.code_dim() as i32,
+                            num_bytes_per_code as i32,
                         )
                         .unwrap(),
                     );
+
                     pq_array.push(fsl);
-                    row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
+                    row_id_array.push(row_ids.clone());
                 }
             }
         }
