@@ -102,10 +102,12 @@ fn is_version_hint_sync_write() -> bool {
 }
 
 /// Check if version hint should use JSON format.
+/// Default is JSON format (more portable and debuggable).
+/// Set LANCE_VERSION_HINT_FORMAT=file_size to use file-size encoding.
 fn is_version_hint_json_format() -> bool {
     match std::env::var(VERSION_HINT_FORMAT_ENV_VAR) {
-        Ok(val) => val.to_lowercase() == "json",
-        Err(_) => false, // Default to file-size encoding
+        Ok(val) => val.to_lowercase() != "file_size",
+        Err(_) => true, // Default to JSON format
     }
 }
 
@@ -340,56 +342,16 @@ async fn current_manifest_path(
         return result;
     }
 
-    // Stagger start: give hint a head start to avoid connection contention
-    // When hint and listing start simultaneously, both slow down due to TCP/TLS contention
-    // By giving hint a head start, it can complete quickly (~4ms) before listing starts
-    let hint_head_start_ms = std::env::var("LANCE_HINT_HEAD_START_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10u64);
-
-    let hint_future = read_version_hint_and_probe(object_store, base);
-    tokio::pin!(hint_future);
-
-    // Phase 1: Give hint a head start
-    let head_start = tokio::time::Duration::from_millis(hint_head_start_ms);
-    let hint_result = tokio::select! {
-        biased;
-        result = &mut hint_future => Some(result),
-        _ = tokio::time::sleep(head_start) => None,
-    };
-
-    // If hint completed during head start, use it
-    if let Some(Some(location)) = hint_result {
-        eprintln!(
-            "[LOAD] hint won (head start): {:?}, version={}",
-            start.elapsed(),
-            location.version
-        );
-        return Ok(location);
-    }
-
-    // If hint failed during head start, fall back to listing only
-    if let Some(None) = hint_result {
-        let result = resolve_version_from_listing(object_store, base).await;
-        eprintln!(
-            "[LOAD] hint failed, listing fallback: {:?}, version={}",
-            start.elapsed(),
-            result.as_ref().map(|l| l.version).unwrap_or(0)
-        );
-        return result;
-    }
-
-    // Phase 2: Hint didn't complete in head start, race with listing
-    eprintln!("[LOAD] hint head start timeout, starting race");
+    // Race hint-based and listing-based approaches
+    // Use tokio::select! to return whichever completes first
     tokio::select! {
         biased;
 
-        // Continue hint attempt
-        hint_result = hint_future => {
+        // Try hint-based approach first (biased because it's usually faster)
+        hint_result = read_version_hint_and_probe(object_store, base) => {
             if let Some(location) = hint_result {
                 eprintln!(
-                    "[LOAD] hint won (after race): {:?}, version={}",
+                    "[LOAD] hint won: {:?}, version={}",
                     start.elapsed(),
                     location.version
                 );
