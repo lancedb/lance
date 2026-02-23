@@ -118,6 +118,12 @@ fn get_storage_options(uri: &str) -> HashMap<String, String> {
     let mut options = HashMap::new();
     if is_s3_express(uri) {
         options.insert("s3_express".to_string(), "true".to_string());
+        // S3 Express requires explicit region because GetBucketLocation API doesn't work
+        if let Ok(region) = std::env::var("AWS_DEFAULT_REGION") {
+            options.insert("region".to_string(), region);
+        } else if let Ok(region) = std::env::var("AWS_REGION") {
+            options.insert("region".to_string(), region);
+        }
     }
     options
 }
