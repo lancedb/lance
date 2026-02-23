@@ -934,32 +934,42 @@ impl Extend<Self> for RowAddrTreeMap {
     }
 }
 
-/// Convert a RoaringBitmap to a vector of contiguous ranges.
-///
-/// This is more efficient than iterating over individual bits and coalescing,
-/// as it builds ranges directly in a single pass.
 pub fn bitmap_to_ranges(bitmap: &RoaringBitmap) -> Vec<Range<u64>> {
-    if bitmap.is_empty() {
-        return vec![];
-    }
-
     let mut ranges = Vec::new();
     let mut iter = bitmap.iter();
-    let first = iter.next().unwrap();
-    let mut start = first;
-    let mut end = first;
+    while let Some(r) = iter.next_range() {
+        ranges.push(*r.start() as u64..(*r.end() as u64 + 1));
+    }
+    ranges
+}
 
-    for val in iter {
-        if val == end + 1 {
-            end = val;
-        } else {
-            ranges.push(start as u64..(end + 1) as u64);
-            start = val;
-            end = val;
+pub fn ranges_to_bitmap(ranges: &[Range<u64>], sorted: bool) -> RoaringBitmap {
+    if ranges.is_empty() {
+        return RoaringBitmap::new();
+    }
+    if sorted {
+        let sample_size = ranges.len().min(10);
+        let avg_len: u64 = ranges
+            .iter()
+            .take(sample_size)
+            .map(|r| r.end - r.start)
+            .sum::<u64>()
+            / sample_size as u64;
+        // from_sorted_iter appends each value in O(1) but must visit every u32.
+        // insert_range bulk-fills containers but does a binary search per call.
+        // Crossover is ~6: below that, iterating all values is cheaper.
+        if avg_len <= 6 {
+            return RoaringBitmap::from_sorted_iter(
+                ranges.iter().flat_map(|r| r.start as u32..r.end as u32),
+            )
+            .unwrap();
         }
     }
-    ranges.push(start as u64..(end + 1) as u64);
-    ranges
+    let mut bm = RoaringBitmap::new();
+    for r in ranges {
+        bm.insert_range(r.start as u32..r.end as u32);
+    }
+    bm
 }
 
 /// A set of stable row ids backed by a 64-bit Roaring bitmap.
@@ -2034,6 +2044,85 @@ mod tests {
         for id in [0, 5, u32::MAX as u64] {
             assert!(map.contains(id));
         }
+    }
+
+    // ============================================================================
+    // Tests for bitmap_to_ranges / ranges_to_bitmap
+    // ============================================================================
+
+    #[test]
+    fn test_bitmap_to_ranges_empty() {
+        let bm = RoaringBitmap::new();
+        assert!(bitmap_to_ranges(&bm).is_empty());
+    }
+
+    #[test]
+    fn test_bitmap_to_ranges_single() {
+        let bm = RoaringBitmap::from_iter([5]);
+        assert_eq!(bitmap_to_ranges(&bm), vec![5..6]);
+    }
+
+    #[test]
+    fn test_bitmap_to_ranges_contiguous() {
+        let mut bm = RoaringBitmap::new();
+        bm.insert_range(10..20);
+        assert_eq!(bitmap_to_ranges(&bm), vec![10..20]);
+    }
+
+    #[test]
+    fn test_bitmap_to_ranges_multiple() {
+        let mut bm = RoaringBitmap::new();
+        bm.insert_range(0..3);
+        bm.insert_range(10..15);
+        bm.insert(100);
+        assert_eq!(bitmap_to_ranges(&bm), vec![0..3, 10..15, 100..101]);
+    }
+
+    #[test]
+    fn test_ranges_to_bitmap_empty() {
+        let bm = ranges_to_bitmap(&[], true);
+        assert!(bm.is_empty());
+    }
+
+    #[test]
+    fn test_ranges_to_bitmap_sorted_short_ranges() {
+        // avg len = 1, uses from_sorted_iter path
+        let ranges = vec![0..1, 5..6, 10..11];
+        let bm = ranges_to_bitmap(&ranges, true);
+        assert!(bm.contains(0) && bm.contains(5) && bm.contains(10));
+        assert_eq!(bm.len(), 3);
+    }
+
+    #[test]
+    fn test_ranges_to_bitmap_sorted_long_ranges() {
+        // avg len = 100, uses insert_range path
+        let ranges = vec![0..100, 200..300];
+        let bm = ranges_to_bitmap(&ranges, true);
+        assert_eq!(bm.len(), 200);
+        assert!(bm.contains(0) && bm.contains(99));
+        assert!(!bm.contains(100));
+        assert!(bm.contains(200) && bm.contains(299));
+    }
+
+    #[test]
+    fn test_ranges_to_bitmap_unsorted() {
+        let ranges = vec![200..300, 0..100];
+        let bm = ranges_to_bitmap(&ranges, false);
+        assert_eq!(bm.len(), 200);
+        assert!(bm.contains(0) && bm.contains(250));
+    }
+
+    #[test]
+    fn test_bitmap_ranges_roundtrip() {
+        let mut original = RoaringBitmap::new();
+        original.insert_range(0..50);
+        original.insert_range(100..200);
+        original.insert(500);
+        original.insert_range(1000..1010);
+
+        let ranges = bitmap_to_ranges(&original);
+        let reconstructed = ranges_to_bitmap(&ranges, true);
+        assert_eq!(original, reconstructed);
     }
 
     // ============================================================================

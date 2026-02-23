@@ -32,7 +32,9 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{bitmap_to_ranges, RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_core::utils::mask::{
+    bitmap_to_ranges, ranges_to_bitmap, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
+};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
@@ -1501,11 +1503,7 @@ impl FilteredReadInternalPlan {
         let mut rows = RowAddrTreeMap::new();
         for (fragment_id, ranges) in &self.rows {
             if !ranges.is_empty() {
-                let mut bitmap = RoaringBitmap::new();
-                for range in ranges {
-                    bitmap.insert_range(range.start as u32..range.end as u32);
-                }
-                rows.insert_bitmap(*fragment_id, bitmap);
+                rows.insert_bitmap(*fragment_id, ranges_to_bitmap(ranges, true));
             }
         }
         FilteredReadPlan {

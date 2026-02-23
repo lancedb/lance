@@ -39,6 +39,8 @@ from lance_namespace import (
     ListNamespacesResponse,
     ListTablesRequest,
     ListTablesResponse,
+    ListTableVersionsRequest,
+    ListTableVersionsResponse,
     NamespaceExistsRequest,
     RegisterTableRequest,
     RegisterTableResponse,
@@ -393,6 +395,70 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.declare_table(request.model_dump())
         return DeclareTableResponse.from_dict(response_dict)
 
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
+
 
 class RestNamespace(LanceNamespace):
     """REST-based Lance Namespace implementation backed by Rust.
@@ -541,6 +607,70 @@ class RestNamespace(LanceNamespace):
     def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
         response_dict = self._inner.rename_table(request.model_dump())
         return RenameTableResponse.from_dict(response_dict)
+
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
 
 
 class RestAdapter:

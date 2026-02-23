@@ -434,6 +434,8 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
+        namespace: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -464,6 +466,8 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
+            namespace=namespace,
+            table_id=table_id,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -647,12 +651,11 @@ class LanceDataset(pa.dataset.Dataset):
         list index information and index_statistics() to get the statistics for
         individual indexes of interest.
         """
-        # TODO: https://github.com/lancedb/lance/issues/5237 deprecate this method
-        # warnings.warn(
-        #     "The 'list_indices' method is deprecated.  It may be removed in a future"
-        #     "version.  Use describe_indices() instead.",
-        #     DeprecationWarning,
-        # )
+        warnings.warn(
+            "The 'list_indices' method is deprecated. It may be removed in a future "
+            "version. Use describe_indices() instead.",
+            DeprecationWarning,
+        )
 
         return self._ds.load_indices()
 
@@ -670,7 +673,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     @property
     def has_index(self):
-        return len(self.list_indices()) > 0
+        return len(self.describe_indices()) > 0
 
     def _apply_default_scan_options(self, builder: ScannerBuilder):
         if self._default_scan_options:
@@ -3298,8 +3301,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Note: Indices are dropped by "index name".  This is not the same as the field
         name. If you did not specify a name when you created the index then a name was
-        generated for you.  You can use the `list_indices` method to get the names of
-        the indices.
+        generated for you.  You can use the `describe_indices` method to get the names
+        of the indices.
         """
         return self._ds.drop_index(name)
 
@@ -3939,9 +3942,19 @@ class LanceDataset(pa.dataset.Dataset):
 
         Raises KeyError if no such index exists.
         """
-        for meta in self.list_indices():
-            if column in meta["fields"] and meta["type"].startswith("IVF"):
-                return meta["name"]
+        # Resolve column path to field id for describe_indices matching.
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise KeyError(f"No IVF index for column '{column}'")
+        field_id = lance_field.id()
+
+        indices = self.describe_indices()
+        for idx in indices:
+            if field_id in idx.fields:
+                # Use index_stats to get the concrete IVF subtype.
+                index_type = self.stats.index_stats(idx.name).get("index_type", "")
+                if index_type.startswith("IVF"):
+                    return idx.name
         raise KeyError(f"No IVF index for column '{column}'")
 
     def centroids(
@@ -5804,6 +5817,9 @@ def write_dataset(
                 f"Namespace did not return a table location in {mode} response"
             )
 
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
+
         # Use namespace storage options
         namespace_storage_options = response.storage_options
 
@@ -5828,6 +5844,7 @@ def write_dataset(
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
     else:
         storage_options_provider = None
+        managed_versioning = False
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -5867,6 +5884,11 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
+
+    # Add namespace and table_id for managed versioning (external manifest store)
+    if managed_versioning and namespace is not None and table_id is not None:
+        params["namespace"] = namespace
+        params["table_id"] = table_id
 
     if commit_lock:
         if not callable(commit_lock):

@@ -336,6 +336,7 @@ pub(crate) async fn remap_index(
                             &new_store,
                             inverted_index.params().clone(),
                             None,
+                            Arc::new(NoopIndexBuildProgress),
                         )
                         .await?
                     } else {

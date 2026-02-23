@@ -12,9 +12,11 @@ use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
 use std::collections::HashMap;
@@ -23,12 +25,15 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
-    DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableRequest, DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateEmptyTableRequest,
+    CreateEmptyTableResponse, CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
+    DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
+    NamespaceExistsRequest, TableExistsRequest, TableVersion,
 };
 
 use lance_core::{box_error, Error, Result};
@@ -94,6 +99,7 @@ pub struct DirectoryNamespaceBuilder {
     manifest_enabled: bool,
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
+    table_version_tracking_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
 }
@@ -108,6 +114,10 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
             .field(
                 "inline_optimization_enabled",
                 &self.inline_optimization_enabled,
+            )
+            .field(
+                "table_version_tracking_enabled",
+                &self.table_version_tracking_enabled,
             )
             .field(
                 "context_provider",
@@ -131,6 +141,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: true,
+            table_version_tracking_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
         }
@@ -161,6 +172,18 @@ impl DirectoryNamespaceBuilder {
     /// When disabled, manual optimization must be performed separately.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable table version tracking through the namespace.
+    ///
+    /// When enabled, `describe_table` returns `managed_versioning: true` to indicate
+    /// that commits should go through the namespace's table version APIs rather than
+    /// direct object store operations.
+    ///
+    /// When disabled (default), `managed_versioning` is not set.
+    pub fn table_version_tracking_enabled(mut self, enabled: bool) -> Self {
+        self.table_version_tracking_enabled = enabled;
         self
     }
 
@@ -274,6 +297,12 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
+        // Extract table_version_tracking_enabled (default: false)
+        let table_version_tracking_enabled = properties
+            .get("table_version_tracking_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
         // The build() method will check if enabled=true before creating the vendor
@@ -292,6 +321,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled,
             dir_listing_enabled,
             inline_optimization_enabled,
+            table_version_tracking_enabled,
             credential_vendor_properties,
             context_provider: None,
         })
@@ -459,6 +489,7 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
+            table_version_tracking_enabled: self.table_version_tracking_enabled,
             credential_vendor,
             context_provider: self.context_provider,
         })
@@ -530,6 +561,9 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
     dir_listing_enabled: bool,
+    /// When true, `describe_table` returns `managed_versioning: true` to indicate
+    /// commits should go through namespace table version APIs.
+    table_version_tracking_enabled: bool,
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
     credential_vendor: Option<Arc<dyn CredentialVendor>>,
@@ -656,9 +690,36 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
-    /// Get the full URI path for a table (for returning in responses)
+    async fn resolve_table_location(&self, id: &Option<Vec<String>>) -> Result<String> {
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = id.clone();
+        describe_req.load_detailed_metadata = Some(false);
+
+        let describe_resp = self.describe_table(describe_req).await?;
+
+        describe_resp.location.ok_or_else(|| Error::Namespace {
+            source: format!("Table location not found for: {:?}", id).into(),
+            location: snafu::location!(),
+        })
+    }
+
     fn table_full_uri(&self, table_name: &str) -> String {
         format!("{}/{}.lance", &self.root, table_name)
+    }
+
+    fn uri_to_object_store_path(uri: &str) -> Path {
+        let path_str = if let Some(rest) = uri.strip_prefix("file://") {
+            rest
+        } else if let Some(rest) = uri.strip_prefix("s3://") {
+            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
+        } else if let Some(rest) = uri.strip_prefix("gs://") {
+            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
+        } else if let Some(rest) = uri.strip_prefix("az://") {
+            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
+        } else {
+            uri
+        };
+        Path::from(path_str)
     }
 
     /// Get the object store path for a table (relative to base_path)
@@ -707,13 +768,6 @@ impl DirectoryNamespace {
         }
     }
 
-    /// Atomically create a marker file using put_if_not_exists semantics.
-    ///
-    /// This uses `PutMode::Create` which will fail if the file already exists,
-    /// providing atomic creation semantics to avoid race conditions.
-    ///
-    /// Returns Ok(()) if the file was created successfully.
-    /// Returns Err with appropriate message if the file already exists or other error.
     async fn put_marker_file_atomic(
         &self,
         path: &Path,
@@ -1023,6 +1077,10 @@ impl LanceNamespace for DirectoryNamespace {
                     } else if request.vend_credentials == Some(false) {
                         response.storage_options = None;
                     }
+                    // Set managed_versioning flag when table_version_tracking_enabled
+                    if self.table_version_tracking_enabled {
+                        response.managed_versioning = Some(true);
+                    }
                     return Ok(response);
                 }
                 Err(_)
@@ -1080,6 +1138,11 @@ impl LanceNamespace for DirectoryNamespace {
                 location: Some(table_uri.clone()),
                 table_uri: Some(table_uri),
                 storage_options,
+                managed_versioning: if self.table_version_tracking_enabled {
+                    Some(true)
+                } else {
+                    None
+                },
                 ..Default::default()
             });
         }
@@ -1122,6 +1185,11 @@ impl LanceNamespace for DirectoryNamespace {
                     schema: Some(Box::new(json_schema)),
                     storage_options,
                     metadata: Some(metadata),
+                    managed_versioning: if self.table_version_tracking_enabled {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 })
             }
@@ -1146,6 +1214,11 @@ impl LanceNamespace for DirectoryNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         storage_options,
+                        managed_versioning: if self.table_version_tracking_enabled {
+                            Some(true)
+                        } else {
+                            None
+                        },
                         ..Default::default()
                     })
                 } else {
@@ -1374,6 +1447,10 @@ impl LanceNamespace for DirectoryNamespace {
             } else if request.vend_credentials == Some(false) {
                 response.storage_options = None;
             }
+            // Set managed_versioning when table_version_tracking_enabled
+            if self.table_version_tracking_enabled {
+                response.managed_versioning = Some(true);
+            }
             return Ok(response);
         }
 
@@ -1432,6 +1509,11 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DeclareTableResponse {
             location: Some(table_uri),
             storage_options,
+            managed_versioning: if self.table_version_tracking_enabled {
+                Some(true)
+            } else {
+                None
+            },
             ..Default::default()
         })
     }
@@ -1514,6 +1596,289 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn list_table_versions(
+        &self,
+        request: ListTableVersionsRequest,
+    ) -> Result<ListTableVersionsResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let table_path = Self::uri_to_object_store_path(&table_uri);
+        let versions_dir = table_path.child("_versions");
+        let manifest_metas: Vec<_> = self
+            .object_store
+            .read_dir_all(&versions_dir, None)
+            .try_collect()
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to list manifest files for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+                location: snafu::location!(),
+            })?;
+
+        let is_v2_naming = manifest_metas
+            .first()
+            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
+
+        let mut table_versions: Vec<TableVersion> = manifest_metas
+            .into_iter()
+            .filter_map(|meta| {
+                let filename = meta.location.filename()?;
+                let version_str = filename.strip_suffix(".manifest")?;
+                if version_str.starts_with('d') {
+                    return None;
+                }
+                let file_version: u64 = version_str.parse().ok()?;
+
+                let actual_version = if file_version > u64::MAX / 2 {
+                    u64::MAX - file_version
+                } else {
+                    file_version
+                };
+
+                // Use full path from object_store (relative to object store root)
+                Some(TableVersion {
+                    version: actual_version as i64,
+                    manifest_path: meta.location.to_string(),
+                    manifest_size: Some(meta.size as i64),
+                    e_tag: meta.e_tag,
+                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+                    metadata: None,
+                })
+            })
+            .collect();
+
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let want_descending = request.descending == Some(true);
+
+        let needs_sort = if list_is_ordered {
+            if is_v2_naming {
+                !want_descending
+            } else {
+                want_descending
+            }
+        } else {
+            true
+        };
+
+        if needs_sort {
+            if want_descending {
+                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
+            } else {
+                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
+            }
+        }
+
+        if let Some(limit) = request.limit {
+            table_versions.truncate(limit as usize);
+        }
+
+        Ok(ListTableVersionsResponse {
+            versions: table_versions,
+            page_token: None,
+        })
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> Result<CreateTableVersionResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let staging_manifest_path = &request.manifest_path;
+        let version = request.version as u64;
+
+        let table_path = Self::uri_to_object_store_path(&table_uri);
+
+        // Determine naming scheme from request, default to V2
+        let naming_scheme = match request.naming_scheme.as_deref() {
+            Some("V1") => ManifestNamingScheme::V1,
+            _ => ManifestNamingScheme::V2,
+        };
+
+        // Compute final path using the naming scheme
+        let final_path = naming_scheme.manifest_path(&table_path, version);
+
+        let staging_path = Self::uri_to_object_store_path(staging_manifest_path);
+        let manifest_data = self
+            .object_store
+            .inner
+            .get(&staging_path)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to read staging manifest at '{}': {}",
+                    staging_manifest_path, e
+                )
+                .into(),
+                location: snafu::location!(),
+            })?
+            .bytes()
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to read staging manifest bytes at '{}': {}",
+                    staging_manifest_path, e
+                )
+                .into(),
+                location: snafu::location!(),
+            })?;
+
+        let manifest_size = manifest_data.len() as i64;
+
+        let put_result = self
+            .object_store
+            .inner
+            .put_opts(
+                &final_path,
+                manifest_data.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } => Error::Namespace {
+                    source: format!(
+                        "Version {} already exists for table at '{}'",
+                        version, table_uri
+                    )
+                    .into(),
+                    location: snafu::location!(),
+                },
+                _ => Error::Namespace {
+                    source: format!(
+                        "Failed to create version {} for table at '{}': {}",
+                        version, table_uri, e
+                    )
+                    .into(),
+                    location: snafu::location!(),
+                },
+            })?;
+
+        // Delete the staging manifest after successful copy
+        if let Err(e) = self.object_store.inner.delete(&staging_path).await {
+            log::warn!(
+                "Failed to delete staging manifest at '{}': {:?}",
+                staging_path,
+                e
+            );
+        }
+
+        Ok(CreateTableVersionResponse {
+            transaction_id: None,
+            version: Some(Box::new(TableVersion {
+                version: version as i64,
+                manifest_path: final_path.to_string(),
+                manifest_size: Some(manifest_size),
+                e_tag: put_result.e_tag,
+                timestamp_millis: None,
+                metadata: None,
+            })),
+        })
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let mut dataset = Dataset::open(&table_uri)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
+                location: snafu::location!(),
+            })?;
+
+        if let Some(version) = request.version {
+            dataset = dataset
+                .checkout_version(version as u64)
+                .await
+                .map_err(|e| Error::Namespace {
+                    source: format!(
+                        "Failed to checkout version {} for table at '{}': {}",
+                        version, table_uri, e
+                    )
+                    .into(),
+                    location: snafu::location!(),
+                })?;
+        }
+
+        let version_info = dataset.version();
+        let manifest_location = dataset.manifest_location();
+        let metadata: std::collections::HashMap<String, String> =
+            version_info.metadata.into_iter().collect();
+
+        let table_version = TableVersion {
+            version: version_info.version as i64,
+            manifest_path: manifest_location.path.to_string(),
+            manifest_size: manifest_location.size.map(|s| s as i64),
+            e_tag: manifest_location.e_tag.clone(),
+            timestamp_millis: Some(version_info.timestamp.timestamp_millis()),
+            metadata: if metadata.is_empty() {
+                None
+            } else {
+                Some(metadata)
+            },
+        };
+
+        Ok(DescribeTableVersionResponse {
+            version: Box::new(table_version),
+        })
+    }
+
+    async fn batch_delete_table_versions(
+        &self,
+        request: BatchDeleteTableVersionsRequest,
+    ) -> Result<BatchDeleteTableVersionsResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let table_path = Self::uri_to_object_store_path(&table_uri);
+        let table_path_str = table_path.as_ref();
+        let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+
+        let mut deleted_count = 0i64;
+
+        for range in &request.ranges {
+            let start = range.start_version as u64;
+            let end = if range.end_version > 0 {
+                range.end_version as u64
+            } else {
+                start
+            };
+
+            for version in start..=end {
+                let version_path = versions_dir_path.child(format!("{}.manifest", version));
+                match self.object_store.inner.delete(&version_path).await {
+                    Ok(_) => {
+                        deleted_count += 1;
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
+                        return Err(Error::Namespace {
+                            source: format!(
+                                "Failed to delete version {} for table at '{}': {}",
+                                version, table_uri, e
+                            )
+                            .into(),
+                            location: snafu::location!(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(BatchDeleteTableVersionsResponse {
+            deleted_count: Some(deleted_count),
+            transaction_id: None,
+        })
+    }
+
     fn namespace_id(&self) -> String {
         format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
@@ -1524,7 +1889,7 @@ mod tests {
     use super::*;
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
-    use lance_core::utils::tempfile::TempStdDir;
+    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
@@ -3552,5 +3917,1084 @@ mod tests {
         assert!(status.exists);
         assert!(!status.is_deregistered);
         assert!(!status.has_reserved_file);
+    }
+
+    #[tokio::test]
+    async fn test_table_version_tracking_enabled_managed_versioning() {
+        use lance_namespace::models::DescribeTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace with table_version_tracking_enabled=true
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .table_version_tracking_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Describe table should return managed_versioning=true
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_resp = namespace.describe_table(describe_req).await.unwrap();
+
+        // managed_versioning should be true
+        assert_eq!(
+            describe_resp.managed_versioning,
+            Some(true),
+            "managed_versioning should be true when table_version_tracking_enabled=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_version_tracking_disabled_no_managed_versioning() {
+        use lance_namespace::models::DescribeTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace with table_version_tracking_enabled=false (default)
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .table_version_tracking_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Describe table should not have managed_versioning set
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_resp = namespace.describe_table(describe_req).await.unwrap();
+
+        // managed_versioning should be None when table_version_tracking_enabled=false
+        assert!(
+            describe_resp.managed_versioning.is_none(),
+            "managed_versioning should be None when table_version_tracking_enabled=false, got: {:?}",
+            describe_resp.managed_versioning
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_list_table_versions() {
+        use arrow::array::{Int32Array, RecordBatchIterator};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, ListTableVersionsRequest};
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        // Append to create version 2
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema.clone());
+        dataset.append(batches, None).await.unwrap();
+
+        // Append to create version 3
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![300, 400]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch3)], arrow_schema);
+        dataset.append(batches, None).await.unwrap();
+
+        // List versions - should have versions 1, 2, and 3
+        let mut list_req = ListTableVersionsRequest::new();
+        list_req.id = Some(table_id.clone());
+        let list_resp = namespace.list_table_versions(list_req).await.unwrap();
+
+        assert_eq!(
+            list_resp.versions.len(),
+            3,
+            "Should have 3 versions, got: {:?}",
+            list_resp.versions
+        );
+
+        // Verify each version
+        for expected_version in 1..=3 {
+            let version = list_resp
+                .versions
+                .iter()
+                .find(|v| v.version == expected_version)
+                .unwrap_or_else(|| panic!("Expected version {}", expected_version));
+
+            assert!(
+                !version.manifest_path.is_empty(),
+                "manifest_path should be set for version {}",
+                expected_version
+            );
+            assert!(
+                version.manifest_path.contains(".manifest"),
+                "manifest_path should contain .manifest for version {}",
+                expected_version
+            );
+            assert!(
+                version.manifest_size.is_some(),
+                "manifest_size should be set for version {}",
+                expected_version
+            );
+            assert!(
+                version.manifest_size.unwrap() > 0,
+                "manifest_size should be > 0 for version {}",
+                expected_version
+            );
+            assert!(
+                version.timestamp_millis.is_some(),
+                "timestamp_millis should be set for version {}",
+                expected_version
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_describe_table_version() {
+        use arrow::array::{Int32Array, RecordBatchIterator};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, DescribeTableVersionRequest};
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        // Append data to create version 2
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema);
+        dataset.append(batches, None).await.unwrap();
+
+        // Describe version 1
+        let mut describe_req = DescribeTableVersionRequest::new();
+        describe_req.id = Some(table_id.clone());
+        describe_req.version = Some(1);
+        let describe_resp = namespace
+            .describe_table_version(describe_req)
+            .await
+            .unwrap();
+
+        let version = &describe_resp.version;
+        assert_eq!(version.version, 1);
+        assert!(version.timestamp_millis.is_some());
+        assert!(
+            !version.manifest_path.is_empty(),
+            "manifest_path should be set"
+        );
+        assert!(
+            version.manifest_path.contains(".manifest"),
+            "manifest_path should contain .manifest"
+        );
+        assert!(
+            version.manifest_size.is_some(),
+            "manifest_size should be set"
+        );
+        assert!(
+            version.manifest_size.unwrap() > 0,
+            "manifest_size should be > 0"
+        );
+
+        // Describe version 2
+        let mut describe_req = DescribeTableVersionRequest::new();
+        describe_req.id = Some(table_id.clone());
+        describe_req.version = Some(2);
+        let describe_resp = namespace
+            .describe_table_version(describe_req)
+            .await
+            .unwrap();
+
+        let version = &describe_resp.version;
+        assert_eq!(version.version, 2);
+        assert!(version.timestamp_millis.is_some());
+        assert!(
+            !version.manifest_path.is_empty(),
+            "manifest_path should be set"
+        );
+        assert!(
+            version.manifest_size.is_some(),
+            "manifest_size should be set"
+        );
+        assert!(
+            version.manifest_size.unwrap() > 0,
+            "manifest_size should be > 0"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_describe_table_version_latest() {
+        use arrow::array::{Int32Array, RecordBatchIterator};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::models::{CreateNamespaceRequest, DescribeTableVersionRequest};
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create parent namespace first
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table using write_into_namespace (version 1)
+        let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone(),
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        // Append to create version 2
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema.clone());
+        dataset.append(batches, None).await.unwrap();
+
+        // Append to create version 3
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![300, 400]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch3)], arrow_schema);
+        dataset.append(batches, None).await.unwrap();
+
+        // Describe latest version (no version specified)
+        let mut describe_req = DescribeTableVersionRequest::new();
+        describe_req.id = Some(table_id.clone());
+        describe_req.version = None;
+        let describe_resp = namespace
+            .describe_table_version(describe_req)
+            .await
+            .unwrap();
+
+        // Should return version 3 as it's the latest
+        assert_eq!(describe_resp.version.version, 3);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_create_table_version() {
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Open the dataset using from_namespace to get proper object_store and paths
+        let table_id = vec!["test_table".to_string()];
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+
+        // Use dataset's object_store to find and copy the manifest
+        let versions_path = dataset.versions_dir();
+        let manifest_metas: Vec<_> = dataset
+            .object_store()
+            .inner
+            .list(Some(&versions_path))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let manifest_meta = manifest_metas
+            .iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("No manifest file found");
+
+        // Read the existing manifest data
+        let manifest_data = dataset
+            .object_store()
+            .inner
+            .get(&manifest_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        // Write to a staging location using the dataset's object_store
+        let staging_path = dataset.versions_dir().child("staging_manifest");
+        dataset
+            .object_store()
+            .inner
+            .put(&staging_path, manifest_data.into())
+            .await
+            .unwrap();
+
+        // Create version 2 from staging manifest
+        // Use the same naming scheme as the existing dataset (V2)
+        let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        create_version_req.id = Some(table_id.clone());
+        create_version_req.naming_scheme = Some("V2".to_string());
+
+        let result = namespace.create_table_version(create_version_req).await;
+        assert!(
+            result.is_ok(),
+            "create_table_version should succeed: {:?}",
+            result
+        );
+
+        // Verify version 2 was created at the path returned in the response
+        let response = result.unwrap();
+        let version_info = response
+            .version
+            .expect("response should contain version info");
+        let version_2_path = Path::from(version_info.manifest_path);
+        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        assert!(
+            head_result.is_ok(),
+            "Version 2 manifest should exist at {}",
+            version_2_path
+        );
+
+        // Verify the staging file has been deleted
+        let staging_head_result = dataset.object_store().inner.head(&staging_path).await;
+        assert!(
+            staging_head_result.is_err(),
+            "Staging manifest should have been deleted after create_table_version"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_create_table_version_conflict() {
+        // create_table_version should fail if the version already exists.
+        // Each version always writes to a new file location.
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Open the dataset using from_namespace to get proper object_store and paths
+        let table_id = vec!["test_table".to_string()];
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+
+        // Use dataset's object_store to find and copy the manifest
+        let versions_path = dataset.versions_dir();
+        let manifest_metas: Vec<_> = dataset
+            .object_store()
+            .inner
+            .list(Some(&versions_path))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let manifest_meta = manifest_metas
+            .iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("No manifest file found");
+
+        // Read the existing manifest data
+        let manifest_data = dataset
+            .object_store()
+            .inner
+            .get(&manifest_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        // Write to a staging location using the dataset's object_store
+        let staging_path = dataset.versions_dir().child("staging_manifest");
+        dataset
+            .object_store()
+            .inner
+            .put(&staging_path, manifest_data.into())
+            .await
+            .unwrap();
+
+        // First create version 2 (should succeed)
+        let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        create_version_req.id = Some(table_id.clone());
+        create_version_req.naming_scheme = Some("V2".to_string());
+        let first_result = namespace.create_table_version(create_version_req).await;
+        assert!(
+            first_result.is_ok(),
+            "First create_table_version for version 2 should succeed: {:?}",
+            first_result
+        );
+
+        // Get the path from the response for verification
+        let version_2_path = Path::from(
+            first_result
+                .unwrap()
+                .version
+                .expect("response should contain version info")
+                .manifest_path,
+        );
+
+        // Create version 2 again (should fail - conflict)
+        let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        create_version_req.id = Some(table_id.clone());
+        create_version_req.naming_scheme = Some("V2".to_string());
+
+        let result = namespace.create_table_version(create_version_req).await;
+        assert!(
+            result.is_err(),
+            "create_table_version should fail for existing version"
+        );
+
+        // Verify version 2 still exists using the dataset's object_store
+        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        assert!(
+            head_result.is_ok(),
+            "Version 2 manifest should still exist at {}",
+            version_2_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_version_table_not_found() {
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .table_version_tracking_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to create version for non-existent table
+        let mut create_version_req =
+            CreateTableVersionRequest::new(1, "/some/staging/path".to_string());
+        create_version_req.id = Some(vec!["non_existent_table".to_string()]);
+
+        let result = namespace.create_table_version(create_version_req).await;
+        assert!(
+            result.is_err(),
+            "create_table_version should fail for non-existent table"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "Error should mention table does not exist, got: {}",
+            err_msg
+        );
+    }
+
+    /// End-to-end integration test module for table version tracking.
+    mod e2e_table_version_tracking {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Tracking wrapper around a namespace that counts method invocations.
+        struct TrackingNamespace {
+            inner: DirectoryNamespace,
+            create_table_version_count: AtomicUsize,
+            describe_table_version_count: AtomicUsize,
+            list_table_versions_count: AtomicUsize,
+        }
+
+        impl TrackingNamespace {
+            fn new(inner: DirectoryNamespace) -> Self {
+                Self {
+                    inner,
+                    create_table_version_count: AtomicUsize::new(0),
+                    describe_table_version_count: AtomicUsize::new(0),
+                    list_table_versions_count: AtomicUsize::new(0),
+                }
+            }
+
+            fn create_table_version_calls(&self) -> usize {
+                self.create_table_version_count.load(Ordering::SeqCst)
+            }
+
+            fn describe_table_version_calls(&self) -> usize {
+                self.describe_table_version_count.load(Ordering::SeqCst)
+            }
+
+            fn list_table_versions_calls(&self) -> usize {
+                self.list_table_versions_count.load(Ordering::SeqCst)
+            }
+        }
+
+        impl std::fmt::Debug for TrackingNamespace {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("TrackingNamespace")
+                    .field(
+                        "create_table_version_calls",
+                        &self.create_table_version_calls(),
+                    )
+                    .finish()
+            }
+        }
+
+        #[async_trait]
+        impl LanceNamespace for TrackingNamespace {
+            async fn create_namespace(
+                &self,
+                request: CreateNamespaceRequest,
+            ) -> Result<CreateNamespaceResponse> {
+                self.inner.create_namespace(request).await
+            }
+
+            async fn describe_namespace(
+                &self,
+                request: DescribeNamespaceRequest,
+            ) -> Result<DescribeNamespaceResponse> {
+                self.inner.describe_namespace(request).await
+            }
+
+            async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+                self.inner.namespace_exists(request).await
+            }
+
+            async fn list_namespaces(
+                &self,
+                request: ListNamespacesRequest,
+            ) -> Result<ListNamespacesResponse> {
+                self.inner.list_namespaces(request).await
+            }
+
+            async fn drop_namespace(
+                &self,
+                request: DropNamespaceRequest,
+            ) -> Result<DropNamespaceResponse> {
+                self.inner.drop_namespace(request).await
+            }
+
+            async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+                self.inner.list_tables(request).await
+            }
+
+            async fn describe_table(
+                &self,
+                request: DescribeTableRequest,
+            ) -> Result<DescribeTableResponse> {
+                self.inner.describe_table(request).await
+            }
+
+            async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+                self.inner.table_exists(request).await
+            }
+
+            async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+                self.inner.drop_table(request).await
+            }
+
+            async fn create_table(
+                &self,
+                request: CreateTableRequest,
+                request_data: Bytes,
+            ) -> Result<CreateTableResponse> {
+                self.inner.create_table(request, request_data).await
+            }
+
+            #[allow(deprecated)]
+            async fn create_empty_table(
+                &self,
+                request: CreateEmptyTableRequest,
+            ) -> Result<CreateEmptyTableResponse> {
+                self.inner.create_empty_table(request).await
+            }
+
+            async fn declare_table(
+                &self,
+                request: DeclareTableRequest,
+            ) -> Result<DeclareTableResponse> {
+                self.inner.declare_table(request).await
+            }
+
+            async fn list_table_versions(
+                &self,
+                request: ListTableVersionsRequest,
+            ) -> Result<ListTableVersionsResponse> {
+                self.list_table_versions_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.inner.list_table_versions(request).await
+            }
+
+            async fn create_table_version(
+                &self,
+                request: CreateTableVersionRequest,
+            ) -> Result<CreateTableVersionResponse> {
+                self.create_table_version_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.inner.create_table_version(request).await
+            }
+
+            async fn describe_table_version(
+                &self,
+                request: DescribeTableVersionRequest,
+            ) -> Result<DescribeTableVersionResponse> {
+                self.describe_table_version_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.inner.describe_table_version(request).await
+            }
+
+            async fn batch_delete_table_versions(
+                &self,
+                request: BatchDeleteTableVersionsRequest,
+            ) -> Result<BatchDeleteTableVersionsResponse> {
+                self.inner.batch_delete_table_versions(request).await
+            }
+
+            fn namespace_id(&self) -> String {
+                self.inner.namespace_id()
+            }
+        }
+
+        #[tokio::test]
+        async fn test_describe_table_returns_managed_versioning() {
+            use lance_namespace::models::{CreateNamespaceRequest, DescribeTableRequest};
+
+            let temp_dir = TempStdDir::default();
+            let temp_path = temp_dir.to_str().unwrap();
+
+            // Create namespace with table_version_tracking_enabled and manifest_enabled
+            let ns = DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .manifest_enabled(true)
+                .build()
+                .await
+                .unwrap();
+
+            // Create parent namespace
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["workspace".to_string()]);
+            ns.create_namespace(create_ns_req).await.unwrap();
+
+            // Create a table with multi-level ID (namespace + table)
+            let schema = create_test_schema();
+            let ipc_data = create_test_ipc_data(&schema);
+            let mut create_req = CreateTableRequest::new();
+            create_req.id = Some(vec!["workspace".to_string(), "test_table".to_string()]);
+            ns.create_table(create_req, bytes::Bytes::from(ipc_data))
+                .await
+                .unwrap();
+
+            // Describe table should return managed_versioning=true
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["workspace".to_string(), "test_table".to_string()]);
+            let describe_resp = ns.describe_table(describe_req).await.unwrap();
+
+            // managed_versioning should be true
+            assert_eq!(
+                describe_resp.managed_versioning,
+                Some(true),
+                "managed_versioning should be true when table_version_tracking_enabled=true"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_external_manifest_store_invokes_namespace_apis() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use lance::dataset::builder::DatasetBuilder;
+            use lance::dataset::{WriteMode, WriteParams};
+            use lance::Dataset;
+            use lance_namespace::models::CreateNamespaceRequest;
+
+            let temp_dir = TempStdDir::default();
+            let temp_path = temp_dir.to_str().unwrap();
+
+            // Create namespace with table_version_tracking_enabled and manifest_enabled
+            let inner_ns = DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .manifest_enabled(true)
+                .build()
+                .await
+                .unwrap();
+
+            let tracking_ns = Arc::new(TrackingNamespace::new(inner_ns));
+            let ns: Arc<dyn LanceNamespace> = tracking_ns.clone();
+
+            // Create parent namespace
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["workspace".to_string()]);
+            ns.create_namespace(create_ns_req).await.unwrap();
+
+            // Create a table with multi-level ID (namespace + table)
+            let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+
+            // Create some initial data
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+
+            // Create a table using write_into_namespace
+            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            };
+            let mut dataset = Dataset::write_into_namespace(
+                batches,
+                ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.version().version, 1);
+
+            // Verify create_table_version was called once during initial write_into_namespace
+            assert_eq!(
+                tracking_ns.create_table_version_calls(),
+                1,
+                "create_table_version should have been called once during initial write_into_namespace"
+            );
+
+            // Append data - this should call create_table_version again
+            let append_batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let append_batches = RecordBatchIterator::new(vec![Ok(append_batch)], arrow_schema);
+            dataset.append(append_batches, None).await.unwrap();
+
+            assert_eq!(
+                tracking_ns.create_table_version_calls(),
+                2,
+                "create_table_version should have been called twice (once for create, once for append)"
+            );
+
+            // checkout_latest should call list_table_versions exactly once
+            let initial_list_calls = tracking_ns.list_table_versions_calls();
+            let latest_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(latest_dataset.version().version, 2);
+            assert_eq!(
+                tracking_ns.list_table_versions_calls(),
+                initial_list_calls + 1,
+                "list_table_versions should have been called exactly once during checkout_latest"
+            );
+
+            // checkout to specific version should call describe_table_version exactly once
+            let initial_describe_calls = tracking_ns.describe_table_version_calls();
+            let v1_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .with_version(1)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(v1_dataset.version().version, 1);
+            assert_eq!(
+                tracking_ns.describe_table_version_calls(),
+                initial_describe_calls + 1,
+                "describe_table_version should have been called exactly once during checkout to version 1"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_dataset_commit_with_external_manifest_store() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use futures::TryStreamExt;
+            use lance::dataset::{Dataset, WriteMode, WriteParams};
+            use lance_namespace::models::CreateNamespaceRequest;
+            use lance_table::io::commit::ManifestNamingScheme;
+
+            let temp_dir = TempStdDir::default();
+            let temp_path = temp_dir.to_str().unwrap();
+
+            // Create namespace with table_version_tracking_enabled and manifest_enabled
+            let inner_ns = DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .manifest_enabled(true)
+                .build()
+                .await
+                .unwrap();
+
+            let tracking_ns: Arc<dyn LanceNamespace> = Arc::new(TrackingNamespace::new(inner_ns));
+
+            // Create parent namespace
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["workspace".to_string()]);
+            tracking_ns.create_namespace(create_ns_req).await.unwrap();
+
+            // Create a table using write_into_namespace
+            let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            };
+            let dataset = Dataset::write_into_namespace(
+                batches,
+                tracking_ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.version().version, 1);
+
+            // Append data using write_into_namespace (APPEND mode)
+            let batch2 = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(batch2)], arrow_schema);
+            let write_params = WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            Dataset::write_into_namespace(
+                batches,
+                tracking_ns.clone(),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+            // Verify version 2 was created using the dataset's object_store
+            // List manifests in the versions directory to find the V2 named manifest
+            let manifest_metas: Vec<_> = dataset
+                .object_store()
+                .inner
+                .list(Some(&dataset.versions_dir()))
+                .try_collect()
+                .await
+                .unwrap();
+            let version_2_found = manifest_metas.iter().any(|m| {
+                m.location
+                    .filename()
+                    .map(|f| {
+                        f.ends_with(".manifest")
+                            && ManifestNamingScheme::V2.parse_version(f) == Some(2)
+                    })
+                    .unwrap_or(false)
+            });
+            assert!(
+                version_2_found,
+                "Version 2 manifest should exist in versions directory"
+            );
+        }
     }
 }

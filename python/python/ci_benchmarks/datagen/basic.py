@@ -72,7 +72,7 @@ def _create(dataset_uri: str):
             schema=SCHEMA,
             mode="create",
         )
-    if ds.list_indices() == []:
+    if not ds.describe_indices():
         ds.create_scalar_index("row_number", "BTREE")
         ds.create_scalar_index("row_number_bitmap", "BITMAP")
 

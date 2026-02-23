@@ -185,9 +185,9 @@ def btree_comparison_datasets(tmp_path):
 
 
 def test_load_indices(indexed_dataset: lance.LanceDataset):
-    indices = indexed_dataset.list_indices()
-    vec_idx = next(idx for idx in indices if idx["type"] == "IVF_PQ")
-    scalar_idx = next(idx for idx in indices if idx["type"] == "BTree")
+    indices = indexed_dataset.describe_indices()
+    vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
+    scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
 
@@ -665,7 +665,7 @@ def test_filter_with_fts_index(dataset):
 
 def test_create_scalar_index_fts_alias(dataset):
     dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
-    assert any(idx["type"] == "Inverted" for idx in dataset.list_indices())
+    assert any(idx.index_type == "Inverted" for idx in dataset.describe_indices())
 
 
 def test_multi_index_create(tmp_path):
@@ -677,24 +677,23 @@ def test_multi_index_create(tmp_path):
         "ints", index_type="BITMAP", name="ints_bitmap_idx", replace=True
     )
 
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 2
 
-    assert indices[0]["name"] == "ints_idx"
-    assert indices[0]["type"] == "BTree"
-    assert indices[1]["name"] == "ints_bitmap_idx"
-    assert indices[1]["type"] == "Bitmap"
+    idx_by_name = {idx.name: idx for idx in indices}
+    assert idx_by_name["ints_idx"].index_type == "BTree"
+    assert idx_by_name["ints_bitmap_idx"].index_type == "Bitmap"
 
     # Test that we can drop one of the indices
     dataset.drop_index("ints_idx")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "ints_bitmap_idx"
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].name == "ints_bitmap_idx"
+    assert indices[0].index_type == "Bitmap"
 
     # Test that we can drop the last index
     dataset.drop_index("ints_bitmap_idx")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 0
 
 
@@ -1549,9 +1548,9 @@ def test_bitmap_index(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("a", index_type="BITMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].index_type == "Bitmap"
 
 
 def test_bitmap_empty_range(tmp_path: Path):
@@ -1629,9 +1628,9 @@ def test_ngram_index(tmp_path: Path):
     def test_with(tbl: pa.Table):
         dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
         dataset.create_scalar_index("words", index_type="NGRAM")
-        indices = dataset.list_indices()
+        indices = dataset.describe_indices()
         assert len(indices) == 1
-        assert indices[0]["type"] == "NGram"
+        assert indices[0].index_type == "NGram"
 
         scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
             True
@@ -1683,7 +1682,7 @@ def test_zonemap_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([pa.array([i for i in range(8193)])], names=["values"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("values", index_type="ZONEMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
     # Get detailed index statistics
@@ -1779,9 +1778,9 @@ def test_zonemap_index_remapping(tmp_path: Path):
 
     # Train a zone map index
     dataset.create_scalar_index("values", index_type="ZONEMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "ZoneMap"
+    assert indices[0].index_type == "ZoneMap"
 
     # Confirm the zone map index is used if you search the dataset
     scanner = dataset.scanner(filter="values > 2500", prefilter=True)
@@ -1828,7 +1827,7 @@ def test_bloomfilter_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("values", index_type="BLOOMFILTER")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
     # Get detailed index statistics
@@ -2016,9 +2015,9 @@ def test_label_list_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([tag_list], names=["tags"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("tags", index_type="LABEL_LIST")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "LabelList"
+    assert indices[0].index_type == "LabelList"
 
 
 def test_label_list_index_array_contains(tmp_path: Path):
@@ -2215,8 +2214,8 @@ def test_create_index_empty_dataset(tmp_path: Path):
     test_searches()
 
     # Make sure fetching index stats on empty index is ok
-    for idx in ds.list_indices():
-        ds.stats.index_stats(idx["name"])
+    for idx in ds.describe_indices():
+        ds.stats.index_stats(idx.name)
 
     # Make sure updating empty indices is ok
     ds.optimize.optimize_indices()
@@ -2286,17 +2285,17 @@ def test_drop_index(tmp_path):
     ds.create_scalar_index("fts", index_type="INVERTED")
     ds.create_scalar_index("ngram", index_type="NGRAM")
 
-    assert len(ds.list_indices()) == 4
+    assert len(ds.describe_indices()) == 4
 
     # Attempt to drop index (name does not exist)
     with pytest.raises(RuntimeError, match="index not found"):
         ds.drop_index("nonexistent_name")
 
-    for idx in ds.list_indices():
-        idx_name = idx["name"]
+    for idx in ds.describe_indices():
+        idx_name = idx.name
         ds.drop_index(idx_name)
 
-    assert len(ds.list_indices()) == 0
+    assert len(ds.describe_indices()) == 0
 
     # Ensure we can still search columns
     assert ds.to_table(filter="btree = 1").num_rows == 1
@@ -2964,20 +2963,10 @@ def test_build_distributed_fts_index_basic(tmp_path):
     )
 
     # Verify the index was created
-    indices = distributed_ds.list_indices()
-    assert len(indices) > 0, "No indices found after distributed index creation"
-
-    # Find our distributed index
-    distributed_index = None
-    for idx in indices:
-        if "distributed" in idx["name"]:
-            distributed_index = idx
-            break
-
-    assert distributed_index is not None, "Distributed index not found"
-    assert distributed_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {distributed_index['type']}"
-    )
+    index_name = "text_distributed_idx"
+    stats = distributed_ds.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "Inverted"
 
     # Test that the index works for searching
     results = distributed_ds.scanner(
@@ -3392,19 +3381,9 @@ def test_distribute_fts_index_build(tmp_path):
     )
 
     # Verify the index was created and is functional
-    indices = ds_committed.list_indices()
-    assert len(indices) > 0, "No indices found after commit"
-
-    # Find our index
-    our_index = None
-    for idx in indices:
-        if idx["name"] == index_name:
-            our_index = idx
-            break
-    assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert our_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {our_index['type']}"
-    )
+    stats = ds_committed.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "Inverted"
 
     # Test that the index works for searching
     # Get a sample text from the dataset to search for
@@ -3472,10 +3451,10 @@ def test_backward_compatibility_no_fragment_ids(tmp_path):
     )
 
     # Verify the index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "full_dataset_idx"
-    assert indices[0]["type"] == "Inverted"
+    assert indices[0].name == "full_dataset_idx"
+    assert indices[0].index_type == "Inverted"
 
     # Test that the index works
     sample_data = ds.take([0], columns=["text"])
@@ -3496,10 +3475,10 @@ def test_backward_compatibility_changed_index_protos(tmp_path):
     shutil.copytree(path, tmp_path, dirs_exist_ok=True)
     ds = lance.dataset(tmp_path)
 
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "x_idx"
-    assert indices[0]["type"] == "BTree"
+    assert indices[0].name == "x_idx"
+    assert indices[0].index_type == "BTree"
 
     results = ds.scanner(filter="x = 100").to_table()
     assert results.num_rows == 1
@@ -3583,20 +3562,9 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
     # Verify the index was created and is functional
-    indices = ds_committed.list_indices()
-    assert len(indices) > 0, "No indices found after commit"
-
-    # Find our index
-    our_index = None
-    for idx in indices:
-        if idx["name"] == index_name:
-            our_index = idx
-            break
-
-    assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert our_index["type"] == "BTree", (
-        f"Expected BTree index, got {our_index['type']}"
-    )
+    stats = ds_committed.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "BTree"
 
     # Test that the index works for searching
     # Test exact equality queries
@@ -3984,10 +3952,10 @@ def test_nested_field_btree_index(tmp_path):
     dataset.create_scalar_index(column="meta.lang", index_type="BTREE")
 
     # Verify index was created
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["meta.lang"]
-    assert indices[0]["type"] == "BTree"
+    assert indices[0].field_names == ["lang"]
+    assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
     result = dataset.scanner(filter="meta.lang = 'en'").to_table()
@@ -4085,10 +4053,10 @@ def test_nested_field_fts_index(tmp_path):
     ds.create_scalar_index("data.text", index_type="INVERTED", with_position=False)
 
     # Verify index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["data.text"]
-    assert indices[0]["type"] == "Inverted"
+    assert indices[0].field_names == ["text"]
+    assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
     results = ds.to_table(full_text_query="lance")
@@ -4159,10 +4127,10 @@ def test_nested_field_bitmap_index(tmp_path):
     ds.create_scalar_index("attributes.color", index_type="BITMAP")
 
     # Verify index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["attributes.color"]
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].field_names == ["color"]
+    assert indices[0].index_type == "Bitmap"
 
     # Test equality query
     results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)

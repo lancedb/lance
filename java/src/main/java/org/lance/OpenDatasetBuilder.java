@@ -209,6 +209,9 @@ public class OpenDatasetBuilder {
       throw new IllegalArgumentException("Namespace did not return a table location");
     }
 
+    // Check if namespace manages versioning (commits go through namespace API)
+    Boolean managedVersioning = response.getManagedVersioning();
+
     Map<String, String> namespaceStorageOptions = response.getStorageOptions();
 
     ReadOptions.Builder optionsBuilder =
@@ -232,7 +235,19 @@ public class OpenDatasetBuilder {
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
-    // Open dataset with regular open method
+    // If managed_versioning is true, pass namespace for commit handler setup
+    if (Boolean.TRUE.equals(managedVersioning)) {
+      return Dataset.open(
+          allocator,
+          selfManagedAllocator,
+          location,
+          optionsBuilder.build(),
+          session,
+          namespace,
+          tableId);
+    }
+
+    // Open dataset with regular open method (no namespace commit handler)
     return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build(), session);
   }
 }
