@@ -603,21 +603,33 @@ async fn read_version_hint_and_probe(
     // Read version from hint file (format determined by env var)
     let mut current_version = read_version_from_hint(object_store, base).await?;
     let hint_read_time = start.elapsed();
+    eprintln!("[HINT_READ_DONE] hint_read={:?}, version={}", hint_read_time, current_version);
 
     // Try V2 scheme first (more likely for newer datasets)
     let mut scheme = ManifestNamingScheme::V2;
 
     // Verify the hinted version exists
     let manifest_path = scheme.manifest_path(base, current_version);
+    let verify_start = std::time::Instant::now();
     let manifest_meta = match object_store.inner.head(&manifest_path).await {
-        Ok(meta) => Some(meta),
+        Ok(meta) => {
+            eprintln!("[VERIFY_HEAD] v={}, found, {:?}", current_version, verify_start.elapsed());
+            Some(meta)
+        }
         Err(ObjectStoreError::NotFound { .. }) => {
+            eprintln!("[VERIFY_HEAD] v={}, not_found_v2, {:?}", current_version, verify_start.elapsed());
             // Try V1 scheme
             scheme = ManifestNamingScheme::V1;
             let manifest_path = scheme.manifest_path(base, current_version);
-            object_store.inner.head(&manifest_path).await.ok()
+            let v1_start = std::time::Instant::now();
+            let result = object_store.inner.head(&manifest_path).await.ok();
+            eprintln!("[VERIFY_HEAD] v={}, v1_fallback={:?}, {:?}", current_version, result.is_some(), v1_start.elapsed());
+            result
         }
-        Err(_) => None,
+        Err(e) => {
+            eprintln!("[VERIFY_HEAD] v={}, error={:?}, {:?}", current_version, e, verify_start.elapsed());
+            None
+        }
     };
     let verify_time = start.elapsed();
 
