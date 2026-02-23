@@ -21,10 +21,10 @@ use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
-use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use shellexpand::tilde;

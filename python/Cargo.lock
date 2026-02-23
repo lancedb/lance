@@ -4267,6 +4267,7 @@ dependencies = [
  "chrono",
  "deepsize",
  "futures",
+ "http 1.4.0",
  "lance-arrow",
  "lance-core",
  "lance-namespace",
