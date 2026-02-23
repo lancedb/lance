@@ -93,6 +93,19 @@ const VERSION_HINT_WRITE_MODE_ENV_VAR: &str = "LANCE_VERSION_HINT_WRITE_MODE";
 /// Set to "file_size" (default) to use file-size encoding (file size = version number).
 const VERSION_HINT_FORMAT_ENV_VAR: &str = "LANCE_VERSION_HINT_FORMAT";
 
+/// Environment variable to enable hint-only mode (no racing with listing).
+/// Set to "1" or "true" to enable hint-only mode for debugging/benchmarking.
+/// When enabled, the load path will ONLY use hint+HEAD, no listing fallback race.
+const HINT_ONLY_ENV_VAR: &str = "LANCE_HINT_ONLY";
+
+/// Check if hint-only mode is enabled (no racing with listing).
+fn is_hint_only_mode() -> bool {
+    match std::env::var(HINT_ONLY_ENV_VAR) {
+        Ok(val) => matches!(val.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
 /// Check if version hint writes should be synchronous (blocking).
 fn is_version_hint_sync_write() -> bool {
     match std::env::var(VERSION_HINT_WRITE_MODE_ENV_VAR) {
@@ -318,6 +331,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
 ///
 /// The version hint optimization can be disabled by setting the environment
 /// variable `LANCE_USE_VERSION_HINT=0` (or "false", "no", "off").
+#[allow(clippy::print_stderr)]
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
@@ -336,6 +350,28 @@ async fn current_manifest_path(
         let result = resolve_version_from_listing(object_store, base).await;
         eprintln!(
             "[LOAD] no hint, listing only: {:?}, version={}",
+            start.elapsed(),
+            result.as_ref().map(|l| l.version).unwrap_or(0)
+        );
+        return result;
+    }
+
+    // Hint-only mode: no racing, purely hint+HEAD approach
+    // This is for debugging/benchmarking to isolate hint performance from racing overhead
+    if is_hint_only_mode() {
+        eprintln!("[LOAD] hint-only mode enabled");
+        if let Some(location) = read_version_hint_and_probe(object_store, base).await {
+            eprintln!(
+                "[LOAD] hint-only success: {:?}, version={}",
+                start.elapsed(),
+                location.version
+            );
+            return Ok(location);
+        }
+        // Hint failed, fall back to listing (no racing)
+        let result = resolve_version_from_listing(object_store, base).await;
+        eprintln!(
+            "[LOAD] hint-only failed, listing fallback: {:?}, version={}",
             start.elapsed(),
             result.as_ref().map(|l| l.version).unwrap_or(0)
         );
@@ -534,6 +570,7 @@ pub async fn write_version_hint_blocking(object_store: &ObjectStore, base: &Path
 /// The format is determined by `LANCE_VERSION_HINT_FORMAT` env var:
 /// - "json": Reads from latest_version_hint.json
 /// - "file_size" (default): Reads from latest_version_hint.bin (file size = version)
+#[allow(clippy::print_stderr)]
 async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
     let hint_path = version_hint_path(base);
     let start = std::time::Instant::now();
@@ -554,7 +591,11 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
         version
     } else {
         // File-size format: version = file size in bytes
-        eprintln!("[HINT_READ_START] file_size, path={}, at={:?}", hint_path, start.elapsed());
+        eprintln!(
+            "[HINT_READ_START] file_size, path={}, at={:?}",
+            hint_path,
+            start.elapsed()
+        );
         let head_start = std::time::Instant::now();
         let meta = object_store.inner.head(&hint_path).await.ok()?;
         let version = meta.size as u64;
@@ -599,6 +640,7 @@ fn parse_version_from_json(json: &str) -> Option<u64> {
 /// 1. Reads the hint file to get the version hint (file size or JSON content)
 /// 2. Probes version+1, version+2, etc. with HEAD requests until not found
 /// 3. Returns the highest version found
+#[allow(clippy::print_stderr)]
 async fn read_version_hint_and_probe(
     object_store: &ObjectStore,
     base: &Path,
@@ -608,7 +650,10 @@ async fn read_version_hint_and_probe(
     // Read version from hint file (format determined by env var)
     let mut current_version = read_version_from_hint(object_store, base).await?;
     let hint_read_time = start.elapsed();
-    eprintln!("[HINT_READ_DONE] hint_read={:?}, version={}", hint_read_time, current_version);
+    eprintln!(
+        "[HINT_READ_DONE] hint_read={:?}, version={}",
+        hint_read_time, current_version
+    );
 
     // Try V2 scheme first (more likely for newer datasets)
     let mut scheme = ManifestNamingScheme::V2;
@@ -618,21 +663,39 @@ async fn read_version_hint_and_probe(
     let verify_start = std::time::Instant::now();
     let manifest_meta = match object_store.inner.head(&manifest_path).await {
         Ok(meta) => {
-            eprintln!("[VERIFY_HEAD] v={}, found, {:?}", current_version, verify_start.elapsed());
+            eprintln!(
+                "[VERIFY_HEAD] v={}, found, {:?}",
+                current_version,
+                verify_start.elapsed()
+            );
             Some(meta)
         }
         Err(ObjectStoreError::NotFound { .. }) => {
-            eprintln!("[VERIFY_HEAD] v={}, not_found_v2, {:?}", current_version, verify_start.elapsed());
+            eprintln!(
+                "[VERIFY_HEAD] v={}, not_found_v2, {:?}",
+                current_version,
+                verify_start.elapsed()
+            );
             // Try V1 scheme
             scheme = ManifestNamingScheme::V1;
             let manifest_path = scheme.manifest_path(base, current_version);
             let v1_start = std::time::Instant::now();
             let result = object_store.inner.head(&manifest_path).await.ok();
-            eprintln!("[VERIFY_HEAD] v={}, v1_fallback={:?}, {:?}", current_version, result.is_some(), v1_start.elapsed());
+            eprintln!(
+                "[VERIFY_HEAD] v={}, v1_fallback={:?}, {:?}",
+                current_version,
+                result.is_some(),
+                v1_start.elapsed()
+            );
             result
         }
         Err(e) => {
-            eprintln!("[VERIFY_HEAD] v={}, error={:?}, {:?}", current_version, e, verify_start.elapsed());
+            eprintln!(
+                "[VERIFY_HEAD] v={}, error={:?}, {:?}",
+                current_version,
+                e,
+                verify_start.elapsed()
+            );
             None
         }
     };
@@ -650,17 +713,29 @@ async fn read_version_hint_and_probe(
         let head_start = std::time::Instant::now();
         match object_store.inner.head(&next_path).await {
             Ok(meta) => {
-                eprintln!("[PROBE_HEAD] v={}, found, {:?}", next_version, head_start.elapsed());
+                eprintln!(
+                    "[PROBE_HEAD] v={}, found, {:?}",
+                    next_version,
+                    head_start.elapsed()
+                );
                 current_version = next_version;
                 last_meta = meta;
                 probe_count += 1;
             }
             Err(ObjectStoreError::NotFound { .. }) => {
-                eprintln!("[PROBE_HEAD] v={}, not_found, {:?}", next_version, head_start.elapsed());
+                eprintln!(
+                    "[PROBE_HEAD] v={}, not_found, {:?}",
+                    next_version,
+                    head_start.elapsed()
+                );
                 break;
             }
             Err(_) => {
-                eprintln!("[PROBE_HEAD] v={}, error, {:?}", next_version, head_start.elapsed());
+                eprintln!(
+                    "[PROBE_HEAD] v={}, error, {:?}",
+                    next_version,
+                    head_start.elapsed()
+                );
                 break;
             }
         }
@@ -845,6 +920,7 @@ async fn list_manifests_since_version_with_hint(
 /// Resolve the latest version from listing.
 ///
 /// This is the traditional approach that lists all manifests and finds the highest version.
+#[allow(clippy::print_stderr)]
 async fn resolve_version_from_listing(
     object_store: &ObjectStore,
     base: &Path,
