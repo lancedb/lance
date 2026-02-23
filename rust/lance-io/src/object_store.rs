@@ -24,6 +24,7 @@ use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
@@ -886,6 +887,7 @@ impl StorageOptions {
     /// `x-ms-version: 2023-11-03`.
     ///
     /// Returns an error if any `header.*` key has an invalid header name or value.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     pub fn client_options(&self) -> Result<ClientOptions> {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.0 {
@@ -1403,6 +1405,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_extracts_headers() {
         let opts = StorageOptions(HashMap::from([
             ("header.x-custom-foo".to_string(), "bar".to_string()),
@@ -1432,6 +1435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_rejects_invalid_header_name() {
         let opts = StorageOptions(HashMap::from([(
             "header.bad header".to_string(),
@@ -1442,6 +1446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_rejects_invalid_header_value() {
         let opts = StorageOptions(HashMap::from([(
             "header.x-good-name".to_string(),
@@ -1452,6 +1457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_empty_when_no_header_keys() {
         let opts = StorageOptions(HashMap::from([
             ("region".to_string(), "us-east-1".to_string()),
