@@ -26,7 +26,6 @@ use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -37,7 +36,8 @@ pub mod providers;
 pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
-use crate::object_writer::WriteResult;
+use crate::object_writer::{LocalWriter, WriteResult};
+use crate::traits::Writer;
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -336,7 +336,8 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 }
 
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
-    let expanded = tilde(str_path.as_ref()).to_string();
+    let str_path = str_path.as_ref();
+    let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
@@ -350,6 +351,22 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     }
 
     Ok(expanded_path)
+}
+
+fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
+    let home_dir = std::env::home_dir()?;
+    if path == "~" {
+        return Some(home_dir);
+    }
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return Some(home_dir.join(stripped));
+    }
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix("~\\") {
+        return Some(home_dir.join(stripped));
+    }
+
+    None
 }
 
 fn local_path_to_url(str_path: &str) -> Result<Url> {
@@ -633,7 +650,7 @@ impl ObjectStore {
         let object_store = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
-        object_store.create(&os_path).await
+        ObjectWriter::new(&object_store, &os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
@@ -645,15 +662,42 @@ impl ObjectStore {
     }
 
     /// Create a new file.
-    pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self, path).await
+    pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
+        match self.scheme.as_str() {
+            "file" => {
+                let local_path = super::local::to_local_path(path);
+                let local_path = std::path::PathBuf::from(&local_path);
+                if let Some(parent) = local_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let parent = local_path
+                    .parent()
+                    .expect("file path must have parent")
+                    .to_owned();
+                let named_temp =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await
+                        .map_err(|e| {
+                            Error::io(format!("spawn_blocking failed: {}", e), location!())
+                        })??;
+                let (std_file, temp_path) = named_temp.into_parts();
+                let file = tokio::fs::File::from_std(std_file);
+                Ok(Box::new(LocalWriter::new(
+                    file,
+                    path.clone(),
+                    temp_path,
+                    Arc::new(self.io_tracker.clone()),
+                )))
+            }
+            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
+        }
     }
 
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
-        writer.shutdown().await
+        Writer::shutdown(writer.as_mut()).await
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -706,7 +750,7 @@ impl ObjectStore {
         let path = Path::parse(&path)?;
 
         if self.is_local() {
-            // Local file system needs to delete directories as well.
+            // The local file system provider needs to delete both files and directories.
             return super::local::remove_dir_all(&path);
         }
         let sub_entries = self
@@ -718,6 +762,11 @@ impl ObjectStore {
             .delete_stream(sub_entries)
             .try_collect::<Vec<_>>()
             .await?;
+        if self.scheme == "file-object-store" {
+            // file-object-store tries to do everything as similarly as possible to the remote
+            // object stores. But we still have to delete the directory entries afterwards.
+            return super::local::remove_dir_all(&path);
+        }
         Ok(())
     }
 
@@ -934,8 +983,7 @@ mod tests {
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
-        let expanded = tilde(path_str).to_string();
-        let path = StdPath::new(&expanded);
+        let path = expand_path(path_str).map_err(std::io::Error::other)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
     }
@@ -1099,7 +1147,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_directory() {
+    async fn test_delete_directory_local_store() {
+        test_delete_directory("").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_file_object_store() {
+        test_delete_directory("file-object-store").await;
+    }
+
+    async fn test_delete_directory(scheme: &str) {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
@@ -1113,8 +1170,16 @@ mod tests {
             "delete",
         )
         .unwrap();
-        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
-        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let url = if scheme.is_empty() {
+            file_url
+        } else {
+            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+            // Use the file:// URL's normalized path so this works on Windows too.
+            url.set_path(file_url.path());
+            url
+        };
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
@@ -1184,7 +1249,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let reader = ObjectStore::open_local(&file_path).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
@@ -1196,7 +1261,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();

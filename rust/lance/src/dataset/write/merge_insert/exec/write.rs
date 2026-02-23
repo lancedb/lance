@@ -444,11 +444,7 @@ impl FullSchemaMergeInsertExec {
             .iter()
             .map(|&idx| {
                 let field = input_schema.field(idx);
-                Arc::new(arrow_schema::Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ))
+                Arc::new(field.clone())
             })
             .collect();
         let output_schema = Arc::new(Schema::new(output_fields));

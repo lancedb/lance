@@ -37,12 +37,8 @@ impl fmt::Display for LanceToolFileMetadata {
 impl LanceToolFileMetadata {
     async fn open(source: &String) -> Result<Self> {
         let (object_store, path) = crate::util::get_object_store_and_path(source).await?;
-        let scan_scheduler = ScanScheduler::new(
-            object_store,
-            SchedulerConfig {
-                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
-            },
-        );
+        let scan_scheduler =
+            ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
         let file_scheduler = scan_scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await?;

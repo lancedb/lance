@@ -37,6 +37,10 @@ fn main() -> Result<(), String> {
     if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
+    } else if target_arch == "aarch64" && target_os == "ios" {
+        // Build version with NEON
+        // A13 bionic is the earliest supported iOS SOC
+        build_f16_with_flags("neon", &["-mtune=apple-a13"]).unwrap();
     } else if target_arch == "aarch64" && target_os == "linux" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
@@ -76,7 +80,14 @@ fn main() -> Result<(), String> {
         build_f16_with_flags("lsx", &["-mlsx"]).unwrap();
         build_f16_with_flags("lasx", &["-mlasx"]).unwrap();
     } else {
-        return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
+        // Only error if fp16kernels was explicitly requested on unsupported platform.
+        // This allows builds on iOS, Android, etc. when the feature is disabled.
+        //
+        // Note: We use CARGO_FEATURE_* env var instead of cfg!() because cfg!()
+        // checks the build script's features, not the library's features.
+        if env::var("CARGO_FEATURE_FP16KERNELS").is_ok() {
+            return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
+        }
     }
     Ok(())
 }

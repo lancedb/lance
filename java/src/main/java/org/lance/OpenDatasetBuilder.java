@@ -58,6 +58,7 @@ public class OpenDatasetBuilder {
   private LanceNamespace namespace;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
   OpenDatasetBuilder() {}
@@ -128,6 +129,24 @@ public class OpenDatasetBuilder {
   }
 
   /**
+   * Sets the session to share caches between multiple datasets.
+   *
+   * <p>When a session is provided, the index and metadata caches from the session will be used
+   * instead of creating new caches. This can improve cache hit rates when opening multiple related
+   * datasets.
+   *
+   * <p>Note: When a session is provided, the indexCacheSizeBytes and metadataCacheSizeBytes
+   * settings in ReadOptions are ignored because the session's caches are used instead.
+   *
+   * @param session The session to use
+   * @return this builder instance
+   */
+  public OpenDatasetBuilder session(Session session) {
+    this.session = session;
+    return this;
+  }
+
+  /**
    * Opens the dataset with the configured parameters.
    *
    * <p>If a namespace is configured, this automatically fetches the table location and storage
@@ -173,7 +192,7 @@ public class OpenDatasetBuilder {
     }
 
     // Handle URI-based opening
-    return Dataset.open(allocator, selfManagedAllocator, uri, options);
+    return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
   }
 
   private Dataset buildFromNamespace() {
@@ -189,6 +208,9 @@ public class OpenDatasetBuilder {
     if (location == null || location.isEmpty()) {
       throw new IllegalArgumentException("Namespace did not return a table location");
     }
+
+    // Check if namespace manages versioning (commits go through namespace API)
+    Boolean managedVersioning = response.getManagedVersioning();
 
     Map<String, String> namespaceStorageOptions = response.getStorageOptions();
 
@@ -213,7 +235,19 @@ public class OpenDatasetBuilder {
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
-    // Open dataset with regular open method
-    return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build());
+    // If managed_versioning is true, pass namespace for commit handler setup
+    if (Boolean.TRUE.equals(managedVersioning)) {
+      return Dataset.open(
+          allocator,
+          selfManagedAllocator,
+          location,
+          optionsBuilder.build(),
+          session,
+          namespace,
+          tableId);
+    }
+
+    // Open dataset with regular open method (no namespace commit handler)
+    return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build(), session);
   }
 }

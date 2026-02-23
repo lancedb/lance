@@ -40,11 +40,21 @@ jobs:
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
       - name: Checkout lance-namespace-impls
         uses: actions/checkout@v4
         with:
           repository: lance-format/lance-namespace-impls
           path: lance-namespace-impls
+      - name: Checkout lance-trino
+        uses: actions/checkout@v4
+        with:
+          repository: lance-format/lance-trino
+          path: lance-trino
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -72,6 +82,12 @@ jobs:
           # Copy .pages from lance-namespace-impls and append template entry
           cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
           echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
+      - name: Copy lance-huggingface docs
+        run: |
+          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Huggingface: huggingface
+          EOF
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
@@ -83,6 +99,12 @@ jobs:
           cp -r lance-ray/docs/src docs/src/integrations/ray
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
+          EOF
+      - name: Copy lance-trino docs
+        run: |
+          cp -r lance-trino/docs/src docs/src/integrations/trino
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Trino: trino
           EOF
       - name: Copy contributing docs
         run: |
@@ -100,6 +122,7 @@ jobs:
           cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
           cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
           cp lance-namespace-impls/CONTRIBUTING.md docs/src/community/project-specific/namespace-impls.md || true
+          cp lance-trino/CONTRIBUTING.md docs/src/community/project-specific/trino.md
 
           # Create .pages for project-specific
           cat > docs/src/community/project-specific/.pages << 'EOF'
@@ -110,6 +133,7 @@ jobs:
             - Lance Namespace Impls: namespace-impls.md
             - Lance Ray: ray.md
             - Lance Spark: spark.md
+            - Lance Trino: trino.md
           EOF
 
           # Create .pages for lance subfolder

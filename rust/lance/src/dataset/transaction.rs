@@ -46,12 +46,12 @@
 //!
 
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
-use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
+use super::ManifestWriteConfig;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::BlobVersion, datatypes::Schema, Error, Result};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
@@ -2059,6 +2059,18 @@ impl Transaction {
 
                 let existing_fragments = maybe_existing_fragments?;
 
+                // Collect replaced field IDs before consuming new_datafiles
+                let replaced_fields: Vec<u32> = new_datafiles
+                    .first()
+                    .map(|f| {
+                        f.fields
+                            .iter()
+                            .filter(|&&id| id >= 0)
+                            .map(|&id| id as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
                 // 3. add modified fragments to final_fragments
                 for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
@@ -2128,6 +2140,19 @@ impl Transaction {
                     .collect::<Vec<_>>();
 
                 final_fragments.extend(unmodified_fragments);
+
+                // 5. Invalidate index bitmaps for replaced fields
+                let modified_fragments: Vec<Fragment> = final_fragments
+                    .iter()
+                    .filter(|f| fragments_changed.contains(&f.id))
+                    .cloned()
+                    .collect();
+
+                Self::prune_updated_fields_from_indices(
+                    &mut final_indices,
+                    &modified_fragments,
+                    &replaced_fields,
+                );
             }
             Operation::UpdateMemWalState { merged_generations } => {
                 update_mem_wal_index_merged_generations(
@@ -2175,19 +2200,12 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            let mut manifest = Manifest::new(
+            Manifest::new(
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
                 reference_paths,
-            );
-            if manifest.data_storage_format.lance_file_version()? >= LanceFileVersion::V2_2 {
-                manifest.config_mut().insert(
-                    BLOB_VERSION_CONFIG_KEY.to_string(),
-                    BlobVersion::V2.config_value().to_string(),
-                );
-            }
-            manifest
+            )
         };
 
         manifest.tag.clone_from(&self.tag);
@@ -2399,9 +2417,9 @@ impl Transaction {
                 || is_system_index(existing_index)
         });
 
-        // Fragment bitmaps are now immutable and always represent the fragments that
-        // the index contains row IDs for, regardless of whether those fragments still exist.
-        // This ensures consistent prefiltering behavior and clear semantics.
+        // Fragment bitmaps record which fragments the index was originally built for.
+        // Operations like updates and data replacement prune these bitmaps, and
+        // effective_fragment_bitmap intersects with existing fragments at query time.
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)
@@ -2523,18 +2541,13 @@ impl Transaction {
                 return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id), location!()));
             }
 
-            let index = indices
+            // Skip indices that no longer exist (may have been removed by concurrent operation)
+            let Some(index) = indices
                 .iter_mut()
                 .find(|idx| idx.uuid == rewritten_index.old_id)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "Invalid compaction plan refers to index {} which does not exist",
-                            rewritten_index.old_id
-                        ),
-                        location!(),
-                    )
-                })?;
+            else {
+                continue;
+            };
 
             index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
                 index.fragment_bitmap.as_ref().ok_or_else(|| {
@@ -4336,5 +4349,29 @@ mod tests {
 
         // Verify idx_e removed (bad field)
         assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
+    }
+
+    #[test]
+    fn test_handle_rewrite_indices_skips_missing_index() {
+        use uuid::Uuid;
+
+        // Create an empty indices list
+        let mut indices = vec![];
+
+        // Create rewritten_indices referring to a non-existent index
+        let rewritten_indices = vec![RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any {
+                type_url: String::new(),
+                value: vec![],
+            },
+            new_index_version: 1,
+        }];
+
+        // Should succeed (skip missing index) instead of error
+        let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
+        assert!(result.is_ok());
+        assert!(indices.is_empty());
     }
 }

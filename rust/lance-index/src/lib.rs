@@ -26,6 +26,7 @@ pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
+pub mod progress;
 pub mod registry;
 pub mod scalar;
 pub mod traits;
@@ -178,6 +179,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswSq as i32 => Ok(Self::IvfHnswSq),
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
+            v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
             _ => Err(Error::InvalidInput {
                 source: format!("the input value {} is not a valid IndexType", value).into(),
                 location: location!(),
@@ -191,15 +193,13 @@ impl TryFrom<&str> for IndexType {
 
     fn try_from(value: &str) -> Result<Self> {
         match value {
-            "BTree" => Ok(Self::BTree),
-            "Bitmap" => Ok(Self::Bitmap),
-            "LabelList" => Ok(Self::LabelList),
-            "Inverted" => Ok(Self::Inverted),
-            "NGram" => Ok(Self::NGram),
-            "FragmentReuse" => Ok(Self::FragmentReuse),
-            "MemWal" => Ok(Self::MemWal),
-            "ZoneMap" => Ok(Self::ZoneMap),
-            "Vector" => Ok(Self::Vector),
+            "BTree" | "BTREE" => Ok(Self::BTree),
+            "Bitmap" | "BITMAP" => Ok(Self::Bitmap),
+            "LabelList" | "LABELLIST" => Ok(Self::LabelList),
+            "Inverted" | "INVERTED" => Ok(Self::Inverted),
+            "NGram" | "NGRAM" => Ok(Self::NGram),
+            "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
+            "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
             "IVF_PQ" => Ok(Self::IvfPq),
@@ -207,6 +207,8 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(
                 format!("invalid index type: {}", value),
                 location!(),

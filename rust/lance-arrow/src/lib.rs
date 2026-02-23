@@ -34,6 +34,7 @@ pub mod cast;
 pub mod json;
 pub mod list;
 pub mod memory;
+pub mod scalar;
 pub mod r#struct;
 
 /// Arrow extension metadata key for extension name

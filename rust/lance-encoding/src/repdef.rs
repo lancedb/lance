@@ -533,7 +533,13 @@ impl SerializerContext {
         // are reading.
 
         let mut new_len = 0;
-        assert!(self.rep_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1);
+        let expected_len = offset_desc.num_values + self.current_num_specials;
+        if expected_len == 0 {
+            // Offsets [0] mean no list values, so no levels.
+            self.current_len = 0;
+            return;
+        }
+        assert!(self.rep_levels.len() >= expected_len - 1);
         if self.def_levels.is_empty() {
             let mut write_itr = self.spare_rep.iter_mut();
             let mut read_iter = self.rep_levels.iter().copied();
@@ -552,9 +558,7 @@ impl SerializerContext {
             }
             std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
         } else {
-            assert!(
-                self.def_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1
-            );
+            assert!(self.def_levels.len() >= expected_len - 1);
             let mut def_write_itr = self.spare_def.iter_mut();
             let mut rep_write_itr = self.spare_rep.iter_mut();
             let mut rep_read_itr = self.rep_levels.iter().copied();
@@ -2257,6 +2261,16 @@ mod tests {
 
     fn offsets_64(values: &[i64]) -> OffsetBuffer<i64> {
         OffsetBuffer::<i64>::new(ScalarBuffer::from_iter(values.iter().copied()))
+    }
+
+    #[test]
+    fn test_repdef_empty_offsets() {
+        // Empty offsets should serialize without panicking.
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(offsets_32(&[0]), None);
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        assert!(repdefs.repetition_levels.is_none());
+        assert!(repdefs.definition_levels.is_none());
     }
 
     #[test]

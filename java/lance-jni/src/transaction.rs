@@ -394,6 +394,22 @@ fn convert_to_java_operation_inner<'local>(
                 ],
             )?)
         }
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => {
+            let java_new_indices = export_vec(env, &new_indices)?;
+            let java_removed_indices = export_vec(env, &removed_indices)?;
+
+            Ok(env.new_object(
+                "org/lance/operation/CreateIndex",
+                "(Ljava/util/List;Ljava/util/List;)V",
+                &[
+                    JValue::Object(&java_new_indices),
+                    JValue::Object(&java_removed_indices),
+                ],
+            )?)
+        }
         Operation::Update {
             removed_fragment_ids,
             updated_fragments,

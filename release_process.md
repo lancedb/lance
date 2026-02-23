@@ -1,11 +1,14 @@
 # Release Process
 
-Lance uses [semantic versioning](https://semver.org/) and maintains a linear commit history.
-* All pull requests are merged into the `main` branch.
+Lance maintains a linear commit history with a controlled release process.
+
+* All pull requests are merged into the `main` branch first.
 * Beta releases (or preview releases) are created on-demand from the `main` branch.
 * Stable releases (non-prereleases) are created only after a voting process and come from a release branch `release/vX.Y`. These are typically created once every two weeks.
 * Release Candidates (RC) are created from release branches prior to voting.
+* Minor releases can be cut from either main branch or an existing release branch (when main is targeting a major release).
 * Patch releases are created by committing fixes directly to the release branch, voting on a new RC, and releasing.
+* All changes (features, fixes) must be committed to main first, then cherry-picked to release branches as needed.
 
 ```mermaid
 gitGraph
@@ -31,15 +34,22 @@ gitGraph
     commit tag: "1.4.1-rc.1"
     commit tag: "1.4.1"
     checkout main
-    commit tag: "1.5.0-beta.1"
+    commit tag: "2.0.0-beta.1" id: "breaking"
+    checkout "release/v1.4"
+    cherry-pick id: "breaking" tag: "1.5.0-rc.1"
+    branch "release/v1.5"
+    checkout "release/v1.5"
+    commit tag: "1.5.0"
 
 ```
 
 ## Version Semantics
 
+Lance uses version numbers inspired by semantic versioning, but with flexibility for practical release management. Specifically, minor releases can be cut from existing release branches when the main branch is targeting a major release.
+
 ### Version Format
 
-Lance uses semantic versioning with prerelease identifiers:
+Lance uses version numbers with prerelease identifiers:
 - **Stable**: `X.Y.Z` (e.g., `1.3.0`)
 - **Beta**: `X.Y.Z-beta.N` (e.g., `1.3.0-beta.1`, `1.3.0-beta.2`)
 - **RC**: `X.Y.Z-rc.N` (e.g., `1.3.0-rc.1`, `1.3.0-rc.2`)
@@ -63,31 +73,50 @@ Lance uses semantic versioning with prerelease identifiers:
 
 ### GitHub Releases and Release Notes
 
-| Release Type              | GitHub Release Type | Start Commit (exclusive)    | End Commit (inclusive) | Explanation                                                          |
-|---------------------------|---------------------|-----------------------------|------------------------|----------------------------------------------------------------------|
-| **Stable (Major/Minor)**  | Release             | `release-root/X.Y.0-beta.N` | `vX.Y.0`               | All changes from main + RC fixes                                     |
-| **Stable (Patch)**        | Release             | `vX.Y.(Z-1)`                | `vX.Y.Z`               | Only changes in this patch release                                   |
-| **RC (Major/Minor)**      | Pre-Release         | `release-root/X.Y.0-beta.N` | `vX.Y.0-rc.N`          | All changes for the release                                          |
-| **RC (Patch)**            | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-rc.N`          | Only changes in this patch release                                   |
-| **RC (Iterations)**       | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-rc.N`          | Only changes in this patch release (not changes against previous RC) |
-| **Beta (Main branch)**    | Pre-Release         | `release-root/X.Y.Z-beta.N` | `vX.Y.Z-beta.N`        | Changes since last stable release RC cut in main branch              |
-| **Beta (Release branch)** | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-beta.N`        | Changes since last stable release                                    |
+| Release Type                       | GitHub Release Type | Start Commit (exclusive)    | End Commit (inclusive) | Explanation                                                          |
+|------------------------------------|---------------------|-----------------------------|------------------------|----------------------------------------------------------------------|
+| **Stable (Major/Minor from main)** | Release             | `release-root/X.Y.0-beta.N` | `vX.Y.0`               | All changes from main + RC fixes                                     |
+| **Stable (Minor from release)**    | Release             | `vX.(Y-1).Z` (last stable)  | `vX.Y.0`               | Changes since last stable on source release branch                   |
+| **Stable (Patch)**                 | Release             | `vX.Y.(Z-1)`                | `vX.Y.Z`               | Only changes in this patch release                                   |
+| **RC (Major/Minor from main)**     | Pre-Release         | `release-root/X.Y.0-beta.N` | `vX.Y.0-rc.N`          | All changes for the release                                          |
+| **RC (Minor from release)**        | Pre-Release         | `vX.(Y-1).Z` (last stable)  | `vX.Y.0-rc.N`          | Changes since last stable on source release branch                   |
+| **RC (Patch)**                     | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-rc.N`          | Only changes in this patch release                                   |
+| **RC (Iterations)**                | Pre-Release         | Same as initial RC          | `vX.Y.Z-rc.N`          | Same comparison as initial RC (not against previous RC)              |
+| **Beta (Main branch)**             | Pre-Release         | `release-root/X.Y.Z-beta.N` | `vX.Y.Z-beta.N`        | Changes since last stable release RC cut in main branch              |
+| **Beta (Release branch)**          | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-beta.N`        | Changes since last stable release                                    |
 
 ## Branching Strategy
 
 ### Main Branch
+
 - Always contains the latest development work
 - Version format: `X.Y.Z-beta.N`
 - After RC creation, bumped to next minor version with `-beta.0` (unreleased)
   - Beta previews published by bumping to `-beta.1+`
 
 ### Release Branches
+
 - Format: `release/v{major}.{minor}` (e.g., `release/v1.3`)
 - Created when cutting initial RC for major/minor release
+- Can be created from:
+    - **Main branch**: Standard flow for major/minor releases
+    - **Existing release branch**: For minor releases when main is targeting a major release
 - Maintained for patch releases
 - Version progression: `rc.1` → `rc.2` → stable → `beta.0` → `rc.1` (for patches)
 
+### Commit Flow
+
+All changes must be committed to the main branch first:
+
+1. **Features and fixes**: Merge PR to main
+2. **Release branch needs**: Cherry-pick from main to release branch
+3. **Never commit directly to release branch** without the change existing in main first
+
+This ensures main always has the complete history and release branches only contain subsets of main's changes.
+
 ## Version Flow
+
+### Standard Flow (Major/Minor from Main)
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': { 'fontSize':'14px'}}}%%
@@ -112,6 +141,7 @@ flowchart LR
 ```
 
 **Flow explanation:**
+
 - **Main branch**: Commit M0 at `1.3.0-beta.2` has `release-root/1.4.0-beta.N` (created when cutting v1.3.0-rc.1, pointing to this commit) and `release-root/2.0.0-beta.N` (created when breaking changes bumped major version, pointing to same commit) → M1 bumps to `1.4.0-beta.0` (unreleased) → M2 publishes `1.4.0-beta.1` (preview, tagged) → M3 publishes `2.0.0-beta.1` after detecting breaking changes (tagged)
 - **Release branch** `release/v1.3` created from M0, starts at `1.3.0-rc.1` (tagged) → `1.3.0` (stable, tagged) → `1.3.1-beta.0` → `1.3.1-rc.1` (tagged) → `1.3.1` (stable, tagged) → `1.3.2-beta.0`
 - **Tags**: 🏷️ = version tag (points to tagged commit), 📍 = release-root tag (points to commit before RC was created, used for breaking change detection)
@@ -119,12 +149,47 @@ flowchart LR
 
 **Note**: All commits are linear on their respective branches. `beta.0` = unreleased, `beta.1+` = published previews.
 
+### Minor Release from Release Branch (When Main is Major)
+
+```mermaid
+%%{init: {'theme':'base', 'themeVariables': { 'fontSize':'14px'}}}%%
+flowchart LR
+    subgraph main["Main Branch (at 2.0.0)"]
+        direction LR
+        M1["2.0.0-beta.0"] --> M2["2.0.0-beta.1<br/>🏷️ v2.0.0-beta.1"]
+    end
+
+    subgraph release13["Release Branch: release/v1.3"]
+        direction LR
+        R1["1.3.0<br/>🏷️ v1.3.0"] --> R2["1.3.1-beta.0"]
+        R2 --> R3["1.3.1<br/>🏷️ v1.3.1"]
+    end
+
+    subgraph release14["Release Branch: release/v1.4"]
+        direction LR
+        S1["1.4.0-rc.1<br/>🏷️ v1.4.0-rc.1"] --> S2["1.4.0<br/>🏷️ v1.4.0"]
+        S2 --> S3["1.4.1-beta.0"]
+    end
+
+    R3 -.->|"create minor release<br/>(main is at 2.x)"| S1
+```
+
+**Flow explanation:**
+
+- **Main branch** is at `2.0.0-beta.N` (major version)
+- **release/v1.3** has released `1.3.1` and needs a new minor release with features
+- **release/v1.4** is created from `release/v1.3` (not from main) because main is at a different major version
+- Release notes for `v1.4.0` compare against `v1.3.1` (latest stable on source branch)
+- Main branch is NOT modified (already at 2.x)
+
 ## Workflows
 
 ### User-Facing Workflows
 
 1. **publish-beta.yml** - Publish beta preview releases from any branch
 2. **create-release-branch.yml** - Create release branch with initial RC for new major/minor version
+    - From main: Standard flow for major/minor releases
+    - From release branch: For minor releases when main is targeting a major release
 3. **create-rc.yml** - Create RC on existing release branch (for new patch release RC or iterations of an existing RC)
 4. **approve-rc.yml** - Approve any RC to stable (works for all release types)
 
@@ -139,6 +204,8 @@ flowchart LR
 4. Review results, then run with **dry_run**: `false`
 
 **Result**: Creates a beta tag (e.g., `v1.4.0-beta.1`) and publishes preview artifacts to fury.io, Maven Central, and Buf Schema Registry.
+
+**Release Notes**: For the first beta (beta.1), release notes include all changes since the release-root tag. For subsequent betas (beta.2+), release notes only include incremental changes since the previous beta.
 
 <details>
 <summary>How beta versioning works</summary>
@@ -187,10 +254,26 @@ Release root tags mark the base commits for breaking change detection. The tag n
    - Example: When bumping 1.4.0-beta.5 → 2.0.0-beta.1, create `release-root/2.0.0-beta.N` pointing to the SAME commit with the SAME base RC version
 
 **Key properties**:
+
 - **Multiple tags, same commit**: `release-root/1.4.0-beta.N` and `release-root/2.0.0-beta.N` point to the same commit on main (the commit before the RC branch was created)
 - **Major version bumped once**: Both tags store same base RC version (1.3.0-rc.1), so we know 2.x is already a major bump from 1.3.0
 - **No additional bumps**: When at 2.0.0-beta.1, we detect breaking changes but see major already bumped (2 > 1), so just increment beta
 - **Beta reset on major bump**: When bumping major version, beta number resets to 1 (e.g., 1.4.0-beta.5 → 2.0.0-beta.1)
+
+### Minor Release Root Tag
+
+When a minor release is created from an existing release branch (not from main), a `minor-release-root` tag is created to track the comparison base for release notes.
+
+**Tag Format**: `minor-release-root/{major}.{minor}.0`
+
+- Created when using `create-release-branch` workflow with `source_release_branch` parameter
+- Tag message contains the source stable tag (e.g., `v1.3.1`)
+- Used by `determine_previous_tag` to find the correct comparison base
+
+**Example**: When creating `release/v1.4` from `release/v1.3` (where latest stable is v1.3.1):
+
+- Creates `minor-release-root/1.4.0` with message `v1.3.1`
+- Release notes for v1.4.0-rc.N and v1.4.0 will compare against v1.3.1
 
 ### Detection Process
 
@@ -219,11 +302,12 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 **Key insight**: Multiple beta version series can share the same release-root commit, with major version bumped only once when first detected.
 </details>
 
-## Create a Major / Minor Release
+## Create a Major / Minor Release (from Main)
 
 **Purpose**: Create a new major or minor release from the main branch.
 
 **Steps**:
+
 1. Ensure CI on main is green
 2. Trigger **"Create Release Branch"** workflow with **dry_run**: `true`
 3. Review the RC version and changes
@@ -234,6 +318,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 8. **If approved**: Trigger **"Approve RC"** workflow with **rc_tag** (e.g., `v1.3.0-rc.2`)
 
 **Result**:
+
 - Creates release branch (e.g., `release/v1.3`) with RC tag (e.g., `v1.3.0-rc.1`)
 - Bumps main to next minor (e.g., `1.4.0-beta.0`)
 - After approval: Creates stable tag (e.g., `v1.3.0`) and publishes to PyPI, crates.io, Maven Central
@@ -242,6 +327,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 <summary>What happens under the hood</summary>
 
 **Create Release Branch workflow**:
+
 - Reads current version from main (e.g., `1.3.0-beta.2`)
 - Checks for breaking changes since release-root tag
 - If breaking changes: Creates RC with bumped major (e.g., `2.0.0-rc.1`), bumps main to `2.1.0-beta.0`
@@ -250,6 +336,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 - Creates GitHub Discussion for voting
 
 **Approve RC workflow**:
+
 - Bumps version from `rc.N` to stable
 - Generates release notes comparing against `release-root/{version}-beta.N` tag
 - Creates GitHub Release and publishes stable artifacts
@@ -257,22 +344,77 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 - Main branch is NOT affected (already bumped in step 1)
 </details>
 
+## Create a Minor Release (from Release Branch)
+
+**Purpose**: Create a new minor release from an existing release branch when main is targeting a major release.
+
+**When to use**: When main branch has breaking changes and is targeting a major version (e.g., `2.0.0`), but you need to release new features for users who aren't ready to upgrade to the new major version.
+
+**Prerequisites**:
+
+- Main branch must be at a major version (e.g., `2.0.0-beta.N` where patch = 0 and minor = 0)
+- Source release branch must exist (e.g., `release/v1.3`)
+- Features to release must already be committed to main, then cherry-picked to the source release branch
+
+**Steps**:
+
+1. Cherry-pick desired features from main to the source release branch
+2. Trigger **"Create Release Branch"** workflow with:
+    - **source_release_branch**: e.g., `release/v1.3`
+    - **dry_run**: `true`
+3. Review the minor RC version (e.g., `1.4.0-rc.1`)
+4. Run with **dry_run**: `false` to create new release branch and RC
+5. Test RC artifacts and vote in the GitHub Discussion
+6. **If issues found**: Fix and run **"Create RC"** workflow
+7. **If approved**: Trigger **"Approve RC"** workflow
+
+**Result**:
+
+- Creates new release branch (e.g., `release/v1.4`) from source branch
+- Creates RC tag (e.g., `v1.4.0-rc.1`)
+- Main branch is NOT modified (already at major version)
+- Release notes compare against latest stable on source branch (e.g., `v1.3.1`)
+- After approval: Creates stable tag and publishes artifacts
+
+<details>
+<summary>What happens under the hood</summary>
+
+**Create Release Branch workflow (with source_release_branch)**:
+
+- Validates main is at major version (`X.0.0-beta.N` where patch = 0)
+- Checks out source release branch (e.g., `release/v1.3`)
+- Reads current version from source branch
+- Increments minor version (e.g., `1.3.1-beta.0` → `1.4.0-rc.1`)
+- Creates new release branch (e.g., `release/v1.4`) from source branch HEAD
+- Finds latest stable tag on source branch for release notes comparison
+- Does NOT modify main branch
+- Creates GitHub Discussion for voting
+
+**Key differences from main branch flow**:
+
+- No breaking change detection (assumes features are already validated)
+- No release-root tag created (not needed for this flow)
+- Main branch version unchanged
+- Release notes compare against source branch's latest stable release
+</details>
+
 ## Create a Patch / Bugfix Release
 
 **Purpose**: Release critical bug fixes for an existing release.
 
 **Steps**:
-1. Checkout the release branch (e.g., `release/v1.3`)
-2. Create and test your fix (ensure no breaking changes)
-3. Create a PR to merge into the release branch
-4. Trigger **"Create RC"** workflow with **release_branch** (e.g., `release/v1.3`) and **dry_run**: `true`
-5. Review the patch RC version
-6. Run with **dry_run**: `false` to create the patch RC
-7. Test RC artifacts and vote in the GitHub Discussion
-8. **If issues found**: Fix and run **"Create RC"** again to create `rc.2`, `rc.3`, etc.
-9. **If approved**: Trigger **"Approve RC"** workflow with **rc_tag** (e.g., `v1.3.1-rc.1`)
+
+1. Commit the fix to main branch first (all changes must go to main first)
+2. Cherry-pick the fix to the release branch (e.g., `release/v1.3`)
+3. Trigger **"Create RC"** workflow with **release_branch** (e.g., `release/v1.3`) and **dry_run**: `true`
+4. Review the patch RC version
+5. Run with **dry_run**: `false` to create the patch RC
+6. Test RC artifacts and vote in the GitHub Discussion
+7. **If issues found**: Fix and run **"Create RC"** again to create `rc.2`, `rc.3`, etc.
+8. **If approved**: Trigger **"Approve RC"** workflow with **rc_tag** (e.g., `v1.3.1-rc.1`)
 
 **Result**:
+
 - Creates patch RC tag (e.g., `v1.3.1-rc.1`) on release branch
 - After approval: Creates stable tag (e.g., `v1.3.1`) and publishes to PyPI, crates.io, Maven Central
 - Auto-bumps release branch to next patch `beta.0` (e.g., `1.3.2-beta.0`)
@@ -281,7 +423,8 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 <details>
 <summary>Important notes</summary>
 
-- **Breaking changes not allowed**: Release branches are for patch releases only
+- **Commit to main first**: All fixes must be committed to main before cherry-picking to release branches
+- **Breaking changes not allowed**: Patch releases should not introduce breaking changes
 - **Beta versions**: Release branches stay at `X.Y.Z-beta.N` between releases (auto-bumped after stable)
 - **Release notes**: Compares against previous stable tag (e.g., `v1.3.0`)
 - **Allowed changes**: Correctness bugs, security fixes, major performance regressions, unintentional breaking change reverts
@@ -419,7 +562,7 @@ Workflow: Create Release Branch
 ```bash
 # 1. Start with release/v1.3 @ 1.3.1-beta.0 (auto-bumped after previous stable release)
 # 2. Critical bug found in 1.3.0
-# 3. Fix committed to release/v1.3
+# 3. Fix committed to main first, then cherry-picked to release/v1.3
 # 4. Create patch RC
 Workflow: Create RC
   release_branch: release/v1.3
@@ -442,6 +585,48 @@ Workflow: Approve RC
     - Stable artifacts published
     - Auto-bumped to 1.3.2-beta.0 (ready for next patch)
     - Main unchanged
+```
+
+### Minor Release from Release Branch
+
+```bash
+# Scenario: Main is at 2.0.0-beta.N (major version), need to release v1.4.0 with new features
+
+# 1. Main is at 2.0.0-beta.1 (breaking changes introduced)
+# 2. release/v1.3 is at 1.3.1-beta.0 (after releasing v1.3.1)
+# 3. Cherry-pick desired features from main to release/v1.3
+
+# 4. Create minor release branch from release/v1.3
+Workflow: Create Release Branch
+  source_release_branch: release/v1.3
+  Result:
+    - Validates main is at major version (2.0.0-beta.1)
+    - Source branch at 1.3.1-beta.0
+    - Created release/v1.4 at 1.4.0-rc.1
+    - Tagged v1.4.0-rc.1
+    - Found latest stable: v1.3.1
+    - Created GitHub Pre-Release with release notes from v1.3.1 to v1.4.0-rc.1
+    - Main NOT modified (stays at 2.0.0-beta.1)
+    - GitHub Discussion created
+
+# 5. Vote on RC (3-day voting for minor release)
+  - Navigate to Discussion thread
+  - Test RC artifacts
+  - Vote with +1, 0, -1
+
+# 6. Approve RC
+Workflow: Approve RC
+  rc_tag: v1.4.0-rc.1
+  Result:
+    - release/v1.4 @ 1.4.0
+    - Tagged v1.4.0
+    - Generated release notes comparing v1.4.0 vs v1.3.1
+    - Created GitHub Release (not pre-release)
+    - Stable artifacts published
+    - Release branch auto-bumped to 1.4.1-beta.0
+    - Main unchanged (stays at 2.0.0-beta.1)
+
+# 7. Future: Can continue with patches on release/v1.4 or create release/v1.5 from it
 ```
 
 ### RC Iteration Due to Issues

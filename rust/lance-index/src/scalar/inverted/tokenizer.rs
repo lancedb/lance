@@ -223,6 +223,11 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Get whether positions are stored in this index.
+    pub fn has_positions(&self) -> bool {
+        self.with_position
+    }
+
     pub fn max_token_length(mut self, max_token_length: Option<usize>) -> Self {
         self.max_token_length = max_token_length;
         self

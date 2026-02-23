@@ -37,12 +37,12 @@ def test_drop_columns(tmp_path: Path):
             "c": pa.int64(),
         }
     )
-    assert len(dataset.list_indices()) == 1
+    assert len(dataset.describe_indices()) == 1
 
     # Drop vector column, index is dropped
     dataset.drop_columns(["a"])
     assert dataset.schema == pa.schema({"c": pa.int64()})
-    assert len(dataset.list_indices()) == 0
+    assert len(dataset.describe_indices()) == 0
 
     # Can't drop all columns
     with pytest.raises(ValueError):

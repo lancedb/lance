@@ -13,7 +13,7 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::cache::LanceCache;
-use lance_core::utils::mask::NullableRowAddrSet;
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -45,7 +45,12 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
     ) -> Result<NullableRowAddrSet> {
         let result = self.search(query, metrics).await?;
         match result {
-            SearchResult::Exact(row_ids) => Ok(row_ids),
+            SearchResult::Exact(row_ids) => {
+                // Label list semantics treat NULL elements as non-matches, so only TRUE/FALSE
+                // results should remain for array_has_any/array_has_all when the list itself
+                // is non-NULL. Clear nulls to avoid propagating element-level NULLs.
+                Ok(row_ids.with_nulls(RowAddrTreeMap::new()))
+            }
             _ => Err(Error::Internal {
                 message: "Label list sub-index should return exact results".to_string(),
                 location: location!(),
@@ -207,9 +212,10 @@ impl ScalarIndex for LabelListIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.values_index
-            .update(unnest_chunks(new_data)?, dest_store)
+            .update(unnest_chunks(new_data)?, dest_store, valid_old_fragments)
             .await?;
 
         Ok(CreatedIndex {
@@ -409,6 +415,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {
@@ -445,7 +452,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let data = unnest_chunks(data)?;
         let bitmap_plugin = BitmapIndexPlugin;
         bitmap_plugin
-            .train_index(data, index_store, request, fragment_ids)
+            .train_index(data, index_store, request, fragment_ids, progress)
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())

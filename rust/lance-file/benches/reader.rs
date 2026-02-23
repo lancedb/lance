@@ -120,8 +120,7 @@ fn bench_reader(c: &mut Criterion) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn drop_file_from_cache(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-    println!("drop_file_from_cache: not implemented on this platform");
+pub fn drop_file_from_cache(_path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
     Ok(())
 }
 

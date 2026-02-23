@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use lance::{
     dataset::{InsertBuilder, WriteParams},
     Dataset,
 };
-use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -40,6 +41,7 @@ pub enum DeletionState {
 pub struct DatasetTestCases {
     original: RecordBatch,
     index_options: Vec<(String, Vec<Option<IndexType>>)>,
+    inverted_index_params: HashMap<String, InvertedIndexParams>,
 }
 
 impl DatasetTestCases {
@@ -47,6 +49,7 @@ impl DatasetTestCases {
         Self {
             original,
             index_options: Vec::new(),
+            inverted_index_params: HashMap::new(),
         }
     }
 
@@ -57,6 +60,19 @@ impl DatasetTestCases {
     ) -> Self {
         self.index_options
             .push((column.into(), index_types.into_iter().collect()));
+        self
+    }
+
+    pub fn with_index_types_and_inverted_index_params(
+        mut self,
+        column: impl Into<String>,
+        index_types: impl IntoIterator<Item = Option<IndexType>>,
+        inverted_params: InvertedIndexParams,
+    ) -> Self {
+        let column = column.into();
+        self.index_options
+            .push((column.clone(), index_types.into_iter().collect()));
+        self.inverted_index_params.insert(column, inverted_params);
         self
     }
 
@@ -109,12 +125,17 @@ impl DatasetTestCases {
             ] {
                 let index_combinations = self.generate_index_combinations();
                 for indices in index_combinations {
-                    let ds =
-                        build_dataset(self.original.clone(), fragmentation, deletion, &indices)
-                            .await;
+                    let ds = build_dataset(
+                        self.original.clone(),
+                        fragmentation,
+                        deletion,
+                        &indices,
+                        &self.inverted_index_params,
+                    )
+                    .await;
                     let context = format!(
-                        "fragmentation: {:?}, deletion: {:?}, index: {:?}",
-                        fragmentation, deletion, indices
+                        "fragmentation: {:?}, deletion: {:?}, index: {:?}, inverted_index_params: {:?}",
+                        fragmentation, deletion, indices, self.inverted_index_params
                     );
                     // Catch unwind so we can add test context to the panic.
                     AssertUnwindSafe(test_fn(ds, self.original.clone()))
@@ -136,6 +157,7 @@ async fn build_dataset(
     fragmentation: Fragmentation,
     deletion: DeletionState,
     indices: &[(&str, IndexType)],
+    inverted_index_params: &HashMap<String, InvertedIndexParams>,
 ) -> Dataset {
     let data_to_write = fill_deleted_rows(&original, deletion);
 
@@ -172,10 +194,17 @@ async fn build_dataset(
             | IndexType::LabelList
             | IndexType::NGram
             | IndexType::ZoneMap
-            | IndexType::Inverted
             | IndexType::BloomFilter => Box::new(ScalarIndexParams::for_builtin(
                 (*index_type).try_into().unwrap(),
             )),
+            IndexType::Inverted => inverted_index_params
+                .get(*column)
+                .map(|params| Box::new(params.clone()) as Box<dyn IndexParams>)
+                .unwrap_or_else(|| {
+                    Box::new(ScalarIndexParams::for_builtin(
+                        (*index_type).try_into().unwrap(),
+                    ))
+                }),
             IndexType::IvfFlat => {
                 // Use a small number of partitions for testing
                 Box::new(VectorIndexParams::ivf_flat(2, MetricType::L2))

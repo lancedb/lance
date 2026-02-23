@@ -19,7 +19,6 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
-use lance_io::object_writer::ObjectWriter;
 use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
@@ -201,7 +200,7 @@ pub async fn write_vector_storage(
     pq: ProductQuantizer,
     distance_type: DistanceType,
     column: &str,
-    writer: ObjectWriter,
+    writer: Box<dyn Writer>,
     precomputed_partitions_ds_uri: Option<&str>,
 ) -> Result<()> {
     info!("Transforming {} vectors for storage", num_rows);

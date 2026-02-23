@@ -522,6 +522,7 @@ impl ScalarIndex for NGramIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         let spill_files = builder.train(new_data).await?;
@@ -1296,6 +1297,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {
@@ -1620,7 +1622,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index.update(data, test_store.as_ref()).await.unwrap();
+        index.update(data, test_store.as_ref(), None).await.unwrap();
 
         let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await
@@ -1699,7 +1701,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index.update(data, test_store.as_ref()).await.unwrap();
+        index.update(data, test_store.as_ref(), None).await.unwrap();
 
         let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await

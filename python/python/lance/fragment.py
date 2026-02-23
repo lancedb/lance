@@ -448,6 +448,9 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        blob_handling: Optional[
+            Literal["all_binary", "blobs_descriptions", "all_descriptions"]
+        ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
@@ -468,6 +471,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            blob_handling=blob_handling,
             order_by=order_by,
             **columns_arg,
         )
@@ -515,6 +519,9 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        blob_handling: Optional[
+            Literal["all_binary", "blobs_descriptions", "all_descriptions"]
+        ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
@@ -526,6 +533,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            blob_handling=blob_handling,
             order_by=order_by,
         ).to_batches()
 
@@ -537,6 +545,9 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
+        blob_handling: Optional[
+            Literal["all_binary", "blobs_descriptions", "all_descriptions"]
+        ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         return self.scanner(
@@ -546,6 +557,7 @@ class LanceFragment(pa.dataset.Fragment):
             offset=offset,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
+            blob_handling=blob_handling,
             order_by=order_by,
         ).to_table()
 
