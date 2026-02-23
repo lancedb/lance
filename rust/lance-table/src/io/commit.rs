@@ -552,6 +552,7 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
         version
     } else {
         // File-size format: version = file size in bytes
+        eprintln!("[HINT_READ_START] file_size, path={}", hint_path);
         let meta = object_store.inner.head(&hint_path).await.ok()?;
         let version = meta.size as u64;
         eprintln!(
@@ -844,6 +845,7 @@ async fn resolve_version_from_listing(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    eprintln!("[LIST_START] versions_dir={}", base.child(VERSIONS_DIR));
     let list_start = std::time::Instant::now();
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
