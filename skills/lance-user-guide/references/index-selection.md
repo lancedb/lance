@@ -65,7 +65,7 @@ Choose scalar index type based on the filter expression:
 - Equality / IN-list filters on low-cardinality columns: start with `BITMAP`
 - List membership filters on list-like columns: start with `LABEL_LIST`
 - Substring / `contains(...)` filters on strings: start with `NGRAM`
-- Text search: start with `INVERTED`
+- Full-text search (FTS): start with `INVERTED`
 - Range filters: start with range-friendly options (for example `ZONEMAP` when appropriate)
 - Highly selective negative membership / presence checks: consider `BLOOMFILTER` (inexact)
 - Geospatial queries (if present in your build): use `RTREE`
