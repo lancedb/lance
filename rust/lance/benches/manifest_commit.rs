@@ -6,13 +6,14 @@
 //! This benchmark tests how performance degrades as the number of small fragments
 //! grows. Each fragment contains only 10 rows, and we measure both:
 //! - Commit time (manifest write only, excludes fragment data writing)
-//! - Load time (manifest read from storage, no caching)
+//! - Load time (manifest read from storage, using checkout_latest with no caching)
 //!
 //! Key optimizations:
 //! - Uses shared session for commits to avoid re-reading old manifests
 //! - Disables auto-cleanup to avoid background cleanup overhead
 //! - Separates fragment writing from commit measurement
-//! - Uses fresh session (no cache) for load measurement to force actual storage read
+//! - Uses checkout_latest() with zero cache size to measure actual storage read
+//!   while reusing warm TCP/TLS connections
 //!
 //! ## Running against S3
 //!
@@ -42,9 +43,7 @@
 //! - `DATASET_PREFIX`: Base URI for datasets (optional, e.g. s3://bucket/prefix or /tmp/bench). If not set, uses a temporary directory.
 //! - `NUM_ITERATIONS`: Number of small fragment writes to perform (default: 100).
 //! - `ROWS_PER_FRAGMENT`: Number of rows per fragment (default: 10).
-//! - `DIRECT_CHECKOUT`: When "true", use checkout_version which bypasses listing. When "false" (default), use load() which includes listing.
 //! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes. When "false" (default), keep the dataset for inspection.
-//! - `WARM_SESSION`: When "true", use the same shared session for load() to test warm connection performance. When "false" (default), use fresh session for each load.
 
 #![allow(clippy::print_stdout)]
 
@@ -54,6 +53,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
+use lance_io::object_store::ObjectStoreRegistry;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -76,20 +76,8 @@ fn get_num_iterations() -> usize {
         .unwrap_or(DEFAULT_NUM_ITERATIONS)
 }
 
-fn get_direct_checkout() -> bool {
-    std::env::var("DIRECT_CHECKOUT")
-        .map(|s| s.to_lowercase() == "true")
-        .unwrap_or(false)
-}
-
 fn get_delete_dataset() -> bool {
     std::env::var("DELETE_DATASET")
-        .map(|s| s.to_lowercase() == "true")
-        .unwrap_or(false)
-}
-
-fn get_warm_session() -> bool {
-    std::env::var("WARM_SESSION")
         .map(|s| s.to_lowercase() == "true")
         .unwrap_or(false)
 }
@@ -158,9 +146,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let dataset_prefix = get_dataset_prefix();
     let num_iterations = get_num_iterations();
     let rows_per_fragment = get_rows_per_fragment();
-    let direct_checkout = get_direct_checkout();
     let delete_dataset = get_delete_dataset();
-    let warm_session = get_warm_session();
     let storage_label = get_storage_label(&dataset_prefix);
 
     let short_id = &Uuid::new_v4().to_string()[..8];
@@ -178,35 +164,48 @@ fn bench_manifest_commit(c: &mut Criterion) {
         "Total fragments (including initial): {}",
         num_iterations + 1
     );
-    println!(
-        "Direct checkout: {} ({})",
-        direct_checkout,
-        if direct_checkout {
-            "checkout_version - bypasses listing"
-        } else {
-            "load() - includes listing"
-        }
-    );
     println!("Delete dataset: {}", delete_dataset);
-    println!(
-        "Warm session: {} ({})",
-        warm_session,
-        if warm_session {
-            "reuse session for load - tests warm connection"
-        } else {
-            "fresh session for load - tests cold start"
-        }
-    );
+    println!();
+    println!("Load method: checkout_latest() with zero cache size");
+    println!("  - Reuses warm TCP/TLS connections (shared ObjectStoreRegistry)");
+    println!("  - No manifest caching (zero cache size)");
+    println!("  - Measures actual storage read latency without cold start overhead");
     println!();
 
-    // Create a shared session to avoid re-opening old manifests
-    let session = Arc::new(Session::default());
+    // Create a shared ObjectStoreRegistry to reuse TCP/TLS connections
+    let shared_store_registry = Arc::new(ObjectStoreRegistry::default());
+
+    // Create a session with caching for commits (to avoid re-reading old manifests)
+    let commit_session = Arc::new(Session::new(
+        128 * 1024 * 1024, // index_cache_size
+        128 * 1024 * 1024, // metadata_cache_size
+        shared_store_registry.clone(),
+    ));
+
+    // Create a session with zero cache for load measurements
+    // This shares the ObjectStoreRegistry (warm connections) but has no manifest cache
+    let load_session = Arc::new(Session::new(
+        0, // index_cache_size = 0
+        0, // metadata_cache_size = 0
+        shared_store_registry,
+    ));
 
     let initial_dataset = runtime.block_on(create_initial_dataset(
         &uri,
         rows_per_fragment,
-        session.clone(),
+        commit_session.clone(),
     ));
+
+    // Create a load dataset that uses the zero-cache session
+    // This will be used to call checkout_latest() for load measurements
+    let uri_clone = uri.clone();
+    let mut load_dataset = runtime.block_on(async {
+        DatasetBuilder::from_uri(&uri_clone)
+            .with_session(load_session.clone())
+            .load()
+            .await
+            .expect("failed to load dataset for load measurements")
+    });
 
     // Keep a mutable dataset reference that we update after each commit
     let mut current_dataset = Arc::new(initial_dataset);
@@ -222,7 +221,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
 
         let (commit_time, new_dataset) = {
             let dataset = current_dataset.clone();
-            let session_clone = session.clone();
+            let session_clone = commit_session.clone();
             runtime.block_on(async move {
                 let schema: Arc<ArrowSchema> = Arc::new((&dataset.schema().clone()).into());
                 let start_id = dataset.count_rows(None).await.unwrap() as usize;
@@ -258,53 +257,24 @@ fn bench_manifest_commit(c: &mut Criterion) {
         // This avoids the hint write from previous commit interfering with load measurement
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // Measure load time
-        let load_time = if direct_checkout {
-            // Direct checkout: use checkout_version which bypasses listing
-            let dataset = current_dataset.clone();
-            let new_version = (i + 1) as u64;
-            runtime.block_on(async move {
-                let start = Instant::now();
-                let checked_out = dataset
-                    .checkout_version(new_version)
-                    .await
-                    .expect("failed to checkout");
-                let elapsed = start.elapsed();
+        // Measure load time using checkout_latest() with zero-cache session
+        // This reuses warm TCP/TLS connections but doesn't use cached manifests
+        let load_time = runtime.block_on(async {
+            let start = Instant::now();
+            load_dataset
+                .checkout_latest()
+                .await
+                .expect("failed to checkout latest");
+            let elapsed = start.elapsed();
 
-                assert_eq!(
-                    checked_out.manifest().fragments.len(),
-                    num_fragments,
-                    "Expected {} fragments",
-                    num_fragments
-                );
-                elapsed
-            })
-        } else {
-            // Load dataset
-            let uri_ref = uri.as_str();
-            let session_for_load = if warm_session {
-                Some(session.clone())
-            } else {
-                None
-            };
-            runtime.block_on(async move {
-                let start = Instant::now();
-                let mut builder = DatasetBuilder::from_uri(uri_ref);
-                if let Some(s) = session_for_load {
-                    builder = builder.with_session(s);
-                }
-                let dataset = builder.load().await.expect("failed to load");
-                let elapsed = start.elapsed();
-
-                assert_eq!(
-                    dataset.manifest().fragments.len(),
-                    num_fragments,
-                    "Expected {} fragments",
-                    num_fragments
-                );
-                elapsed
-            })
-        };
+            assert_eq!(
+                load_dataset.manifest().fragments.len(),
+                num_fragments,
+                "Expected {} fragments",
+                num_fragments
+            );
+            elapsed
+        });
 
         // Update current_dataset for next iteration
         current_dataset = new_dataset;
