@@ -95,7 +95,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 log::warn!(
                     "Cannot open index on column '{}': {}. \
                      Skipping index merge for this column.",
-                    field_path, e
+                    field_path,
+                    e
                 );
                 return Ok(None);
             }

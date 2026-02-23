@@ -5,17 +5,16 @@ use std::{collections::HashMap, sync::Arc};
 use lance_core::{Error, Result};
 use snafu::location;
 
+#[cfg(feature = "geo")]
+use crate::scalar::rtree::RTreeIndexPlugin;
 use crate::{
     pb, pbold,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
-        zonemap::ZoneMapIndexPlugin,
+        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
     },
 };
-#[cfg(feature = "geo")]
-use crate::scalar::rtree::RTreeIndexPlugin;
 
 /// A registry of index plugins
 pub struct IndexPluginRegistry {

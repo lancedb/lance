@@ -300,7 +300,9 @@ pub(crate) async fn remap_index(
             log::warn!(
                 "Cannot open index '{}' on '{}': {}. \
                  Index will be dropped during compaction.",
-                index_id, field_path, e
+                index_id,
+                field_path,
+                e
             );
             return Ok(RemapResult::Drop);
         }
@@ -1680,7 +1682,9 @@ impl DatasetIndexInternalExt for Dataset {
                     log::warn!(
                         "Skipping index '{}' on column '{}': {}. \
                          Queries on this column will fall back to a full scan.",
-                        index.name, field_path, e
+                        index.name,
+                        field_path,
+                        e
                     );
                     continue;
                 }
