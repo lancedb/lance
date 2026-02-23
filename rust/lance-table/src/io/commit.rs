@@ -340,16 +340,56 @@ async fn current_manifest_path(
         return result;
     }
 
-    // Race hint-based and listing-based approaches
-    // Use tokio::select! to return whichever completes first
+    // Stagger start: give hint a head start to avoid connection contention
+    // When hint and listing start simultaneously, both slow down due to TCP/TLS contention
+    // By giving hint a head start, it can complete quickly (~4ms) before listing starts
+    let hint_head_start_ms = std::env::var("LANCE_HINT_HEAD_START_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10u64);
+
+    let hint_future = read_version_hint_and_probe(object_store, base);
+    tokio::pin!(hint_future);
+
+    // Phase 1: Give hint a head start
+    let head_start = tokio::time::Duration::from_millis(hint_head_start_ms);
+    let hint_result = tokio::select! {
+        biased;
+        result = &mut hint_future => Some(result),
+        _ = tokio::time::sleep(head_start) => None,
+    };
+
+    // If hint completed during head start, use it
+    if let Some(Some(location)) = hint_result {
+        eprintln!(
+            "[LOAD] hint won (head start): {:?}, version={}",
+            start.elapsed(),
+            location.version
+        );
+        return Ok(location);
+    }
+
+    // If hint failed during head start, fall back to listing only
+    if let Some(None) = hint_result {
+        let result = resolve_version_from_listing(object_store, base).await;
+        eprintln!(
+            "[LOAD] hint failed, listing fallback: {:?}, version={}",
+            start.elapsed(),
+            result.as_ref().map(|l| l.version).unwrap_or(0)
+        );
+        return result;
+    }
+
+    // Phase 2: Hint didn't complete in head start, race with listing
+    eprintln!("[LOAD] hint head start timeout, starting race");
     tokio::select! {
         biased;
 
-        // Try hint-based approach first (biased because it's usually faster)
-        hint_result = read_version_hint_and_probe(object_store, base) => {
+        // Continue hint attempt
+        hint_result = hint_future => {
             if let Some(location) = hint_result {
                 eprintln!(
-                    "[LOAD] hint won: {:?}, version={}",
+                    "[LOAD] hint won (after race): {:?}, version={}",
                     start.elapsed(),
                     location.version
                 );
