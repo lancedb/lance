@@ -44,6 +44,7 @@
 //! - `ROWS_PER_FRAGMENT`: Number of rows per fragment (default: 10).
 //! - `DIRECT_CHECKOUT`: When "true", use checkout_version which bypasses listing. When "false" (default), use load() which includes listing.
 //! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes. When "false" (default), keep the dataset for inspection.
+//! - `WARM_SESSION`: When "true", use the same shared session for load() to test warm connection performance. When "false" (default), use fresh session for each load.
 
 #![allow(clippy::print_stdout)]
 
@@ -83,6 +84,12 @@ fn get_direct_checkout() -> bool {
 
 fn get_delete_dataset() -> bool {
     std::env::var("DELETE_DATASET")
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn get_warm_session() -> bool {
+    std::env::var("WARM_SESSION")
         .map(|s| s.to_lowercase() == "true")
         .unwrap_or(false)
 }
@@ -153,6 +160,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let rows_per_fragment = get_rows_per_fragment();
     let direct_checkout = get_direct_checkout();
     let delete_dataset = get_delete_dataset();
+    let warm_session = get_warm_session();
     let storage_label = get_storage_label(&dataset_prefix);
 
     let short_id = &Uuid::new_v4().to_string()[..8];
@@ -180,6 +188,15 @@ fn bench_manifest_commit(c: &mut Criterion) {
         }
     );
     println!("Delete dataset: {}", delete_dataset);
+    println!(
+        "Warm session: {} ({})",
+        warm_session,
+        if warm_session {
+            "reuse session for load - tests warm connection"
+        } else {
+            "fresh session for load - tests cold start"
+        }
+    );
     println!();
 
     // Create a shared session to avoid re-opening old manifests
@@ -263,14 +280,20 @@ fn bench_manifest_commit(c: &mut Criterion) {
                 elapsed
             })
         } else {
-            // Load with listing: use load() without session to force actual storage read
+            // Load dataset
             let uri_ref = uri.as_str();
+            let session_for_load = if warm_session {
+                Some(session.clone())
+            } else {
+                None
+            };
             runtime.block_on(async move {
                 let start = Instant::now();
-                let dataset = DatasetBuilder::from_uri(uri_ref)
-                    .load()
-                    .await
-                    .expect("failed to load");
+                let mut builder = DatasetBuilder::from_uri(uri_ref);
+                if let Some(s) = session_for_load {
+                    builder = builder.with_session(s);
+                }
+                let dataset = builder.load().await.expect("failed to load");
                 let elapsed = start.elapsed();
 
                 assert_eq!(
