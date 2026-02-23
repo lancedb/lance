@@ -1679,34 +1679,19 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
                   // Delete branch1 and verify listing
-                  try {
-                    mainV2.branches().delete("branch1");
-                  } catch (Exception ignored) {
-                    // Some environments may report NotFound on cleanup; ignore and proceed
-                  }
-                  List<Branch> branchListAfterDelete = mainV2.branches().list();
-                  assertTrue(
-                      branchListAfterDelete.stream().noneMatch(b -> b.getName().equals("branch1")),
-                      "branch1 should be deleted");
+                  mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
 
-                  Optional<Branch> branch2AfterDelete =
-                      branchListAfterDelete.stream()
-                          .filter(b -> b.getName().equals("branch2"))
-                          .findFirst();
-                  assertTrue(branch2AfterDelete.isPresent(), "branch2 should remain");
-                  assertEquals(branch2Meta, branch2AfterDelete.get());
-
-                  // Step 6. use checkout_branch to checkout branch2
-                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2"))) {
-                    assertNotNull(branch2V4New.getSchema());
-                    assertEquals(4, branch2V4New.version());
-                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  // Step 6. use checkout_branch to checkout branch1
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch1"))) {
+                    assertEquals(3, branch2V4New.version());
+                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
                   }
 
                   // Step 7. use checkout reference to checkout branch2
-                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2", 3))) {
-                    assertEquals(3, branch2V4New.version());
-                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch1", 2))) {
+                    assertEquals(2, branch2V4New.version());
+                    assertEquals(5, branch2V4New.countRows()); // A(5)
                   }
                 }
               }

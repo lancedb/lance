@@ -22,7 +22,7 @@ use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
-use lance_io::traits::Reader;
+use lance_io::traits::{Reader, Writer};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -40,7 +40,7 @@ struct PackWriter {
     data_file_key: String,
     max_pack_size: usize,
     current_blob_id: Option<u32>,
-    writer: Option<lance_io::object_writer::ObjectWriter>,
+    writer: Option<Box<dyn lance_io::traits::Writer>>,
     current_size: usize,
 }
 
@@ -102,7 +102,7 @@ impl PackWriter {
 
     async fn finish(&mut self) -> Result<()> {
         if let Some(mut writer) = self.writer.take() {
-            writer.shutdown().await?;
+            Writer::shutdown(writer.as_mut()).await?;
         }
         self.current_blob_id = None;
         self.current_size = 0;
@@ -172,7 +172,7 @@ impl BlobPreprocessor {
         let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
-        writer.shutdown().await?;
+        Writer::shutdown(&mut writer).await?;
         Ok(path)
     }
 
@@ -236,6 +236,12 @@ impl BlobPreprocessor {
                     Error::invalid_input("Blob struct missing `uri` field", location!())
                 })?
                 .as_string::<i32>();
+            let position_col = struct_arr
+                .column_by_name("position")
+                .map(|col| col.as_primitive::<UInt64Type>());
+            let size_col = struct_arr
+                .column_by_name("size")
+                .map(|col| col.as_primitive::<UInt64Type>());
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
             let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
@@ -262,6 +268,14 @@ impl BlobPreprocessor {
 
                 let has_data = !data_col.is_null(i);
                 let has_uri = !uri_col.is_null(i);
+                let has_position = position_col
+                    .as_ref()
+                    .map(|col| !col.is_null(i))
+                    .unwrap_or(false);
+                let has_size = size_col
+                    .as_ref()
+                    .map(|col| !col.is_null(i))
+                    .unwrap_or(false);
                 let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
                 let dedicated_threshold = self.dedicated_thresholds[idx];
@@ -296,8 +310,18 @@ impl BlobPreprocessor {
                     data_builder.append_null();
                     uri_builder.append_value(uri_val);
                     blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    position_builder.append_null();
+                    if has_position && has_size {
+                        let position = position_col
+                            .as_ref()
+                            .expect("position column must exist")
+                            .value(i);
+                        let size = size_col.as_ref().expect("size column must exist").value(i);
+                        blob_size_builder.append_value(size);
+                        position_builder.append_value(position);
+                    } else {
+                        blob_size_builder.append_null();
+                        position_builder.append_null();
+                    }
                     continue;
                 }
 
@@ -463,6 +487,7 @@ impl BlobFile {
     }
     pub async fn new_external(
         uri: String,
+        position: u64,
         size: u64,
         registry: Arc<ObjectStoreRegistry>,
         params: Arc<ObjectStoreParams>,
@@ -477,7 +502,7 @@ impl BlobFile {
         Ok(Self {
             object_store,
             path,
-            position: 0,
+            position,
             size,
             kind: BlobKind::External,
             uri: Some(uri),
@@ -820,6 +845,7 @@ async fn collect_blob_files_v2(
             }
             BlobKind::External => {
                 let uri = blob_uris.value(idx).to_string();
+                let position = positions.value(idx);
                 let size = sizes.value(idx);
                 let registry = dataset.session.store_registry();
                 let params = dataset
@@ -827,7 +853,7 @@ async fn collect_blob_files_v2(
                     .as_ref()
                     .map(|p| Arc::new((**p).clone()))
                     .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-                files.push(BlobFile::new_external(uri, size, registry, params).await?);
+                files.push(BlobFile::new_external(uri, position, size, registry, params).await?);
             }
         }
     }

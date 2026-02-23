@@ -662,6 +662,21 @@ impl MemTable {
         Ok(self.batch_store.to_vec())
     }
 
+    /// Scan all data from the MemTable in reverse order (newest first).
+    ///
+    /// This is used when flushing MemTable to persistent storage to ensure
+    /// the flushed data is ordered from newest to oldest. This enables more
+    /// efficient K-way merge during LSM scan because flushed generations
+    /// will be pre-sorted in the order needed for deduplication.
+    ///
+    /// The total number of rows in the MemTable is also returned to allow
+    /// callers to compute reversed row positions for indexes.
+    pub async fn scan_batches_reversed(&self) -> Result<(Vec<RecordBatch>, usize)> {
+        let total_rows = self.batch_store.total_rows();
+        let batches = self.batch_store.to_vec_reversed()?;
+        Ok((batches, total_rows))
+    }
+
     /// Scan specific batches by their batch_positions.
     pub async fn scan_batches_by_ids(&self, batch_positions: &[usize]) -> Result<Vec<RecordBatch>> {
         let mut results = Vec::with_capacity(batch_positions.len());

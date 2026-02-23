@@ -13,13 +13,19 @@
  */
 package org.lance.namespace;
 
+import org.lance.Dataset;
+import org.lance.ReadOptions;
+import org.lance.WriteParams;
 import org.lance.namespace.model.*;
+import org.lance.namespace.model.DescribeTableVersionRequest;
+import org.lance.namespace.model.DescribeTableVersionResponse;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -35,6 +41,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -304,5 +311,381 @@ public class DirectoryNamespaceTest {
 
     assertNotNull(createResp);
     assertNotNull(createResp.getLocation());
+  }
+
+  @Test
+  void testDescribeTableReturnsManagedVersioningWhenTrackingEnabled() throws Exception {
+    // Create namespace with table_version_tracking_enabled and manifest_enabled
+    DirectoryNamespace trackingNs = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.toString());
+    config.put("table_version_tracking_enabled", "true");
+    config.put("manifest_enabled", "true");
+    trackingNs.initialize(config, allocator);
+
+    try {
+      // Create parent namespace
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+      trackingNs.createNamespace(createNsReq);
+
+      // Create a table
+      byte[] tableData = createTestTableData();
+      CreateTableRequest createReq =
+          new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+      trackingNs.createTable(createReq, tableData);
+
+      // Describe table should return managedVersioning=true
+      DescribeTableRequest descReq =
+          new DescribeTableRequest().id(Arrays.asList("workspace", "test_table"));
+      DescribeTableResponse descResp = trackingNs.describeTable(descReq);
+
+      assertNotNull(descResp);
+      assertNotNull(descResp.getLocation());
+      assertTrue(
+          Boolean.TRUE.equals(descResp.getManagedVersioning()),
+          "Expected managedVersioning=true, got " + descResp.getManagedVersioning());
+    } finally {
+      trackingNs.close();
+    }
+  }
+
+  @Test
+  void testDescribeTableVersion() throws Exception {
+    // Use multi-level table ID with manifest_enabled
+    DirectoryNamespace trackingNs = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.toString());
+    config.put("manifest_enabled", "true");
+    trackingNs.initialize(config, allocator);
+
+    try {
+      // Create parent namespace
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+      trackingNs.createNamespace(createNsReq);
+
+      // Create a table with multi-level ID
+      byte[] tableData = createTestTableData();
+      CreateTableRequest createReq =
+          new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+      trackingNs.createTable(createReq, tableData);
+
+      // Describe table version
+      DescribeTableVersionRequest descReq =
+          new DescribeTableVersionRequest()
+              .id(Arrays.asList("workspace", "test_table"))
+              .version(1L);
+      DescribeTableVersionResponse descResp = trackingNs.describeTableVersion(descReq);
+
+      assertNotNull(descResp);
+      assertNotNull(descResp.getVersion());
+      assertEquals(Long.valueOf(1), descResp.getVersion().getVersion());
+      assertNotNull(descResp.getVersion().getManifestPath());
+    } finally {
+      trackingNs.close();
+    }
+  }
+
+  /**
+   * Inner class that wraps DirectoryNamespace and tracks API calls for testing managed versioning.
+   */
+  static class TableVersionTrackingNamespace implements LanceNamespace, java.io.Closeable {
+    private final DirectoryNamespace inner;
+    private final AtomicInteger createTableVersionCount = new AtomicInteger(0);
+    private final AtomicInteger describeTableVersionCount = new AtomicInteger(0);
+    private final AtomicInteger listTableVersionsCount = new AtomicInteger(0);
+
+    public TableVersionTrackingNamespace(Path root) {
+      Map<String, String> dirProps = new HashMap<>();
+      dirProps.put("root", root.toString());
+      dirProps.put("table_version_tracking_enabled", "true");
+      dirProps.put("manifest_enabled", "true");
+
+      this.inner = new DirectoryNamespace();
+      try (BufferAllocator allocator = new RootAllocator()) {
+        this.inner.initialize(dirProps, allocator);
+      }
+    }
+
+    public int getCreateTableVersionCount() {
+      return createTableVersionCount.get();
+    }
+
+    public int getDescribeTableVersionCount() {
+      return describeTableVersionCount.get();
+    }
+
+    public int getListTableVersionsCount() {
+      return listTableVersionsCount.get();
+    }
+
+    public long getNativeHandle() {
+      return inner.getNativeHandle();
+    }
+
+    @Override
+    public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
+      // Already initialized in constructor
+    }
+
+    @Override
+    public String namespaceId() {
+      return "TableVersionTrackingNamespace { inner: " + inner.namespaceId() + " }";
+    }
+
+    @Override
+    public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
+      return inner.createEmptyTable(request);
+    }
+
+    @Override
+    public DeclareTableResponse declareTable(DeclareTableRequest request) {
+      return inner.declareTable(request);
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      return inner.describeTable(request);
+    }
+
+    @Override
+    public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
+      createTableVersionCount.incrementAndGet();
+      return inner.createTableVersion(request);
+    }
+
+    @Override
+    public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
+      describeTableVersionCount.incrementAndGet();
+      return inner.describeTableVersion(request);
+    }
+
+    @Override
+    public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+      listTableVersionsCount.incrementAndGet();
+      return inner.listTableVersions(request);
+    }
+
+    @Override
+    public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
+        BatchDeleteTableVersionsRequest request) {
+      return inner.batchDeleteTableVersions(request);
+    }
+
+    @Override
+    public void close() {
+      inner.close();
+    }
+  }
+
+  @Test
+  void testExternalManifestStoreInvokesNamespaceApis(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      // Create namespace with table_version_tracking_enabled
+      TableVersionTrackingNamespace namespace =
+          new TableVersionTrackingNamespace(managedVersioningTempDir);
+      String tableName = "test_table";
+      java.util.List<String> tableId = Arrays.asList(tableName);
+
+      // Create schema and data
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("a", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("b", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector aVector = (IntVector) root.getVector("a");
+        IntVector bVector = (IntVector) root.getVector("b");
+
+        aVector.allocateNew(2);
+        bVector.allocateNew(2);
+
+        aVector.set(0, 1);
+        bVector.set(0, 2);
+        aVector.set(1, 10);
+        bVector.set(1, 20);
+
+        aVector.setValueCount(2);
+        bVector.setValueCount(2);
+        root.setRowCount(2);
+
+        ArrowReader testReader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return root;
+              }
+            };
+
+        // Create dataset through namespace
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(testReader)
+                .namespace(namespace)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+          assertEquals(2, dataset.countRows());
+          assertEquals(1, dataset.version());
+        }
+      }
+
+      // Verify describe_table returns managed_versioning=true
+      DescribeTableRequest descReq = new DescribeTableRequest();
+      descReq.setId(tableId);
+      DescribeTableResponse descResp = namespace.describeTable(descReq);
+
+      assertEquals(
+          Boolean.TRUE,
+          descResp.getManagedVersioning(),
+          "Expected managedVersioning=true when table_version_tracking_enabled");
+
+      // Open dataset through namespace - this should call list_table_versions for latest
+      int initialListCount = namespace.getListTableVersionsCount();
+      try (Dataset dsFromNamespace =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+
+        assertEquals(2, dsFromNamespace.countRows());
+        assertEquals(1, dsFromNamespace.version());
+      }
+      assertEquals(
+          initialListCount + 1,
+          namespace.getListTableVersionsCount(),
+          "list_table_versions should have been called once when opening latest version");
+
+      // Verify create_table_version was called once during CREATE
+      assertEquals(
+          1,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should have been called once during CREATE");
+
+      try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector aVector = (IntVector) appendRoot.getVector("a");
+        IntVector bVector = (IntVector) appendRoot.getVector("b");
+
+        aVector.allocateNew(2);
+        bVector.allocateNew(2);
+
+        aVector.set(0, 100);
+        bVector.set(0, 200);
+        aVector.set(1, 1000);
+        bVector.set(1, 2000);
+
+        aVector.setValueCount(2);
+        bVector.setValueCount(2);
+        appendRoot.setRowCount(2);
+
+        ArrowReader appendReader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return appendRoot;
+              }
+            };
+
+        // Append through namespace
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(appendReader)
+                .namespace(namespace)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.APPEND)
+                .execute()) {
+          assertEquals(4, dataset.countRows());
+          assertEquals(2, dataset.version());
+        }
+      }
+
+      assertEquals(
+          2,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should have been called twice (once for CREATE, once for APPEND)");
+
+      // Open latest version - should call list_table_versions
+      int listCountBeforeLatest = namespace.getListTableVersionsCount();
+      try (Dataset latestDs =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+
+        assertEquals(4, latestDs.countRows());
+        assertEquals(2, latestDs.version());
+      }
+      assertEquals(
+          listCountBeforeLatest + 1,
+          namespace.getListTableVersionsCount(),
+          "list_table_versions should have been called once when opening latest version");
+
+      // Open specific version (version 1) - should call describe_table_version
+      int describeCountBeforeV1 = namespace.getDescribeTableVersionCount();
+      try (Dataset v1Ds =
+          Dataset.open()
+              .allocator(allocator)
+              .namespace(namespace)
+              .tableId(tableId)
+              .readOptions(new ReadOptions.Builder().setVersion(1L).build())
+              .build()) {
+
+        assertEquals(2, v1Ds.countRows());
+        assertEquals(1, v1Ds.version());
+      }
+      assertEquals(
+          describeCountBeforeV1 + 1,
+          namespace.getDescribeTableVersionCount(),
+          "describe_table_version should have been called once when opening version 1");
+
+      namespace.close();
+    }
   }
 }

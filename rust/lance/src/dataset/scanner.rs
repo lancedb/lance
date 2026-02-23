@@ -14,7 +14,6 @@ use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
-use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -24,7 +23,6 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::Literal,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
@@ -34,7 +32,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
 use datafusion_functions::core::getfield::GetFieldFunc;
-use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -53,6 +51,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
+use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
     analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
 };
@@ -462,6 +461,223 @@ impl ExprFilter {
     }
 }
 
+/// Aggregate expression from Substrait or DataFusion.
+#[derive(Debug, Clone)]
+pub enum AggregateExpr {
+    #[cfg(feature = "substrait")]
+    Substrait(Vec<u8>),
+    Datafusion {
+        group_by: Vec<Expr>,
+        aggregates: Vec<Expr>,
+    },
+}
+
+impl AggregateExpr {
+    /// Create a new builder for aggregate expressions.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let agg = AggregateExpr::builder()
+    ///     .group_by("category")
+    ///     .count_star().alias("total_count")
+    ///     .sum("amount").alias("total_amount")
+    ///     .avg("price")
+    ///     .build();
+    /// scanner.aggregate(agg);
+    /// ```
+    pub fn builder() -> AggregateExprBuilder<false> {
+        AggregateExprBuilder::new()
+    }
+
+    /// Create from Substrait Plan bytes.
+    #[cfg(feature = "substrait")]
+    pub fn substrait(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Substrait(bytes.into())
+    }
+
+    /// Create from DataFusion expressions.
+    /// Use `.alias()` on expressions to set output column names.
+    pub fn datafusion(group_by: Vec<Expr>, aggregates: Vec<Expr>) -> Self {
+        Self::Datafusion {
+            group_by,
+            aggregates,
+        }
+    }
+
+    /// Parse into a unified Aggregate structure.
+    ///
+    /// For Substrait, this parses the bytes into DataFusion expressions.
+    /// For DataFusion, this just wraps the expressions.
+    ///
+    /// The schema is used to resolve field references in Substrait expressions.
+    fn parse(self, #[allow(unused_variables)] schema: Arc<ArrowSchema>) -> Result<Aggregate> {
+        match self {
+            #[cfg(feature = "substrait")]
+            Self::Substrait(bytes) => {
+                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::substrait::parse_substrait_aggregate;
+
+                let ctx = get_session_context(&LanceExecutionOptions::default());
+                parse_substrait_aggregate(&bytes, schema, &ctx.state())
+                    .now_or_never()
+                    .expect("could not parse the Substrait aggregate in a synchronous fashion")
+            }
+            Self::Datafusion {
+                group_by,
+                aggregates,
+            } => Ok(Aggregate::new(group_by, aggregates)),
+        }
+    }
+}
+
+/// Builder for creating aggregate expressions without using DataFusion or Substrait directly.
+///
+/// The const generic `HAS_PENDING` tracks whether there's a pending aggregate that can be aliased.
+/// When `HAS_PENDING` is `true`, the last item in `aggregates` is the pending aggregate.
+#[derive(Debug, Clone)]
+pub struct AggregateExprBuilder<const HAS_PENDING: bool> {
+    group_by: Vec<Expr>,
+    aggregates: Vec<Expr>,
+}
+
+impl Default for AggregateExprBuilder<false> {
+    fn default() -> Self {
+        Self {
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+        }
+    }
+}
+
+impl AggregateExprBuilder<false> {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build the aggregate expression.
+    pub fn build(self) -> AggregateExpr {
+        AggregateExpr::Datafusion {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
+impl<const HAS_PENDING: bool> AggregateExprBuilder<HAS_PENDING> {
+    /// Add a column to group by.
+    ///
+    /// Multiple invocations will add to the list (not replace it).
+    /// E.g. `.group_by("x").group_by("y")` will group by both `x` and `y`.
+    pub fn group_by(mut self, column: impl Into<String>) -> AggregateExprBuilder<false> {
+        self.group_by.push(col(column.into()));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add multiple columns to group by.
+    ///
+    /// Multiple invocations will add to the list (not replace it).
+    /// E.g. `.group_by("x").group_by_columns(["y", "z"])` will group by `x`, `y`, and `z`.
+    pub fn group_by_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> AggregateExprBuilder<false> {
+        for column in columns {
+            self.group_by.push(col(column.into()));
+        }
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add COUNT(*) aggregate that counts all rows.
+    pub fn count_star(mut self) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::count::count(lit(1)));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add COUNT(column) aggregate.
+    ///
+    /// Unlike `count_star`, this will only count the number of rows where `column`
+    /// is not NULL.
+    pub fn count(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::count::count(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add SUM(column) aggregate.
+    pub fn sum(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::sum::sum(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add AVG(column) aggregate.
+    pub fn avg(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::average::avg(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add MIN(column) aggregate.
+    pub fn min(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::min_max::min(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add MAX(column) aggregate.
+    pub fn max(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::min_max::max(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
+impl AggregateExprBuilder<true> {
+    /// Set an alias for the pending aggregate (the last added aggregate).
+    pub fn alias(mut self, name: impl Into<String>) -> AggregateExprBuilder<false> {
+        let pending = self.aggregates.pop().expect("pending aggregate must exist");
+        self.aggregates.push(pending.alias(name.into()));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Build the aggregate expression.
+    pub fn build(self) -> AggregateExpr {
+        AggregateExpr::Datafusion {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -569,6 +785,8 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    aggregate: Option<Aggregate>,
 
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
@@ -787,6 +1005,7 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            aggregate: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -1015,6 +1234,17 @@ impl Scanner {
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter.expr_filter = Some(ExprFilter::Datafusion(filter));
         self
+    }
+
+    /// Set aggregation.
+    ///
+    /// The aggregate expression is parsed immediately using the dataset schema.
+    /// For Substrait aggregates, this converts them to DataFusion expressions.
+    pub fn aggregate(&mut self, aggregate: AggregateExpr) -> Result<&mut Self> {
+        let schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
+        let parsed = aggregate.parse(schema)?;
+        self.aggregate = Some(parsed);
+        Ok(self)
     }
 
     /// Set the batch size.
@@ -1684,59 +1914,6 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    pub fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
-        // Future intentionally boxed here to avoid large futures on the stack
-        async move {
-            if self.projection_plan.physical_projection.is_empty() {
-                return Err(Error::invalid_input("count_rows called but with_row_id is false".to_string(), location!()));
-            }
-            if !self.projection_plan.physical_projection.is_metadata_only() {
-                let physical_schema = self.projection_plan.physical_projection.to_schema();
-                let columns: Vec<&str> = physical_schema.fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect();
-
-                let msg = format!(
-                    "count_rows should not be called on a plan selecting columns. selected columns: [{}]",
-                    columns.join(", ")
-                );
-
-                return Err(Error::invalid_input(msg, location!()));
-            }
-
-            if self.limit.is_some() || self.offset.is_some() {
-                log::warn!(
-                    "count_rows called with limit or offset which could have surprising results"
-                );
-            }
-
-            let plan = self.create_plan().await?;
-            // Datafusion interprets COUNT(*) as COUNT(1)
-            let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
-
-            let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
-            let schema = plan.schema();
-
-            let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
-            builder = builder.schema(schema);
-            builder = builder.alias("count_rows".to_string());
-
-            let count_expr = builder.build()?;
-
-            let plan_schema = plan.schema();
-            Ok(Arc::new(AggregateExec::try_new(
-                AggregateMode::Single,
-                PhysicalGroupBy::new_single(Vec::new()),
-                vec![Arc::new(count_expr)],
-                vec![None],
-                plan,
-                plan_schema,
-            )?) as Arc<dyn ExecutionPlan>)
-        }
-        .boxed()
-    }
-
     /// Scan and return the number of matching rows
     ///
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
@@ -1745,8 +1922,11 @@ impl Scanner {
     pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
-            let count_plan = self.create_count_plan().await?;
-            let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
+            let mut scanner = self.clone();
+            scanner.aggregate(AggregateExpr::builder().count_star().build())?;
+
+            let plan = scanner.create_plan().await?;
+            let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
 
             // A count plan will always return a single batch with a single row.
             if let Some(first_batch) = stream.next().await {
@@ -1756,7 +1936,7 @@ impl Scanner {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or(Error::invalid_input(
-                        "Count plan did not return a UInt64Array".to_string(),
+                        "Count plan did not return an Int64Array".to_string(),
                         location!(),
                     ))?;
                 Ok(array.value(0) as u64)
@@ -1765,6 +1945,160 @@ impl Scanner {
             }
         }
         .boxed()
+    }
+
+    /// Create an execution plan with aggregation.
+    ///
+    /// Requires `aggregate()` to be called first.
+    #[deprecated(note = "Use create_plan() instead, which now applies aggregate automatically")]
+    pub fn create_aggregate_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+        async move {
+            if self.aggregate.is_none() {
+                return Err(Error::invalid_input(
+                    "create_aggregate_plan called but no aggregate was set",
+                    location!(),
+                ));
+            }
+            // create_plan() now applies aggregate automatically when set
+            self.create_plan().await
+        }
+        .boxed()
+    }
+
+    async fn apply_aggregate(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        agg: &Aggregate,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
+
+        let schema = plan.schema();
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+
+        let group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = agg
+            .group_by
+            .iter()
+            .map(|expr| {
+                let name = expr.schema_name().to_string();
+                let physical_expr =
+                    create_physical_expr(expr, &df_schema, &ExecutionProps::default())?;
+                Ok((physical_expr, name))
+            })
+            .collect::<Result<_>>()?;
+
+        #[allow(clippy::type_complexity)]
+        let aggr_results: Vec<(Arc<AggregateFunctionExpr>, Option<Arc<dyn PhysicalExpr>>)> = agg
+            .aggregates
+            .iter()
+            .map(|expr| self.build_physical_aggregate_expr(expr, &df_schema, &schema))
+            .collect::<Result<_>>()?;
+
+        let (aggr_exprs, filters): (Vec<_>, Vec<_>) = aggr_results.into_iter().unzip();
+
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(group_exprs),
+            aggr_exprs,
+            filters,
+            plan,
+            schema,
+        )?) as Arc<dyn ExecutionPlan>)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_physical_aggregate_expr(
+        &self,
+        expr: &Expr,
+        df_schema: &DFSchema,
+        input_schema: &SchemaRef,
+    ) -> Result<(
+        Arc<datafusion_physical_expr::aggregate::AggregateFunctionExpr>,
+        Option<Arc<dyn PhysicalExpr>>,
+    )> {
+        use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
+
+        let coerced_expr = self.coerce_aggregate_expr(expr, df_schema)?;
+
+        // Note: order_by is already embedded in the AggregateFunctionExpr for ordered aggregates
+        let (agg_expr, filter, _order_by) = create_aggregate_expr_and_maybe_filter(
+            &coerced_expr,
+            df_schema,
+            input_schema.as_ref(),
+            &ExecutionProps::default(),
+        )?;
+
+        Ok((agg_expr, filter))
+    }
+
+    /// Apply type coercion to aggregate arguments for UserDefined signature functions.
+    ///
+    /// Most aggregate functions (SUM, COUNT, MIN, MAX) have explicit type signatures that
+    /// DataFusion handles automatically. However, some functions like AVG use UserDefined
+    /// type signatures in the Substrait consumer, which means DataFusion doesn't know the
+    /// expected input types and won't perform automatic coercion. We must explicitly coerce
+    /// arguments to the types returned by `func.coerce_types()`.
+    fn coerce_aggregate_expr(&self, expr: &Expr, schema: &DFSchema) -> Result<Expr> {
+        Self::coerce_aggregate_expr_impl(expr, schema)
+    }
+
+    fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
+        use datafusion::logical_expr::{expr::AggregateFunction, Expr, TypeSignature};
+
+        match expr {
+            Expr::AggregateFunction(agg_func) => {
+                let func = &agg_func.func;
+                let args = &agg_func.params.args;
+
+                // Only UserDefined signature functions need explicit coercion
+                if !matches!(func.signature().type_signature, TypeSignature::UserDefined) {
+                    return Ok(expr.clone());
+                }
+
+                if args.is_empty() {
+                    return Ok(expr.clone());
+                }
+
+                let current_types: Vec<arrow_schema::DataType> = args
+                    .iter()
+                    .map(|e| e.get_type(schema))
+                    .collect::<std::result::Result<_, _>>()?;
+
+                let coerced_types = func.coerce_types(&current_types)?;
+                let coerced_args: Vec<Expr> = args
+                    .iter()
+                    .zip(coerced_types.iter())
+                    .map(|(arg, target_type)| {
+                        let arg_type = arg.get_type(schema)?;
+                        if arg_type == *target_type {
+                            Ok(arg.clone())
+                        } else {
+                            arg.clone().cast_to(target_type, schema)
+                        }
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+
+                Ok(Expr::AggregateFunction(AggregateFunction::new_udf(
+                    func.clone(),
+                    coerced_args,
+                    agg_func.params.distinct,
+                    agg_func.params.filter.clone(),
+                    agg_func.params.order_by.clone(),
+                    agg_func.params.null_treatment,
+                )))
+            }
+            Expr::Alias(alias) => {
+                // Recursively coerce the inner expression and preserve the alias
+                let coerced_inner = Self::coerce_aggregate_expr_impl(&alias.expr, schema)?;
+                Ok(coerced_inner.alias(&alias.name))
+            }
+            other => Err(Error::invalid_input(
+                format!(
+                    "Expected aggregate function expression, got {:?}",
+                    other.variant_name()
+                ),
+                location!(),
+            )),
+        }
     }
 
     // A "narrow" field is a field that is so small that we are better off reading the
@@ -1850,6 +2184,25 @@ impl Scanner {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
             });
+        }
+
+        if self.aggregate.is_some() {
+            if self.limit.is_some() || self.offset.is_some() {
+                return Err(Error::InvalidInput {
+                    source:
+                        "Cannot use limit/offset with aggregate. Apply limit to the result instead."
+                            .into(),
+                    location: location!(),
+                });
+            }
+            if self.ordering.is_some() {
+                return Err(Error::InvalidInput {
+                    source:
+                        "Cannot use order_by with aggregate. Apply ordering to the result instead."
+                            .into(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -2008,7 +2361,7 @@ impl Scanner {
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
         let mut use_limit_node = true;
-        // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
+        // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
@@ -2066,8 +2419,7 @@ impl Scanner {
             }
         };
 
-        // Stage 1.5 load columns needed for stages 2 & 3
-        // Calculate the schema needed for the filter and ordering.
+        // Load columns needed for filter and ordering
         let mut pre_filter_projection = self.dataset.empty_projection();
 
         // We may need to take filter columns if we are going to refine
@@ -2093,10 +2445,26 @@ impl Scanner {
 
         plan = self.take(plan, pre_filter_projection)?;
 
-        // Stage 2: filter
+        // Filter
         plan = filter_plan.refine_filter(plan, self).await?;
 
-        // Stage 3: sort
+        // Aggregate (if set, applies aggregate and returns early)
+        if let Some(agg) = &self.aggregate {
+            // Take only columns needed by the aggregate, not the full projection.
+            // For COUNT(*), this is empty. For SUM(x), this is just [x].
+            let required_columns = agg.required_columns();
+            let agg_projection = if required_columns.is_empty() {
+                self.dataset.empty_projection()
+            } else {
+                self.dataset
+                    .empty_projection()
+                    .union_columns(&required_columns, OnMissing::Error)?
+            };
+            plan = self.take(plan, agg_projection)?;
+            return self.apply_aggregate(plan, agg).await;
+        }
+
+        // Sort
         if let Some(ordering) = &self.ordering {
             let ordering_columns = ordering.iter().map(|col| &col.column_name);
             let projection_with_ordering = self
@@ -2128,25 +2496,25 @@ impl Scanner {
             ));
         }
 
-        // Stage 4: limit / offset
+        // Limit / offset
         if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
-        // Stage 5: take remaining columns required for projection
+        // Take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 6: Add system columns, if requested
+        // Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
 
-        // Stage 7: final projection
+        // Final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
-        // Stage 8: If requested, apply a strict batch size to the final output
+        // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
@@ -2409,16 +2777,35 @@ impl Scanner {
         filter_plan: &mut ExprFilterPlan,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
+
+        // Compute the effective projection based on what's actually needed.
+        // If we have an aggregate, we only need the columns referenced by the aggregate,
+        // not all the columns from the projection plan.
+        let effective_projection = if let Some(agg) = &self.aggregate {
+            let required_columns = agg.required_columns();
+            if required_columns.is_empty() {
+                // COUNT(*) or similar - no columns needed
+                self.dataset.empty_projection()
+            } else {
+                // Aggregate needs specific columns
+                self.dataset
+                    .empty_projection()
+                    .union_columns(&required_columns, OnMissing::Error)?
+            }
+        } else {
+            self.projection_plan.physical_projection.clone()
+        };
+
         let mut projection = if filter_plan.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
-            self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
+            self.calc_eager_projection(filter_plan, &effective_projection)?
                 .with_row_id()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
-            self.projection_plan.physical_projection.clone()
+            effective_projection
         };
 
         if projection.is_empty() {
@@ -2747,7 +3134,7 @@ impl Scanner {
                     AggregateMode::Single,
                     PhysicalGroupBy::new_single(group_expr),
                     vec![Arc::new(
-                        AggregateExprBuilder::new(
+                        datafusion_physical_expr::aggregate::AggregateExprBuilder::new(
                             functions_aggregate::min_max::max_udaf(),
                             vec![expressions::col(SCORE_COL, &schema)?],
                         )
@@ -2938,8 +3325,29 @@ impl Scanner {
             .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?;
 
+        // Get target fragments
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
+                // Get unindexed fragments and filter to target fragments
+                let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+                let target_bitmap =
+                    RoaringBitmap::from_iter(target_fragments.iter().map(|f| f.id as u32));
+                unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+
+                // If all target fragments are unindexed, skip index entirely
+                if unindexed_fragments.len() == target_fragments.len() {
+                    let flat_match_plan = self
+                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .await?;
+                    return Ok(flat_match_plan);
+                }
+
+                // Mixed case: use index + flat search for unindexed
                 let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
                     self.dataset.clone(),
                     query.clone(),
@@ -2947,7 +3355,6 @@ impl Scanner {
                     prefilter_source.clone(),
                 ));
 
-                let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
                 if unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
@@ -2958,9 +3365,9 @@ impl Scanner {
                 }
             }
             None => {
-                let unindexed_fragments = self.dataset.fragments().iter().cloned().collect();
+                // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -3102,7 +3509,20 @@ impl Scanner {
             None
         };
 
-        if let Some((index, _idx, index_metric)) = matching_index {
+        // Only return index and deltas if there is an index on the column and at least one of the target fragments are indexed
+        let index_and_deltas = if let Some((index, _idx, index_metric)) = matching_index {
+            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
+            let index_frags = self.get_indexed_frags(&deltas);
+            if !index_frags.is_empty() {
+                Some((index, deltas, index_metric))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((index, deltas, index_metric)) = index_and_deltas {
             log::trace!("index found for vector search");
             // Use the index's metric type
             q.metric_type = Some(index_metric);
@@ -3114,9 +3534,6 @@ impl Scanner {
                     location!(),
                 ));
             }
-
-            // Find all deltas with the same index name.
-            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => self.ann(&q, &deltas, filter_plan).await?,
                 DataType::List(_) => self.multivec_ann(&q, &deltas, filter_plan).await?,
@@ -3166,7 +3583,7 @@ impl Scanner {
                     filter_plan,
                     vector_scan_projection,
                     /*include_deleted_rows=*/ true,
-                    None,
+                    self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
                 )
@@ -3187,8 +3604,13 @@ impl Scanner {
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Check if we've created new versions since the index was built.
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        // Get unindexed fragments and filter to target fragments
+        let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        if let Some(target_frags) = &self.fragments {
+            let target_bitmap = RoaringBitmap::from_iter(target_frags.iter().map(|f| f.id as u32));
+            unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+        }
+
         if !unindexed_fragments.is_empty() {
             // need to set the metric type to be the same as the index
             // to make sure the distance is comparable.
@@ -4242,16 +4664,21 @@ pub mod test_dataset {
         }
 
         pub async fn append_new_data(&mut self) -> Result<()> {
-            let vector_values: Float32Array = (0..10)
+            self.append_data_with_range(400, 410).await
+        }
+
+        pub async fn append_data_with_range(&mut self, start: i32, end: i32) -> Result<()> {
+            let count = (end - start) as usize;
+            let vector_values: Float32Array = (0..count)
                 .flat_map(|i| vec![i as f32; self.dimension as usize].into_iter())
                 .collect();
             let new_vectors =
                 FixedSizeListArray::try_new_from_values(vector_values, self.dimension as i32)
                     .unwrap();
             let new_data: Vec<ArrayRef> = vec![
-                Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
+                Arc::new(Int32Array::from_iter_values(start..end)),
                 Arc::new(StringArray::from_iter_values(
-                    (400..410).map(|v| format!("s-{}", v)),
+                    (start..end).map(|v| format!("s-{}", v)),
                 )),
                 Arc::new(new_vectors),
             ];
@@ -6964,56 +7391,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_count_plan() {
-        // A count rows operation should load the minimal amount of data
-        let dim = 256;
-        let fixture = TestVectorDataset::new_with_dimension(LanceFileVersion::Stable, true, dim)
-            .await
-            .unwrap();
-
-        // By default, all columns are returned, this is bad for a count_rows op
-        let err = fixture
-            .dataset
-            .scan()
-            .create_count_plan()
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-
-        let mut scan = fixture.dataset.scan();
-        scan.project(&Vec::<String>::default()).unwrap();
-
-        // with_row_id needs to be specified
-        let err = scan.create_count_plan().await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-
-        scan.with_row_id();
-
-        let plan = scan.create_count_plan().await.unwrap();
-
-        assert_plan_node_equals(
-            plan,
-            "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
-  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--",
-        )
-        .await
-        .unwrap();
-
-        scan.filter("s == ''").unwrap();
-
-        let plan = scan.create_count_plan().await.unwrap();
-
-        assert_plan_node_equals(
-            plan,
-            "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
-  ProjectionExec: expr=[_rowid@1 as _rowid]
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn test_inexact_scalar_index_plans() {
         let data = gen_batch()
             .col("ngram", array::rand_utf8(ByteCount::from(5), false))
@@ -9078,5 +9455,169 @@ mod test {
             "Tasks should have finished within 10 seconds but there are still {} tasks running",
             runtime.handle().metrics().num_alive_tasks()
         );
+    }
+
+    fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {
+        assert!(!array.is_empty(), "Expected some results but got none");
+        assert!(
+            array
+                .iter()
+                .all(|v| v.is_some_and(|val| range.contains(&val))),
+            "{msg} (expected range {range:?})"
+        );
+    }
+
+    // Helper to assert that results exist from all fragment ranges
+    fn assert_has_all_fragments(array: &Int32Array) {
+        assert!(
+            array
+                .iter()
+                .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (200..400).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (400..410).contains(&val)))
+                && array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (410..420).contains(&val))),
+            "Expected results from all fragments"
+        );
+    }
+
+    // Common test function for fragment list filtering
+    async fn test_fragment_list_filtering(
+        test_ds: &TestVectorDataset,
+        fragments: &[Fragment],
+        mut build_scanner: impl FnMut(&Dataset) -> Scanner,
+    ) {
+        // Test 1: Query without fragment filter - should get results from all fragments
+        let batch = build_scanner(&test_ds.dataset)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_has_all_fragments(i_array);
+
+        // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[2].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(i_array, 400..410, "Should only get results from fragment 2");
+
+        // Test 3: Query only indexed fragments (fragments 0 and 1)
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            0..400,
+            "Should only get results from indexed fragments",
+        );
+
+        // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![
+            fragments[0].clone(),
+            fragments[1].clone(),
+            fragments[2].clone(),
+        ]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            0..410,
+            "Should get results from fragments 0, 1, and 2, excluding fragment 3",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_respects_fragment_list() {
+        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        // Create index on first 2 fragments
+        test_ds.make_vector_index().await.unwrap();
+
+        // Append two more fragments after indexing (these will be unindexed)
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+
+        // Now we have 4 fragments:
+        // Fragment 0: i=0..200 (indexed)
+        // Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed)
+        // Fragment 3: i=410..420 (unindexed)
+
+        let fragments = test_ds.dataset.fragments();
+        assert_eq!(fragments.len(), 4);
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+
+        test_fragment_list_filtering(&test_ds, fragments, |dataset| {
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query, 420).unwrap();
+            scanner
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_fts_respects_fragment_list() {
+        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        // Create FTS index on first 2 fragments
+        test_ds.make_fts_index().await.unwrap();
+
+        // Append two more fragments after indexing (these will be unindexed)
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+
+        // Now we have 4 fragments:
+        // Fragment 0: i=0..200 (indexed)
+        // Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed)
+        // Fragment 3: i=410..420 (unindexed)
+
+        let fragments = test_ds.dataset.fragments();
+        assert_eq!(fragments.len(), 4);
+
+        // "s-5" matches: s-5, s-50-59, s-150-159 (frag 0), s-250-259, s-350-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
+        test_fragment_list_filtering(&test_ds, fragments, |dataset| {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s-5".into()))
+                .unwrap();
+            scanner
+        })
+        .await;
     }
 }

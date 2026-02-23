@@ -26,6 +26,7 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+use crate::object_writer::WriteResult;
 use crate::traits::{Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
@@ -283,5 +284,11 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
 impl Writer for tokio::fs::File {
     async fn tell(&mut self) -> Result<usize> {
         Ok(self.seek(SeekFrom::Current(0)).await? as usize)
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        let size = self.seek(SeekFrom::Current(0)).await? as usize;
+        tokio::io::AsyncWriteExt::shutdown(self).await?;
+        Ok(WriteResult { size, e_tag: None })
     }
 }

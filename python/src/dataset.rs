@@ -36,7 +36,8 @@ use snafu::location;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
-    ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    MaterializationStyle, QueryFilter,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::AutoCleanupParams;
@@ -74,19 +75,22 @@ use lance_index::{
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
-        sq::builder::SQBuildParams,
+        sq::builder::SQBuildParams, Query as VectorQuery,
     },
     DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
+use lance_namespace::LanceNamespace;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
+use crate::namespace::{PyDirectoryNamespace, PyLanceNamespace, PyRestNamespace};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -94,6 +98,7 @@ use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -482,7 +487,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace=None, table_id=None))]
     fn new(
         py: Python,
         uri: String,
@@ -498,6 +503,8 @@ impl Dataset {
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -590,6 +597,30 @@ impl Dataset {
             use crate::storage_options::py_object_to_storage_options_provider;
             let provider = py_object_to_storage_options_provider(provider_obj)?;
             builder = builder.with_storage_options_provider(provider);
+        }
+
+        // Set up namespace commit handler if namespace and table_id are provided
+        if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
+            // or create a PyLanceNamespace wrapper for custom Python implementations
+            let ns_arc: Arc<dyn LanceNamespace> =
+                if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+                    // Native DirectoryNamespace - use inner directly (bypass Python layer)
+                    dir_ns.borrow().inner.clone()
+                } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+                    // Native RestNamespace - use inner directly (bypass Python layer)
+                    rest_ns.borrow().inner.clone()
+                } else {
+                    // Custom Python implementation - wrap with PyLanceNamespace
+                    // This calls back into Python for namespace methods
+                    PyLanceNamespace::create_arc(py, ns)?
+                };
+
+            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
@@ -764,12 +795,13 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
         filter: Option<String>,
+        search_filter: Option<PySearchFilter>,
         prefilter: Option<bool>,
         limit: Option<i64>,
         offset: Option<i64>,
@@ -794,6 +826,7 @@ impl Dataset {
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         disable_scoring_autoprojection: Option<bool>,
+        substrait_aggregate: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -835,6 +868,11 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(qf) = search_filter {
+            scanner
+                .filter_query(qf.inner)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
@@ -1001,111 +1039,18 @@ impl Dataset {
         }
 
         if let Some(nearest) = nearest {
-            let column = nearest
-                .get_item("column")?
-                .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
-                .to_string();
-
-            let qval = nearest
-                .get_item("q")?
-                .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
-            let data = ArrayData::from_pyarrow_bound(&qval)?;
-            let q = make_array(data);
-
-            let k: usize = if let Some(k) = nearest.get_item("k")? {
-                if k.is_none() {
-                    // Use limit if k is not specified, default to 10.
-                    limit.unwrap_or(10) as usize
-                } else {
-                    k.extract()?
-                }
-            } else {
-                10
-            };
-
-            let mut minimum_nprobes = DEFAULT_NPROBES;
-            let mut maximum_nprobes = None;
-
-            if let Some(nprobes) = nearest.get_item("nprobes")? {
-                if !nprobes.is_none() {
-                    let extracted: usize = nprobes.extract()?;
-                    minimum_nprobes = extracted;
-                    maximum_nprobes = Some(extracted);
-                }
-            }
-
-            if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
-                if !min_nprobes.is_none() {
-                    minimum_nprobes = min_nprobes.extract()?;
-                }
-            }
-
-            if let Some(max_nprobes) = nearest.get_item("maximum_nprobes")? {
-                if !max_nprobes.is_none() {
-                    maximum_nprobes = Some(max_nprobes.extract()?);
-                }
-            }
-
-            if let Some(maximum_nprobes) = maximum_nprobes {
-                if minimum_nprobes > maximum_nprobes {
-                    return Err(PyValueError::new_err(
-                        "minimum_nprobes must be <= maximum_nprobes",
-                    ));
-                }
-            }
-
-            if minimum_nprobes < 1 {
-                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
-            }
-
-            if let Some(maximum_nprobes) = maximum_nprobes {
-                if maximum_nprobes < 1 {
-                    return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
-                }
-            }
-
-            let metric_type: Option<MetricType> =
-                if let Some(metric) = nearest.get_item("metric")? {
-                    if metric.is_none() {
-                        None
-                    } else {
-                        Some(
-                            MetricType::try_from(metric.to_string().to_lowercase().as_str())
-                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                        )
-                    }
-                } else {
-                    None
-                };
-
-            // When refine factor is specified, a final Refine stage will be added to the I/O plan,
-            // and use Flat index over the raw vectors to refine the results.
-            // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
-            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor")? {
-                if rf.is_none() {
-                    None
-                } else {
-                    rf.extract()?
-                }
-            } else {
-                None
-            };
-
-            let use_index: bool = if let Some(idx) = nearest.get_item("use_index")? {
-                idx.extract()?
-            } else {
-                true
-            };
-
-            let ef: Option<usize> = if let Some(ef) = nearest.get_item("ef")? {
-                if ef.is_none() {
-                    None
-                } else {
-                    ef.extract()?
-                }
-            } else {
-                None
-            };
+            let default_k: usize = limit.unwrap_or(10) as usize;
+            let (
+                column,
+                q,
+                k,
+                minimum_nprobes,
+                maximum_nprobes,
+                metric_type,
+                refine_factor,
+                use_index,
+                ef,
+            ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -1176,6 +1121,11 @@ impl Dataset {
         if let Some(orderings) = order_by {
             scanner
                 .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(aggregate_bytes) = substrait_aggregate {
+            scanner
+                .aggregate(AggregateExpr::substrait(aggregate_bytes))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
@@ -2196,7 +2146,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2208,6 +2158,7 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         commit_message: Option<String>,
+        enable_stable_row_ids: Option<bool>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2227,13 +2178,14 @@ impl Dataset {
             enable_v2_manifest_paths,
             detached,
             max_retries,
+            enable_stable_row_ids,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2243,6 +2195,7 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        enable_stable_row_ids: Option<bool>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2271,6 +2224,10 @@ impl Dataset {
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(enable) = enable_stable_row_ids {
+            builder = builder.use_stable_row_ids(enable);
+        }
 
         if let Some(store_params) = object_store_params {
             builder = builder.with_store_params(store_params);
@@ -3205,6 +3162,37 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.transaction_properties = Some(Arc::new(new_props));
         }
 
+        // Handle namespace and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user
+        if p.commit_handler.is_none() {
+            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
+            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
+                let py = options.py();
+                // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
+                // or create a PyLanceNamespace wrapper for custom Python implementations
+                let ns_arc: Arc<dyn LanceNamespace> =
+                    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+                        // Native DirectoryNamespace - use inner directly (bypass Python layer)
+                        dir_ns.borrow().inner.clone()
+                    } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+                        // Native RestNamespace - use inner directly (bypass Python layer)
+                        rest_ns.borrow().inner.clone()
+                    } else {
+                        // Custom Python implementation - wrap with PyLanceNamespace
+                        PyLanceNamespace::create_arc(py, &ns)?
+                    };
+
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                p.commit_handler = Some(commit_handler);
+            }
+        }
+
         Some(p)
     };
     Ok(params)
@@ -3645,6 +3633,197 @@ impl PyFullTextQuery {
 
         Ok(Self {
             inner: BooleanQuery::new(sub_queries).into(),
+        })
+    }
+}
+
+type VectorQueryParams = (
+    String,
+    arrow_array::ArrayRef,
+    usize,
+    usize,
+    Option<usize>,
+    Option<MetricType>,
+    Option<u32>,
+    bool,
+    Option<usize>,
+);
+
+fn vector_query_params_from_dict(
+    dict: &Bound<'_, PyDict>,
+    default_k: usize,
+) -> PyResult<VectorQueryParams> {
+    let column = dict
+        .get_item("column")?
+        .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
+        .to_string();
+
+    let qval = dict
+        .get_item("q")?
+        .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
+    let data = ArrayData::from_pyarrow_bound(&qval)?;
+    let key = make_array(data);
+
+    let k: usize = if let Some(k) = dict.get_item("k")? {
+        if k.is_none() {
+            // Use limit if k is not specified, default to 10.
+            default_k
+        } else {
+            k.extract()?
+        }
+    } else {
+        default_k
+    };
+
+    let mut minimum_nprobes = DEFAULT_NPROBES;
+    let mut maximum_nprobes: Option<usize> = None;
+
+    if let Some(nprobes) = dict.get_item("nprobes")? {
+        if !nprobes.is_none() {
+            let extracted: usize = nprobes.extract()?;
+            minimum_nprobes = extracted;
+            maximum_nprobes = Some(extracted);
+        }
+    }
+
+    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")? {
+        if !min_nprobes.is_none() {
+            minimum_nprobes = min_nprobes.extract()?;
+        }
+    }
+
+    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")? {
+        if !max_nprobes.is_none() {
+            maximum_nprobes = Some(max_nprobes.extract()?);
+        }
+    }
+
+    if let Some(maximum_nprobes_val) = maximum_nprobes {
+        if minimum_nprobes > maximum_nprobes_val {
+            return Err(PyValueError::new_err(
+                "minimum_nprobes must be <= maximum_nprobes",
+            ));
+        }
+    }
+
+    if minimum_nprobes < 1 {
+        return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+    }
+
+    if let Some(maximum_nprobes_val) = maximum_nprobes {
+        if maximum_nprobes_val < 1 {
+            return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+        }
+    }
+
+    let metric_type: Option<MetricType> = if let Some(metric) = dict.get_item("metric")? {
+        if metric.is_none() {
+            None
+        } else {
+            Some(
+                MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    // When refine factor is specified, a final Refine stage will be added to the I/O plan,
+    // and use Flat index over the raw vectors to refine the results.
+    // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
+    let refine_factor: Option<u32> = if let Some(rf) = dict.get_item("refine_factor")? {
+        if rf.is_none() {
+            None
+        } else {
+            rf.extract()?
+        }
+    } else {
+        None
+    };
+
+    let use_index: bool = if let Some(idx) = dict.get_item("use_index")? {
+        idx.extract()?
+    } else {
+        true
+    };
+
+    let ef: Option<usize> = if let Some(ef_obj) = dict.get_item("ef")? {
+        if ef_obj.is_none() {
+            None
+        } else {
+            ef_obj.extract()?
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        column,
+        key,
+        k,
+        minimum_nprobes,
+        maximum_nprobes,
+        metric_type,
+        refine_factor,
+        use_index,
+        ef,
+    ))
+}
+
+#[pyclass(name = "PySearchFilter")]
+#[derive(Debug, Clone)]
+pub struct PySearchFilter {
+    pub(crate) inner: QueryFilter,
+}
+
+#[pymethods]
+impl PySearchFilter {
+    /// Create a search filter from a full text query.
+    #[staticmethod]
+    #[pyo3(signature = (query))]
+    fn from_full_text_query(query: PyFullTextQuery) -> PyResult<Self> {
+        Ok(Self {
+            inner: QueryFilter::Fts(FullTextSearchQuery::new_query(query.inner.clone())),
+        })
+    }
+
+    /// Create a query filter from a vector search query dict.
+    #[staticmethod]
+    #[pyo3(signature = (query))]
+    fn from_vector_search_query(query: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let default_k = 10;
+        let (
+            column,
+            key,
+            k,
+            minimum_nprobes,
+            maximum_nprobes,
+            metric_type_opt,
+            refine_factor,
+            use_index,
+            ef,
+        ) = vector_query_params_from_dict(query, default_k)?;
+
+        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
+
+        let vector_query = VectorQuery {
+            column,
+            key,
+            k,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes,
+            maximum_nprobes,
+            ef,
+            refine_factor,
+            metric_type,
+            use_index,
+            dist_q_c: 0.0,
+        };
+
+        Ok(Self {
+            inner: QueryFilter::Vector(vector_query),
         })
     }
 }

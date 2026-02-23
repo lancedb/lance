@@ -296,8 +296,8 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     fragments = list(ds.get_fragments())
     assert len(fragments) == 2
 
-    index = ds.list_indices()[0]
-    index_frag_ids = list(index["fragment_ids"])
+    index = ds.describe_indices()[0]
+    index_frag_ids = list(index.segments[0].fragment_ids)
     frag_ids = [frag.fragment_id for frag in fragments]
 
     assert len(index_frag_ids) == 1

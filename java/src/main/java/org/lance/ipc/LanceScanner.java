@@ -72,7 +72,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.isWithRowId(),
             options.isWithRowAddress(),
             options.getBatchReadahead(),
-            options.getColumnOrderings());
+            options.getColumnOrderings(),
+            options.getSubstraitAggregate());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
@@ -93,7 +94,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
-      Optional<List<ColumnOrdering>> columnOrderings);
+      Optional<List<ColumnOrdering>> columnOrderings,
+      Optional<ByteBuffer> substraitAggregate);
 
   /**
    * Closes this scanner and releases any system resources associated with it. If the scanner is

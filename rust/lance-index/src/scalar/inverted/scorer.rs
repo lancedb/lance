@@ -57,7 +57,7 @@ impl MemBM25Scorer {
     }
 
     pub fn avg_doc_length(&self) -> f32 {
-        (self.total_tokens / self.num_docs as u64) as f32
+        self.total_tokens as f32 / self.num_docs as f32
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {
@@ -71,6 +71,7 @@ impl MemBM25Scorer {
 pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,
+    total_tokens: u64,
     avg_doc_length: f32,
 }
 
@@ -86,6 +87,7 @@ impl<'a> IndexBM25Scorer<'a> {
         Self {
             partitions,
             num_docs,
+            total_tokens,
             avg_doc_length: avgdl,
         }
     }
@@ -94,8 +96,8 @@ impl<'a> IndexBM25Scorer<'a> {
         self.num_docs
     }
 
-    pub fn avg_doc_length(&self) -> f32 {
-        self.avg_doc_length
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {

@@ -87,9 +87,8 @@ class TestMemoryLeaks:
 
         def access_index_stats() -> None:
             d = lance.dataset(dataset_path)
-            for idx in d.list_indices():
-                if name := idx.get("name"):
-                    d.stats.index_stats(name)
+            for idx in d.describe_indices():
+                d.stats.index_stats(idx.name)
 
         assert_noleaks(
             access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25

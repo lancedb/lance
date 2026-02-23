@@ -504,6 +504,61 @@ impl BatchStore {
         self.iter().cloned().collect()
     }
 
+    /// Iterate over all committed batches in reverse order (newest first).
+    ///
+    /// The iterator captures a snapshot of the committed length at creation
+    /// time, so it will not see batches appended during iteration.
+    pub fn iter_reversed(&self) -> BatchStoreIterReversed<'_> {
+        let len = self.committed_len.load(Ordering::Acquire);
+        BatchStoreIterReversed {
+            store: self,
+            current: len,
+        }
+    }
+
+    /// Get all batches as a Vec with rows in reverse order (newest first).
+    ///
+    /// This is useful for flushing MemTable to disk where we want the
+    /// flushed data to be ordered from newest to oldest for efficient
+    /// K-way merge during LSM scan.
+    ///
+    /// The batches are iterated in reverse order, and the rows within each
+    /// batch are also reversed, so the final result has all rows in reverse
+    /// order from newest to oldest.
+    pub fn to_vec_reversed(&self) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
+        use arrow::compute::kernels::take::take;
+        use arrow_array::UInt32Array;
+
+        self.iter_reversed()
+            .map(|b| {
+                // Reverse the rows within each batch
+                let num_rows = b.data.num_rows();
+                if num_rows == 0 {
+                    return Ok(b.data.clone());
+                }
+
+                // Create indices for reversed order: [n-1, n-2, ..., 1, 0]
+                let indices: Vec<u32> = (0..num_rows as u32).rev().collect();
+                let indices_array = UInt32Array::from(indices);
+
+                // Take rows in reversed order
+                let columns: Result<Vec<_>, _> = b
+                    .data
+                    .columns()
+                    .iter()
+                    .map(|col| take(col.as_ref(), &indices_array, None))
+                    .collect();
+
+                RecordBatch::try_new(b.data.schema(), columns?)
+            })
+            .collect()
+    }
+
+    /// Get all StoredBatches as a Vec in reverse order (newest first).
+    pub fn to_stored_vec_reversed(&self) -> Vec<StoredBatch> {
+        self.iter_reversed().cloned().collect()
+    }
+
     // =========================================================================
     // Visibility API
     // =========================================================================
@@ -610,6 +665,45 @@ impl<'a> Iterator for BatchStoreIter<'a> {
 }
 
 impl ExactSizeIterator for BatchStoreIter<'_> {}
+
+/// Reverse iterator over committed batches in a BatchStore.
+///
+/// Iterates from the newest batch (highest index) to the oldest batch (index 0).
+/// This is used during MemTable flush to write batches in reverse order,
+/// ensuring flushed data is ordered from newest to oldest for efficient
+/// K-way merge during LSM scan.
+pub struct BatchStoreIterReversed<'a> {
+    store: &'a BatchStore,
+    /// Points to the next batch to return (exclusive upper bound).
+    /// Starts at len and decrements to 0.
+    current: usize,
+}
+
+impl<'a> Iterator for BatchStoreIterReversed<'a> {
+    type Item = &'a StoredBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == 0 {
+            return None;
+        }
+
+        self.current -= 1;
+
+        // SAFETY: current is now in range [0, len), and len was captured with Acquire ordering
+        let batch = unsafe {
+            let slot_ptr = self.store.slots[self.current].get();
+            (*slot_ptr).assume_init_ref()
+        };
+
+        Some(batch)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.current, Some(self.current))
+    }
+}
+
+impl ExactSizeIterator for BatchStoreIterReversed<'_> {}
 
 // =========================================================================
 // Tests
@@ -809,6 +903,90 @@ mod tests {
         assert_eq!(vec.len(), 2);
         assert_eq!(vec[0].num_rows(), 10);
         assert_eq!(vec[1].num_rows(), 20);
+    }
+
+    #[test]
+    fn test_to_vec_reversed() {
+        let store = BatchStore::with_capacity(10);
+
+        // Create batches with identifiable values
+        // batch1: ids [0, 1, 2, ..., 9], values [0, 10, 20, ..., 90]
+        let batch1 = create_test_batch(10);
+        // batch2: ids [0, 1, 2, ..., 4], values [0, 10, 20, 30, 40]
+        let batch2 = create_test_batch(5);
+
+        store.append(batch1).unwrap();
+        store.append(batch2).unwrap();
+
+        // Forward order: batches in insertion order, rows in original order
+        let forward = store.to_vec();
+        assert_eq!(forward.len(), 2);
+        assert_eq!(forward[0].num_rows(), 10);
+        assert_eq!(forward[1].num_rows(), 5);
+
+        // Verify first row of first batch is id=0
+        let ids = forward[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 0);
+        assert_eq!(ids.value(9), 9);
+
+        // Reversed order: batches in reverse order, rows within each batch also reversed
+        let reversed = store.to_vec_reversed().unwrap();
+        assert_eq!(reversed.len(), 2);
+        assert_eq!(reversed[0].num_rows(), 5); // batch2 comes first
+        assert_eq!(reversed[1].num_rows(), 10); // batch1 comes second
+
+        // Verify batch2 rows are reversed: [4, 3, 2, 1, 0] instead of [0, 1, 2, 3, 4]
+        let ids = reversed[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 4); // Was last, now first
+        assert_eq!(ids.value(4), 0); // Was first, now last
+
+        // Verify batch1 rows are reversed: [9, 8, ..., 0] instead of [0, 1, ..., 9]
+        let ids = reversed[1]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 9); // Was last, now first
+        assert_eq!(ids.value(9), 0); // Was first, now last
+    }
+
+    #[test]
+    fn test_iter_reversed() {
+        let store = BatchStore::with_capacity(10);
+
+        for i in 0..5 {
+            store.append(create_test_batch(10 * (i + 1))).unwrap();
+        }
+
+        // Forward iteration: batch positions 0, 1, 2, 3, 4
+        let forward: Vec<_> = store.iter().map(|b| b.batch_position).collect();
+        assert_eq!(forward, vec![0, 1, 2, 3, 4]);
+
+        // Reversed iteration: batch positions 4, 3, 2, 1, 0 (newest first)
+        let reversed: Vec<_> = store.iter_reversed().map(|b| b.batch_position).collect();
+        assert_eq!(reversed, vec![4, 3, 2, 1, 0]);
+
+        // Verify row counts match
+        let forward_rows: Vec<_> = store.iter().map(|b| b.num_rows).collect();
+        let reversed_rows: Vec<_> = store.iter_reversed().map(|b| b.num_rows).collect();
+        assert_eq!(forward_rows, vec![10, 20, 30, 40, 50]);
+        assert_eq!(reversed_rows, vec![50, 40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn test_iter_reversed_empty() {
+        let store = BatchStore::with_capacity(10);
+
+        let reversed: Vec<_> = store.iter_reversed().collect();
+        assert!(reversed.is_empty());
     }
 
     #[test]

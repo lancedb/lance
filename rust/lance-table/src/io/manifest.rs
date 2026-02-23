@@ -19,7 +19,6 @@ use lance_core::{datatypes::Schema, Error, Result};
 use lance_io::{
     encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder},
     object_store::ObjectStore,
-    object_writer::ObjectWriter,
     traits::{WriteExt, Writer},
     utils::read_message,
 };
@@ -233,7 +232,7 @@ pub struct ManifestDescribing {}
 #[async_trait]
 impl PreviousManifestProvider for ManifestDescribing {
     async fn store_schema(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         schema: &Schema,
     ) -> Result<Option<usize>> {
         let mut manifest = Manifest::new(
@@ -295,14 +294,14 @@ mod test {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        let pos = write_manifest(&mut writer, &mut manifest, None, None)
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
             .await
             .unwrap();
         writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await
             .unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
 
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 

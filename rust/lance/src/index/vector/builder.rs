@@ -32,6 +32,7 @@ use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -150,6 +151,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     merged_num: usize,
     // whether to transpose codes when building storage
     transpose_codes: bool,
+
+    progress: Arc<dyn IndexBuildProgress>,
 }
 
 type BuildStream<S, Q> =
@@ -192,6 +195,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            progress: Arc::new(NoopIndexBuildProgress),
         })
     }
 
@@ -259,27 +263,44 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            progress: Arc::new(NoopIndexBuildProgress),
         })
     }
 
     // build the index with the all data in the dataset,
     // return the number of indices merged
     pub async fn build(&mut self) -> Result<usize> {
-        // step 1. train IVF & quantizer
-        self.with_ivf(self.load_or_build_ivf().await?);
+        let progress = self.progress.clone();
 
+        // step 1. train IVF & quantizer
+        let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
+        progress
+            .stage_start("train_ivf", max_iters, "iterations")
+            .await?;
+        self.with_ivf(self.load_or_build_ivf().await?);
+        progress.stage_complete("train_ivf").await?;
+
+        progress.stage_start("train_quantizer", None, "").await?;
         self.with_quantizer(self.load_or_build_quantizer().await?);
+        progress.stage_complete("train_quantizer").await?;
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
+            progress.stage_start("shuffle", None, "batches").await?;
             self.shuffle_dataset().await?;
+            progress.stage_complete("shuffle").await?;
         }
 
         // step 3. build partitions
+        let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
+        progress
+            .stage_start("build_partitions", num_partitions, "partitions")
+            .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
 
         // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
+        progress.stage_complete("build_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -365,6 +386,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Set progress callback for index building
+    pub fn with_progress(&mut self, progress: Arc<dyn IndexBuildProgress>) -> &mut Self {
+        self.progress = progress;
+        self
+    }
+
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
     async fn load_or_build_ivf(&self) -> Result<IvfModel> {
         match &self.ivf {
@@ -381,8 +408,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     "IVF build params not set",
                     location!(),
                 ))?;
-                super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params)
-                    .await
+                super::build_ivf_model(
+                    dataset,
+                    &self.column,
+                    dim,
+                    self.distance_type,
+                    ivf_params,
+                    self.progress.clone(),
+                )
+                .await
             }
         }
     }
@@ -1049,9 +1083,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
+        let progress = self.progress.clone();
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
+            progress.stage_progress("build_partitions", part_id).await?;
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 

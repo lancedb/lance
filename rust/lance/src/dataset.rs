@@ -41,9 +41,12 @@ use lance_table::format::{
     pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
-    CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
+    external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
+    write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler, CommitLock,
+    ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
 };
+
+use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
@@ -94,7 +97,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::refs::{BranchContents, Branches, Tags};
+use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
@@ -481,7 +484,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-        let branch_location = self.find_branch_location(branch)?;
+        let branch_location = self.branch_location().find_branch(Some(branch))?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
@@ -806,6 +809,8 @@ impl Dataset {
                             transaction_id: fallback_resp.transaction_id,
                             location: fallback_resp.location,
                             storage_options: fallback_resp.storage_options,
+                            properties: fallback_resp.properties,
+                            managed_versioning: None,
                         }
                     }
                     Err(e) => {
@@ -822,6 +827,19 @@ impl Dataset {
                     )),
                     location: location!(),
                 })?;
+
+                // Set up commit handler when managed_versioning is enabled
+                if response.managed_versioning == Some(true) {
+                    let external_store = LanceNamespaceExternalManifestStore::new(
+                        namespace.clone(),
+                        table_id.clone(),
+                    );
+                    let commit_handler: Arc<dyn CommitHandler> =
+                        Arc::new(ExternalManifestCommitHandler {
+                            external_manifest_store: Arc::new(external_store),
+                        });
+                    write_params.commit_handler = Some(commit_handler);
+                }
 
                 // Set initial credentials and provider from namespace
                 if let Some(namespace_storage_options) = response.storage_options {
@@ -871,6 +889,19 @@ impl Dataset {
                     )),
                     location: location!(),
                 })?;
+
+                // Set up commit handler when managed_versioning is enabled
+                if response.managed_versioning == Some(true) {
+                    let external_store = LanceNamespaceExternalManifestStore::new(
+                        namespace.clone(),
+                        table_id.clone(),
+                    );
+                    let commit_handler: Arc<dyn CommitHandler> =
+                        Arc::new(ExternalManifestCommitHandler {
+                            external_manifest_store: Arc::new(external_store),
+                        });
+                    write_params.commit_handler = Some(commit_handler);
+                }
 
                 // Set initial credentials and provider from namespace
                 if let Some(namespace_storage_options) = response.storage_options {
@@ -952,13 +983,11 @@ impl Dataset {
         }
     }
 
-    pub fn find_branch_location(&self, branch_name: &str) -> Result<BranchLocation> {
-        let current_location = BranchLocation {
-            path: self.base.clone(),
-            uri: self.uri.clone(),
-            branch: self.manifest.branch.clone(),
-        };
-        current_location.find_branch(Some(branch_name))
+    pub async fn branch_identifier(&self) -> Result<BranchIdentifier> {
+        self.refs
+            .branches()
+            .get_identifier(self.manifest.branch.as_deref())
+            .await
     }
 
     /// Get the full manifest of the dataset version.
@@ -1508,11 +1537,15 @@ impl Dataset {
         take::take_scan(self, row_ranges, projection, batch_readahead)
     }
 
-    /// Sample `n` rows from the dataset.
-    pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+    /// Randomly sample `n` rows from the dataset.
+    ///
+    /// The returned rows are in row-id order (not random order), which allows
+    /// the underlying take operation to use an efficient sorted code path.
+    pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
-        let ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+        let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+        ids.sort_unstable();
         self.take(&ids, projection.clone()).await
     }
 
@@ -1570,6 +1603,24 @@ impl Dataset {
 
     pub fn object_store(&self) -> &ObjectStore {
         &self.object_store
+    }
+
+    /// Clone this dataset with a different object store binding.
+    ///
+    /// The returned dataset shares metadata, session state, and caches with the
+    /// original dataset, but all subsequent operations on the returned dataset
+    /// use the supplied object store.
+    pub fn with_object_store(
+        &self,
+        object_store: Arc<ObjectStore>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.object_store = object_store;
+        if let Some(store_params) = store_params {
+            cloned.store_params = Some(Box::new(store_params));
+        }
+        cloned
     }
 
     /// Returns the initial storage options used when opening this dataset, if any.

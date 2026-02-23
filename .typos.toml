@@ -19,5 +19,8 @@ nprobs = "nprobes"
 nprob = "nprobe"
 
 [files]
-extend-exclude = ["notebooks/*.ipynb"]
+extend-exclude = [
+    "notebooks/*.ipynb",
+    "*_THIRD_PARTY_LICENSES.*",
+]
 # If a line ends with # or // and has spellchecker:disable-line, ignore it

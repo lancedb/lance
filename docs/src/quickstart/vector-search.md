@@ -280,4 +280,4 @@ print(result.to_pandas())
 
 ## Next Steps
 
-You should check out **[Versioning Your Datasets with Lance](../quickstart/versioning.md)**. We'll show you how to version your vector datasets and track changes over time.
+Check out **[Full-text Search](../quickstart/full-text-search.md)**, where we show how to create and query a BM25 index for keyword-based search in Lance.

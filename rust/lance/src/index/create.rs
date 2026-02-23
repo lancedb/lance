@@ -18,6 +18,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use lance_core::datatypes::format_field_path;
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
@@ -54,6 +55,7 @@ pub struct CreateIndexBuilder<'a> {
     fragments: Option<Vec<u32>>,
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    progress: Arc<dyn IndexBuildProgress>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -74,6 +76,7 @@ impl<'a> CreateIndexBuilder<'a> {
             fragments: None,
             index_uuid: None,
             preprocessed_data: None,
+            progress: Arc::new(NoopIndexBuildProgress),
         }
     }
 
@@ -107,6 +110,11 @@ impl<'a> CreateIndexBuilder<'a> {
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Self {
         self.preprocessed_data = Some(stream);
+        self
+    }
+
+    pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
+        self.progress = p;
         self
     }
 
@@ -243,6 +251,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     preprocesssed_data,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -264,6 +273,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -288,6 +298,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -296,6 +307,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfPq
                 | IndexType::IvfSq
                 | IndexType::IvfFlat
+                | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq,
@@ -324,6 +336,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             vec_params,
                             fri,
                             self.fragments.as_ref().unwrap(),
+                            self.progress.clone(),
                         ))
                         .await?;
                     } else {
@@ -335,6 +348,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             &index_id.to_string(),
                             vec_params,
                             fri,
+                            self.progress.clone(),
                         ))
                         .await?;
                     }

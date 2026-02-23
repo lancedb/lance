@@ -37,7 +37,8 @@ pub mod providers;
 pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
-use crate::object_writer::WriteResult;
+use crate::object_writer::{LocalWriter, WriteResult};
+use crate::traits::Writer;
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -633,7 +634,7 @@ impl ObjectStore {
         let object_store = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
-        object_store.create(&os_path).await
+        ObjectWriter::new(&object_store, &os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
@@ -645,15 +646,42 @@ impl ObjectStore {
     }
 
     /// Create a new file.
-    pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self, path).await
+    pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
+        match self.scheme.as_str() {
+            "file" => {
+                let local_path = super::local::to_local_path(path);
+                let local_path = std::path::PathBuf::from(&local_path);
+                if let Some(parent) = local_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let parent = local_path
+                    .parent()
+                    .expect("file path must have parent")
+                    .to_owned();
+                let named_temp =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await
+                        .map_err(|e| {
+                            Error::io(format!("spawn_blocking failed: {}", e), location!())
+                        })??;
+                let (std_file, temp_path) = named_temp.into_parts();
+                let file = tokio::fs::File::from_std(std_file);
+                Ok(Box::new(LocalWriter::new(
+                    file,
+                    path.clone(),
+                    temp_path,
+                    Arc::new(self.io_tracker.clone()),
+                )))
+            }
+            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
+        }
     }
 
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
-        writer.shutdown().await
+        Writer::shutdown(writer.as_mut()).await
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -1206,7 +1234,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let reader = ObjectStore::open_local(&file_path).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
@@ -1218,7 +1246,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();

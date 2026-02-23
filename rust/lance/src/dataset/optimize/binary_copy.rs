@@ -14,7 +14,6 @@ use lance_encoding::version::LanceFileVersion;
 use lance_file::format::pbfile;
 use lance_file::reader::FileReader as LFReader;
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_io::object_writer::ObjectWriter;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
@@ -34,7 +33,7 @@ const ALIGN: usize = 64;
 ///
 /// Returns the new position after padding (if any).
 async fn apply_alignment_padding(
-    writer: &mut ObjectWriter,
+    writer: &mut dyn Writer,
     current_pos: u64,
     version: LanceFileVersion,
 ) -> Result<u64> {
@@ -53,7 +52,7 @@ async fn apply_alignment_padding(
 
 async fn init_writer_if_necessary(
     dataset: &Dataset,
-    current_writer: &mut Option<ObjectWriter>,
+    current_writer: &mut Option<Box<dyn Writer>>,
     current_filename: &mut Option<String>,
 ) -> Result<bool> {
     if current_writer.is_none() {
@@ -102,7 +101,7 @@ fn compute_field_column_indices(
 async fn finalize_current_output_file(
     schema: &Schema,
     full_field_ids: &[i32],
-    current_writer: &mut Option<ObjectWriter>,
+    current_writer: &mut Option<Box<dyn Writer>>,
     current_filename: &mut Option<String>,
     current_page_table: &[ColumnInfo],
     col_pages: &mut [Vec<DecPageInfo>],
@@ -232,7 +231,7 @@ pub async fn rewrite_files_binary_copy(
     }
 
     let mut out: Vec<Fragment> = Vec::new();
-    let mut current_writer: Option<ObjectWriter> = None;
+    let mut current_writer: Option<Box<dyn Writer>> = None;
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<ColumnInfo> = Vec::new();
@@ -367,7 +366,7 @@ pub async fn rewrite_files_binary_copy(
                         let mut new_offsets = Vec::with_capacity(*buffer_count);
                         for _ in 0..*buffer_count {
                             if let Some(bytes) = bytes_iter.next() {
-                                let writer = current_writer.as_mut().unwrap();
+                                let writer = current_writer.as_mut().unwrap().as_mut();
                                 current_pos =
                                     apply_alignment_padding(writer, current_pos, version).await?;
                                 let start = current_pos;
@@ -419,7 +418,7 @@ pub async fn rewrite_files_binary_copy(
                         .collect();
                     let bytes_vec = file_scheduler.submit_request(ranges, 0).await?;
                     for bytes in bytes_vec.into_iter() {
-                        let writer = current_writer.as_mut().unwrap();
+                        let writer = current_writer.as_mut().unwrap().as_mut();
                         current_pos = apply_alignment_padding(writer, current_pos, version).await?;
                         let start = current_pos;
                         writer.write_all(&bytes).await?;
@@ -501,14 +500,14 @@ pub async fn rewrite_files_binary_copy(
 /// - v2_0 structural single‑page enforcement is handled when building `final_cols`; this function
 ///   only performs consistent finalization.
 async fn flush_footer(
-    mut writer: ObjectWriter,
+    mut writer: Box<dyn Writer>,
     schema: &Schema,
     final_cols: &[Arc<ColumnInfo>],
     total_rows_in_current: u64,
     version: LanceFileVersion,
 ) -> Result<()> {
     let pos = writer.tell().await? as u64;
-    let _new_pos = apply_alignment_padding(&mut writer, pos, version).await?;
+    let _new_pos = apply_alignment_padding(writer.as_mut(), pos, version).await?;
 
     let mut col_metadatas = Vec::with_capacity(final_cols.len());
     for col in final_cols {

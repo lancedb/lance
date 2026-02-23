@@ -84,10 +84,10 @@ class TestMixedCaseColumnNames:
         """Scalar index creation should work with mixed-case column names."""
         mixed_case_dataset.create_scalar_index("userId", index_type="BTREE")
 
-        indices = mixed_case_dataset.list_indices()
+        indices = mixed_case_dataset.describe_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["userId"]
-        assert indices[0]["name"] == "userId_idx"
+        assert indices[0].field_names == ["userId"]
+        assert indices[0].name == "userId_idx"
 
         # Query using the indexed column
         result = mixed_case_dataset.to_table(filter="userId = 50")
@@ -206,7 +206,7 @@ class TestCaseOnlyDifferentColumnNames:
         # Create separate datasets for each test to avoid index conflicts
         ds1 = lance.write_dataset(case_variant_table, tmp_path / "ds1")
         ds1.create_scalar_index("camelCase", index_type="BTREE")
-        assert ds1.list_indices()[0]["fields"] == ["camelCase"]
+        assert ds1.describe_indices()[0].field_names == ["camelCase"]
 
         # Query camelCase=50 should return row 50 (where CamelCase=49, CAMELCASE=0)
         result = ds1.to_table(filter="camelCase = 50")
@@ -221,7 +221,7 @@ class TestCaseOnlyDifferentColumnNames:
         # Test CamelCase index
         ds2 = lance.write_dataset(case_variant_table, tmp_path / "ds2")
         ds2.create_scalar_index("CamelCase", index_type="BTREE")
-        assert ds2.list_indices()[0]["fields"] == ["CamelCase"]
+        assert ds2.describe_indices()[0].field_names == ["CamelCase"]
 
         # Query CamelCase=50 should return row 49 (where camelCase=49, CAMELCASE=99)
         result = ds2.to_table(filter="CamelCase = 50")
@@ -236,7 +236,7 @@ class TestCaseOnlyDifferentColumnNames:
         # Test CAMELCASE index
         ds3 = lance.write_dataset(case_variant_table, tmp_path / "ds3")
         ds3.create_scalar_index("CAMELCASE", index_type="BTREE")
-        assert ds3.list_indices()[0]["fields"] == ["CAMELCASE"]
+        assert ds3.describe_indices()[0].field_names == ["CAMELCASE"]
 
         # Query CAMELCASE=50 should return row 0 (where camelCase=0, CamelCase=99)
         result = ds3.to_table(filter="CAMELCASE = 50")
@@ -347,11 +347,10 @@ class TestSpecialCharacterColumnNames:
         # Column name is used directly without SQL parsing
         special_char_dataset.create_scalar_index("user-id", index_type="BTREE")
 
-        indices = special_char_dataset.list_indices()
+        indices = special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Field with special chars is returned in quoted format for SQL compatibility
-        assert indices[0]["fields"] == ["`user-id`"]
-        assert indices[0]["name"] == "user-id_idx"
+        assert indices[0].field_names == ["user-id"]
+        assert indices[0].name == "user-id_idx"
 
         # Query using the indexed column (requires backticks in filter)
         result = special_char_dataset.to_table(filter="`user-id` = 50")
@@ -460,10 +459,10 @@ class TestNestedFieldColumnNames:
             "MetaData.userId", index_type="BTREE"
         )
 
-        indices = nested_mixed_case_dataset.list_indices()
+        indices = nested_mixed_case_dataset.describe_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["MetaData.userId"]
-        assert indices[0]["name"] == "MetaData.userId_idx"
+        assert indices[0].name == "MetaData.userId_idx"
+        assert indices[0].field_names == ["userId"]
 
         # Query using the indexed column
         result = nested_mixed_case_dataset.to_table(filter="MetaData.userId = 50")
@@ -482,10 +481,10 @@ class TestNestedFieldColumnNames:
         """Scalar index on top-level mixed-case column works."""
         nested_mixed_case_dataset.create_scalar_index("rowId", index_type="BTREE")
 
-        indices = nested_mixed_case_dataset.list_indices()
+        indices = nested_mixed_case_dataset.describe_indices()
         assert len(indices) == 1
-        assert indices[0]["fields"] == ["rowId"]
-        assert indices[0]["name"] == "rowId_idx"
+        assert indices[0].name == "rowId_idx"
+        assert indices[0].field_names == ["rowId"]
 
         result = nested_mixed_case_dataset.to_table(filter="rowId = 50")
         assert result.num_rows == 1
@@ -509,10 +508,11 @@ class TestNestedFieldColumnNames:
             "metadata.userid", index_type="BTREE"
         )
 
-        indices = nested_mixed_case_dataset.list_indices()
+        indices = nested_mixed_case_dataset.describe_indices()
         assert len(indices) == 1
         # Should store with correct case from schema
-        assert indices[0]["fields"] == ["MetaData.userId"]
+        assert indices[0].name == "MetaData.userId_idx"
+        assert indices[0].field_names == ["userId"]
 
         # Query should also work with correct case
         result = nested_mixed_case_dataset.to_table(filter="MetaData.userId = 50")
@@ -574,11 +574,10 @@ class TestNestedFieldColumnNames:
             "`meta-data`.`user-id`", index_type="BTREE"
         )
 
-        indices = nested_special_char_dataset.list_indices()
+        indices = nested_special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Fields with special chars are returned in quoted format for SQL compatibility
-        assert indices[0]["fields"] == ["`meta-data`.`user-id`"]
-        assert indices[0]["name"] == "meta-data.user-id_idx"
+        assert indices[0].field_names == ["user-id"]
+        assert indices[0].name == "meta-data.user-id_idx"
 
         # Query using the indexed column (backticks required in filter)
         result = nested_special_char_dataset.to_table(
@@ -599,10 +598,9 @@ class TestNestedFieldColumnNames:
         """Scalar index on top-level special char column works."""
         nested_special_char_dataset.create_scalar_index("`row-id`", index_type="BTREE")
 
-        indices = nested_special_char_dataset.list_indices()
+        indices = nested_special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Field with special chars is returned in quoted format for SQL compatibility
-        assert indices[0]["fields"] == ["`row-id`"]
+        assert indices[0].field_names == ["row-id"]
 
         result = nested_special_char_dataset.to_table(filter="`row-id` = 50")
         assert result.num_rows == 1

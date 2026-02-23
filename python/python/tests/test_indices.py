@@ -347,6 +347,6 @@ def test_load_shuffled_vectors(
     )
 
     final_ds = lance.dataset(str(tmpdir / "dataset"))
-    assert final_ds.has_index
-    assert final_ds.list_indices()[0]["fields"] == ["vectors"]
-    assert len(final_ds.list_indices()[0]["fragment_ids"]) == NUM_FRAGMENTS
+    stats = final_ds.stats.index_stats("vectors_idx")
+    assert stats["name"] == "vectors_idx"
+    assert stats["num_indexed_fragments"] == NUM_FRAGMENTS

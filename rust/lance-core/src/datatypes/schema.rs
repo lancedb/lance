@@ -1024,7 +1024,7 @@ impl Projectable for Schema {
 }
 
 /// Specifies how to handle blob columns when projecting
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum BlobHandling {
     /// Read all blobs as binary
     AllBinary,

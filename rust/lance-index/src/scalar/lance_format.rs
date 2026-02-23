@@ -364,7 +364,13 @@ pub mod tests {
             )
             .unwrap();
         btree_plugin
-            .train_index(data, index_store.as_ref(), request, None)
+            .train_index(
+                data,
+                index_store.as_ref(),
+                request,
+                None,
+                crate::progress::noop_progress(),
+            )
             .await
             .unwrap();
     }
@@ -472,6 +478,7 @@ pub mod tests {
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
+                None,
             )
             .await
             .unwrap();
@@ -907,7 +914,13 @@ pub mod tests {
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
-            .train_index(data, index_store.as_ref(), request, None)
+            .train_index(
+                data,
+                index_store.as_ref(),
+                request,
+                None,
+                crate::progress::noop_progress(),
+            )
             .await
             .unwrap();
     }
@@ -1290,6 +1303,7 @@ pub mod tests {
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
+                None,
             )
             .await
             .unwrap();
@@ -1395,7 +1409,13 @@ pub mod tests {
             )
             .unwrap();
         LabelListIndexPlugin
-            .train_index(data, index_store.as_ref(), request, None)
+            .train_index(
+                data,
+                index_store.as_ref(),
+                request,
+                None,
+                crate::progress::noop_progress(),
+            )
             .await
             .unwrap();
     }
@@ -1551,7 +1571,7 @@ pub mod tests {
 
         // Test: Search for lists containing value 1
         // Row 0: [1, 2] - contains 1 → TRUE
-        // Row 1: [3, null] - has null item, unknown if it matches → NULL
+        // Row 1: [3, null] - null elements are ignored → FALSE
         // Row 2: [4] - doesn't contain 1 → FALSE
         let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
@@ -1570,17 +1590,9 @@ pub mod tests {
                     "Should find row 0 where list contains 1"
                 );
 
-                let null_row_ids = row_ids.null_rows();
                 assert!(
-                    !null_row_ids.is_empty(),
-                    "null_row_ids should not be empty - row 1 has null item"
-                );
-                let null_rows: Vec<u64> =
-                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
-                assert_eq!(
-                    null_rows,
-                    vec![1],
-                    "Should report row 1 as null because it contains a null item"
+                    row_ids.null_rows().is_empty(),
+                    "null_row_ids should be empty when null elements are ignored"
                 );
             }
             _ => panic!("Expected Exact search result"),

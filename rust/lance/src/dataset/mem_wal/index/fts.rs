@@ -31,9 +31,10 @@ use std::sync::Mutex;
 use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::InvertedIndexParams;
+use snafu::location;
 use tantivy::tokenizer::TokenStream;
 
 use super::RowPosition;
@@ -1222,6 +1223,130 @@ impl FtsMemIndex {
                 score,
             })
             .collect()
+    }
+
+    /// Export the in-memory FTS index to an `InnerBuilder` for direct flush.
+    ///
+    /// This creates an `InnerBuilder` containing all the index data with
+    /// reversed row positions for efficient LSM scan. The builder can then
+    /// be written directly to disk without re-tokenizing the documents.
+    ///
+    /// # Arguments
+    /// * `partition_id` - Partition ID for the index files
+    /// * `total_rows` - Total number of rows in the MemTable (for position reversal)
+    ///
+    /// # Returns
+    /// An `InnerBuilder` ready to be written to disk
+    pub fn to_index_builder_reversed(
+        &self,
+        partition_id: u64,
+        total_rows: usize,
+    ) -> Result<lance_index::scalar::inverted::builder::InnerBuilder> {
+        use lance_index::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
+        use lance_index::scalar::inverted::{DocSet, PostingListBuilder, TokenSet};
+
+        if self.is_empty() {
+            return Ok(InnerBuilder::new(
+                partition_id,
+                self.params.has_positions(),
+                Default::default(),
+            ));
+        }
+
+        let total_rows_u64 = total_rows as u64;
+        let with_position = self.params.has_positions();
+
+        // Step 1: Build DocSet with reversed row positions
+        // Collect (original_pos, num_tokens) -> (reversed_pos, num_tokens)
+        let mut doc_entries: Vec<(u64, u32)> = self
+            .doc_lengths
+            .iter()
+            .map(|e| {
+                let original_pos = *e.key();
+                let reversed_pos = total_rows_u64 - original_pos - 1;
+                (reversed_pos, *e.value())
+            })
+            .collect();
+
+        // Sort by reversed position so doc_id assignment matches flushed data order
+        doc_entries.sort_by_key(|(pos, _)| *pos);
+
+        // Build DocSet and create mapping from reversed_pos -> doc_id
+        let mut docs = DocSet::default();
+        let mut reversed_pos_to_doc_id: HashMap<u64, u32> =
+            HashMap::with_capacity(doc_entries.len());
+        for (idx, (reversed_pos, num_tokens)) in doc_entries.into_iter().enumerate() {
+            docs.append(reversed_pos, num_tokens);
+            reversed_pos_to_doc_id.insert(reversed_pos, idx as u32);
+        }
+
+        // Step 2: Build TokenSet and group postings by token
+        let mut tokens = TokenSet::default();
+        let mut token_postings: HashMap<String, Vec<(u32, PostingValue)>> = HashMap::new();
+
+        for entry in self.postings.iter() {
+            let token = entry.key().token.clone();
+            let original_pos = entry.key().row_position;
+            let reversed_pos = total_rows_u64 - original_pos - 1;
+            let doc_id = *reversed_pos_to_doc_id.get(&reversed_pos).ok_or_else(|| {
+                Error::io(
+                    format!(
+                        "FTS index internal error: doc_id not found for reversed position {} (original: {}, total_rows: {})",
+                        reversed_pos, original_pos, total_rows
+                    ),
+                    location!(),
+                )
+            })?;
+
+            token_postings
+                .entry(token)
+                .or_default()
+                .push((doc_id, entry.value().clone()));
+        }
+
+        // Assign token IDs in sorted order for FST format
+        let mut sorted_tokens: Vec<_> = token_postings.keys().cloned().collect();
+        sorted_tokens.sort();
+        for token in &sorted_tokens {
+            tokens.add(token.clone());
+        }
+
+        // Step 3: Build posting lists
+        let mut posting_lists: Vec<PostingListBuilder> = (0..tokens.len())
+            .map(|_| PostingListBuilder::new(with_position))
+            .collect();
+
+        for (token, mut postings) in token_postings {
+            let token_id = tokens.get(&token).ok_or_else(|| {
+                Error::io(
+                    format!(
+                        "FTS index internal error: token '{}' not found in TokenSet",
+                        token
+                    ),
+                    location!(),
+                )
+            })? as usize;
+
+            // Sort postings by doc_id for proper ordering
+            postings.sort_by_key(|(doc_id, _)| *doc_id);
+
+            for (doc_id, value) in postings {
+                let position_recorder = if with_position {
+                    PositionRecorder::Position(value.positions.into())
+                } else {
+                    PositionRecorder::Count(value.frequency)
+                };
+                posting_lists[token_id].add(doc_id, position_recorder);
+            }
+        }
+
+        // Step 4: Create InnerBuilder with all the data
+        let mut builder = InnerBuilder::new(partition_id, with_position, Default::default());
+        builder.set_tokens(tokens);
+        builder.set_docs(docs);
+        builder.set_posting_lists(posting_lists);
+
+        Ok(builder)
     }
 }
 

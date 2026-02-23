@@ -982,6 +982,94 @@ impl IvfPqMemIndex {
 
         Ok(result)
     }
+
+    /// Export partition data as RecordBatches with reversed row positions.
+    ///
+    /// This is used when flushing MemTable to disk with batches in reverse order.
+    /// Since the flushed data will have rows in reverse order, we need to map
+    /// the row positions accordingly:
+    /// `reversed_position = total_rows - original_position - 1`
+    ///
+    /// # Arguments
+    /// * `total_rows` - Total number of rows in the MemTable (needed for position reversal)
+    pub fn to_partition_batches_reversed(
+        &self,
+        total_rows: usize,
+    ) -> Result<Vec<(usize, RecordBatch)>> {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{Field, Schema};
+        use lance_core::ROW_ID;
+        use lance_index::vector::PQ_CODE_COLUMN;
+        use std::sync::Arc;
+
+        let pq_code_len = self.pq.num_sub_vectors * self.pq.num_bits as usize / 8;
+        let total_rows_u64 = total_rows as u64;
+
+        // Schema for partition data: row_id and pq_code
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            Field::new(
+                PQ_CODE_COLUMN,
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false)),
+                    pq_code_len as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let mut result = Vec::new();
+
+        for part_id in 0..self.num_partitions {
+            let entries = self.get_partition(part_id);
+            if entries.is_empty() {
+                continue;
+            }
+
+            // Collect row IDs with reversed positions
+            let row_ids: Vec<u64> = entries
+                .iter()
+                .map(|e| total_rows_u64 - e.row_position - 1)
+                .collect();
+            let row_id_array = Arc::new(UInt64Array::from(row_ids));
+
+            // Collect PQ codes into a flat array
+            let mut pq_codes_flat: Vec<u8> = Vec::with_capacity(entries.len() * pq_code_len);
+            for entry in &entries {
+                pq_codes_flat.extend_from_slice(&entry.pq_code);
+            }
+
+            // Create FixedSizeList array for PQ codes with non-nullable inner field
+            let pq_codes_array = UInt8Array::from(pq_codes_flat);
+            let inner_field = Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false));
+            let pq_codes_fsl = Arc::new(
+                FixedSizeListArray::try_new(
+                    inner_field,
+                    pq_code_len as i32,
+                    Arc::new(pq_codes_array),
+                    None,
+                )
+                .map_err(|e| {
+                    Error::io(
+                        format!("Failed to create PQ code array: {}", e),
+                        location!(),
+                    )
+                })?,
+            );
+
+            let batch = RecordBatch::try_new(schema.clone(), vec![row_id_array, pq_codes_fsl])
+                .map_err(|e| {
+                    Error::io(
+                        format!("Failed to create partition batch: {}", e),
+                        location!(),
+                    )
+                })?;
+
+            result.push((part_id, batch));
+        }
+
+        Ok(result)
+    }
 }
 
 /// Configuration for an IVF-PQ vector index.
