@@ -145,19 +145,6 @@ fn create_batch(schema: Arc<ArrowSchema>, start_id: usize, num_rows: usize) -> R
         .expect("failed to create batch")
 }
 
-fn linear_regression(x: &[f64], y: &[f64]) -> (f64, f64) {
-    let n = x.len() as f64;
-    let sum_x: f64 = x.iter().sum();
-    let sum_y: f64 = y.iter().sum();
-    let sum_xx: f64 = x.iter().map(|v| v * v).sum();
-    let sum_xy: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
-
-    let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x);
-    let intercept = (sum_y - slope * sum_x) / n;
-
-    (slope, intercept)
-}
-
 fn bench_manifest_commit(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to build tokio runtime");
 
@@ -335,34 +322,6 @@ fn bench_manifest_commit(c: &mut Criterion) {
         max_load.as_secs_f64() * 1000.0
     );
 
-    let fragment_counts: Vec<f64> = (2..=(num_iterations + 1)).map(|x| x as f64).collect();
-    let commit_ms: Vec<f64> = commit_latencies
-        .iter()
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .collect();
-    let load_ms: Vec<f64> = load_latencies
-        .iter()
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .collect();
-
-    let (commit_slope, commit_intercept) = linear_regression(&fragment_counts, &commit_ms);
-    let (load_slope, load_intercept) = linear_regression(&fragment_counts, &load_ms);
-
-    println!();
-    println!("=== Linear Regression Analysis ===");
-    println!(
-        "Commit latency = {:.4}ms + {:.4}ms * fragments",
-        commit_intercept, commit_slope
-    );
-    println!(
-        "Load latency   = {:.4}ms + {:.4}ms * fragments",
-        load_intercept, load_slope
-    );
-    println!();
-    println!("Per-fragment overhead:");
-    println!("  Commit: {:.4}ms per additional fragment", commit_slope);
-    println!("  Load:   {:.4}ms per additional fragment", load_slope);
-
     let first_10_avg_commit = commit_latencies
         .iter()
         .take(10)
@@ -416,10 +375,6 @@ fn bench_manifest_commit(c: &mut Criterion) {
     group.bench_function("avg_load_latency", |b| {
         b.iter(|| std::time::Duration::from_secs_f64(avg_load))
     });
-
-    group.bench_function("commit_slope_per_fragment", |b| b.iter(|| commit_slope));
-
-    group.bench_function("load_slope_per_fragment", |b| b.iter(|| load_slope));
 
     group.finish();
 

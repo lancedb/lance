@@ -669,29 +669,34 @@ async fn list_manifests_since_version_with_hint(
     // Read version hint
     let hint_version = read_version_from_hint(object_store, base).await?;
 
-    // If hint is not newer than since_version, no new manifests
+    // If hint is not newer than since_version, check if there are any new versions
     if hint_version <= since_version {
-        // But there might be newer versions, so probe upward from since_version
-        let (_true_latest, scheme, probed) =
-            probe_versions_upward(object_store, base, since_version + 1).await?;
+        // Try to probe upward from since_version+1, but if nothing exists, return empty
+        match probe_versions_upward(object_store, base, since_version + 1).await {
+            Some((_true_latest, scheme, probed)) => {
+                // Filter to only versions > since_version and convert to ManifestLocations
+                let mut locations: Vec<ManifestLocation> = probed
+                    .into_iter()
+                    .filter(|(v, _)| *v > since_version)
+                    .map(|(version, meta)| ManifestLocation {
+                        version,
+                        path: scheme.manifest_path(base, version),
+                        size: Some(meta.size),
+                        naming_scheme: scheme,
+                        e_tag: meta.e_tag,
+                    })
+                    .collect();
 
-        // Filter to only versions > since_version and convert to ManifestLocations
-        let locations: Vec<ManifestLocation> = probed
-            .into_iter()
-            .filter(|(v, _)| *v > since_version)
-            .map(|(version, meta)| ManifestLocation {
-                version,
-                path: scheme.manifest_path(base, version),
-                size: Some(meta.size),
-                naming_scheme: scheme,
-                e_tag: meta.e_tag,
-            })
-            .collect();
-
-        // Sort descending
-        let mut locations = locations;
-        locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
-        return Some(locations);
+                // Sort descending
+                locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                return Some(locations);
+            }
+            None => {
+                // No versions exist after since_version, return empty list
+                // This is the FAST PATH - no new transactions!
+                return Some(Vec::new());
+            }
+        }
     }
 
     // Probe upward from hint to find true latest and collect metadata

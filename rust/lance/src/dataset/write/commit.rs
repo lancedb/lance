@@ -816,4 +816,119 @@ mod tests {
         );
         assert_eq!(transaction.read_version, 1);
     }
+
+    /// Test that commit uses HEAD-based probing instead of LIST on non-lexically ordered stores.
+    ///
+    /// This test verifies the version hint optimization works correctly for commit operations
+    /// on stores like S3 Express where listing is not lexicographically ordered.
+    ///
+    /// The test creates a dataset with many versions and verifies that subsequent commits
+    /// use HEAD requests (O(k) where k = new versions) instead of full listing (O(n)).
+    #[tokio::test]
+    async fn test_commit_uses_version_hint_on_non_lexical_store() {
+        use lance_io::object_store::ObjectStoreParams;
+
+        // Create a throttled store that makes list calls VERY slow
+        // but HEAD calls fast
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                // Make list operations very slow - 100ms per entry
+                wait_list_per_entry: Duration::from_millis(100),
+                // HEAD (get metadata) should be fast
+                wait_get_per_call: Duration::from_millis(1),
+                wait_put_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                // This is the key setting - simulate S3 Express behavior
+                list_is_lexically_ordered: Some(false),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+
+        // Create initial dataset
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://test_version_hint")
+            .with_params(&write_params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        // Create 50 more versions to simulate a dataset with many versions
+        let mut dataset = Arc::new(dataset);
+        for _ in 0..50 {
+            let new_ds = CommitBuilder::new(dataset.clone())
+                .execute(sample_transaction(dataset.manifest().version))
+                .await
+                .unwrap();
+            dataset = Arc::new(new_ds);
+        }
+
+        assert_eq!(dataset.manifest().version, 51);
+
+        // Reset IO stats
+        dataset.object_store().io_stats_incremental();
+
+        // Now do a commit and measure time
+        // If the optimization is working, this should be fast (using HEAD requests)
+        // If not working, this would be slow (100ms * 51 entries = 5.1 seconds)
+        let start = std::time::Instant::now();
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(sample_transaction(dataset.manifest().version))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // With 51 versions and 100ms per list entry, a full list would take ~5.1 seconds
+        // With HEAD-based probing, it should take < 500ms even with some overhead
+        // Use 2 seconds as a generous threshold to avoid flaky tests
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Commit took {:?}, expected < 2s. This suggests list was used instead of HEAD-based probing.",
+            elapsed
+        );
+
+        let io_stats = new_ds.object_store().io_stats_incremental();
+
+        // The read_iops should be low - just HEAD requests for version hint + probing
+        // A full list would show many more read operations
+        // With version hint optimization: ~2-5 HEAD requests (hint + probe a few versions)
+        // Without optimization: 51+ list entries
+        assert!(
+            io_stats.read_iops < 10,
+            "read_iops = {}, expected < 10 (HEAD-based). High value suggests full listing was used.",
+            io_stats.read_iops
+        );
+
+        // Write should still be: txn file + manifest + version hint = 3
+        assert_io_eq!(
+            io_stats,
+            write_iops,
+            3,
+            "write txn + manifest + version_hint"
+        );
+
+        println!(
+            "Commit with version hint optimization: elapsed={:?}, read_iops={}, write_iops={}",
+            elapsed, io_stats.read_iops, io_stats.write_iops
+        );
+    }
 }
