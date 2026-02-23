@@ -177,7 +177,6 @@ rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
-shellexpand = "3.0"
 slatedb = "0.3"
 snafu = "0.8"
 strum = "0.26"
