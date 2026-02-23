@@ -592,12 +592,14 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
         version
     } else {
         // File-size format: version = file size in bytes
-        eprintln!("[HINT_READ_START] file_size, path={}", hint_path);
+        eprintln!("[HINT_READ_START] file_size, path={}, at={:?}", hint_path, start.elapsed());
+        let head_start = std::time::Instant::now();
         let meta = object_store.inner.head(&hint_path).await.ok()?;
         let version = meta.size as u64;
         eprintln!(
-            "[HINT_READ] file_size, head={:?}, version={}",
+            "[HINT_READ] file_size, total={:?}, head_only={:?}, version={}",
             start.elapsed(),
+            head_start.elapsed(),
             version
         );
         Some(version)
