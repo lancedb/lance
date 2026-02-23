@@ -237,6 +237,10 @@ fn bench_manifest_commit(c: &mut Criterion) {
             })
         };
 
+        // Small delay to let fire-and-forget hint write complete
+        // This avoids the hint write from previous commit interfering with load measurement
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
         // Measure load time
         let load_time = if direct_checkout {
             // Direct checkout: use checkout_version which bypasses listing
