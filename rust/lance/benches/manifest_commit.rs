@@ -6,20 +6,18 @@
 //! This benchmark tests how performance degrades as the number of small fragments
 //! grows. Each fragment contains only 10 rows, and we measure both:
 //! - Commit time (manifest write only, excludes fragment data writing)
-//! - Load time (manifest read from storage, using checkout_latest with no caching)
+//! - Load time (manifest read from storage, using checkout_latest)
 //!
 //! Key optimizations:
-//! - Uses shared session for commits to avoid re-reading old manifests
+//! - Uses shared ObjectStoreRegistry to reuse TCP/TLS connections
 //! - Disables auto-cleanup to avoid background cleanup overhead
 //! - Separates fragment writing from commit measurement
-//! - Uses checkout_latest() with zero cache size to measure actual storage read
-//!   while reusing warm TCP/TLS connections
 //!
-//! ## Running against S3
+//! ## Running against S3 Express
 //!
 //! ```bash
-//! export AWS_DEFAULT_REGION=us-east-1
-//! export DATASET_PREFIX=s3://your-bucket/bench/manifest_commit
+//! export AWS_REGION=us-east-1
+//! export DATASET_PREFIX=s3://your-bucket--use1-az4--x-s3/bench/manifest_commit
 //! export NUM_ITERATIONS=100
 //! cargo bench --bench manifest_commit
 //! ```
@@ -30,20 +28,15 @@
 //! cargo bench --bench manifest_commit
 //! ```
 //!
-//! ## Running against specific local directory
-//!
-//! ```bash
-//! export DATASET_PREFIX=/tmp/bench/manifest_commit
-//! export NUM_ITERATIONS=50
-//! cargo bench --bench manifest_commit
-//! ```
-//!
 //! ## Configuration
 //!
-//! - `DATASET_PREFIX`: Base URI for datasets (optional, e.g. s3://bucket/prefix or /tmp/bench). If not set, uses a temporary directory.
+//! - `DATASET_PREFIX`: Base URI for datasets (e.g. s3://bucket/prefix or /tmp/bench).
+//!   If not set, uses a temporary directory.
 //! - `NUM_ITERATIONS`: Number of small fragment writes to perform (default: 100).
 //! - `ROWS_PER_FRAGMENT`: Number of rows per fragment (default: 10).
-//! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes. When "false" (default), keep the dataset for inspection.
+//! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes.
+//! - `ENABLE_CACHE`: When "true", enable manifest caching for load measurements.
+//!   Default is "false" to measure actual storage read latency.
 
 #![allow(clippy::print_stdout)]
 
@@ -53,8 +46,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
-use lance_io::object_store::{ObjectStoreRegistry, StorageOptionsAccessor};
-use std::collections::HashMap;
+use lance_io::object_store::ObjectStoreRegistry;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -83,6 +75,12 @@ fn get_delete_dataset() -> bool {
         .unwrap_or(false)
 }
 
+fn get_enable_cache() -> bool {
+    std::env::var("ENABLE_CACHE")
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
 fn get_dataset_prefix() -> String {
     std::env::var("DATASET_PREFIX").unwrap_or_else(|_| {
         let temp_dir = std::env::temp_dir().join(format!("lance_bench_{}", Uuid::new_v4()));
@@ -93,11 +91,7 @@ fn get_dataset_prefix() -> String {
 
 fn get_storage_label(prefix: &str) -> &'static str {
     if prefix.starts_with("s3://") {
-        if is_s3_express(prefix) {
-            "s3-express"
-        } else {
-            "s3"
-        }
+        "s3"
     } else if prefix.starts_with("gs://") {
         "gcs"
     } else if prefix.starts_with("az://") {
@@ -109,30 +103,10 @@ fn get_storage_label(prefix: &str) -> &'static str {
     }
 }
 
-fn is_s3_express(uri: &str) -> bool {
-    // S3 Express bucket names end with --<az>--x-s3
-    uri.contains("--x-s3")
-}
-
-fn get_storage_options(uri: &str) -> HashMap<String, String> {
-    let mut options = HashMap::new();
-    if is_s3_express(uri) {
-        options.insert("s3_express".to_string(), "true".to_string());
-        // S3 Express requires explicit region because GetBucketLocation API doesn't work
-        if let Ok(region) = std::env::var("AWS_DEFAULT_REGION") {
-            options.insert("region".to_string(), region);
-        } else if let Ok(region) = std::env::var("AWS_REGION") {
-            options.insert("region".to_string(), region);
-        }
-    }
-    options
-}
-
 async fn create_initial_dataset(
     uri: &str,
     rows_per_fragment: usize,
     session: Arc<Session>,
-    storage_options: HashMap<String, String>,
 ) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -144,21 +118,9 @@ async fn create_initial_dataset(
 
     std::fs::remove_dir_all(uri).ok();
 
-    let store_params = if storage_options.is_empty() {
-        None
-    } else {
-        Some(lance_io::object_store::ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                storage_options,
-            ))),
-            ..Default::default()
-        })
-    };
-
     let params = WriteParams {
         session: Some(session),
         skip_auto_cleanup: true,
-        store_params,
         ..Default::default()
     };
 
@@ -184,6 +146,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let num_iterations = get_num_iterations();
     let rows_per_fragment = get_rows_per_fragment();
     let delete_dataset = get_delete_dataset();
+    let enable_cache = get_enable_cache();
     let storage_label = get_storage_label(&dataset_prefix);
 
     let short_id = &Uuid::new_v4().to_string()[..8];
@@ -202,58 +165,42 @@ fn bench_manifest_commit(c: &mut Criterion) {
         num_iterations + 1
     );
     println!("Delete dataset: {}", delete_dataset);
-    println!();
-    println!("Load method: checkout_latest() with zero cache size");
-    println!("  - Reuses warm TCP/TLS connections (shared ObjectStoreRegistry)");
-    println!("  - No manifest caching (zero cache size)");
-    println!("  - Measures actual storage read latency without cold start overhead");
+    println!(
+        "Cache enabled: {} ({})",
+        enable_cache,
+        if enable_cache {
+            "using default cache size"
+        } else {
+            "zero cache size - measures actual storage read"
+        }
+    );
     println!();
 
-    // Get storage options (e.g., s3_express=true for S3 Express buckets)
-    let storage_options = get_storage_options(&uri);
-    if !storage_options.is_empty() {
-        println!("Storage options: {:?}", storage_options);
-        println!();
-    }
-
-    // Create a shared ObjectStoreRegistry to reuse TCP/TLS connections
+    // Create a shared session for both commit and load operations
+    // When cache is disabled, use zero cache size to measure actual storage read latency
+    // When cache is enabled, use default cache sizes (6GB index, 1GB metadata)
     let shared_store_registry = Arc::new(ObjectStoreRegistry::default());
-
-    // Create a session with caching for commits (to avoid re-reading old manifests)
-    let commit_session = Arc::new(Session::new(
-        128 * 1024 * 1024, // index_cache_size
-        128 * 1024 * 1024, // metadata_cache_size
-        shared_store_registry.clone(),
-    ));
-
-    // Create a session with zero cache for load measurements
-    // This shares the ObjectStoreRegistry (warm connections) but has no manifest cache
-    let load_session = Arc::new(Session::new(
-        0, // index_cache_size = 0
-        0, // metadata_cache_size = 0
-        shared_store_registry,
-    ));
+    let session = if enable_cache {
+        Arc::new(Session::default())
+    } else {
+        Arc::new(Session::new(0, 0, shared_store_registry))
+    };
 
     let initial_dataset = runtime.block_on(create_initial_dataset(
         &uri,
         rows_per_fragment,
-        commit_session.clone(),
-        storage_options.clone(),
+        session.clone(),
     ));
 
-    // Create a load dataset that uses the zero-cache session
-    // This will be used to call checkout_latest() for load measurements
     let uri_clone = uri.clone();
     let mut load_dataset = runtime.block_on(async {
         DatasetBuilder::from_uri(&uri_clone)
-            .with_session(load_session.clone())
-            .with_storage_options(storage_options.clone())
+            .with_session(session.clone())
             .load()
             .await
             .expect("failed to load dataset for load measurements")
     });
 
-    // Keep a mutable dataset reference that we update after each commit
     let mut current_dataset = Arc::new(initial_dataset);
 
     let mut commit_latencies = Vec::with_capacity(num_iterations);
@@ -267,7 +214,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
 
         let (commit_time, new_dataset) = {
             let dataset = current_dataset.clone();
-            let session_clone = commit_session.clone();
+            let session_clone = session.clone();
             runtime.block_on(async move {
                 let schema: Arc<ArrowSchema> = Arc::new((&dataset.schema().clone()).into());
                 let start_id = dataset.count_rows(None).await.unwrap() as usize;
@@ -280,14 +227,12 @@ fn bench_manifest_commit(c: &mut Criterion) {
                     ..Default::default()
                 };
 
-                // Write fragments without committing (not measured)
                 let transaction = InsertBuilder::new(dataset.clone())
                     .with_params(&write_params)
                     .execute_uncommitted(vec![batch])
                     .await
                     .expect("failed to write fragment");
 
-                // Measure only the commit time
                 let start = Instant::now();
                 let new_ds = CommitBuilder::new(dataset)
                     .with_session(session_clone)
@@ -300,11 +245,8 @@ fn bench_manifest_commit(c: &mut Criterion) {
         };
 
         // Small delay to let fire-and-forget hint write complete
-        // This avoids the hint write from previous commit interfering with load measurement
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // Measure load time using checkout_latest() with zero-cache session
-        // This reuses warm TCP/TLS connections but doesn't use cached manifests
         let load_time = runtime.block_on(async {
             let start = Instant::now();
             load_dataset
@@ -322,7 +264,6 @@ fn bench_manifest_commit(c: &mut Criterion) {
             elapsed
         });
 
-        // Update current_dataset for next iteration
         current_dataset = new_dataset;
 
         commit_latencies.push(commit_time);

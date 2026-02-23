@@ -93,19 +93,6 @@ const VERSION_HINT_WRITE_MODE_ENV_VAR: &str = "LANCE_VERSION_HINT_WRITE_MODE";
 /// Set to "file_size" (default) to use file-size encoding (file size = version number).
 const VERSION_HINT_FORMAT_ENV_VAR: &str = "LANCE_VERSION_HINT_FORMAT";
 
-/// Environment variable to enable hint-only mode (no racing with listing).
-/// Set to "1" or "true" to enable hint-only mode for debugging/benchmarking.
-/// When enabled, the load path will ONLY use hint+HEAD, no listing fallback race.
-const HINT_ONLY_ENV_VAR: &str = "LANCE_HINT_ONLY";
-
-/// Check if hint-only mode is enabled (no racing with listing).
-fn is_hint_only_mode() -> bool {
-    match std::env::var(HINT_ONLY_ENV_VAR) {
-        Ok(val) => matches!(val.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => false,
-    }
-}
-
 /// Check if version hint writes should be synchronous (blocking).
 fn is_version_hint_sync_write() -> bool {
     match std::env::var(VERSION_HINT_WRITE_MODE_ENV_VAR) {
@@ -344,16 +331,6 @@ async fn current_manifest_path(
 
     // Check if version hint is disabled via environment variable
     if !is_version_hint_enabled() {
-        return resolve_version_from_listing(object_store, base).await;
-    }
-
-    // Hint-only mode: no racing, purely hint+HEAD approach
-    // This is for debugging/benchmarking to isolate hint performance from racing overhead
-    if is_hint_only_mode() {
-        if let Some(location) = read_version_hint_and_probe(object_store, base).await {
-            return Ok(location);
-        }
-        // Hint failed, fall back to listing (no racing)
         return resolve_version_from_listing(object_store, base).await;
     }
 
