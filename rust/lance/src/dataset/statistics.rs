@@ -57,8 +57,7 @@ impl DatasetStatisticsExt for Dataset {
             let fragments = self.fragments().as_ref().clone();
             futures::stream::iter(fragments)
                 .map(|fragment| {
-                    let file_fragment =
-                        FileFragment::new(dataset.clone(), fragment);
+                    let file_fragment = FileFragment::new(dataset.clone(), fragment);
                     let schema = schema.clone();
                     let scan_scheduler = scan_scheduler.clone();
                     async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
