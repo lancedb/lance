@@ -260,12 +260,13 @@ impl Merger for SizeBasedMerger<'_> {
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
             let cache = cache.clone();
-            async move { part.load(&cache, token_set_format).await }
+            tokio::task::spawn(async move { part.load(&cache, token_set_format).await })
         }))
         .buffered(buffer_size);
 
         let mut idx = 0;
         while let Some(part) = stream.try_next().await? {
+            let part = part?;
             idx += 1;
             self.merge_partition(part, &mut estimated_size).await?;
             self.progress

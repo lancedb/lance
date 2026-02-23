@@ -1186,7 +1186,12 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.get_json(&path, &query, "list_table_versions", &id)
+        let descending_str;
+        if let Some(descending) = request.descending {
+            descending_str = descending.to_string();
+            query.push(("descending", descending_str.as_str()));
+        }
+        self.post_json(&path, &query, &(), "list_table_versions", &id)
             .await
     }
 
@@ -1208,15 +1213,9 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<DescribeTableVersionResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
-        let version_str;
-        let path = if let Some(version) = request.version {
-            version_str = version.to_string();
-            format!("/v1/table/{}/version/{}", encoded_id, version_str)
-        } else {
-            format!("/v1/table/{}/version/latest", encoded_id)
-        };
+        let path = format!("/v1/table/{}/version/describe", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.get_json(&path, &query, "describe_table_version", &id)
+        self.post_json(&path, &query, &request, "describe_table_version", &id)
             .await
     }
 

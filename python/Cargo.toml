@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "3.0.0-beta.4"
+version = "3.0.0-beta.5"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
