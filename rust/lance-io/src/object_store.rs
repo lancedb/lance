@@ -883,25 +883,35 @@ impl StorageOptions {
     ///
     /// Keys prefixed with `header.` are parsed into HTTP headers. For example,
     /// `header.x-ms-version = 2023-11-03` results in a default header
-    /// `x-ms-version: 2023-11-03`. Invalid header names or values are silently
-    /// skipped.
-    pub fn client_options(&self) -> ClientOptions {
+    /// `x-ms-version: 2023-11-03`.
+    ///
+    /// Returns an error if any `header.*` key has an invalid header name or value.
+    pub fn client_options(&self) -> Result<ClientOptions> {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.0 {
             if let Some(header_name) = key.strip_prefix("header.") {
-                if let (Ok(name), Ok(val)) = (
-                    header_name.parse::<http::header::HeaderName>(),
-                    HeaderValue::from_str(value),
-                ) {
-                    headers.insert(name, val);
-                }
+                let name = header_name
+                    .parse::<http::header::HeaderName>()
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("invalid header name '{header_name}': {e}"),
+                            location!(),
+                        )
+                    })?;
+                let val = HeaderValue::from_str(value).map_err(|e| {
+                    Error::invalid_input(
+                        format!("invalid header value for '{header_name}': {e}"),
+                        location!(),
+                    )
+                })?;
+                headers.insert(name, val);
             }
         }
         let mut client_options = ClientOptions::default();
         if !headers.is_empty() {
             client_options = client_options.with_default_headers(headers);
         }
-        client_options
+        Ok(client_options)
     }
 
     /// Get the expiration time in milliseconds since epoch, if present
@@ -1399,9 +1409,7 @@ mod tests {
             ("header.x-ms-version".to_string(), "2023-11-03".to_string()),
             ("region".to_string(), "us-west-2".to_string()),
         ]));
-        // Should succeed without panic; the returned ClientOptions is opaque,
-        // but we can verify it round-trips through a builder.
-        let client_options = opts.client_options();
+        let client_options = opts.client_options().unwrap();
 
         // Verify non-header keys are not consumed as headers by creating
         // another StorageOptions with no header.* keys.
@@ -1409,7 +1417,7 @@ mod tests {
             "region".to_string(),
             "us-west-2".to_string(),
         )]));
-        let _ = opts_no_headers.client_options();
+        opts_no_headers.client_options().unwrap();
 
         // Smoke test: the client_options with headers should be usable
         // in a builder (we can't inspect the headers directly, but building
@@ -1424,17 +1432,22 @@ mod tests {
     }
 
     #[test]
-    fn test_client_options_skips_invalid_headers() {
+    fn test_client_options_rejects_invalid_header_name() {
         let opts = StorageOptions(HashMap::from([
-            // Invalid header name (spaces not allowed)
             ("header.bad header".to_string(), "value".to_string()),
-            // Invalid header value (non-visible ASCII)
-            ("header.x-good-name".to_string(), "bad\x01value".to_string()),
-            // Valid header
-            ("header.x-valid".to_string(), "good".to_string()),
         ]));
-        // Should not panic even with invalid entries
-        let _ = opts.client_options();
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header name"));
+    }
+
+    #[test]
+    fn test_client_options_rejects_invalid_header_value() {
+        let opts = StorageOptions(HashMap::from([(
+            "header.x-good-name".to_string(),
+            "bad\x01value".to_string(),
+        )]));
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header value"));
     }
 
     #[test]
@@ -1443,6 +1456,6 @@ mod tests {
             ("region".to_string(), "us-east-1".to_string()),
             ("access_key_id".to_string(), "AKID".to_string()),
         ]));
-        let _ = opts.client_options();
+        opts.client_options().unwrap();
     }
 }

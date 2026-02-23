@@ -79,7 +79,7 @@ impl AwsStoreProvider {
 
         // we can't use parse_url_opts here because we need to manually set the credentials provider
         let mut builder =
-            AmazonS3Builder::new().with_client_options(storage_options.client_options());
+            AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
         for (key, value) in s3_storage_options {
             builder = builder.with_config(key, value);
         }
