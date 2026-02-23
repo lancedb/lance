@@ -53,7 +53,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::object_store::{ObjectStoreRegistry, StorageOptionsAccessor};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -92,7 +93,11 @@ fn get_dataset_prefix() -> String {
 
 fn get_storage_label(prefix: &str) -> &'static str {
     if prefix.starts_with("s3://") {
-        "s3"
+        if is_s3_express(prefix) {
+            "s3-express"
+        } else {
+            "s3"
+        }
     } else if prefix.starts_with("gs://") {
         "gcs"
     } else if prefix.starts_with("az://") {
@@ -104,10 +109,24 @@ fn get_storage_label(prefix: &str) -> &'static str {
     }
 }
 
+fn is_s3_express(uri: &str) -> bool {
+    // S3 Express bucket names end with --<az>--x-s3
+    uri.contains("--x-s3")
+}
+
+fn get_storage_options(uri: &str) -> HashMap<String, String> {
+    let mut options = HashMap::new();
+    if is_s3_express(uri) {
+        options.insert("s3_express".to_string(), "true".to_string());
+    }
+    options
+}
+
 async fn create_initial_dataset(
     uri: &str,
     rows_per_fragment: usize,
     session: Arc<Session>,
+    storage_options: HashMap<String, String>,
 ) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -119,9 +138,21 @@ async fn create_initial_dataset(
 
     std::fs::remove_dir_all(uri).ok();
 
+    let store_params = if storage_options.is_empty() {
+        None
+    } else {
+        Some(lance_io::object_store::ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage_options,
+            ))),
+            ..Default::default()
+        })
+    };
+
     let params = WriteParams {
         session: Some(session),
         skip_auto_cleanup: true,
+        store_params,
         ..Default::default()
     };
 
@@ -172,6 +203,13 @@ fn bench_manifest_commit(c: &mut Criterion) {
     println!("  - Measures actual storage read latency without cold start overhead");
     println!();
 
+    // Get storage options (e.g., s3_express=true for S3 Express buckets)
+    let storage_options = get_storage_options(&uri);
+    if !storage_options.is_empty() {
+        println!("Storage options: {:?}", storage_options);
+        println!();
+    }
+
     // Create a shared ObjectStoreRegistry to reuse TCP/TLS connections
     let shared_store_registry = Arc::new(ObjectStoreRegistry::default());
 
@@ -194,6 +232,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
         &uri,
         rows_per_fragment,
         commit_session.clone(),
+        storage_options.clone(),
     ));
 
     // Create a load dataset that uses the zero-cache session
@@ -202,6 +241,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let mut load_dataset = runtime.block_on(async {
         DatasetBuilder::from_uri(&uri_clone)
             .with_session(load_session.clone())
+            .with_storage_options(storage_options.clone())
             .load()
             .await
             .expect("failed to load dataset for load measurements")
