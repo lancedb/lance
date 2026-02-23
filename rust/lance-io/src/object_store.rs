@@ -1433,9 +1433,10 @@ mod tests {
 
     #[test]
     fn test_client_options_rejects_invalid_header_name() {
-        let opts = StorageOptions(HashMap::from([
-            ("header.bad header".to_string(), "value".to_string()),
-        ]));
+        let opts = StorageOptions(HashMap::from([(
+            "header.bad header".to_string(),
+            "value".to_string(),
+        )]));
         let err = opts.client_options().unwrap_err();
         assert!(err.to_string().contains("invalid header name"));
     }
