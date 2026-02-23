@@ -320,6 +320,8 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    let start = std::time::Instant::now();
+
     // Fast path for local filesystem
     if object_store.is_local() {
         if let Ok(Some(location)) = current_manifest_local(base) {
@@ -329,7 +331,13 @@ async fn current_manifest_path(
 
     // Check if version hint is disabled via environment variable
     if !is_version_hint_enabled() {
-        return resolve_version_from_listing(object_store, base).await;
+        let result = resolve_version_from_listing(object_store, base).await;
+        eprintln!(
+            "[LOAD] no hint, listing only: {:?}, version={}",
+            start.elapsed(),
+            result.as_ref().map(|l| l.version).unwrap_or(0)
+        );
+        return result;
     }
 
     // Race hint-based and listing-based approaches
@@ -340,14 +348,30 @@ async fn current_manifest_path(
         // Try hint-based approach first (biased because it's usually faster)
         hint_result = read_version_hint_and_probe(object_store, base) => {
             if let Some(location) = hint_result {
+                eprintln!(
+                    "[LOAD] hint won: {:?}, version={}",
+                    start.elapsed(),
+                    location.version
+                );
                 return Ok(location);
             }
             // Hint failed, fall back to listing
-            resolve_version_from_listing(object_store, base).await
+            let result = resolve_version_from_listing(object_store, base).await;
+            eprintln!(
+                "[LOAD] hint failed, listing fallback: {:?}, version={}",
+                start.elapsed(),
+                result.as_ref().map(|l| l.version).unwrap_or(0)
+            );
+            result
         }
 
         // Listing approach as backup
         list_result = resolve_version_from_listing(object_store, base) => {
+            eprintln!(
+                "[LOAD] listing won: {:?}, version={}",
+                start.elapsed(),
+                list_result.as_ref().map(|l| l.version).unwrap_or(0)
+            );
             list_result
         }
     }
@@ -510,17 +534,32 @@ pub async fn write_version_hint_blocking(object_store: &ObjectStore, base: &Path
 /// - "file_size" (default): Reads from latest_version_hint.bin (file size = version)
 async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
     let hint_path = version_hint_path(base);
+    let start = std::time::Instant::now();
 
     if is_version_hint_json_format() {
         // JSON format: read and parse the file content
         let bytes = object_store.inner.get(&hint_path).await.ok()?;
+        let get_time = start.elapsed();
         let bytes = bytes.bytes().await.ok()?;
         let text = std::str::from_utf8(&bytes).ok()?;
-        parse_version_from_json(text)
+        let version = parse_version_from_json(text);
+        eprintln!(
+            "[HINT_READ] json, get={:?}, total={:?}, version={:?}",
+            get_time,
+            start.elapsed(),
+            version
+        );
+        version
     } else {
         // File-size format: version = file size in bytes
         let meta = object_store.inner.head(&hint_path).await.ok()?;
-        Some(meta.size as u64)
+        let version = meta.size as u64;
+        eprintln!(
+            "[HINT_READ] file_size, head={:?}, version={}",
+            start.elapsed(),
+            version
+        );
+        Some(version)
     }
 }
 
@@ -559,8 +598,11 @@ async fn read_version_hint_and_probe(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Option<ManifestLocation> {
+    let start = std::time::Instant::now();
+
     // Read version from hint file (format determined by env var)
     let mut current_version = read_version_from_hint(object_store, base).await?;
+    let hint_read_time = start.elapsed();
 
     // Try V2 scheme first (more likely for newer datasets)
     let mut scheme = ManifestNamingScheme::V2;
@@ -577,23 +619,45 @@ async fn read_version_hint_and_probe(
         }
         Err(_) => None,
     };
+    let verify_time = start.elapsed();
 
     // If the hinted version doesn't exist, the hint is stale/invalid
     let mut last_meta = manifest_meta?;
 
     // Probe for higher versions
+    let mut probe_count = 0;
+    let probe_start = std::time::Instant::now();
     loop {
         let next_version = current_version + 1;
         let next_path = scheme.manifest_path(base, next_version);
+        let head_start = std::time::Instant::now();
         match object_store.inner.head(&next_path).await {
             Ok(meta) => {
+                eprintln!("[PROBE_HEAD] v={}, found, {:?}", next_version, head_start.elapsed());
                 current_version = next_version;
                 last_meta = meta;
+                probe_count += 1;
             }
-            Err(ObjectStoreError::NotFound { .. }) => break,
-            Err(_) => break,
+            Err(ObjectStoreError::NotFound { .. }) => {
+                eprintln!("[PROBE_HEAD] v={}, not_found, {:?}", next_version, head_start.elapsed());
+                break;
+            }
+            Err(_) => {
+                eprintln!("[PROBE_HEAD] v={}, error, {:?}", next_version, head_start.elapsed());
+                break;
+            }
         }
     }
+
+    eprintln!(
+        "[HINT_PROBE] hint_read={:?}, verify={:?}, probe={:?}, total={:?}, probe_count={}, version={}",
+        hint_read_time,
+        verify_time - hint_read_time,
+        probe_start.elapsed(),
+        start.elapsed(),
+        probe_count,
+        current_version
+    );
 
     Some(ManifestLocation {
         version: current_version,
@@ -768,6 +832,7 @@ async fn resolve_version_from_listing(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    let list_start = std::time::Instant::now();
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
@@ -780,6 +845,7 @@ async fn resolve_version_from_listing(
     });
 
     let first = valid_manifests.next().await.transpose()?;
+    let first_item_time = list_start.elapsed();
     match (first, object_store.list_is_lexically_ordered) {
         // If the first valid manifest we see is V2, we can assume that we are using
         // V2 naming scheme for all manifests.
@@ -812,6 +878,12 @@ async fn resolve_version_from_listing(
                 }
             }
 
+            eprintln!(
+                "[LIST] lexical, first_item={:?}, total={:?}, version={}",
+                first_item_time,
+                list_start.elapsed(),
+                version
+            );
             Ok(ManifestLocation {
                 version,
                 path: meta.location,
@@ -828,8 +900,10 @@ async fn resolve_version_from_listing(
                 .unwrap();
             let mut current_meta = meta;
             let scheme = first_scheme;
+            let mut count = 1;
 
             while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
+                count += 1;
                 if entry_scheme != scheme {
                     return Err(Error::Internal {
                         message: format!(
@@ -848,6 +922,13 @@ async fn resolve_version_from_listing(
                     current_meta = meta;
                 }
             }
+            eprintln!(
+                "[LIST] non-lexical, first_item={:?}, total={:?}, count={}, version={}",
+                first_item_time,
+                list_start.elapsed(),
+                count,
+                current_version
+            );
             Ok(ManifestLocation {
                 version: current_version,
                 path: current_meta.location,
