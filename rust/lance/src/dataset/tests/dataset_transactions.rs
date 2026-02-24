@@ -368,6 +368,7 @@ async fn test_inline_transaction() {
         &ManifestWriteConfig::default(),
         ds.manifest_location.naming_scheme,
         None,
+        false,
     )
     .await
     .unwrap();

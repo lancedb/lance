@@ -3069,6 +3069,7 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     mut transaction: Option<&Transaction>,
+    sync_version_hint_write: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(
@@ -3091,6 +3092,7 @@ pub(crate) async fn write_manifest_file(
             write_manifest_file_to_path,
             naming_scheme,
             transaction.take().map(|tx| tx.into()),
+            sync_version_hint_write,
         )
         .await
 }

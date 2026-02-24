@@ -163,6 +163,19 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Whether to wait for the version hint write to complete before returning.
+    ///
+    /// When `true`, the commit will block until the version hint is written.
+    /// This adds ~10ms latency on S3 Express but guarantees the hint is available
+    /// for immediate reads by other clients.
+    ///
+    /// When `false` (default), the version hint is written asynchronously in the
+    /// background, allowing the commit to return immediately.
+    pub fn with_sync_version_hint_write(mut self, sync_write: bool) -> Self {
+        self.commit_config.sync_version_hint_write = sync_write;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
@@ -924,11 +937,6 @@ mod tests {
             write_iops,
             3,
             "write txn + manifest + version_hint"
-        );
-
-        println!(
-            "Commit with version hint optimization: elapsed={:?}, read_iops={}, write_iops={}",
-            elapsed, io_stats.read_iops, io_stats.write_iops
         );
     }
 }

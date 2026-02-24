@@ -472,6 +472,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
@@ -498,8 +499,12 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         match result {
             Ok(location) => {
-                // Write version hint (fire-and-forget, spawned as background task)
-                write_version_hint(object_store, base_path, manifest.version);
+                write_version_hint(
+                    object_store,
+                    base_path,
+                    manifest.version,
+                    sync_version_hint_write,
+                );
                 Ok(location)
             }
             Err(_) => {

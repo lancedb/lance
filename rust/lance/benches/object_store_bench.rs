@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 //! Direct object_store benchmark to isolate S3 vs S3 Express performance.
 //!
 //! This benchmark reads actual manifest files from a Lance dataset and measures:
@@ -31,11 +33,9 @@
 //! - `AWS_REGION`: AWS region (required for S3)
 //! - `MAX_MANIFESTS`: Maximum number of manifests to test (default: all)
 
-#![allow(clippy::print_stdout)]
-
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};

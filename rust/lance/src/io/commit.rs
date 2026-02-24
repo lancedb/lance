@@ -228,6 +228,7 @@ async fn do_commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         Some(transaction),
+        false, // New datasets use async hint write by default
     )
     .await;
 
@@ -710,6 +711,7 @@ pub(crate) async fn do_commit_detached_transaction(
             write_config,
             ManifestNamingScheme::V2,
             Some(transaction),
+            commit_config.sync_version_hint_write,
         )
         .await;
 
@@ -907,6 +909,7 @@ pub(crate) async fn commit_transaction(
             write_config,
             manifest_naming_scheme,
             Some(&transaction),
+            commit_config.sync_version_hint_write,
         )
         .await;
 

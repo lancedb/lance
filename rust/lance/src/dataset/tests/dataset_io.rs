@@ -549,6 +549,7 @@ async fn test_write_manifest(
         },
         dataset.manifest_location.naming_scheme,
         None,
+        false,
     )
     .await
     .unwrap();

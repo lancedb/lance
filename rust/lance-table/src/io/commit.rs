@@ -70,54 +70,10 @@ use {
 pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
-/// File name for the version hint file (file-size encoding).
-/// The file size in bytes indicates the latest version number.
+/// File name for the JSON-based version hint file.
 /// This enables O(1) latest version lookup via HEAD request on object stores
 /// where listing is not lexicographically ordered (e.g., S3 Express).
-const VERSION_HINT_FILE: &str = "latest_version_hint.bin";
-
-/// File name for the JSON-based version hint file.
 const VERSION_HINT_JSON_FILE: &str = "latest_version_hint.json";
-
-/// Environment variable to enable/disable version hint optimization.
-/// Set to "0" or "false" to disable, any other value (or unset) to enable.
-const VERSION_HINT_ENV_VAR: &str = "LANCE_USE_VERSION_HINT";
-
-/// Environment variable to control version hint write mode.
-/// Set to "sync" to wait for the write to complete (adds latency but guarantees write).
-/// Set to "async" (default) to spawn a background task and return immediately.
-const VERSION_HINT_WRITE_MODE_ENV_VAR: &str = "LANCE_VERSION_HINT_WRITE_MODE";
-
-/// Environment variable to control version hint encoding format.
-/// Set to "json" to use JSON encoding (writes version number as JSON).
-/// Set to "file_size" (default) to use file-size encoding (file size = version number).
-const VERSION_HINT_FORMAT_ENV_VAR: &str = "LANCE_VERSION_HINT_FORMAT";
-
-/// Check if version hint writes should be synchronous (blocking).
-fn is_version_hint_sync_write() -> bool {
-    match std::env::var(VERSION_HINT_WRITE_MODE_ENV_VAR) {
-        Ok(val) => val.to_lowercase() == "sync",
-        Err(_) => false, // Default to async (fire-and-forget)
-    }
-}
-
-/// Check if version hint should use JSON format.
-/// Default is JSON format (more portable and debuggable).
-/// Set LANCE_VERSION_HINT_FORMAT=file_size to use file-size encoding.
-fn is_version_hint_json_format() -> bool {
-    match std::env::var(VERSION_HINT_FORMAT_ENV_VAR) {
-        Ok(val) => val.to_lowercase() != "file_size",
-        Err(_) => true, // Default to JSON format
-    }
-}
-
-/// Check if version hint optimization is enabled via environment variable.
-fn is_version_hint_enabled() -> bool {
-    match std::env::var(VERSION_HINT_ENV_VAR) {
-        Ok(val) => !matches!(val.to_lowercase().as_str(), "0" | "false" | "no" | "off"),
-        Err(_) => true, // Enabled by default
-    }
-}
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,9 +271,6 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
 ///
 /// Even with lexicographic ordering (V2 naming), LIST still requires a full
 /// request that takes hundreds of milliseconds, while HEAD is much faster.
-///
-/// The version hint optimization can be disabled by setting the environment
-/// variable `LANCE_USE_VERSION_HINT=0` (or "false", "no", "off").
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
@@ -327,11 +280,6 @@ async fn current_manifest_path(
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
-    }
-
-    // Check if version hint is disabled via environment variable
-    if !is_version_hint_enabled() {
-        return resolve_version_from_listing(object_store, base).await;
     }
 
     // Race hint-based and listing-based approaches
@@ -422,39 +370,27 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
 
 /// Get the path to the version hint file.
 fn version_hint_path(base: &Path) -> Path {
-    let filename = if is_version_hint_json_format() {
-        VERSION_HINT_JSON_FILE
-    } else {
-        VERSION_HINT_FILE
-    };
-    base.child(VERSIONS_DIR).child(filename)
+    base.child(VERSIONS_DIR).child(VERSION_HINT_JSON_FILE)
 }
 
 /// Write the version hint file after a successful commit.
 ///
-/// The encoding format depends on `LANCE_VERSION_HINT_FORMAT`:
-/// - "file_size" (default): File size in bytes indicates the version number
-/// - "json": JSON file containing `{"version": N}`
+/// The hint is written as a JSON file containing `{"version": N}`.
 ///
-/// The write mode depends on `LANCE_VERSION_HINT_WRITE_MODE`:
-/// - "async" (default): Spawns a background task and returns immediately (fire-and-forget)
-/// - "sync": Spawns a background task and waits for it to complete before returning
+/// When `sync_write` is true, blocks until the write completes.
+/// When `sync_write` is false (default), spawns a background task and returns immediately.
 ///
 /// This write is optimistic and failures are logged but ignored,
 /// as the hint is only used to accelerate reads, not for correctness.
-pub fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
-    if !is_version_hint_enabled() {
-        return;
-    }
+pub fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64, sync_write: bool) {
     let hint_path = version_hint_path(base);
-    let use_json = is_version_hint_json_format();
     let object_store = object_store.clone();
 
     let handle = tokio::spawn(async move {
-        write_version_hint_inner(&object_store, &hint_path, version, use_json).await;
+        write_version_hint_inner(&object_store, &hint_path, version).await;
     });
 
-    if is_version_hint_sync_write() {
+    if sync_write {
         // Synchronous write - block until the spawned task completes
         // Use block_in_place to avoid blocking the async runtime
         let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(handle));
@@ -465,27 +401,12 @@ pub fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64)
 /// Async version of write_version_hint that can be awaited.
 /// Use this when you need to ensure the write completes before proceeding.
 pub async fn write_version_hint_async(object_store: &ObjectStore, base: &Path, version: u64) {
-    if !is_version_hint_enabled() {
-        return;
-    }
     let hint_path = version_hint_path(base);
-    let use_json = is_version_hint_json_format();
-    write_version_hint_inner(object_store, &hint_path, version, use_json).await;
+    write_version_hint_inner(object_store, &hint_path, version).await;
 }
 
-async fn write_version_hint_inner(
-    object_store: &ObjectStore,
-    hint_path: &Path,
-    version: u64,
-    use_json: bool,
-) {
-    let content = if use_json {
-        // JSON format: {"version": N}
-        format!("{{\"version\":{}}}", version).into_bytes()
-    } else {
-        // File-size format: file with `version` zero bytes
-        vec![0u8; version as usize]
-    };
+async fn write_version_hint_inner(object_store: &ObjectStore, hint_path: &Path, version: u64) {
+    let content = format!("{{\"version\":{}}}", version).into_bytes();
 
     if let Err(e) = object_store.put(hint_path, content.as_slice()).await {
         // Log but don't fail - the hint is optional for correctness
@@ -501,29 +422,18 @@ async fn write_version_hint_inner(
 #[cfg(test)]
 pub async fn write_version_hint_blocking(object_store: &ObjectStore, base: &Path, version: u64) {
     let hint_path = version_hint_path(base);
-    let use_json = is_version_hint_json_format();
-    write_version_hint_inner(object_store, &hint_path, version, use_json).await;
+    write_version_hint_inner(object_store, &hint_path, version).await;
 }
 
 /// Read the version from the hint file.
 ///
-/// The format is determined by `LANCE_VERSION_HINT_FORMAT` env var:
-/// - "json": Reads from latest_version_hint.json
-/// - "file_size" (default): Reads from latest_version_hint.bin (file size = version)
+/// The hint file is a JSON file containing `{"version": N}`.
 async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
     let hint_path = version_hint_path(base);
-
-    if is_version_hint_json_format() {
-        // JSON format: read and parse the file content
-        let bytes = object_store.inner.get(&hint_path).await.ok()?;
-        let bytes = bytes.bytes().await.ok()?;
-        let text = std::str::from_utf8(&bytes).ok()?;
-        parse_version_from_json(text)
-    } else {
-        // File-size format: version = file size in bytes
-        let meta = object_store.inner.head(&hint_path).await.ok()?;
-        Some(meta.size as u64)
-    }
+    let bytes = object_store.inner.get(&hint_path).await.ok()?;
+    let bytes = bytes.bytes().await.ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    parse_version_from_json(text)
 }
 
 /// Parse version number from JSON string like {"version": 123}
@@ -1002,16 +912,7 @@ pub trait CommitHandler: Debug + Send + Sync {
                 .boxed();
         }
 
-        // For non-lexically ordered stores, try version hint optimization if enabled
-        if !is_version_hint_enabled() {
-            // Fall back to full listing with filter
-            return self
-                .list_manifest_locations(base_path, object_store, true)
-                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
-                .boxed();
-        }
-
-        // Use version hint optimization
+        // Use version hint optimization for non-lexically ordered stores
         let base_path = base_path.clone();
         let object_store_clone = object_store.clone();
 
@@ -1045,6 +946,10 @@ pub trait CommitHandler: Debug + Send + Sync {
     ///
     /// This function should return an [CommitError::CommitConflict] if another
     /// transaction has already been committed to the path.
+    ///
+    /// The `sync_version_hint_write` parameter controls whether to wait for the
+    /// version hint write to complete before returning. When `true`, adds ~10ms
+    /// latency but guarantees the hint is available for immediate reads.
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1054,6 +959,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError>;
 
     /// Delete the recorded manifest information for a dataset at the base_path
@@ -1324,6 +1230,7 @@ impl CommitHandler for UnsafeCommitHandler {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1338,8 +1245,12 @@ impl CommitHandler for UnsafeCommitHandler {
         let res =
             manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
 
-        // Write version hint (fire-and-forget, spawned as background task)
-        write_version_hint(object_store, base_path, manifest.version);
+        write_version_hint(
+            object_store,
+            base_path,
+            manifest.version,
+            sync_version_hint_write,
+        );
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1394,6 +1305,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         // NOTE: once we have the lease we cannot use ? to return errors, since
@@ -1425,8 +1337,12 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
 
         let res = res?;
 
-        // Write version hint (fire-and-forget, spawned as background task)
-        write_version_hint(object_store, base_path, manifest.version);
+        write_version_hint(
+            object_store,
+            base_path,
+            manifest.version,
+            sync_version_hint_write,
+        );
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1449,6 +1365,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         self.as_ref()
             .commit(
@@ -1459,6 +1376,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
                 manifest_writer,
                 naming_scheme,
                 transaction,
+                sync_version_hint_write,
             )
             .await
     }
@@ -1480,6 +1398,7 @@ impl CommitHandler for RenameCommitHandler {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
@@ -1495,8 +1414,12 @@ impl CommitHandler for RenameCommitHandler {
             .await
         {
             Ok(_) => {
-                // Write version hint (fire-and-forget, spawned as background task)
-                write_version_hint(object_store, base_path, manifest.version);
+                write_version_hint(
+                    object_store,
+                    base_path,
+                    manifest.version,
+                    sync_version_hint_write,
+                );
 
                 // Successfully committed
                 Ok(ManifestLocation {
@@ -1541,6 +1464,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
+        sync_version_hint_write: bool,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
@@ -1574,8 +1498,12 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 _ => CommitError::OtherError(err.into()),
             })?;
 
-        // Write version hint (fire-and-forget, spawned as background task)
-        write_version_hint(object_store, base_path, manifest.version);
+        write_version_hint(
+            object_store,
+            base_path,
+            manifest.version,
+            sync_version_hint_write,
+        );
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1597,6 +1525,15 @@ impl Debug for ConditionalPutCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    /// Whether to wait for the version hint write to complete before returning.
+    ///
+    /// When `true`, the commit will block until the version hint is written.
+    /// This adds ~10ms latency on S3 Express but guarantees the hint is available
+    /// for immediate reads.
+    ///
+    /// When `false` (default), the version hint is written asynchronously in the
+    /// background, allowing the commit to return immediately.
+    pub sync_version_hint_write: bool,
     // TODO: add isolation_level
 }
 
@@ -1605,6 +1542,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            sync_version_hint_write: false,
         }
     }
 }
