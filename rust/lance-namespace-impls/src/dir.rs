@@ -13,6 +13,7 @@ use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -1148,7 +1149,15 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Try to load the dataset to get real information
-        match Dataset::open(&table_uri).await {
+        // Use DatasetBuilder with storage options to support S3 with custom endpoints
+        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        match builder.load().await {
             Ok(mut dataset) => {
                 // If a specific version is requested, checkout that version
                 if let Some(requested_version) = request.version {
@@ -1788,12 +1797,18 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<DescribeTableVersionResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
 
-        let mut dataset = Dataset::open(&table_uri)
-            .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
-                location: snafu::location!(),
-            })?;
+        // Use DatasetBuilder with storage options to support S3 with custom endpoints
+        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        let mut dataset = builder.load().await.map_err(|e| Error::Namespace {
+            source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
+            location: snafu::location!(),
+        })?;
 
         if let Some(version) = request.version {
             dataset = dataset
