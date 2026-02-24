@@ -1691,6 +1691,13 @@ pub struct StructuralBatchDecodeStream {
     rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
+    // Decode scheduling policy selected at planning time.
+    //
+    // Performance tradeoff:
+    // - true: spawn `into_batch` onto Tokio, which improves scan throughput by allowing
+    //   more decode parallelism.
+    // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
+    //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
 }
 
@@ -1798,13 +1805,12 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                // Capture the per-stream policy once so every emitted batch task follows the
+                // same throughput-vs-overhead choice made by the scheduler.
                 let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
                 let task = async move {
                     let next_task = next_task?;
                     if spawn_batch_decode_tasks {
-                        // Real decode work happens inside into_batch, which can block the current
-                        // thread for a long time. By spawning it as a new task, we allow Tokio's
-                        // worker threads to keep making progress.
                         tokio::spawn(
                             async move { next_task.into_batch(emitted_batch_size_warning) },
                         )
