@@ -3399,6 +3399,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        namespace: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3465,6 +3467,12 @@ class LanceDataset(pa.dataset.Dataset):
             row IDs assign each row a monotonically increasing id that persists
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
+        namespace : LanceNamespace, optional
+            A namespace instance. Must be provided together with table_id.
+            Use lance.namespace.connect() to create a namespace.
+        table_id : List[str], optional
+            The table identifier within the namespace (e.g., ["workspace", "table"]).
+            Must be provided together with namespace.
 
         Returns
         -------
@@ -3535,6 +3543,8 @@ class LanceDataset(pa.dataset.Dataset):
                 detached=detached,
                 max_retries=max_retries,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3549,6 +3559,8 @@ class LanceDataset(pa.dataset.Dataset):
                 max_retries=max_retries,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         else:
             raise TypeError(
