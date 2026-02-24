@@ -153,14 +153,14 @@ print(dataset.schema)
 # id: int64
 ```
 
+Starting with Lance file format `2.2`, nested sub-column removal is supported for
+nested types (for example `people.item.city` on `list<struct<...>>`), instead of
+being limited to `struct` only.
+
 To actually remove the data from disk, the files must be rewritten to remove the
 columns and then the old files must be deleted. This can be done using
 `lance.dataset.DatasetOptimizer.compact_files()` followed by
 `lance.LanceDataset.cleanup_old_versions()`.
-
-Starting with Lance file format `2.2`, nested sub-column removal is supported for
-nested types (for example `people.item.city` on `list<struct<...>>`), instead of
-being limited to `struct` only.
 
 !!! warning
 
