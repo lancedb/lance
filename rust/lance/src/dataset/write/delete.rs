@@ -177,61 +177,67 @@ impl RetryExecutor for DeleteJob {
             .filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
-        let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) = if let Some(filter_expr) =
-            scanner.get_expr_filter()?
-        {
-            if matches!(
-                filter_expr,
-                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
-            ) {
-                // Predicate evaluated to false - no deletions
-                (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
-            } else if matches!(
-                filter_expr,
-                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-            ) {
-                // Predicate evaluated to true - delete all fragments
-                let fragments = self.dataset.get_fragments();
-                let num_deleted_rows: u64 = fragments
-                    .iter()
-                    .map(|f| f.metadata.physical_rows.unwrap_or(0) as u64)
-                    .sum();
-                let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
+        let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
+            if let Some(filter_expr) = scanner.get_expr_filter()? {
+                if matches!(
+                    filter_expr,
+                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+                ) {
+                    // Predicate evaluated to false - no deletions
+                    (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
+                } else if matches!(
+                    filter_expr,
+                    Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+                ) {
+                    // Predicate evaluated to true - delete all fragments
+                    let fragments = self.dataset.get_fragments();
+                    let num_deleted_rows: u64 = fragments
+                        .iter()
+                        .map(|f| f.metadata.physical_rows.unwrap_or(0) as u64)
+                        .sum();
+                    let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
 
-                // When deleting everything, we don't have specific row addresses,
-                // so better not to emit affected rows.
-                (Vec::new(), deleted_fragment_ids, None, num_deleted_rows)
-            } else {
-                // Regular predicate - scan and collect row addresses to delete
-                let stream = scanner.try_into_stream().await?.into();
-                let (stream, row_id_rx) =
-                    make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+                    // When deleting everything, we don't have specific row addresses,
+                    // so better not to emit affected rows.
+                    (Vec::new(), deleted_fragment_ids, None, num_deleted_rows)
+                } else {
+                    // Regular predicate - scan and collect row addresses to delete
+                    let stream = scanner.try_into_stream().await?.into();
+                    let (stream, row_id_rx) = make_rowid_capture_stream(
+                        stream,
+                        self.dataset.manifest.uses_stable_row_ids(),
+                    )?;
 
-                // Process the stream to capture row addresses
-                // We need to consume the stream to trigger the capture
-                futures::pin_mut!(stream);
-                while let Some(_batch) = stream.try_next().await? {
-                    // The row addresses are captured automatically by make_rowid_capture_stream
+                    // Process the stream to capture row addresses
+                    // We need to consume the stream to trigger the capture
+                    futures::pin_mut!(stream);
+                    while let Some(_batch) = stream.try_next().await? {
+                        // The row addresses are captured automatically by make_rowid_capture_stream
+                    }
+
+                    // Extract the row addresses from the receiver
+                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+                        message: format!("Failed to receive row ids: {}", err),
+                        location: location!(),
+                    })?;
+                    let row_id_index = get_row_id_index(&self.dataset).await?;
+                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+
+                    let (fragments, deleted_ids) =
+                        apply_deletions(&self.dataset, &removed_row_addrs).await?;
+                    let num_deleted_rows = removed_row_addrs.len();
+                    let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
+                    (
+                        fragments,
+                        deleted_ids,
+                        Some(affected_rows),
+                        num_deleted_rows,
+                    )
                 }
-
-                // Extract the row addresses from the receiver
-                let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-                    message: format!("Failed to receive row ids: {}", err),
-                    location: location!(),
-                })?;
-                let row_id_index = get_row_id_index(&self.dataset).await?;
-                let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-
-                let (fragments, deleted_ids) =
-                    apply_deletions(&self.dataset, &removed_row_addrs).await?;
-                let num_deleted_rows = removed_row_addrs.len();
-                let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
-                (fragments, deleted_ids, Some(affected_rows), num_deleted_rows)
-            }
-        } else {
-            // No filter was applied - this shouldn't happen but treat as delete nothing
-            (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
-        };
+            } else {
+                // No filter was applied - this shouldn't happen but treat as delete nothing
+                (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
+            };
 
         Ok(DeleteData {
             updated_fragments,
