@@ -32,10 +32,10 @@ If two regions contain rows with the same primary key, the following scenario ca
 5. The row from Region A (older) now overwrites the row from Region B (newer)
 
 This violates the expected "last write wins" semantics.
-By ensuring each primary key is assigned to exactly one region via the region spec, 
+By ensuring each primary key is assigned to exactly one region via the region spec,
 merge order between regions becomes irrelevant for correctness.
 
-See [MemWAL Region Architecture](#memwal-region-architecture) for the complete region architecture.
+See [MemWAL Region Architecture](#region-architecture) for the complete region architecture.
 
 ### MemWAL Index
 
@@ -66,7 +66,7 @@ The MemTable is periodically **flushed** to storage based on memory pressure and
 
 ### MemTable
 
-A MemTable holds rows inserted into the region before flushing to storage. 
+A MemTable holds rows inserted into the region before flushing to storage.
 It serves 2 purposes:
 
 1. build up data and related indexes to be flushed to storage as a flushed MemTable
@@ -85,7 +85,7 @@ and each write into the MemTable is a new Arrow record batch.
 
 #### MemTable Generation
 
-Based on conditions like memory limit and durability requirements, 
+Based on conditions like memory limit and durability requirements,
 a MemTable needs to be **flushed** to storage and discarded.
 When that happens, new writes go to a new MemTable and the cycle repeats.
 Each MemTable is assigned a monotonically increasing generation number starting from 1.
@@ -145,12 +145,12 @@ A flushed MemTable is created by flushing the MemTable to storage.
 In Lance MemWAL spec, a flushed MemTable must be a Lance table following the Lance table format spec.
 
 !!!note
-    This is called Sorted String Table (SSTable) or Sorted Run in many LSM-tree literatures and implementations.
-    However, since our MemTable is not sorted, we just use the term flushed MemTable to avoid confusion.
+This is called Sorted String Table (SSTable) or Sorted Run in many LSM-tree literatures and implementations.
+However, since our MemTable is not sorted, we just use the term flushed MemTable to avoid confusion.
 
 #### Flushed MemTable Storage Layout
 
-The MemTable of generation `i` is flushed to `_mem_wal/{region_uuid}/{random_hex}_gen_{i}/` directory, 
+The MemTable of generation `i` is flushed to `_mem_wal/{region_uuid}/{random_hex}_gen_{i}/` directory,
 where `{random_hex}` is a random 8-character hex value generated at flush time.
 The random hex value is necessary to ensure if one MemTable flush attempt fails,
 The retry can use another directory.
@@ -158,7 +158,7 @@ The content within the generation directory follows the [Lance table storage lay
 
 #### Merging MemTable to Base Table
 
-Generation numbers determine merge order of flushed MemTable into base table: 
+Generation numbers determine merge order of flushed MemTable into base table:
 lower numbers represent older data and must be merged to the base table first to preserve correct upsert semantics.
 
 Within a single flushed MemTable, if there are multiple rows of the same primary key,
@@ -193,7 +193,7 @@ The manifest is serialized as a protobuf binary file using the `RegionManifest` 
 
 #### Region Manifest Versioning
 
-Manifests are versioned starting from 1 and immutable. 
+Manifests are versioned starting from 1 and immutable.
 Each update creates a new manifest file at the next version number.
 Updates use put-if-not-exists or file rename to ensure atomicity depending on the storage system.
 If two processes compete, one wins and the other retries.
@@ -212,7 +212,7 @@ To read the latest manifest version:
 4. The latest version is the last found version
 
 !!!note
-    This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
+This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
 
 #### Region Manifest Storage Layout
 
@@ -235,17 +235,17 @@ The index stores its data in two parts:
 The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` protobuf message with the following key fields:
 
 - **Configuration fields** (`region_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
-Writers read these fields to determine how to partition data and which indexes to maintain.
+  Writers read these fields to determine how to partition data and which indexes to maintain.
 - **Merge progress** (`merged_generations`) tracks the last generation merged to the base table for each region.
-This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
-Each entry contains the region UUID and generation number.
+  This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
+  Each entry contains the region UUID and generation number.
 - **Index catchup progress** (`index_catchup`) tracks which merged generation each base table index has been rebuilt to cover.
-When data is merged from a flushed MemTable to the base table, the base table's indexes may be rebuilt asynchronously.
-During this window, queries should use the flushed MemTable's pre-built indexes instead of scanning unindexed data in the base table.
-See [Indexed Read Plan](#indexed-read-plan) for details.
+  When data is merged from a flushed MemTable to the base table, the base table's indexes may be rebuilt asynchronously.
+  During this window, queries should use the flushed MemTable's pre-built indexes instead of scanning unindexed data in the base table.
+  See [Indexed Read Plan](#indexed-read-plan) for details.
 - **Region snapshot fields** (`snapshot_ts_millis`, `num_regions`, `inline_snapshots`) provide a snapshot of region states.
-The actual region manifests remain authoritative for region state.
-When `num_regions` is 0, the `inline_snapshots` field may be `None` or an empty Lance file with 0 rows but proper schema.
+  The actual region manifests remain authoritative for region state.
+  When `num_regions` is 0, the `inline_snapshots` field may be `None` or an empty Lance file with 0 rows but proper schema.
 
 <details>
 <summary>MemWalIndexDetails protobuf message</summary>
@@ -277,13 +277,13 @@ Regions without a spec ID (`spec_id = 0`) are manually-created regions not gover
 A region spec's field array consists of **region field** definitions.
 Each region field has the following properties:
 
-| Property | Description |
-|----------|-------------|
-| `field_id` | Unique string identifier for this region field |
-| `source_ids` | Array of field IDs referencing source columns in the schema |
-| `transform` | A well-known region expression, specify this or `expression` |
-| `expression` | A DataFusion SQL expression for custom logic, specify this or `transform` |
-| `result_type` | The output type of the region value |
+| Property      | Description                                                               |
+| ------------- | ------------------------------------------------------------------------- |
+| `field_id`    | Unique string identifier for this region field                            |
+| `source_ids`  | Array of field IDs referencing source columns in the schema               |
+| `transform`   | A well-known region expression, specify this or `expression`              |
+| `expression`  | A DataFusion SQL expression for custom logic, specify this or `transform` |
+| `result_type` | The output type of the region value                                       |
 
 #### Region Expression
 
@@ -304,16 +304,16 @@ Region expressions must satisfy the following requirements:
 A **Region Transform** is a well-known region expression with a predefined name.
 When a transform is specified, the expression is derived automatically.
 
-| Transform | Parameters | Region Expression | Result Type |
-|-----------|------------|-------------------|-------------|
-| `identity` | (none) | `col0` | same as source |
-| `year` | (none) | `date_part('year', col0)` | `int32` |
-| `month` | (none) | `date_part('month', col0)` | `int32` |
-| `day` | (none) | `date_part('day', col0)` | `int32` |
-| `hour` | (none) | `date_part('hour', col0)` | `int32` |
-| `bucket` | `num_buckets` | `abs(murmur3(col0)) % N` | `int32` |
-| `multi_bucket` | `num_buckets` | `abs(murmur3_multi(col0, col1, ...)) % N` | `int32` |
-| `truncate` | `width` | `left(col0, W)` (string) or `col0 - (col0 % W)` (numeric) | same as source |
+| Transform      | Parameters    | Region Expression                                         | Result Type    |
+| -------------- | ------------- | --------------------------------------------------------- | -------------- |
+| `identity`     | (none)        | `col0`                                                    | same as source |
+| `year`         | (none)        | `date_part('year', col0)`                                 | `int32`        |
+| `month`        | (none)        | `date_part('month', col0)`                                | `int32`        |
+| `day`          | (none)        | `date_part('day', col0)`                                  | `int32`        |
+| `hour`         | (none)        | `date_part('hour', col0)`                                 | `int32`        |
+| `bucket`       | `num_buckets` | `abs(murmur3(col0)) % N`                                  | `int32`        |
+| `multi_bucket` | `num_buckets` | `abs(murmur3_multi(col0, col1, ...)) % N`                 | `int32`        |
+| `truncate`     | `width`       | `left(col0, W)` (string) or `col0 - (col0 % W)` (numeric) | same as source |
 
 The `bucket` and `multi_bucket` transforms use Murmur3 hash functions:
 
@@ -326,10 +326,10 @@ The hash result is wrapped with `abs()` and modulo `N` to produce a non-negative
 
 Region snapshots are stored using one of two strategies based on the number of regions:
 
-| Region Count | Storage Strategy | Location |
-|--------------|------------------|----------|
-| <= 100 (threshold) | Inline | `inline_snapshots` field in index details |
-| > 100 | External Lance file | `_indices/{UUID}/index.lance` |
+| Region Count       | Storage Strategy    | Location                                  |
+| ------------------ | ------------------- | ----------------------------------------- |
+| <= 100 (threshold) | Inline              | `inline_snapshots` field in index details |
+| > 100              | External Lance file | `_indices/{UUID}/index.lance`             |
 
 The threshold (100 regions) is implementation-defined and may vary.
 
@@ -344,23 +344,23 @@ This file uses standard Lance format with the region snapshot schema, enabling e
 Region snapshots are stored as a Lance file with one row per region.
 The schema has one column per `RegionManifest` field plus region spec columns:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `region_id` | `fixed_size_binary(16)` | Region UUID bytes |
-| `version` | `uint64` | Region manifest version |
-| `region_spec_id` | `uint32` | Region spec ID (0 if manual) |
-| `writer_epoch` | `uint64` | Writer fencing token |
-| `replay_after_wal_entry_position` | `uint64` | Last WAL entry position (0-based) flushed to MemTable |
-| `wal_entry_position_last_seen` | `uint64` | Last WAL entry position (0-based) seen (hint) |
-| `current_generation` | `uint64` | Next generation to flush |
-| `flushed_generations` | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths |
-| `region_field_{field_id}` | varies | Region field value (one column per field in region spec) |
+| Column                            | Type                                             | Description                                              |
+| --------------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `region_id`                       | `fixed_size_binary(16)`                          | Region UUID bytes                                        |
+| `version`                         | `uint64`                                         | Region manifest version                                  |
+| `region_spec_id`                  | `uint32`                                         | Region spec ID (0 if manual)                             |
+| `writer_epoch`                    | `uint64`                                         | Writer fencing token                                     |
+| `replay_after_wal_entry_position` | `uint64`                                         | Last WAL entry position (0-based) flushed to MemTable    |
+| `wal_entry_position_last_seen`    | `uint64`                                         | Last WAL entry position (0-based) seen (hint)            |
+| `current_generation`              | `uint64`                                         | Next generation to flush                                 |
+| `flushed_generations`             | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths                                   |
+| `region_field_{field_id}`         | varies                                           | Region field value (one column per field in region spec) |
 
 For example, with a region spec containing a field `user_bucket` of type `int32`:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| ... | ... | (base columns above) |
+| Column                     | Type    | Description                  |
+| -------------------------- | ------- | ---------------------------- |
+| ...                        | ...     | (base columns above)         |
 | `region_field_user_bucket` | `int32` | Bucket value for this region |
 
 This schema directly corresponds to the fields in the `RegionManifest` protobuf message plus the computed region field values.
@@ -483,7 +483,7 @@ Without proper merging, queries would return duplicate or stale rows.
 
 ### Reader Consistency
 
-Reader consistency depends on two factors: 
+Reader consistency depends on two factors:
 
 1. access to in-memory MemTables
 2. the source of region metadata (either through MemWAL index or region manifests)
@@ -492,8 +492,8 @@ Strong consistency requires access to in-memory MemTables for all regions involv
 Otherwise, the query is eventually consistent due to missing unflushed data or stale MemWAL Index snapshots.
 
 !!!note
-    Reading a stale MemWAL Index does not impact correctness, only freshness:
-    
+Reading a stale MemWAL Index does not impact correctness, only freshness:
+
     - **Merged MemTable still in index**: If a flushed MemTable has been merged to the base table but still shows in the MemWAL index, readers query both. This results in some inefficiency for querying the same data twice, but [LSM-tree merging](#lsm-tree-merging-read) ensures correct results since both contain the same data. The inefficiency is also compensated by the fact that the data is covered by index and we rarely end up scanning both data.
     - **Garbage collected MemTable still in index**: If a flushed MemTable has been garbage collected, but is still in the MemWAL index, readers would fail to open it and skip it. This is also safe because if it is garbage collected, the data must already exist in the base table.
     - **Newly flushed MemTable not in index**: If a newly flushed MemTable is added after the snapshot was built, it is not queried. The result is eventually consistent but correct for the snapshot's point in time.
@@ -537,16 +537,16 @@ Region pruning applies to both scan queries and prefilters in search queries.
 
 #### Indexed Read Plan
 
-When data is merged from a flushed MemTable to the base table, the base table's indexes are rebuilt asynchronously by the [base table index builders](#base-table-index-builder).
+When data is merged from a flushed MemTable to the base table, the base table's indexes are rebuilt asynchronously by the base table index builders.
 During this window, the merged data exists in the base table but is not yet covered by the base table's indexes.
 
 Without special handling, indexed queries would fall back to expensive full scans for the unindexed part of the base table.
 To maintain indexed read performance, the query planner should use `index_catchup` progress to determine the optimal data source for each query.
 
 The key insight is that flushed MemTables serve as a bridge between the base table's index catchup and the current merged state.
-For a query that requires a specific index for acceleration, when `index_gen < merged_gen`, 
+For a query that requires a specific index for acceleration, when `index_gen < merged_gen`,
 the generations in the gap `(index_gen, merged_gen]` have data already merged in the base table but are not covered by the base table's index.
-Since flushed MemTables contain pre-built indexes (created during [MemTable flush](#memtable-flush)), queries can use these indexes instead of scanning unindexed data in the base table.
+Since flushed MemTables contain pre-built indexes (created during [MemTable flush](#flushed-memtable)), queries can use these indexes instead of scanning unindexed data in the base table.
 This ensures all reads remain indexed regardless of how far behind the async index builder is.
 
 ## Appendices
@@ -566,18 +566,18 @@ Region manifest (version 1):
 
 #### Scenario
 
-| Step | Writer A | Writer B | Manifest State |
-|------|----------|----------|----------------|
-| 1 | Loads manifest, sees epoch=5 | | epoch=5, version=1 |
-| 2 | Increments to epoch=6, writes manifest v2 | | epoch=6, version=2 |
-| 3 | Starts writing WAL entries 13, 14, 15 | | |
-| 4 | | Loads manifest v2, sees epoch=6 | epoch=6, version=2 |
-| 5 | | Increments to epoch=7, writes manifest v3 | epoch=7, version=3 |
-| 6 | | Starts writing WAL entries 16, 17 | |
-| 7 | Tries to flush MemTable, loads manifest | | |
-| 8 | Sees epoch=7, but local epoch=6 | | |
-| 9 | **Writer A is fenced!** Aborts all operations | | |
-| 10 | | Continues writing normally | epoch=7, version=3 |
+| Step | Writer A                                      | Writer B                                  | Manifest State     |
+| ---- | --------------------------------------------- | ----------------------------------------- | ------------------ |
+| 1    | Loads manifest, sees epoch=5                  |                                           | epoch=5, version=1 |
+| 2    | Increments to epoch=6, writes manifest v2     |                                           | epoch=6, version=2 |
+| 3    | Starts writing WAL entries 13, 14, 15         |                                           |                    |
+| 4    |                                               | Loads manifest v2, sees epoch=6           | epoch=6, version=2 |
+| 5    |                                               | Increments to epoch=7, writes manifest v3 | epoch=7, version=3 |
+| 6    |                                               | Starts writing WAL entries 16, 17         |                    |
+| 7    | Tries to flush MemTable, loads manifest       |                                           |                    |
+| 8    | Sees epoch=7, but local epoch=6               |                                           |                    |
+| 9    | **Writer A is fenced!** Aborts all operations |                                           |                    |
+| 10   |                                               | Continues writing normally                | epoch=7, version=3 |
 
 #### What Happens to Writer A's WAL Entries?
 
@@ -622,19 +622,19 @@ Region manifest (version 1):
 
 Two mergers both try to merge generation 6 concurrently.
 
-| Step | Merger A | Merger B | MemWAL Index |
-|------|----------|----------|--------------|
-| 1 | Reads index: merged_gen=5 | | merged_gen=5 |
-| 2 | Reads region manifest | | |
-| 3 | Starts merging gen 6 | | |
-| 4 | | Reads index: merged_gen=5 | merged_gen=5 |
-| 5 | | Reads region manifest | |
-| 6 | | Starts merging gen 6 | |
-| 7 | Commits (merged_gen=6) | | **merged_gen=6** |
-| 8 | | Tries to commit | |
-| 9 | | **Conflict**: reads new index | |
-| 10 | | Sees merged_gen=6 >= 6, aborts | |
-| 11 | | Reloads, continues to gen 7 | |
+| Step | Merger A                  | Merger B                       | MemWAL Index     |
+| ---- | ------------------------- | ------------------------------ | ---------------- |
+| 1    | Reads index: merged_gen=5 |                                | merged_gen=5     |
+| 2    | Reads region manifest     |                                |                  |
+| 3    | Starts merging gen 6      |                                |                  |
+| 4    |                           | Reads index: merged_gen=5      | merged_gen=5     |
+| 5    |                           | Reads region manifest          |                  |
+| 6    |                           | Starts merging gen 6           |                  |
+| 7    | Commits (merged_gen=6)    |                                | **merged_gen=6** |
+| 8    |                           | Tries to commit                |                  |
+| 9    |                           | **Conflict**: reads new index  |                  |
+| 10   |                           | Sees merged_gen=6 >= 6, aborts |                  |
+| 11   |                           | Reloads, continues to gen 7    |                  |
 
 Merger B's conflict resolution detected that generation 6 was already merged by checking the MemWAL Index in the conflicting commit.
 
@@ -642,15 +642,15 @@ Merger B's conflict resolution detected that generation 6 was already merged by 
 
 Merger A crashes after committing to the table.
 
-| Step | Merger A | Merger B | MemWAL Index |
-|------|----------|----------|--------------|
-| 1 | Reads index: merged_gen=5 | | merged_gen=5 |
-| 2 | Merges gen 6, commits | | **merged_gen=6** |
-| 3 | **CRASH** | | merged_gen=6 |
-| 4 | | Reads index: merged_gen=6 | merged_gen=6 |
-| 5 | | Reads region manifest | |
-| 6 | | **Skips gen 6** (already merged) | |
-| 7 | | Merges gen 7, commits | **merged_gen=7** |
+| Step | Merger A                  | Merger B                         | MemWAL Index     |
+| ---- | ------------------------- | -------------------------------- | ---------------- |
+| 1    | Reads index: merged_gen=5 |                                  | merged_gen=5     |
+| 2    | Merges gen 6, commits     |                                  | **merged_gen=6** |
+| 3    | **CRASH**                 |                                  | merged_gen=6     |
+| 4    |                           | Reads index: merged_gen=6        | merged_gen=6     |
+| 5    |                           | Reads region manifest            |                  |
+| 6    |                           | **Skips gen 6** (already merged) |                  |
+| 7    |                           | Merges gen 7, commits            | **merged_gen=7** |
 
 The MemWAL Index is the single source of truth. Merger B correctly used it to determine that generation 6 was already merged.
 
