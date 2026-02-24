@@ -5,7 +5,7 @@ description: Learn how to version your Lance datasets with append, overwrite, ta
 
 # Versioning Your Datasets with Lance
 
-Lance supports versioning natively, allowing you to track changes over time. 
+Lance supports versioning natively, allowing you to track changes over time.
 
 In this tutorial, you'll learn how to append new data to existing datasets while preserving historical versions and access specific versions using version numbers or meaningful tags. You'll also understand how to implement proper data governance practices with Lance's native versioning capabilities.
 
@@ -110,4 +110,4 @@ For more details, see [Tags and Branches](../guide/tags_and_branches.md).
 
 Now that you've mastered dataset versioning with Lance, check out **[Vector Indexing and Vector Search With Lance](vector-search.md)**. You can learn how to build high-performance vector search capabilities on top of your Lance tables.
 
-This will teach you how to build fast, scalable search capabilities for your versioned datasets. 
+This will teach you how to build fast, scalable search capabilities for your versioned datasets.
