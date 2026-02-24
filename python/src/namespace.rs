@@ -887,6 +887,51 @@ impl LanceNamespaceTrait for PyLanceNamespace {
     }
 }
 
+/// Extract an `Arc<dyn LanceNamespace>` from a Python namespace object.
+///
+/// This function handles the different ways a Python namespace can be provided:
+/// 1. Direct PyO3 class (PyDirectoryNamespace or PyRestNamespace)
+/// 2. Python wrapper class with `_inner` attribute that holds the PyO3 class
+/// 3. Custom Python implementation (wrapped with PyLanceNamespace)
+///
+/// For Python wrapper classes (DirectoryNamespace, RestNamespace in namespace.py),
+/// we check if it's the exact wrapper class by comparing type names. Subclasses
+/// are wrapped with PyLanceNamespace to call through Python.
+pub fn extract_namespace_arc(
+    py: Python<'_>,
+    ns: &Bound<'_, PyAny>,
+) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
+    // Direct PyO3 class
+    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+        return Ok(dir_ns.borrow().inner.clone());
+    }
+    if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+        return Ok(rest_ns.borrow().inner.clone());
+    }
+
+    // Python wrapper class - check if it's the exact wrapper class
+    if let Ok(inner) = ns.getattr("_inner") {
+        let type_name = ns
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+
+        if type_name == "DirectoryNamespace" {
+            if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
+                return Ok(dir_ns.borrow().inner.clone());
+            }
+        } else if type_name == "RestNamespace" {
+            if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
+                return Ok(rest_ns.borrow().inner.clone());
+            }
+        }
+    }
+
+    // Custom Python implementation or subclass - wrap with PyLanceNamespace
+    PyLanceNamespace::create_arc(py, ns)
+}
+
 /// Python wrapper for REST adapter server
 #[pyclass(name = "PyRestAdapter", module = "lance.lance")]
 pub struct PyRestAdapter {

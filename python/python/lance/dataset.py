@@ -3468,13 +3468,11 @@ class LanceDataset(pa.dataset.Dataset):
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
         namespace : LanceNamespace, optional
-            A namespace instance to use for managed versioning. When provided along
-            with table_id, the commit will go through the namespace's
-            create_table_version API, enabling server-side version tracking and
-            event emission. Use lance.namespace.connect() to create a namespace.
+            A namespace instance. Must be provided together with table_id.
+            Use lance.namespace.connect() to create a namespace.
         table_id : List[str], optional
             The table identifier within the namespace (e.g., ["workspace", "table"]).
-            Must be provided together with namespace for managed versioning.
+            Must be provided together with namespace.
 
         Returns
         -------
