@@ -193,7 +193,7 @@ impl RetryExecutor for DeleteJob {
                     let fragments = self.dataset.get_fragments();
                     let num_deleted_rows: u64 = fragments
                         .iter()
-                        .map(|f| f.metadata.physical_rows.unwrap_or(0) as u64)
+                        .map(|f| f.metadata.num_rows().unwrap_or(0) as u64)
                         .sum();
                     let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
 
