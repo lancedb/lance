@@ -1121,9 +1121,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chrono"
-version = "0.4.43"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118"
+checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -2386,7 +2386,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3426,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3491,7 +3491,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3578,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3610,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3624,7 +3624,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3691,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3722,7 +3722,6 @@ dependencies = [
  "prost",
  "rand 0.9.2",
  "serde",
- "shellexpand",
  "snafu",
  "tempfile",
  "tokio",
@@ -3732,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3766,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3782,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3794,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3838,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "3.0.0-beta.5"
+version = "3.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5691,9 +5690,9 @@ dependencies = [
 
 [[package]]
 name = "serde_tokenstream"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64060d864397305347a78851c51588fd283767e7e7589829e8121d65512340f1"
+checksum = "d7c49585c52c01f13c5c2ebb333f14f6885d76daa768d8a037d28017ec538c69"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5755,15 +5754,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shellexpand"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1fdf65dd6331831494dd616b30351c38e96e45921a27745cf98490458b90bb"
-dependencies = [
- "dirs",
 ]
 
 [[package]]

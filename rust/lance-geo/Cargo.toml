@@ -13,13 +13,16 @@ description = "Lance's geospatial extension providing geospatial UDFs."
 
 [dependencies]
 datafusion.workspace = true
-geoarrow-array.workspace = true
-geoarrow-schema.workspace = true
-geodatafusion.workspace = true
-geo-traits.workspace = true
-geo-types.workspace = true
+geoarrow-array = { workspace = true, optional = true }
+geoarrow-schema = { workspace = true, optional = true }
+geodatafusion = { workspace = true, optional = true }
+geo-traits = { workspace = true, optional = true }
+geo-types = { workspace = true, optional = true }
 lance-core.workspace = true
 serde.workspace = true
+
+[features]
+geo = ["dep:geoarrow-array", "dep:geoarrow-schema", "dep:geodatafusion", "dep:geo-traits", "dep:geo-types"]
 
 [lints]
 workspace = true
