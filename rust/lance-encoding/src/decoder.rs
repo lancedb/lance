@@ -261,8 +261,6 @@ use crate::{BufferScheduler, EncodingsIo};
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
-const ENV_LANCE_STRUCTURAL_BATCH_DECODE_POINT_LOOKUP_MAX_INDICES: &str =
-    "LANCE_STRUCTURAL_BATCH_DECODE_POINT_LOOKUP_MAX_INDICES";
 const DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES: usize = 1024;
 
 /// Top-level encoding message for a page.  Wraps both the
@@ -1906,29 +1904,8 @@ fn structural_batch_decode_spawn_mode() -> StructuralBatchDecodeSpawnMode {
     }
 }
 
-fn structural_point_lookup_max_indices() -> usize {
-    let from_env = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_POINT_LOOKUP_MAX_INDICES);
-    match from_env {
-        Ok(raw) => match raw.parse::<usize>() {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                warn!(
-                    "Failed to parse {}='{}': {}. Falling back to default {}.",
-                    ENV_LANCE_STRUCTURAL_BATCH_DECODE_POINT_LOOKUP_MAX_INDICES,
-                    raw,
-                    err,
-                    DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES
-                );
-                DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES
-            }
-        },
-        Err(_) => DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES,
-    }
-}
-
 fn should_spawn_structural_batch_decode_tasks_with_mode(
     mode: StructuralBatchDecodeSpawnMode,
-    point_lookup_max_indices: usize,
     requested_rows: &RequestedRows,
     filter: &FilterExpression,
 ) -> bool {
@@ -1941,7 +1918,9 @@ fn should_spawn_structural_batch_decode_tasks_with_mode(
             }
             match requested_rows {
                 RequestedRows::Ranges(_) => true,
-                RequestedRows::Indices(indices) => indices.len() > point_lookup_max_indices,
+                RequestedRows::Indices(indices) => {
+                    indices.len() > DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES
+                }
             }
         }
     }
@@ -1953,7 +1932,6 @@ fn should_spawn_structural_batch_decode_tasks(
 ) -> bool {
     should_spawn_structural_batch_decode_tasks_with_mode(
         structural_batch_decode_spawn_mode(),
-        structural_point_lookup_max_indices(),
         requested_rows,
         filter,
     )
@@ -2841,7 +2819,6 @@ mod tests {
         let requested_rows = RequestedRows::Indices(vec![1, 3, 5]);
         assert!(!should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Auto,
-            8,
             &requested_rows,
             &FilterExpression::no_filter()
         ));
@@ -2849,10 +2826,11 @@ mod tests {
 
     #[test]
     fn test_spawn_policy_auto_large_take() {
-        let requested_rows = RequestedRows::Indices(vec![1, 3, 5]);
+        let requested_rows = RequestedRows::Indices(
+            (0..=(DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES as u64)).collect(),
+        );
         assert!(should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Auto,
-            2,
             &requested_rows,
             &FilterExpression::no_filter()
         ));
@@ -2863,7 +2841,6 @@ mod tests {
         let requested_rows = RequestedRows::Ranges(vec![0..100]);
         assert!(should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Auto,
-            1024,
             &requested_rows,
             &FilterExpression::no_filter()
         ));
@@ -2875,7 +2852,6 @@ mod tests {
         let filter = FilterExpression(Bytes::from_static(b"has-filter"));
         assert!(!should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Auto,
-            1024,
             &requested_rows,
             &filter
         ));
@@ -2887,7 +2863,6 @@ mod tests {
         let filter = FilterExpression(Bytes::from_static(b"has-filter"));
         assert!(should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Always,
-            1024,
             &requested_rows,
             &filter
         ));
@@ -2898,7 +2873,6 @@ mod tests {
         let requested_rows = RequestedRows::Ranges(vec![0..100]);
         assert!(!should_spawn_structural_batch_decode_tasks_with_mode(
             StructuralBatchDecodeSpawnMode::Never,
-            1024,
             &requested_rows,
             &FilterExpression::no_filter()
         ));
