@@ -1805,13 +1805,10 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(sess) = &self.session {
             builder = builder.with_session(sess.clone());
         }
-        let mut dataset = builder
-            .load()
-            .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
-                location: snafu::location!(),
-            })?;
+        let mut dataset = builder.load().await.map_err(|e| Error::Namespace {
+            source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
+            location: snafu::location!(),
+        })?;
 
         if let Some(version) = request.version {
             dataset = dataset
