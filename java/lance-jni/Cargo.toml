@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "3.0.0-beta.3"
+version = "3.1.0-beta.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.91"
@@ -26,6 +26,7 @@ lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
+lance-table = { path = "../../rust/lance-table" }
 arrow = { version = "57.1", features = ["ffi"] }
 arrow-schema = "57.1"
 object_store = { version = "0.12.2" }

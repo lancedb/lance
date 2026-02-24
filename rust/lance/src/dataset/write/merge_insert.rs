@@ -3913,7 +3913,7 @@ mod tests {
             } else {
                 let id_index = id_index.unwrap();
                 let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
-                // Fragment bitmaps are now immutable, so we check the effective bitmap
+                // Check the effective bitmap (raw bitmap intersected with existing fragments)
                 let effective_bitmap = id_index
                     .effective_fragment_bitmap(&dataset.fragment_bitmap)
                     .unwrap();
@@ -3930,7 +3930,7 @@ mod tests {
             } else {
                 let value_index = value_index.unwrap();
                 let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
-                // Fragment bitmaps are now immutable, so we check the effective bitmap
+                // Check the effective bitmap (raw bitmap intersected with existing fragments)
                 let effective_bitmap = value_index
                     .effective_fragment_bitmap(&dataset.fragment_bitmap)
                     .unwrap();
@@ -3943,10 +3943,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            // With immutable fragment bitmaps, the other_value index behavior is:
-            // - Its fragment bitmap is never updated (it retains the original [0,1,2,3])
-            // - The effective bitmap reflects what fragments are still valid for the index
-            // - For partial merges that don't include other_value, the index remains fully valid
+            // The other_value index retains its original bitmap [0,1,2,3] since
+            // partial merges that don't modify other_value won't prune it.
             let effective_bitmap = other_value_index
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .unwrap();

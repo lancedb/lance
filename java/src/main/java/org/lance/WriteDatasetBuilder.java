@@ -364,6 +364,7 @@ public class WriteDatasetBuilder {
   private Dataset executeWithNamespace() {
     String tableUri;
     Map<String, String> namespaceStorageOptions = null;
+    boolean managedVersioning = false;
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
@@ -379,13 +380,16 @@ public class WriteDatasetBuilder {
         DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
         location = declareResponse.getLocation();
         responseStorageOptions = declareResponse.getStorageOptions();
+        managedVersioning = Boolean.TRUE.equals(declareResponse.getManagedVersioning());
       } catch (UnsupportedOperationException e) {
         // Fall back to deprecated createEmptyTable
+        // Note: createEmptyTable doesn't support managedVersioning
         CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
         fallbackRequest.setId(tableId);
         CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
         location = fallbackResponse.getLocation();
         responseStorageOptions = fallbackResponse.getStorageOptions();
+        managedVersioning = false;
       }
 
       tableUri = location;
@@ -407,6 +411,7 @@ public class WriteDatasetBuilder {
       }
 
       namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      managedVersioning = Boolean.TRUE.equals(response.getManagedVersioning());
     }
 
     // Merge storage options (namespace options + user options, with namespace taking precedence)
@@ -436,8 +441,13 @@ public class WriteDatasetBuilder {
             ? null
             : new LanceNamespaceStorageOptionsProvider(namespace, tableId);
 
-    // Use Dataset.create() which handles CREATE/APPEND/OVERWRITE modes
-    return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    // Only use namespace for commit handling if managedVersioning is enabled
+    if (managedVersioning) {
+      return createDatasetWithStreamAndNamespace(
+          tableUri, params, storageOptionsProvider, namespace, tableId);
+    } else {
+      return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    }
   }
 
   private Dataset executeWithUri() {
@@ -473,6 +483,36 @@ public class WriteDatasetBuilder {
     }
 
     // If only schema is provided (empty table), use Dataset.create with schema
+    if (schema != null) {
+      return Dataset.create(allocator, path, schema, params);
+    }
+
+    throw new IllegalStateException("No data source provided");
+  }
+
+  private Dataset createDatasetWithStreamAndNamespace(
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    // If stream is directly provided, use it
+    if (stream != null) {
+      return Dataset.create(
+          allocator, stream, path, params, storageOptionsProvider, namespace, tableId);
+    }
+
+    // If reader is provided, convert to stream
+    if (reader != null) {
+      try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, tempStream);
+        return Dataset.create(
+            allocator, tempStream, path, params, storageOptionsProvider, namespace, tableId);
+      }
+    }
+
+    // If only schema is provided (empty table), use Dataset.create with schema
+    // Note: Schema-only creation doesn't support namespace-based commit handling
     if (schema != null) {
       return Dataset.create(allocator, path, schema, params);
     }

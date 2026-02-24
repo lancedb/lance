@@ -138,8 +138,12 @@ impl ScalarIndex for JsonIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
-        let target_created = self.target_index.update(new_data, dest_store).await?;
+        let target_created = self
+            .target_index
+            .update(new_data, dest_store, valid_old_fragments)
+            .await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
@@ -776,6 +780,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<JsonTrainingRequest>()
@@ -805,7 +810,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         )?;
 
         let target_index = target_plugin
-            .train_index(converted_stream, index_store, target_request, fragment_ids)
+            .train_index(
+                converted_stream,
+                index_store,
+                target_request,
+                fragment_ids,
+                progress,
+            )
             .await?;
 
         let index_details = crate::pb::JsonIndexDetails {

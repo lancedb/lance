@@ -22,6 +22,7 @@ use futures::{future::BoxFuture, FutureExt, Stream};
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 
@@ -39,6 +40,7 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+#[cfg(feature = "geo")]
 pub mod rtree;
 pub mod zoned;
 pub mod zonemap;
@@ -735,6 +737,7 @@ impl AnyQuery for TokenQuery {
     }
 }
 
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationQuery {
     pub value: ScalarValue,
@@ -742,12 +745,14 @@ pub struct RelationQuery {
 }
 
 /// A query that a Geo index can satisfy
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeoQuery {
     IntersectQuery(RelationQuery),
     IsNull,
 }
 
+#[cfg(feature = "geo")]
 impl AnyQuery for GeoQuery {
     fn as_any(&self) -> &dyn Any {
         self
@@ -888,10 +893,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    ///
+    /// If `valid_old_fragments` is provided, old index data for fragments not in the bitmap
+    /// will be filtered out during the merge.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index
