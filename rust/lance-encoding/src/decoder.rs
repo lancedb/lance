@@ -259,9 +259,6 @@ use crate::{BufferScheduler, EncodingsIo};
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
-const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
-    "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
-const DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES: usize = 1024;
 
 /// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
@@ -1692,7 +1689,6 @@ pub struct StructuralBatchDecodeStream {
     rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
-    spawn_batch_decode_tasks: bool,
 }
 
 impl StructuralBatchDecodeStream {
@@ -1710,7 +1706,6 @@ impl StructuralBatchDecodeStream {
         rows_per_batch: u32,
         num_rows: u64,
         root_decoder: StructuralStructDecoder,
-        spawn_batch_decode_tasks: bool,
     ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
@@ -1721,7 +1716,6 @@ impl StructuralBatchDecodeStream {
             rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
-            spawn_batch_decode_tasks,
         }
     }
 
@@ -1799,24 +1793,17 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
                 let task = async move {
                     let next_task = next_task?;
-                    if spawn_batch_decode_tasks {
-                        // Real decode work happens inside into_batch, which can block the current
-                        // thread for a long time. By spawning it as a new task, we allow Tokio's
-                        // worker threads to keep making progress.
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                        )
+                    // Real decode work happens inside into_batch, which can block the current
+                    // thread for a long time. By spawning it as a new task, we allow Tokio's
+                    // worker threads to keep making progress.
+                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
                         .await
                         .map_err(|err| Error::Wrapped {
                             error: err.into(),
                             location: location!(),
                         })?
-                    } else {
-                        next_task.into_batch(emitted_batch_size_warning)
-                    }
                 };
                 (task, num_rows)
             });
@@ -1857,68 +1844,12 @@ impl RequestedRows {
 }
 
 /// Configuration for decoder behavior
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecoderConfig {
     /// Whether to cache repetition indices for better performance
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
-    /// Controls whether structural decode batches should be spawned as tokio tasks.
-    pub structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode,
-    /// In auto mode, takes with at most this many indices are treated as point lookups.
-    pub structural_batch_decode_point_lookup_max_indices: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StructuralBatchDecodeSpawnMode {
-    /// Choose strategy based on request shape:
-    /// - `Indices` with small cardinality => no spawn
-    /// - `Ranges` => spawn
-    /// - any filter => no spawn
-    Auto,
-    /// Always spawn a decode task for structural batches.
-    Always,
-    /// Never spawn a decode task for structural batches.
-    Never,
-}
-
-impl Default for StructuralBatchDecodeSpawnMode {
-    fn default() -> Self {
-        static DEFAULT: LazyLock<StructuralBatchDecodeSpawnMode> = LazyLock::new(|| {
-            let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
-            match mode
-                .ok()
-                .as_deref()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref()
-            {
-                None | Some("") | Some("auto") => StructuralBatchDecodeSpawnMode::Auto,
-                Some("always") => StructuralBatchDecodeSpawnMode::Always,
-                Some("never") => StructuralBatchDecodeSpawnMode::Never,
-                Some(other) => {
-                    warn!(
-                        "Unknown value '{}' for {}. Valid values are auto|always|never. Falling back to auto.",
-                        other,
-                        ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE
-                    );
-                    StructuralBatchDecodeSpawnMode::Auto
-                }
-            }
-        });
-        *DEFAULT
-    }
-}
-
-impl Default for DecoderConfig {
-    fn default() -> Self {
-        Self {
-            cache_repetition_index: false,
-            validate_on_decode: false,
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::default(),
-            structural_batch_decode_point_lookup_max_indices:
-                DEFAULT_STRUCTURAL_POINT_LOOKUP_MAX_INDICES,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1957,7 +1888,6 @@ pub fn create_decode_stream(
     batch_size: u32,
     is_structural: bool,
     should_validate: bool,
-    spawn_structural_batch_decode_tasks: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
@@ -1967,42 +1897,16 @@ pub fn create_decode_stream(
             should_validate,
             /*is_root=*/ true,
         )?;
-        Ok(StructuralBatchDecodeStream::new(
-            rx,
-            batch_size,
-            num_rows,
-            structural_decoder,
-            spawn_structural_batch_decode_tasks,
+        Ok(
+            StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder)
+                .into_stream(),
         )
-        .into_stream())
     } else {
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
-    }
-}
-
-fn should_spawn_structural_batch_decode_tasks(
-    decoder_config: &DecoderConfig,
-    requested_rows: &RequestedRows,
-    filter: &FilterExpression,
-) -> bool {
-    match decoder_config.structural_batch_decode_spawn_mode {
-        StructuralBatchDecodeSpawnMode::Always => true,
-        StructuralBatchDecodeSpawnMode::Never => false,
-        StructuralBatchDecodeSpawnMode::Auto => {
-            if !filter.is_noop() {
-                return false;
-            }
-            match requested_rows {
-                RequestedRows::Ranges(_) => true,
-                RequestedRows::Indices(indices) => {
-                    indices.len() > decoder_config.structural_batch_decode_point_lookup_max_indices
-                }
-            }
-        }
     }
 }
 
@@ -2052,11 +1956,6 @@ fn create_scheduler_decoder(
     let num_rows = requested_rows.num_rows();
 
     let is_structural = column_infos[0].is_structural();
-    let spawn_structural_batch_decode_tasks = should_spawn_structural_batch_decode_tasks(
-        &config.decoder_config,
-        &requested_rows,
-        &filter,
-    );
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -2066,7 +1965,6 @@ fn create_scheduler_decoder(
         config.batch_size,
         is_structural,
         config.decoder_config.validate_on_decode,
-        spawn_structural_batch_decode_tasks,
         rx,
     )?;
 
@@ -2766,19 +2664,12 @@ pub async fn decode_batch(
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
     let is_structural = version >= LanceFileVersion::V2_1;
-    let requested_rows = RequestedRows::Ranges(vec![0..batch.num_rows]);
-    let spawn_structural_batch_decode_tasks = should_spawn_structural_batch_decode_tasks(
-        &DecoderConfig::default(),
-        &requested_rows,
-        filter,
-    );
     let mut decode_stream = create_decode_stream(
         &batch.schema,
         batch.num_rows,
         batch.num_rows as u32,
         is_structural,
         should_validate,
-        spawn_structural_batch_decode_tasks,
         rx,
     )?;
     decode_stream.next().await.unwrap().task.await
@@ -2788,7 +2679,6 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {
@@ -2809,99 +2699,5 @@ mod tests {
         let indices = vec![1, 2, 3, 5, 6, 7, 9];
         let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
         assert_eq!(ranges, vec![1..4, 5..8, 9..10]);
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_auto_small_take() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Auto,
-            structural_batch_decode_point_lookup_max_indices: 8,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Indices(vec![1, 3, 5]);
-
-        assert!(!should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &FilterExpression::no_filter()
-        ));
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_auto_large_take() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Auto,
-            structural_batch_decode_point_lookup_max_indices: 2,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Indices(vec![1, 3, 5]);
-
-        assert!(should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &FilterExpression::no_filter()
-        ));
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_auto_ranges() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Auto,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Ranges(vec![0..100]);
-
-        assert!(should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &FilterExpression::no_filter()
-        ));
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_auto_filter_disables_spawn() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Auto,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Ranges(vec![0..100]);
-        let filter = FilterExpression(Bytes::from_static(b"has-filter"));
-
-        assert!(!should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &filter
-        ));
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_always() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Always,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Indices(vec![1]);
-        let filter = FilterExpression(Bytes::from_static(b"has-filter"));
-
-        assert!(should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &filter
-        ));
-    }
-
-    #[test]
-    fn test_spawn_structural_batch_decode_tasks_never() {
-        let config = DecoderConfig {
-            structural_batch_decode_spawn_mode: StructuralBatchDecodeSpawnMode::Never,
-            ..Default::default()
-        };
-        let requested_rows = RequestedRows::Ranges(vec![0..100]);
-
-        assert!(!should_spawn_structural_batch_decode_tasks(
-            &config,
-            &requested_rows,
-            &FilterExpression::no_filter()
-        ));
     }
 }
