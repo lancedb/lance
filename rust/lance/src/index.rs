@@ -1035,7 +1035,7 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
         "Detecting out-dated fragment metadata, migrating dataset. \
                         To disable migration, set LANCE_AUTO_MIGRATION=false"
     );
-    ds.delete("false").await.map_err(|err| Error::Execution {
+    ds.delete("false").await.map(|_| ()).map_err(|err| Error::Execution {
         message: format!(
             "Failed to migrate dataset while calculating index statistics. \
                             To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
