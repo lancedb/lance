@@ -434,6 +434,8 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
+        namespace: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -464,6 +466,8 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
+            namespace=namespace,
+            table_id=table_id,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -5813,6 +5817,9 @@ def write_dataset(
                 f"Namespace did not return a table location in {mode} response"
             )
 
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
+
         # Use namespace storage options
         namespace_storage_options = response.storage_options
 
@@ -5837,6 +5844,7 @@ def write_dataset(
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
     else:
         storage_options_provider = None
+        managed_versioning = False
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -5876,6 +5884,11 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
+
+    # Add namespace and table_id for managed versioning (external manifest store)
+    if managed_versioning and namespace is not None and table_id is not None:
+        params["namespace"] = namespace
+        params["table_id"] = table_id
 
     if commit_lock:
         if not callable(commit_lock):

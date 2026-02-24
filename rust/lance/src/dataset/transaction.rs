@@ -2059,6 +2059,18 @@ impl Transaction {
 
                 let existing_fragments = maybe_existing_fragments?;
 
+                // Collect replaced field IDs before consuming new_datafiles
+                let replaced_fields: Vec<u32> = new_datafiles
+                    .first()
+                    .map(|f| {
+                        f.fields
+                            .iter()
+                            .filter(|&&id| id >= 0)
+                            .map(|&id| id as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
                 // 3. add modified fragments to final_fragments
                 for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
@@ -2128,6 +2140,19 @@ impl Transaction {
                     .collect::<Vec<_>>();
 
                 final_fragments.extend(unmodified_fragments);
+
+                // 5. Invalidate index bitmaps for replaced fields
+                let modified_fragments: Vec<Fragment> = final_fragments
+                    .iter()
+                    .filter(|f| fragments_changed.contains(&f.id))
+                    .cloned()
+                    .collect();
+
+                Self::prune_updated_fields_from_indices(
+                    &mut final_indices,
+                    &modified_fragments,
+                    &replaced_fields,
+                );
             }
             Operation::UpdateMemWalState { merged_generations } => {
                 update_mem_wal_index_merged_generations(
@@ -2392,9 +2417,9 @@ impl Transaction {
                 || is_system_index(existing_index)
         });
 
-        // Fragment bitmaps are now immutable and always represent the fragments that
-        // the index contains row IDs for, regardless of whether those fragments still exist.
-        // This ensures consistent prefiltering behavior and clear semantics.
+        // Fragment bitmaps record which fragments the index was originally built for.
+        // Operations like updates and data replacement prune these bitmaps, and
+        // effective_fragment_bitmap intersects with existing fragments at query time.
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)

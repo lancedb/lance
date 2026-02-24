@@ -26,7 +26,6 @@ use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -337,7 +336,8 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 }
 
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
-    let expanded = tilde(str_path.as_ref()).to_string();
+    let str_path = str_path.as_ref();
+    let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
@@ -351,6 +351,22 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     }
 
     Ok(expanded_path)
+}
+
+fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
+    let home_dir = std::env::home_dir()?;
+    if path == "~" {
+        return Some(home_dir);
+    }
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return Some(home_dir.join(stripped));
+    }
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix("~\\") {
+        return Some(home_dir.join(stripped));
+    }
+
+    None
 }
 
 fn local_path_to_url(str_path: &str) -> Result<Url> {
@@ -967,8 +983,7 @@ mod tests {
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
-        let expanded = tilde(path_str).to_string();
-        let path = StdPath::new(&expanded);
+        let path = expand_path(path_str).map_err(std::io::Error::other)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
     }

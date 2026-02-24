@@ -4,7 +4,7 @@ nav:
   - Data Evolution: data_evolution.md
   - Blob API: blob.md
   - JSON Support: json.md
-  - Tags: tags.md
+  - Tags and Branches: tags_and_branches.md
   - Object Store Configuration: object_store.md
   - Distributed Write: distributed_write.md
   - Migration Guide: migration.md

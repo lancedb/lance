@@ -197,6 +197,7 @@ def dataset(
         )
 
     # Handle namespace resolution in Python
+    managed_versioning = False
     if namespace is not None:
         if table_id is None:
             raise ValueError(
@@ -209,6 +210,9 @@ def dataset(
         uri = response.location
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
+
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
 
         namespace_storage_options = response.storage_options
 
@@ -239,6 +243,8 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
+        namespace=namespace if managed_versioning else None,
+        table_id=table_id if managed_versioning else None,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
