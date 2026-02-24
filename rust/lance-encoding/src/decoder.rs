@@ -1874,51 +1874,25 @@ pub struct SchedulerDecoderConfig {
     pub decoder_config: DecoderConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StructuralBatchDecodeSpawnMode {
-    Auto,
-    Always,
-    Never,
-}
-
-fn structural_batch_decode_spawn_mode() -> StructuralBatchDecodeSpawnMode {
-    let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
-    match mode
-        .ok()
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        None | Some("") | Some("auto") => StructuralBatchDecodeSpawnMode::Auto,
-        Some("always") => StructuralBatchDecodeSpawnMode::Always,
-        Some("never") => StructuralBatchDecodeSpawnMode::Never,
-        Some(other) => {
-            warn!(
-                "Unknown value '{}' for {}. Valid values are auto|always|never. Falling back to auto.",
-                other,
-                ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE
-            );
-            StructuralBatchDecodeSpawnMode::Auto
-        }
-    }
-}
-
 fn should_spawn_structural_batch_decode_tasks_with_mode(
-    mode: StructuralBatchDecodeSpawnMode,
+    mode: Option<&str>,
     requested_rows: &RequestedRows,
 ) -> bool {
     match mode {
-        StructuralBatchDecodeSpawnMode::Always => true,
-        StructuralBatchDecodeSpawnMode::Never => false,
-        StructuralBatchDecodeSpawnMode::Auto => matches!(requested_rows, RequestedRows::Ranges(_)),
+        Some("always") => true,
+        Some("never") => false,
+        _ => matches!(requested_rows, RequestedRows::Ranges(_)),
     }
 }
 
 fn should_spawn_structural_batch_decode_tasks(requested_rows: &RequestedRows) -> bool {
-    should_spawn_structural_batch_decode_tasks_with_mode(
-        structural_batch_decode_spawn_mode(),
-        requested_rows,
-    )
+    let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
+    should_spawn_structural_batch_decode_tasks_with_mode(mode.ok().as_deref(), requested_rows)
+}
+
+fn should_spawn_structural_batch_decode_tasks_without_request() -> bool {
+    let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
+    !matches!(mode.ok().as_deref(), Some("never"))
 }
 
 fn check_scheduler_on_drop(
@@ -1949,12 +1923,9 @@ pub fn create_decode_stream(
     should_validate: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
-    let spawn_structural_batch_decode_tasks = match structural_batch_decode_spawn_mode() {
-        StructuralBatchDecodeSpawnMode::Always => true,
-        StructuralBatchDecodeSpawnMode::Never => false,
-        // Keep existing behavior for contextless call sites (historically we spawned).
-        StructuralBatchDecodeSpawnMode::Auto => true,
-    };
+    // Keep existing behavior for contextless call sites (historically we spawned).
+    let spawn_structural_batch_decode_tasks =
+        should_spawn_structural_batch_decode_tasks_without_request();
     create_decode_stream_with_spawn(
         schema,
         num_rows,
@@ -2801,7 +2772,7 @@ mod tests {
     fn test_spawn_policy_auto_ranges() {
         let requested_rows = RequestedRows::Ranges(vec![0..100]);
         assert!(should_spawn_structural_batch_decode_tasks_with_mode(
-            StructuralBatchDecodeSpawnMode::Auto,
+            Some("auto"),
             &requested_rows
         ));
     }
@@ -2810,7 +2781,7 @@ mod tests {
     fn test_spawn_policy_auto_indices_never_spawn() {
         let requested_rows = RequestedRows::Indices(vec![1, 3, 5]);
         assert!(!should_spawn_structural_batch_decode_tasks_with_mode(
-            StructuralBatchDecodeSpawnMode::Auto,
+            Some("auto"),
             &requested_rows
         ));
     }
@@ -2819,7 +2790,7 @@ mod tests {
     fn test_spawn_policy_always() {
         let requested_rows = RequestedRows::Indices(vec![1]);
         assert!(should_spawn_structural_batch_decode_tasks_with_mode(
-            StructuralBatchDecodeSpawnMode::Always,
+            Some("always"),
             &requested_rows
         ));
     }
@@ -2828,7 +2799,16 @@ mod tests {
     fn test_spawn_policy_never() {
         let requested_rows = RequestedRows::Ranges(vec![0..100]);
         assert!(!should_spawn_structural_batch_decode_tasks_with_mode(
-            StructuralBatchDecodeSpawnMode::Never,
+            Some("never"),
+            &requested_rows
+        ));
+    }
+
+    #[test]
+    fn test_spawn_policy_unknown_defaults_to_auto() {
+        let requested_rows = RequestedRows::Ranges(vec![0..100]);
+        assert!(should_spawn_structural_batch_decode_tasks_with_mode(
+            Some("something-else"),
             &requested_rows
         ));
     }
