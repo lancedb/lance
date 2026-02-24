@@ -1392,10 +1392,11 @@ impl Dataset {
     #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
     fn delete(
         &mut self,
+        py: Python<'_>,
         predicate: String,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<PyAny>> {
         let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
 
         if let Some(retries) = conflict_retries {
@@ -1406,11 +1407,13 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        let new_dataset = rt()
+        let result = rt()
             .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = new_dataset;
-        Ok(())
+        self.ds = result.new_dataset;
+        let dict = PyDict::new(py);
+        dict.set_item("num_deleted_rows", result.num_deleted_rows)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
