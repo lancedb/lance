@@ -2177,7 +2177,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2190,6 +2190,8 @@ impl Dataset {
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2210,13 +2212,15 @@ impl Dataset {
             detached,
             max_retries,
             enable_stable_row_ids,
+            namespace,
+            table_id,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2227,6 +2231,8 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2242,14 +2248,57 @@ impl Dataset {
             None
         };
 
-        let commit_handler = commit_lock
+        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        let commit_handler: Option<Arc<dyn CommitHandler>> = if let Some(commit_lock) = commit_lock
             .as_ref()
-            .map(|commit_lock| {
+        {
+            // User provided a commit_lock
+            Some(
                 commit_lock
                     .into_py_any(commit_lock.py())
-                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-            })
-            .transpose()?;
+                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
+            )
+        } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            // Create ExternalManifestCommitHandler from namespace and table_id
+            let py = ns.py();
+            let ns_arc: Arc<dyn LanceNamespace> =
+                if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+                    dir_ns.borrow().inner.clone()
+                } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+                    rest_ns.borrow().inner.clone()
+                } else if let Ok(inner) = ns.getattr("_inner") {
+                    let type_name = ns
+                        .get_type()
+                        .name()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default();
+
+                    if type_name == "DirectoryNamespace" {
+                        if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
+                            dir_ns.borrow().inner.clone()
+                        } else {
+                            PyLanceNamespace::create_arc(py, ns)?
+                        }
+                    } else if type_name == "RestNamespace" {
+                        if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
+                            rest_ns.borrow().inner.clone()
+                        } else {
+                            PyLanceNamespace::create_arc(py, ns)?
+                        }
+                    } else {
+                        PyLanceNamespace::create_arc(py, ns)?
+                    }
+                } else {
+                    PyLanceNamespace::create_arc(py, ns)?
+                };
+
+            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            Some(Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            }) as Arc<dyn CommitHandler>)
+        } else {
+            None
+        };
 
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
