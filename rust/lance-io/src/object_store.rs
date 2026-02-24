@@ -896,18 +896,18 @@ impl StorageOptions {
         self.0.get(key)
     }
 
-    /// Build [`ClientOptions`] with default headers extracted from `header.*` keys.
+    /// Build [`ClientOptions`] with default headers extracted from `headers.*` keys.
     ///
-    /// Keys prefixed with `header.` are parsed into HTTP headers. For example,
-    /// `header.x-ms-version = 2023-11-03` results in a default header
+    /// Keys prefixed with `headers.` are parsed into HTTP headers. For example,
+    /// `headers.x-ms-version = 2023-11-03` results in a default header
     /// `x-ms-version: 2023-11-03`.
     ///
-    /// Returns an error if any `header.*` key has an invalid header name or value.
+    /// Returns an error if any `headers.*` key has an invalid header name or value.
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     pub fn client_options(&self) -> Result<ClientOptions> {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.0 {
-            if let Some(header_name) = key.strip_prefix("header.") {
+            if let Some(header_name) = key.strip_prefix("headers.") {
                 let name = header_name
                     .parse::<http::header::HeaderName>()
                     .map_err(|e| {
@@ -1423,14 +1423,14 @@ mod tests {
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_extracts_headers() {
         let opts = StorageOptions(HashMap::from([
-            ("header.x-custom-foo".to_string(), "bar".to_string()),
-            ("header.x-ms-version".to_string(), "2023-11-03".to_string()),
+            ("headers.x-custom-foo".to_string(), "bar".to_string()),
+            ("headers.x-ms-version".to_string(), "2023-11-03".to_string()),
             ("region".to_string(), "us-west-2".to_string()),
         ]));
         let client_options = opts.client_options().unwrap();
 
         // Verify non-header keys are not consumed as headers by creating
-        // another StorageOptions with no header.* keys.
+        // another StorageOptions with no headers.* keys.
         let opts_no_headers = StorageOptions(HashMap::from([(
             "region".to_string(),
             "us-west-2".to_string(),
@@ -1453,7 +1453,7 @@ mod tests {
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_rejects_invalid_header_name() {
         let opts = StorageOptions(HashMap::from([(
-            "header.bad header".to_string(),
+            "headers.bad header".to_string(),
             "value".to_string(),
         )]));
         let err = opts.client_options().unwrap_err();
@@ -1464,7 +1464,7 @@ mod tests {
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn test_client_options_rejects_invalid_header_value() {
         let opts = StorageOptions(HashMap::from([(
-            "header.x-good-name".to_string(),
+            "headers.x-good-name".to_string(),
             "bad\x01value".to_string(),
         )]));
         let err = opts.client_options().unwrap_err();
