@@ -602,14 +602,45 @@ impl Dataset {
         // Set up namespace commit handler if namespace and table_id are provided
         if let (Some(ns), Some(tid)) = (namespace, table_id) {
             // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
-            // or create a PyLanceNamespace wrapper for custom Python implementations
+            // or create a PyLanceNamespace wrapper for custom Python implementations.
+            //
+            // Python wrapper classes (DirectoryNamespace, RestNamespace in namespace.py)
+            // store the PyO3 class in `_inner`. For the EXACT wrapper classes, we can
+            // use _inner directly. For subclasses (which may override methods), we must
+            // use PyLanceNamespace to call through Python.
             let ns_arc: Arc<dyn LanceNamespace> =
                 if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
-                    // Native DirectoryNamespace - use inner directly (bypass Python layer)
+                    // Direct PyO3 class
                     dir_ns.borrow().inner.clone()
                 } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
-                    // Native RestNamespace - use inner directly (bypass Python layer)
+                    // Direct PyO3 class
                     rest_ns.borrow().inner.clone()
+                } else if let Ok(inner) = ns.getattr("_inner") {
+                    // Python wrapper class - check if it's the exact wrapper class
+                    // (not a subclass) by comparing type names
+                    let type_name = ns
+                        .get_type()
+                        .name()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default();
+
+                    if type_name == "DirectoryNamespace" {
+                        if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
+                            dir_ns.borrow().inner.clone()
+                        } else {
+                            PyLanceNamespace::create_arc(py, ns)?
+                        }
+                    } else if type_name == "RestNamespace" {
+                        if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
+                            rest_ns.borrow().inner.clone()
+                        } else {
+                            PyLanceNamespace::create_arc(py, ns)?
+                        }
+                    } else {
+                        // Subclass or custom implementation - use PyLanceNamespace
+                        // to call through Python (requires *_json methods)
+                        PyLanceNamespace::create_arc(py, ns)?
+                    }
                 } else {
                     // Custom Python implementation - wrap with PyLanceNamespace
                     // This calls back into Python for namespace methods
@@ -3171,14 +3202,45 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
                 let py = options.py();
                 // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
-                // or create a PyLanceNamespace wrapper for custom Python implementations
+                // or create a PyLanceNamespace wrapper for custom Python implementations.
+                //
+                // Python wrapper classes (DirectoryNamespace, RestNamespace in namespace.py)
+                // store the PyO3 class in `_inner`. For the EXACT wrapper classes, we can
+                // use _inner directly. For subclasses (which may override methods), we must
+                // use PyLanceNamespace to call through Python.
                 let ns_arc: Arc<dyn LanceNamespace> =
                     if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
-                        // Native DirectoryNamespace - use inner directly (bypass Python layer)
+                        // Direct PyO3 class
                         dir_ns.borrow().inner.clone()
                     } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
-                        // Native RestNamespace - use inner directly (bypass Python layer)
+                        // Direct PyO3 class
                         rest_ns.borrow().inner.clone()
+                    } else if let Ok(inner) = ns.getattr("_inner") {
+                        // Python wrapper class - check if it's the exact wrapper class
+                        // (not a subclass) by comparing type names
+                        let type_name = ns
+                            .get_type()
+                            .name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_default();
+
+                        if type_name == "DirectoryNamespace" {
+                            if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
+                                dir_ns.borrow().inner.clone()
+                            } else {
+                                PyLanceNamespace::create_arc(py, &ns)?
+                            }
+                        } else if type_name == "RestNamespace" {
+                            if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
+                                rest_ns.borrow().inner.clone()
+                            } else {
+                                PyLanceNamespace::create_arc(py, &ns)?
+                            }
+                        } else {
+                            // Subclass or custom implementation - use PyLanceNamespace
+                            // to call through Python (requires *_json methods)
+                            PyLanceNamespace::create_arc(py, &ns)?
+                        }
                     } else {
                         // Custom Python implementation - wrap with PyLanceNamespace
                         PyLanceNamespace::create_arc(py, &ns)?
