@@ -1823,7 +1823,9 @@ mod tests {
 
     use super::*;
     use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
+    use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
+    use crate::session::Session;
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
@@ -3590,21 +3592,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_overwrites_retryable() {
-        use crate::dataset::write::{WriteMode, WriteParams};
-        use crate::dataset::{CommitBuilder, InsertBuilder};
-
-        // Create initial dataset at version 1
         let dataset = test_dataset(5, 1).await;
-
-        // Simulate two concurrent readers at version 1
         let dataset_v1_reader1 = Arc::new(dataset.checkout_version(1).await.unwrap());
         let dataset_v1_reader2 = Arc::new(dataset.checkout_version(1).await.unwrap());
 
-        // Prepare data for overwrite
         let data = RecordBatch::try_new(
-            Arc::new(arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, false),
-                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, true),
             ])),
             vec![
                 Arc::new(Int32Array::from_iter_values(10..15)),
@@ -3613,7 +3608,7 @@ mod tests {
         )
         .unwrap();
 
-        // First overwrite: write uncommitted transaction
+        // First overwrite succeeds
         let txn1 = InsertBuilder::new(dataset_v1_reader1.clone())
             .with_params(&WriteParams {
                 mode: WriteMode::Overwrite,
@@ -3622,15 +3617,13 @@ mod tests {
             .execute_uncommitted(vec![data.clone()])
             .await
             .unwrap();
-
-        // Commit first overwrite - should succeed
         let dataset_v2 = CommitBuilder::new(dataset_v1_reader1)
             .execute(txn1)
             .await
             .unwrap();
         assert_eq!(dataset_v2.manifest.version, 2);
 
-        // Second overwrite: write uncommitted transaction
+        // Second overwrite should fail with retryable conflict
         let txn2 = InsertBuilder::new(dataset_v1_reader2.clone())
             .with_params(&WriteParams {
                 mode: WriteMode::Overwrite,
@@ -3639,45 +3632,28 @@ mod tests {
             .execute_uncommitted(vec![data])
             .await
             .unwrap();
-
-        // Commit second overwrite - should fail with retryable conflict
         let result = CommitBuilder::new(dataset_v1_reader2).execute(txn2).await;
-
         assert!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
             "Expected RetryableCommitConflict but got: {:?}",
             result
         );
 
-        // Verify the first overwrite succeeded and dataset is at version 2
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
     }
 
     #[tokio::test]
     async fn test_concurrent_create_incompatible() {
-        use crate::dataset::write::{WriteMode, WriteParams};
-        use crate::dataset::{CommitBuilder, InsertBuilder};
-        use crate::session::Session;
-
-        // Two concurrent creates should be incompatible.
-        // Only one can create the dataset, the other must fail without retry option.
-
-        // Use shared session so both commits see the same memory store
-        let session = std::sync::Arc::new(Session::default());
+        // Shared session so both commits see the same memory store
+        let session = Arc::new(Session::default());
         let uri = "memory://test_concurrent_create";
 
-        // Prepare data for creates
         let data = RecordBatch::try_new(
-            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "a",
-                arrow_schema::DataType::Int32,
-                false,
-            )])),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from_iter_values(0..5))],
         )
         .unwrap();
 
-        // First create: write uncommitted transaction
         let txn1 = InsertBuilder::new(uri)
             .with_params(&WriteParams {
                 mode: WriteMode::Create,
@@ -3688,7 +3664,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Second create: write uncommitted transaction (same URI, no dataset exists yet)
         let txn2 = InsertBuilder::new(uri)
             .with_params(&WriteParams {
                 mode: WriteMode::Create,
@@ -3699,11 +3674,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Both transactions should have read_version == 0 (creates)
         assert_eq!(txn1.read_version, 0);
         assert_eq!(txn2.read_version, 0);
 
-        // Commit first create - should succeed
+        // First create succeeds
         let dataset_v1 = CommitBuilder::new(uri)
             .with_session(session.clone())
             .execute(txn1)
@@ -3711,21 +3685,17 @@ mod tests {
             .unwrap();
         assert_eq!(dataset_v1.manifest.version, 1);
 
-        // Commit second create - should fail with IncompatibleTransaction
-        // (DatasetAlreadyExists would only occur in true concurrent scenarios where the
-        // pre-check race condition causes both to call commit_new_dataset)
+        // Second create should fail with IncompatibleTransaction
         let result = CommitBuilder::new(uri)
             .with_session(session.clone())
             .execute(txn2)
             .await;
-
         assert!(
             matches!(result, Err(Error::IncompatibleTransaction { .. })),
             "Expected IncompatibleTransaction for concurrent creates, got: {:?}",
             result
         );
 
-        // Verify only the first create succeeded
         assert_eq!(dataset_v1.count_rows(None).await.unwrap(), 5);
     }
 }
