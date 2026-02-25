@@ -112,26 +112,26 @@ criterion = { version = "0.5", features = [
 ] }
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
-datafusion = { version = "51.0.0", default-features = false, features = [
+datafusion = { version = "52.1.0", default-features = false, features = [
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
     "nested_expressions",
     "regex_expressions",
-    "unicode_expressions",
-    "crypto_expressions",
-    "encoding_expressions",
-    "datetime_expressions",
     "sql",
     "string_expressions",
+    "unicode_expressions",
 ] }
-datafusion-common = "51.0.0"
-datafusion-functions = { version = "51.0.0", features = ["regex_expressions"] }
-datafusion-sql = "51.0.0"
-datafusion-expr = "51.0.0"
-datafusion-ffi = "51.0.0"
-datafusion-execution = "51.0.0"
-datafusion-optimizer = "51.0.0"
-datafusion-physical-expr = "51.0.0"
-datafusion-physical-plan = "51.0.0"
-datafusion-substrait = "51.0.0"
+datafusion-common = "52.1.0"
+datafusion-functions = { version = "52.1.0", features = ["regex_expressions"] }
+datafusion-sql = "52.1.0"
+datafusion-expr = "52.1.0"
+datafusion-ffi = "52.1.0"
+datafusion-execution = "52.1.0"
+datafusion-optimizer = "52.1.0"
+datafusion-physical-expr = "52.1.0"
+datafusion-physical-plan = "52.1.0"
+datafusion-substrait = "52.1.0"
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
@@ -140,7 +140,7 @@ fsst = { version = "=3.0.0-rc.1", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.7"
 geoarrow-schema = "0.7"
-geodatafusion = "0.2.0"
+geodatafusion = "0.3.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 http = "1.1.0"

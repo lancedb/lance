@@ -7,7 +7,7 @@ import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-from datafusion import SessionContext, col
+import pytest
 from lance import FFILanceTableProvider, LanceDataset
 
 
@@ -19,6 +19,9 @@ def normalize(batches: list[pa.RecordBatch]) -> pa.RecordBatch:
 
 
 def test_table_loading():
+    pytest.importorskip("datafusion")
+    from datafusion import SessionContext, col
+
     lancedb_temp_path = "/tmp/test.lance"
     shutil.rmtree(lancedb_temp_path, ignore_errors=True)
 
@@ -57,7 +60,8 @@ def test_table_loading():
         ctx.register_table("ffi_lance_table", ffi_lance_table)
         return ctx
 
-    result = normalize(make_ctx().table("ffi_lance_table").collect())
+    ctx = make_ctx()
+    result = normalize(ctx.table("ffi_lance_table").collect())
 
     assert len(result) == 1000000
     assert result.num_columns == 5
@@ -74,15 +78,16 @@ def test_table_loading():
 
     pd.testing.assert_frame_equal(result.to_pandas(), expected)
 
-    result = normalize(
-        make_ctx().table("ffi_lance_table").filter(col("col1") == 4).collect()
-    )
+    ctx = make_ctx()
+    result = normalize(ctx.table("ffi_lance_table").filter(col("col1") == 4).collect())
     assert len(result) == 1
 
-    result = normalize(make_ctx().table("ffi_lance_table").limit(1).collect())
+    ctx = make_ctx()
+    result = normalize(ctx.table("ffi_lance_table").limit(1).collect())
     assert len(result) == 1
     assert result["col1"][0].as_py() == 0
 
-    result = normalize(make_ctx().table("ffi_lance_table").limit(1, offset=1).collect())
+    ctx = make_ctx()
+    result = normalize(ctx.table("ffi_lance_table").limit(1, offset=1).collect())
     assert len(result) == 1
     assert result["col1"][0].as_py() == 1

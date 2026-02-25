@@ -417,8 +417,9 @@ impl ExprFilter {
                 let filter = planner.parse_filter(sql)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
-                let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
-                if ret_type != DataType::Boolean {
+                let ret_field = filter.to_field(&df_schema)?.1;
+                let ret_type = ret_field.data_type();
+                if ret_type != &DataType::Boolean {
                     return Err(Error::InvalidInput {
                         source: format!("The filter {} does not return a boolean", filter).into(),
                         location: location!(),
@@ -2042,33 +2043,39 @@ impl Scanner {
     }
 
     fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
-        use datafusion::logical_expr::{expr::AggregateFunction, Expr, TypeSignature};
+        use datafusion::logical_expr::expr::AggregateFunction;
+        use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
+        use datafusion::logical_expr::Expr;
 
         match expr {
             Expr::AggregateFunction(agg_func) => {
                 let func = &agg_func.func;
                 let args = &agg_func.params.args;
 
-                // Only UserDefined signature functions need explicit coercion
-                if !matches!(func.signature().type_signature, TypeSignature::UserDefined) {
-                    return Ok(expr.clone());
-                }
-
                 if args.is_empty() {
                     return Ok(expr.clone());
                 }
 
-                let current_types: Vec<arrow_schema::DataType> = args
+                let current_fields: Vec<arrow_schema::FieldRef> = args
                     .iter()
-                    .map(|e| e.get_type(schema))
-                    .collect::<std::result::Result<_, _>>()?;
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let dt = e.get_type(schema)?;
+                        Ok(Arc::new(arrow_schema::Field::new(
+                            format!("arg_{i}"),
+                            dt,
+                            true,
+                        )))
+                    })
+                    .collect::<std::result::Result<_, datafusion::common::DataFusionError>>()?;
 
-                let coerced_types = func.coerce_types(&current_types)?;
+                let coerced_fields = fields_with_udf(&current_fields, func.as_ref())?;
                 let coerced_args: Vec<Expr> = args
                     .iter()
-                    .zip(coerced_types.iter())
-                    .map(|(arg, target_type)| {
+                    .zip(coerced_fields.iter())
+                    .map(|(arg, target_field)| {
                         let arg_type = arg.get_type(schema)?;
+                        let target_type = target_field.data_type();
                         if arg_type == *target_type {
                             Ok(arg.clone())
                         } else {
@@ -2461,7 +2468,15 @@ impl Scanner {
                     .union_columns(&required_columns, OnMissing::Error)?
             };
             plan = self.take(plan, agg_projection)?;
-            return self.apply_aggregate(plan, agg).await;
+            plan = self.apply_aggregate(plan, agg).await?;
+
+            let optimizer = get_physical_optimizer();
+            let options = Default::default();
+            for rule in optimizer.rules {
+                plan = rule.optimize(plan, &options)?;
+            }
+
+            return Ok(plan);
         }
 
         // Sort
