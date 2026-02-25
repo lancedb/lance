@@ -1164,8 +1164,7 @@ mod tests {
         use arrow_schema::Field;
 
         let fields = vec![Field::new("a", DataType::Int32, true)];
-        let mut builder =
-            StructBuilder::new(fields.clone(), vec![Box::new(Int32Builder::new()) as _]);
+        let mut builder = StructBuilder::new(fields, vec![Box::new(Int32Builder::new()) as _]);
         for _ in 0..3 {
             builder
                 .field_builder::<Int32Builder>(0)
