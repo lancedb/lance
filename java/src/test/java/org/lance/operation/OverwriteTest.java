@@ -29,6 +29,8 @@ import java.nio.file.Path;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OverwriteTest extends OperationTestBase {
 
@@ -64,10 +66,10 @@ public class OverwriteTest extends OperationTestBase {
         }
       }
 
-      // Commit fragment again
+      // Try to commit from stale version (v1) - should fail with retryable error
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
-      transaction =
+      Transaction staleTxn =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -78,9 +80,27 @@ public class OverwriteTest extends OperationTestBase {
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
-      assertEquals(
-          "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
-      try (Dataset dataset = transaction.commit()) {
+      assertEquals("value", staleTxn.transactionProperties().map(m -> m.get("key")).orElse(null));
+
+      RuntimeException ex = assertThrows(RuntimeException.class, () -> staleTxn.commit().close());
+      assertTrue(
+          ex.getMessage().contains("Retryable commit conflict"),
+          "Expected retryable commit conflict error, got: " + ex.getMessage());
+
+      // Checkout latest and retry - should succeed
+      dataset.checkoutLatest();
+      Transaction retryTxn =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(testDataset.getSchema())
+                      .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
+                      .build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
+              .build();
+      try (Dataset dataset = retryTxn.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
@@ -91,7 +111,7 @@ public class OverwriteTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
-        assertEquals(transaction, dataset.readTransaction().orElse(null));
+        assertEquals(retryTxn, dataset.readTransaction().orElse(null));
       }
     }
   }

@@ -1300,74 +1300,58 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_writes() {
-        for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
-            // Create an empty table
-            let test_dir = TempStrDir::default();
-            let test_uri = test_dir.as_str();
+        // Test concurrent appends - all should succeed
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::Int32,
-                false,
-            )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
 
-            let dataset = Dataset::write(
-                RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
-                test_uri,
-                None,
-            )
-            .await
-            .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
 
-            // Make some sample data
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-            )
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
-            // Write data concurrently in 5 tasks
-            let futures: Vec<_> = (0..5)
-                .map(|_| {
-                    let batch = batch.clone();
-                    let schema = schema.clone();
-                    let uri = test_uri.to_string();
-                    tokio::spawn(async move {
-                        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                        Dataset::write(
-                            reader,
-                            &uri,
-                            Some(WriteParams {
-                                mode: write_mode,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    })
+        let futures: Vec<_> = (0..5)
+            .map(|_| {
+                let batch = batch.clone();
+                let schema = schema.clone();
+                let uri = test_uri.to_string();
+                tokio::spawn(async move {
+                    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    Dataset::write(
+                        reader,
+                        &uri,
+                        Some(WriteParams {
+                            mode: WriteMode::Append,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
                 })
-                .collect();
-            let results = join_all(futures).await;
+            })
+            .collect();
+        let results = join_all(futures).await;
 
-            // Assert all succeeded
-            for result in results {
-                assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-            }
-
-            // Assert final fragments and versions expected
-            let dataset = dataset.checkout_version(6).await.unwrap();
-
-            match write_mode {
-                WriteMode::Append => {
-                    assert_eq!(dataset.get_fragments().len(), 5);
-                }
-                WriteMode::Overwrite => {
-                    assert_eq!(dataset.get_fragments().len(), 1);
-                }
-                _ => unreachable!(),
-            }
-
-            dataset.validate().await.unwrap()
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
         }
+
+        let dataset = dataset.checkout_version(6).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset.validate().await.unwrap()
     }
 
     #[tokio::test]
