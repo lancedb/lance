@@ -17,6 +17,7 @@ use lance::dataset::{builder::DatasetBuilder, ReadParams, WriteParams};
 use lance::session::Session;
 use lance::{dataset::scanner::Scanner, Dataset};
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::Error as LanceError;
 use lance_core::{box_error, Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -258,7 +259,7 @@ pub struct ManifestNamespace {
     /// after every write. Defaults to true.
     inline_optimization_enabled: bool,
     /// Number of retries for commit operations on the manifest table.
-    /// If None, uses the lance default.
+    /// If None, defaults to [`lance_table::io::commit::CommitConfig::default().num_retries`].
     commit_retries: Option<u32>,
 }
 
@@ -829,16 +830,14 @@ impl ManifestNamespace {
             .execute_reader(Box::new(reader))
             .await
             .map_err(|e| {
-                use lance_core::Error as LanceError;
                 match &e {
-                    // CommitConflict/RetryableCommitConflict: version collision retries exhausted -> Throttled (safe to retry)
-                    LanceError::CommitConflict { .. }
-                    | LanceError::RetryableCommitConflict { .. } => NamespaceError::Throttled {
+                    // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
+                    LanceError::CommitConflict { .. } => NamespaceError::Throttled {
                         message: format!("Too many concurrent writes, please retry later: {}", e),
                     }
                     .into(),
-                    // TooMuchWriteContention: semantic conflict -> ConcurrentModification (don't retry)
-                    // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification (don't retry)
+                    // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
+                    // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification
                     LanceError::TooMuchWriteContention { .. }
                     | LanceError::IncompatibleTransaction { .. } => {
                         NamespaceError::ConcurrentModification {
