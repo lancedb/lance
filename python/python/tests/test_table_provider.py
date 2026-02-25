@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from datafusion import SessionContext, col
 from lance import FFILanceTableProvider, LanceDataset
 
 
@@ -21,6 +20,7 @@ def normalize(batches: list[pa.RecordBatch]) -> pa.RecordBatch:
 
 def test_table_loading():
     pytest.importorskip("datafusion")
+    from datafusion import SessionContext, col
 
     lancedb_temp_path = "/tmp/test.lance"
     shutil.rmtree(lancedb_temp_path, ignore_errors=True)
