@@ -3653,52 +3653,79 @@ mod tests {
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
     }
 
-    #[test]
-    fn test_concurrent_create_incompatible() {
-        // Two concurrent creates (read_version == 0) should be incompatible.
+    #[tokio::test]
+    async fn test_concurrent_create_incompatible() {
+        use crate::dataset::write::{WriteMode, WriteParams};
+        use crate::dataset::{CommitBuilder, InsertBuilder};
+        use crate::session::Session;
+
+        // Two concurrent creates should be incompatible.
         // Only one can create the dataset, the other must fail without retry option.
 
-        let fragment0 = Fragment::new(0);
+        // Use shared session so both commits see the same memory store
+        let session = std::sync::Arc::new(Session::default());
+        let uri = "memory://test_concurrent_create";
 
-        // First create transaction (read_version == 0)
-        let create_txn1 = Transaction::new(
-            0, // read_version == 0 means this is a create
-            Operation::Overwrite {
-                fragments: vec![fragment0.clone()],
-                schema: lance_core::datatypes::Schema::default(),
-                config_upsert_values: None,
-                initial_bases: None,
-            },
-            None,
-        );
+        // Prepare data for creates
+        let data = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "a",
+                arrow_schema::DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from_iter_values(0..5))],
+        )
+        .unwrap();
 
-        // Second create transaction (also read_version == 0)
-        let create_txn2 = Transaction::new(
-            0, // read_version == 0 means this is also a create
-            Operation::Overwrite {
-                fragments: vec![fragment0],
-                schema: lance_core::datatypes::Schema::default(),
-                config_upsert_values: None,
-                initial_bases: None,
-            },
-            None,
-        );
+        // First create: write uncommitted transaction
+        let txn1 = InsertBuilder::new(uri)
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![data.clone()])
+            .await
+            .unwrap();
 
-        let mut rebase = TransactionRebase {
-            transaction: create_txn1,
-            initial_fragments: HashMap::new(),
-            modified_fragment_ids: HashSet::new(),
-            affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
-        };
+        // Second create: write uncommitted transaction (same URI, no dataset exists yet)
+        let txn2 = InsertBuilder::new(uri)
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![data])
+            .await
+            .unwrap();
 
-        // Check conflict: two creates should be incompatible (not retryable)
-        let result = rebase.check_txn(&create_txn2, 1);
+        // Both transactions should have read_version == 0 (creates)
+        assert_eq!(txn1.read_version, 0);
+        assert_eq!(txn2.read_version, 0);
+
+        // Commit first create - should succeed
+        let dataset_v1 = CommitBuilder::new(uri)
+            .with_session(session.clone())
+            .execute(txn1)
+            .await
+            .unwrap();
+        assert_eq!(dataset_v1.manifest.version, 1);
+
+        // Commit second create - should fail with IncompatibleTransaction
+        // (DatasetAlreadyExists would only occur in true concurrent scenarios where the
+        // pre-check race condition causes both to call commit_new_dataset)
+        let result = CommitBuilder::new(uri)
+            .with_session(session.clone())
+            .execute(txn2)
+            .await;
+
         assert!(
             matches!(result, Err(Error::IncompatibleTransaction { .. })),
             "Expected IncompatibleTransaction for concurrent creates, got: {:?}",
             result
         );
+
+        // Verify only the first create succeeded
+        assert_eq!(dataset_v1.count_rows(None).await.unwrap(), 5);
     }
 }

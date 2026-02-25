@@ -829,6 +829,20 @@ pub(crate) async fn commit_transaction(
         if !strict_overwrite {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
+            // For create operations (read_version == 0), if the dataset already exists,
+            // this is an incompatible conflict. Only one process can create the dataset.
+            if read_version == 0
+                && matches!(transaction.operation, Operation::Overwrite { .. })
+                && dataset.manifest.version > 0
+            {
+                return Err(crate::Error::IncompatibleTransaction {
+                    source: "This create operation conflicts with a concurrent create. \
+                             The dataset already exists at a newer version."
+                        .into(),
+                    location: location!(),
+                });
+            }
+
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
