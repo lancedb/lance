@@ -829,48 +829,49 @@ impl ManifestNamespace {
             .execute_reader(Box::new(reader))
             .await
             .map_err(|e| {
-                // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
-                // TooMuchWriteContention: semantic conflict -> ConcurrentModification (don't retry)
-                // matched/duplicate: WhenMatched::Fail triggered -> ConcurrentModification
-                let error_msg = e.to_string();
-                if error_msg.contains("CommitConflict")
-                    || error_msg.contains("Failed to commit the transaction after")
-                {
-                    NamespaceError::Throttled {
-                        message: format!(
-                            "Too many concurrent writes, please retry later: {}",
-                            error_msg
-                        ),
+                use lance_core::Error as LanceError;
+                match &e {
+                    // CommitConflict/RetryableCommitConflict: version collision retries exhausted -> Throttled (safe to retry)
+                    LanceError::CommitConflict { .. }
+                    | LanceError::RetryableCommitConflict { .. } => NamespaceError::Throttled {
+                        message: format!("Too many concurrent writes, please retry later: {}", e),
                     }
-                    .into()
-                } else if error_msg.contains("TooMuchWriteContention")
-                    || error_msg.contains("Too many concurrent writers")
-                {
-                    NamespaceError::ConcurrentModification {
-                        message: format!(
-                            "Object '{}' was concurrently modified by another operation",
-                            object_id
-                        ),
+                    .into(),
+                    // TooMuchWriteContention: semantic conflict -> ConcurrentModification (don't retry)
+                    // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification (don't retry)
+                    LanceError::TooMuchWriteContention { .. }
+                    | LanceError::IncompatibleTransaction { .. } => {
+                        NamespaceError::ConcurrentModification {
+                            message: format!(
+                                "Object '{}' was concurrently modified by another operation",
+                                object_id
+                            ),
+                        }
+                        .into()
                     }
-                    .into()
-                } else if error_msg.contains("matched")
-                    || error_msg.contains("duplicate")
-                    || error_msg.contains("already exists")
-                {
-                    NamespaceError::ConcurrentModification {
-                        message: format!(
-                            "Object '{}' was concurrently created by another operation",
-                            object_id
-                        ),
-                    }
-                    .into()
-                } else {
-                    Error::IO {
-                        source: box_error(std::io::Error::other(format!(
-                            "Failed to execute merge: {}",
-                            e
-                        ))),
-                        location: location!(),
+                    // Other errors: check message for semantic conflicts (matched/duplicate from WhenMatched::Fail)
+                    _ => {
+                        let error_msg = e.to_string();
+                        if error_msg.contains("matched")
+                            || error_msg.contains("duplicate")
+                            || error_msg.contains("already exists")
+                        {
+                            NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "Object '{}' was concurrently created by another operation",
+                                    object_id
+                                ),
+                            }
+                            .into()
+                        } else {
+                            Error::IO {
+                                source: box_error(std::io::Error::other(format!(
+                                    "Failed to execute merge: {}",
+                                    e
+                                ))),
+                                location: location!(),
+                            }
+                        }
                     }
                 }
             })?;
@@ -926,7 +927,9 @@ impl ManifestNamespace {
 
         // Update the wrapper with the new dataset
         self.manifest_dataset
-            .set_latest(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
             .await;
 
         // Run inline optimization after delete
