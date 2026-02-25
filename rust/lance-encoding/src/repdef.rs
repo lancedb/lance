@@ -1296,8 +1296,6 @@ impl RepDefUnraveler {
 
         let mut curlen: usize = offsets.last().map(|o| o.as_usize()).unwrap_or(0);
 
-        println!("A: {:#?}", offsets);
-
         // If offsets is empty this is a no-op.  If offsets is not empty that means we already
         // added a set of offsets.  For example, we might have added [0, 3, 5] (2 lists).  Now
         // say we want to add [0, 1, 4] (2 lists).  We should get [0, 3, 5, 6, 9] (4 lists).  If
