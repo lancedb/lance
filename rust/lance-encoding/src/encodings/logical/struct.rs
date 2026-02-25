@@ -779,6 +779,40 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_null_struct_element() {
+        // Regression: a list containing structs where most struct elements are null
+        // causes a length mismatch during decoding with V2_2 encoding.
+        use arrow_array::StringArray;
+
+        let tag_array = StringArray::from(vec![
+            Some("valid"),
+            Some("null_struct"),
+            Some("valid"),
+            Some("valid"),
+        ]);
+        let struct_fields = Fields::from(vec![Field::new("tag", DataType::Utf8, true)]);
+        // 3 out of 4 struct elements are null
+        let struct_validity = NullBuffer::from(vec![false, true, false, false]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(tag_array)],
+            Some(struct_validity),
+        );
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 4]));
+        let list_field = Field::new("item", DataType::Struct(struct_fields), true);
+        let list_array =
+            ListArray::new(Arc::new(list_field), offsets, Arc::new(struct_array), None);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array)],
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_ragged_scheduling() {
         // This test covers scheduling when batches straddle page boundaries
 

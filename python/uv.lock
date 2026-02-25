@@ -2454,7 +2454,7 @@ torch = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", marker = "extra == 'tests'" },
-    { name = "datafusion", marker = "extra == 'tests'", specifier = ">=50.1" },
+    { name = "datafusion", marker = "extra == 'tests'", specifier = ">=50.1,<52" },
     { name = "datasets", marker = "extra == 'tests'" },
     { name = "duckdb", marker = "extra == 'tests'" },
     { name = "geoarrow-rust-core", marker = "extra == 'geo'" },

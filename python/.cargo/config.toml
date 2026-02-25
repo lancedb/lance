@@ -17,7 +17,6 @@ rustflags = [
     "-Wclippy::string_add_assign",
     "-Wclippy::string_add",
     "-Wclippy::string_lit_as_bytes",
-    "-Wclippy::string_to_string",
     "-Wclippy::use_self",
     "-Aclippy::redundant_pub_crate", # PyO3 macros don't pass this.
 ]

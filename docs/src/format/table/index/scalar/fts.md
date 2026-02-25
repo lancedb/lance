@@ -18,6 +18,8 @@ The FTS index consists of multiple files storing the token dictionary, document 
 3. `invert.lance` - Compressed posting lists for each token
 4. `metadata.lance` - Index metadata and configuration
 
+An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
+
 ### Token Dictionary File Schema
 
 | Column      | Type   | Nullable | Description                     |
@@ -188,6 +190,58 @@ address.city:San Francisco
 address.city:San
 address.city:Francisco
 ```
+
+## Training Process
+
+Building an FTS index is a multi-phase pipeline: the source column is scanned, documents are tokenized in parallel, intermediate results are spilled to part files on disk, and the part files are merged into final output partitions.
+
+### Phase 1: Tokenization
+
+The input column is read as a stream of record batches and dispatched to a pool of tokenizer worker tasks. Each worker tokenizes documents independently, accumulating tokens, posting lists, and document metadata in memory.
+
+When a worker's accumulated data reaches the partition size limit or the document count hits `u32::MAX`, it flushes the data to disk as a set of part files (`part_<id>_tokens.lance`, `part_<id>_invert.lance`, `part_<id>_docs.lance`). A single worker may produce multiple part files if it processes enough data.
+
+### Phase 2: Merge
+
+After all workers finish, the part files are merged into output partitions. Part files are streamed with bounded buffering so that not all data needs to be loaded into memory at once. For each part file, the token dictionaries are unified, document sets are concatenated, and posting lists are rewritten with adjusted IDs.
+
+When a merged partition reaches the target size, it is written to the destination store and a new one is started. After all part files are consumed the final partition is flushed, and a `metadata.lance` file is written listing the partition IDs and index parameters.
+
+### Configuration
+
+| Environment Variable       | Default                          | Description                                                                                                           |
+|----------------------------|----------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `LANCE_FTS_NUM_SHARDS`     | Number of compute-intensive CPUs | Number of parallel tokenizer worker tasks. Higher values increase indexing throughput but use more memory.             |
+| `LANCE_FTS_PARTITION_SIZE` | 256 (MiB)                        | Maximum uncompressed size of a worker's in-memory buffer before it is spilled to a part file.                         |
+| `LANCE_FTS_TARGET_SIZE`    | 4096 (MiB)                       | Target uncompressed size for merged output partitions. Fewer, larger partitions improve query performance.             |
+
+### Memory and Performance Considerations
+
+Memory usage is primarily determined by two factors:
+
+- **`LANCE_FTS_NUM_SHARDS`** -- Each worker holds an independent in-memory buffer. Peak memory is roughly `NUM_SHARDS * PARTITION_SIZE` plus the overhead of token dictionaries and posting list structures.
+- **`LANCE_FTS_PARTITION_SIZE`** -- Larger values reduce the number of part files and make the merge phase cheaper. Smaller values reduce per-worker memory at the cost of more part files.
+
+Merge phase memory is bounded by the streaming approach: part files are loaded one at a time with a small concurrency buffer. The merged partition's in-memory size is bounded by `LANCE_FTS_TARGET_SIZE`.
+
+Building an FTS index requires temporary disk space to store the part files generated during tokenization. The amount of temporary space depends heavily on whether position information is enabled. An index with `with_position: true` stores the position of every token occurrence in every document, which can easily require 10x the size of the original column or more in temporary disk space. An index without positions tends to be smaller than the original column and will typically need less than 2x the size of the column in total disk space.
+
+Performance tips:
+
+- Larger `LANCE_FTS_TARGET_SIZE` produces fewer output partitions, which is beneficial for query performance because queries must scan every partition's token dictionary. When memory allows, prefer fewer, larger partitions.
+- `with_position: true` significantly increases index size because term positions are stored for every occurrence. Only enable it when phrase queries are needed.
+- The ngram tokenizer generates many more tokens per document than word-level tokenizers, so expect larger index sizes and higher memory usage.
+
+### Distributed Training
+
+The FTS index supports distributed training where different worker nodes each index a subset of the data and the results are assembled afterward.
+
+1. Each distributed worker is assigned a **fragment mask** (`(fragment_id as u64) << 32`) that is OR'd into the partition IDs it generates, ensuring globally unique IDs across workers.
+2. Workers set `skip_merge: true` so they write their part files directly without running the merge phase.
+3. Instead of a single `metadata.lance`, each worker writes per-partition metadata files named `part_<id>_metadata.lance`.
+4. After all workers finish, a coordinator merges the metadata files: it collects all partition IDs, remaps them to a sequential range starting from 0 (renaming the corresponding data files), and writes the final unified `metadata.lance`.
+
+This allows each worker to operate independently during the tokenization phase. Only the final metadata merge requires a single-node step, and it is lightweight since it only renames files and writes a small metadata file.
 
 ## Accelerated Queries
 
