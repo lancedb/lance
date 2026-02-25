@@ -7079,4 +7079,809 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             }
         }
     }
+
+    // =========================================================================
+    // Tests for concurrent merge_insert duplicate row prevention
+    // =========================================================================
+
+    /// Test: concurrent merge_insert WITHOUT unenforced-primary-key metadata.
+    ///
+    /// This reproduces the bug from lancedb/lancedb#2463 and lancedb/lance#4585:
+    /// two concurrent merge_inserts both insert the same new key, and without
+    /// unenforced-primary-key metadata the bloom filter is not included in the
+    /// transaction, so the conflict goes undetected and both commits succeed,
+    /// producing duplicate rows.
+    #[tokio::test]
+    async fn test_concurrent_insert_same_key_without_pk_metadata_detects_conflict() {
+        // Schema WITHOUT unenforced-primary-key metadata (the common case in
+        // production — users call merge_insert("id") without marking the schema)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+
+        // Initial dataset with ids 0, 1, 2, 3
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Both jobs try to INSERT the same NEW key id=100
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        // Build second job BEFORE first commits (based on version 1), no retries
+        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .conflict_retries(0)
+            .try_build()
+            .unwrap();
+
+        // First merge insert commits (creates version 2)
+        let s1 =
+            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(vec![Ok(batch1)]));
+        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let result1 = b1.execute(Box::pin(s1) as SendableRecordBatchStream).await;
+        assert!(result1.is_ok(), "First merge insert should succeed");
+
+        // Second merge insert should detect the conflict via bloom filter
+        let s2 =
+            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(vec![Ok(batch2)]));
+        let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
+
+        assert!(
+            matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
+            "Expected TooMuchWriteContention for concurrent insert of same new key \
+             even WITHOUT unenforced-primary-key metadata, got: {:?}",
+            result2
+        );
+    }
+
+    /// Test: verify no duplicates after concurrent merge_insert with retries
+    /// (end-to-end correctness check).
+    ///
+    /// With retries enabled, the second operation should detect the conflict,
+    /// retry, find the key now exists, and do an update instead of insert.
+    #[tokio::test]
+    async fn test_concurrent_insert_same_key_without_pk_metadata_no_duplicates_with_retry() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let test_uri = "memory://test_no_dup_retry";
+        let dataset = InsertBuilder::new(test_uri)
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        // Build b2 before b1 commits, WITH retries (default behavior)
+        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .conflict_retries(10)
+            .try_build()
+            .unwrap();
+
+        // First commit
+        let s1 =
+            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(vec![Ok(batch1)]));
+        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let (_ds1, _) = b1
+            .execute(Box::pin(s1) as SendableRecordBatchStream)
+            .await
+            .unwrap();
+
+        // Second commit (should retry and succeed)
+        let s2 =
+            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(vec![Ok(batch2)]));
+        let (ds2, stats) = b2
+            .execute(Box::pin(s2) as SendableRecordBatchStream)
+            .await
+            .expect("Second merge insert should succeed via retry");
+
+        // Verify: exactly one row with id=100 (no duplicates)
+        let batches = ds2
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&schema, &batches).unwrap();
+
+        let ids = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        let id_100_count = ids.iter().filter(|&&id| id == 100).count();
+        assert_eq!(
+            id_100_count, 1,
+            "Expected exactly one row with id=100, got {id_100_count}. \
+             Duplicate row detected! ids = {ids:?}"
+        );
+
+        // The retry should have turned the insert into an update
+        assert!(
+            stats.num_attempts > 1,
+            "Expected retry (num_attempts > 1), got {}",
+            stats.num_attempts
+        );
+    }
+
+    // =========================================================================
+    // Regression test: demonstrates the duplicate row bug (lancedb/lance#4585)
+    //
+    // Before the fix, merge_insert("id") without unenforced-primary-key
+    // metadata on the schema would NOT include a bloom filter in the
+    // transaction. This meant the conflict resolver had nothing to check,
+    // and two concurrent writers inserting the same new key would both
+    // succeed — producing duplicate rows.
+    //
+    // This test reproduces the exact scenario: multiple concurrent
+    // merge_insert operations with overlapping new keys and NO primary key
+    // metadata. With the fix, the bloom filter is always included and
+    // conflicts are detected, so retries produce the correct result
+    // (exactly one row per key).
+    // =========================================================================
+
+    /// Regression test for lancedb/lance#4585: concurrent merge_insert without
+    /// PK metadata must not silently create duplicate rows.
+    ///
+    /// Scenario: 5 concurrent workers each insert 20 rows (ids 0..20) into an
+    /// empty dataset using merge_insert("id"). All workers share the same key
+    /// space, so conflicts are expected. The schema has NO
+    /// unenforced-primary-key metadata (the common production case).
+    ///
+    /// Expected result: exactly 20 unique rows. Before the fix, the dataset
+    /// would contain up to 100 rows (5 * 20) because no conflicts were
+    /// detected.
+    #[tokio::test]
+    async fn test_regression_concurrent_merge_insert_no_pk_metadata_no_duplicates() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        // Start with an empty dataset (single row to create the table, then we
+        // work entirely with new keys).
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![9999])),
+                Arc::new(StringArray::from(vec!["seed"])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://regression_4585")
+            .execute(vec![seed])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let num_workers = 5u32;
+        let rows_per_worker = 20u32;
+
+        let mut handles = Vec::new();
+        for worker in 0..num_workers {
+            let ds = dataset.clone();
+            let s = schema.clone();
+            handles.push(tokio::spawn(async move {
+                let batch = RecordBatch::try_new(
+                    s.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(
+                            (0..rows_per_worker).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            (0..rows_per_worker)
+                                .map(|i| format!("w{worker}_r{i}"))
+                                .collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap();
+
+                let stream = RecordBatchStreamAdapter::new(
+                    s.clone(),
+                    futures::stream::iter(vec![Ok(batch)]),
+                );
+
+                MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+            }));
+        }
+
+        // Collect results — all should succeed (retries handle conflicts)
+        let mut final_ds = None;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok((ds, _stats)) => final_ds = Some(ds),
+                Err(e) => panic!("Worker failed unexpectedly: {e}"),
+            }
+        }
+
+        // Read the final dataset
+        let ds = final_ds.expect("At least one worker should succeed");
+        let batches = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&schema, &batches).unwrap();
+
+        // Count unique ids — should be exactly rows_per_worker + 1 (seed row)
+        let ids = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        let unique_ids: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        let total_rows = ids.len();
+        let expected_unique = rows_per_worker as usize + 1; // +1 for seed row 9999
+
+        assert_eq!(
+            unique_ids.len(),
+            expected_unique,
+            "Expected {expected_unique} unique ids, got {}. \
+             Total rows: {total_rows} (duplicates: {}). \
+             Before the fix (lancedb/lance#4585), this would produce up to {} rows.",
+            unique_ids.len(),
+            total_rows - unique_ids.len(),
+            num_workers as usize * rows_per_worker as usize + 1,
+        );
+        assert_eq!(
+            total_rows, expected_unique,
+            "Duplicate rows detected! Total rows: {total_rows}, unique: {expected_unique}. \
+             This is the exact bug from lancedb/lance#4585."
+        );
+    }
+
+    // =========================================================================
+    // Property-based tests for concurrent merge_insert duplicate prevention
+    // =========================================================================
+
+    mod pbt {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Property: two concurrent merge_insert operations that insert the SAME new
+        /// key into a dataset should never produce duplicate rows when retries are
+        /// enabled.
+        ///
+        /// We parameterize over:
+        ///   - initial dataset size (1..=20)
+        ///   - the new key to insert (must be > initial dataset size to be truly new)
+        ///   - whether the schema has unenforced-primary-key metadata
+        ///
+        /// In all cases, the final dataset should contain exactly one row per key.
+        fn concurrent_same_key_no_duplicates(
+            initial_size: u32,
+            new_key: u32,
+            with_pk_metadata: bool,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let id_field = if with_pk_metadata {
+                    Field::new("id", DataType::UInt32, false).with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_string(),
+                            "true".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                } else {
+                    Field::new("id", DataType::UInt32, false)
+                };
+                let schema = Arc::new(Schema::new(vec![
+                    id_field,
+                    Field::new("value", DataType::UInt32, false),
+                ]));
+
+                // Initial dataset with ids 0..initial_size
+                let initial_ids: Vec<u32> = (0..initial_size).collect();
+                let initial_vals: Vec<u32> = vec![0; initial_size as usize];
+                let initial = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(initial_ids)),
+                        Arc::new(UInt32Array::from(initial_vals)),
+                    ],
+                )
+                .unwrap();
+
+                let test_uri = format!(
+                    "memory://pbt_same_key_{}_{}_{}",
+                    initial_size, new_key, with_pk_metadata
+                );
+                let dataset = InsertBuilder::new(&test_uri)
+                    .execute(vec![initial])
+                    .await
+                    .unwrap();
+                let dataset = Arc::new(dataset);
+
+                // Both workers try to insert the same new key
+                let batch1 = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![new_key])),
+                        Arc::new(UInt32Array::from(vec![1])),
+                    ],
+                )
+                .unwrap();
+                let batch2 = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![new_key])),
+                        Arc::new(UInt32Array::from(vec![2])),
+                    ],
+                )
+                .unwrap();
+
+                // Build b2 before b1 commits (same base version), with retries
+                let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .conflict_retries(10)
+                    .try_build()
+                    .unwrap();
+
+                // First commit
+                let s1 = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch1)]),
+                );
+                let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap();
+                b1.execute(Box::pin(s1) as SendableRecordBatchStream)
+                    .await
+                    .unwrap();
+
+                // Second commit (should retry and succeed without duplicates)
+                let s2 = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch2)]),
+                );
+                let (ds2, _) = b2
+                    .execute(Box::pin(s2) as SendableRecordBatchStream)
+                    .await
+                    .expect("Second merge insert should succeed via retry");
+
+                // Verify: no duplicate keys in the final dataset
+                let batches = ds2
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let merged = concat_batches(&schema, &batches).unwrap();
+
+                let ids = merged
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec();
+
+                // Every key should appear exactly once
+                let mut key_counts = std::collections::HashMap::new();
+                for &id in &ids {
+                    *key_counts.entry(id).or_insert(0u32) += 1;
+                }
+                for (&key, &count) in &key_counts {
+                    assert_eq!(
+                        count, 1,
+                        "Key {key} appears {count} times (expected 1). \
+                         Duplicate detected! All ids: {ids:?}"
+                    );
+                }
+
+                // The new key should be present
+                assert!(
+                    key_counts.contains_key(&new_key),
+                    "New key {new_key} missing from dataset. ids = {ids:?}"
+                );
+
+                // Total rows = initial_size + 1 (the new key)
+                assert_eq!(
+                    ids.len(),
+                    (initial_size + 1) as usize,
+                    "Expected {} rows, got {}. ids = {:?}",
+                    initial_size + 1,
+                    ids.len(),
+                    ids
+                );
+            });
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(20))]
+
+            /// PBT: concurrent same-key insert with PK metadata — no duplicates.
+            #[test]
+            fn pbt_no_duplicates_same_key_with_pk(
+                initial_size in 1u32..=10,
+                new_key_offset in 1u32..=100,
+            ) {
+                let new_key = initial_size + new_key_offset; // guarantee new
+                concurrent_same_key_no_duplicates(initial_size, new_key, true);
+            }
+
+            /// PBT: concurrent same-key insert WITHOUT PK metadata — no duplicates.
+            /// This is the critical case that was previously broken.
+            #[test]
+            fn pbt_no_duplicates_same_key_without_pk(
+                initial_size in 1u32..=10,
+                new_key_offset in 1u32..=100,
+            ) {
+                let new_key = initial_size + new_key_offset;
+                concurrent_same_key_no_duplicates(initial_size, new_key, false);
+            }
+        }
+
+        /// Property: two concurrent merge_insert operations that insert DIFFERENT
+        /// new keys should both succeed and produce no duplicates.
+        fn concurrent_different_keys_both_succeed(
+            initial_size: u32,
+            key_a: u32,
+            key_b: u32,
+            with_pk_metadata: bool,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let id_field = if with_pk_metadata {
+                    Field::new("id", DataType::UInt32, false).with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_string(),
+                            "true".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                } else {
+                    Field::new("id", DataType::UInt32, false)
+                };
+                let schema = Arc::new(Schema::new(vec![
+                    id_field,
+                    Field::new("value", DataType::UInt32, false),
+                ]));
+
+                let initial_ids: Vec<u32> = (0..initial_size).collect();
+                let initial_vals: Vec<u32> = vec![0; initial_size as usize];
+                let initial = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(initial_ids)),
+                        Arc::new(UInt32Array::from(initial_vals)),
+                    ],
+                )
+                .unwrap();
+
+                let test_uri = format!(
+                    "memory://pbt_diff_keys_{}_{}_{}_{}",
+                    initial_size, key_a, key_b, with_pk_metadata
+                );
+                let dataset = InsertBuilder::new(&test_uri)
+                    .execute(vec![initial])
+                    .await
+                    .unwrap();
+                let dataset = Arc::new(dataset);
+
+                let batch1 = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![key_a])),
+                        Arc::new(UInt32Array::from(vec![1])),
+                    ],
+                )
+                .unwrap();
+                let batch2 = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![key_b])),
+                        Arc::new(UInt32Array::from(vec![2])),
+                    ],
+                )
+                .unwrap();
+
+                let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .conflict_retries(10)
+                    .try_build()
+                    .unwrap();
+
+                let s1 = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch1)]),
+                );
+                let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap();
+                b1.execute(Box::pin(s1) as SendableRecordBatchStream)
+                    .await
+                    .unwrap();
+
+                let s2 = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch2)]),
+                );
+                let (ds2, _) = b2
+                    .execute(Box::pin(s2) as SendableRecordBatchStream)
+                    .await
+                    .expect("Second merge insert with different key should succeed");
+
+                let batches = ds2
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let merged = concat_batches(&schema, &batches).unwrap();
+                let ids = merged
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec();
+
+                let mut key_counts = std::collections::HashMap::new();
+                for &id in &ids {
+                    *key_counts.entry(id).or_insert(0u32) += 1;
+                }
+                for (&key, &count) in &key_counts {
+                    assert_eq!(
+                        count, 1,
+                        "Key {key} appears {count} times (expected 1). ids = {ids:?}"
+                    );
+                }
+
+                // Both new keys should be present
+                assert!(
+                    key_counts.contains_key(&key_a),
+                    "Key A ({key_a}) missing from dataset. ids = {ids:?}"
+                );
+                assert!(
+                    key_counts.contains_key(&key_b),
+                    "Key B ({key_b}) missing from dataset. ids = {ids:?}"
+                );
+            });
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(20))]
+
+            /// PBT: concurrent different-key inserts with PK metadata — both succeed.
+            #[test]
+            fn pbt_different_keys_both_succeed_with_pk(
+                initial_size in 1u32..=10,
+                offset_a in 1u32..=50,
+                offset_b in 51u32..=100, // non-overlapping offsets
+            ) {
+                let key_a = initial_size + offset_a;
+                let key_b = initial_size + offset_b;
+                concurrent_different_keys_both_succeed(initial_size, key_a, key_b, true);
+            }
+
+            /// PBT: concurrent different-key inserts without PK metadata — both succeed.
+            #[test]
+            fn pbt_different_keys_both_succeed_without_pk(
+                initial_size in 1u32..=10,
+                offset_a in 1u32..=50,
+                offset_b in 51u32..=100,
+            ) {
+                let key_a = initial_size + offset_a;
+                let key_b = initial_size + offset_b;
+                concurrent_different_keys_both_succeed(initial_size, key_a, key_b, false);
+            }
+        }
+
+        /// Property: N concurrent merge_inserts with overlapping key sets should
+        /// never produce duplicates. Tests multi-way concurrency.
+        fn concurrent_multi_writer_no_duplicates(
+            initial_size: u32,
+            num_writers: usize,
+            keys_per_writer: Vec<Vec<u32>>,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::UInt32, false),
+                    Field::new("value", DataType::UInt32, false),
+                ]));
+
+                let initial_ids: Vec<u32> = (0..initial_size).collect();
+                let initial_vals: Vec<u32> = vec![0; initial_size as usize];
+                let initial = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(initial_ids.clone())),
+                        Arc::new(UInt32Array::from(initial_vals)),
+                    ],
+                )
+                .unwrap();
+
+                let test_uri = format!("memory://pbt_multi_{}_{}", initial_size, num_writers);
+                let dataset = InsertBuilder::new(&test_uri)
+                    .execute(vec![initial])
+                    .await
+                    .unwrap();
+                let mut current_ds = Arc::new(dataset);
+
+                // Execute writers sequentially (each seeing the previous version)
+                for (i, keys) in keys_per_writer.iter().enumerate() {
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let vals: Vec<u32> = vec![(i + 1) as u32; keys.len()];
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(UInt32Array::from(keys.clone())),
+                            Arc::new(UInt32Array::from(vals)),
+                        ],
+                    )
+                    .unwrap();
+
+                    let s = RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        futures::stream::iter(vec![Ok(batch)]),
+                    );
+                    let b = MergeInsertBuilder::try_new(current_ds.clone(), vec!["id".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched(WhenNotMatched::InsertAll)
+                        .conflict_retries(20)
+                        .try_build()
+                        .unwrap();
+                    let (new_ds, _) = b
+                        .execute(Box::pin(s) as SendableRecordBatchStream)
+                        .await
+                        .unwrap_or_else(|e| panic!("Writer {} failed: {:?}", i, e));
+                    current_ds = new_ds;
+                }
+
+                // Verify: no duplicate keys
+                let batches = current_ds
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let merged = concat_batches(&schema, &batches).unwrap();
+                let ids = merged
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec();
+
+                let mut key_counts = std::collections::HashMap::new();
+                for &id in &ids {
+                    *key_counts.entry(id).or_insert(0u32) += 1;
+                }
+                for (&key, &count) in &key_counts {
+                    assert_eq!(
+                        count, 1,
+                        "Key {key} appears {count} times (expected 1) after \
+                         {num_writers} writers. ids = {ids:?}"
+                    );
+                }
+            });
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(10))]
+
+            /// PBT: 3 sequential writers with overlapping key sets — no duplicates.
+            /// Uses hash_set to ensure no duplicate keys within a single writer's batch,
+            /// since within-batch duplicates are a separate concern from cross-transaction
+            /// duplicates.
+            #[test]
+            fn pbt_multi_writer_no_duplicates(
+                initial_size in 1u32..=5,
+                keys1 in proptest::collection::hash_set(0u32..=15, 1..=5),
+                keys2 in proptest::collection::hash_set(0u32..=15, 1..=5),
+                keys3 in proptest::collection::hash_set(0u32..=15, 1..=5),
+            ) {
+                // Shift keys to be above initial dataset
+                let keys1: Vec<u32> = keys1.into_iter().map(|k| k + initial_size).collect();
+                let keys2: Vec<u32> = keys2.into_iter().map(|k| k + initial_size).collect();
+                let keys3: Vec<u32> = keys3.into_iter().map(|k| k + initial_size).collect();
+                concurrent_multi_writer_no_duplicates(
+                    initial_size,
+                    3,
+                    vec![keys1, keys2, keys3],
+                );
+            }
+        }
+    }
 }
