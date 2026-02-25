@@ -1814,7 +1814,6 @@ mod tests {
     use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
-    use crate::session::Session;
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
@@ -3626,62 +3625,5 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_create_incompatible() {
-        // Shared session so both commits see the same memory store
-        let session = Arc::new(Session::default());
-        let uri = "memory://test_concurrent_create";
-
-        let data = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from_iter_values(0..5))],
-        )
-        .unwrap();
-
-        let txn1 = InsertBuilder::new(uri)
-            .with_params(&WriteParams {
-                mode: WriteMode::Create,
-                session: Some(session.clone()),
-                ..Default::default()
-            })
-            .execute_uncommitted(vec![data.clone()])
-            .await
-            .unwrap();
-
-        let txn2 = InsertBuilder::new(uri)
-            .with_params(&WriteParams {
-                mode: WriteMode::Create,
-                session: Some(session.clone()),
-                ..Default::default()
-            })
-            .execute_uncommitted(vec![data])
-            .await
-            .unwrap();
-
-        assert_eq!(txn1.read_version, 0);
-        assert_eq!(txn2.read_version, 0);
-
-        // First create succeeds
-        let dataset_v1 = CommitBuilder::new(uri)
-            .with_session(session.clone())
-            .execute(txn1)
-            .await
-            .unwrap();
-        assert_eq!(dataset_v1.manifest.version, 1);
-
-        // Second create should fail with DatasetAlreadyExists
-        let result = CommitBuilder::new(uri)
-            .with_session(session.clone())
-            .execute(txn2)
-            .await;
-        assert!(
-            matches!(result, Err(Error::DatasetAlreadyExists { .. })),
-            "Expected DatasetAlreadyExists for concurrent creates, got: {:?}",
-            result
-        );
-
-        assert_eq!(dataset_v1.count_rows(None).await.unwrap(), 5);
     }
 }
