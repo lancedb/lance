@@ -890,17 +890,6 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Overwrite { .. } => {
-                // Two concurrent creates (read_version == 0) are incompatible -
-                // only one can create the dataset, the other must fail.
-                if self.transaction.read_version == 0 && other_transaction.read_version == 0 {
-                    return Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ));
-                }
-
-                // Upsert key conflicts are incompatible
                 if self
                     .transaction
                     .operation
@@ -912,8 +901,8 @@ impl<'a> TransactionRebase<'a> {
                         location!(),
                     ))
                 } else {
-                    // Two concurrent overwrites (on existing dataset) are retryable
-                    // so user can decide if their overwrite should still proceed
+                    // Concurrent overwrites are retryable so user can decide
+                    // if their overwrite should still proceed
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
             }
@@ -2441,21 +2430,18 @@ mod tests {
                     config_upsert_values: None,
                     initial_bases: None,
                 },
-                // Note: In this test, both transactions have read_version == 0,
-                // so both overwrites are "creates". Two concurrent creates are
-                // incompatible (only one can create the dataset).
-                // For overwrites on existing datasets (read_version > 0), the
-                // conflict would be Retryable instead.
+                // Concurrent overwrites are retryable so user can decide
+                // if their overwrite should still proceed.
                 [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite (both are creates with read_version == 0)
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
+                    Compatible, // append
+                    Compatible, // create index
+                    Compatible, // delete
+                    Compatible, // merge
+                    Retryable,  // overwrite
+                    Compatible, // rewrite
+                    Compatible, // reserve
+                    Compatible, // update
+                    Compatible, // update config
                 ],
             ),
             (
@@ -3685,14 +3671,14 @@ mod tests {
             .unwrap();
         assert_eq!(dataset_v1.manifest.version, 1);
 
-        // Second create should fail with IncompatibleTransaction
+        // Second create should fail with DatasetAlreadyExists
         let result = CommitBuilder::new(uri)
             .with_session(session.clone())
             .execute(txn2)
             .await;
         assert!(
-            matches!(result, Err(Error::IncompatibleTransaction { .. })),
-            "Expected IncompatibleTransaction for concurrent creates, got: {:?}",
+            matches!(result, Err(Error::DatasetAlreadyExists { .. })),
+            "Expected DatasetAlreadyExists for concurrent creates, got: {:?}",
             result
         );
 
