@@ -535,6 +535,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
                                 BATCH_SIZE,
                                 true, // is_structural for V2_2
                                 false,
+                                false,
                                 rx,
                             )
                             .unwrap();
