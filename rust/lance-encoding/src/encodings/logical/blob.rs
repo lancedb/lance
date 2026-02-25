@@ -141,10 +141,13 @@ impl FieldEncoder for BlobStructuralEncoder {
         let def = repdef.definition_levels.as_ref();
         let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
 
-        if self.def_meaning.is_none() {
-            self.def_meaning = Some(def_meaning.clone());
-        } else {
-            debug_assert_eq!(self.def_meaning.as_ref().unwrap(), &def_meaning);
+        match self.def_meaning.as_ref() {
+            None => {
+                self.def_meaning = Some(def_meaning.clone());
+            }
+            Some(existing) => {
+                debug_assert_eq!(existing, &def_meaning);
+            }
         }
 
         // Collect positions and sizes

@@ -2297,27 +2297,28 @@ impl StructuralPageScheduler for FullZipScheduler {
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         // Check if caching is enabled and we have a repetition index
-        if self.enable_cache && self.rep_index.is_some() {
-            let rep_index = self.rep_index.as_ref().unwrap();
-            // Calculate the total size of the repetition index
-            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
-            let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+        if self.enable_cache {
+            if let Some(rep_index) = self.rep_index.as_ref() {
+                // Calculate the total size of the repetition index
+                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+                let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
 
-            // Load the repetition index buffer
-            let io_clone = io.clone();
-            let future = async move {
-                let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
-                let rep_index_buffer = LanceBuffer::from_bytes(rep_index_data[0].clone(), 1);
+                // Load the repetition index buffer
+                let io_clone = io.clone();
+                let future = async move {
+                    let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                    let rep_index_buffer = LanceBuffer::from_bytes(rep_index_data[0].clone(), 1);
 
-                // Create and return the cacheable state
-                Ok(Arc::new(FullZipCacheableState { rep_index_buffer }) as Arc<dyn CachedPageData>)
-            };
+                    // Create and return the cacheable state
+                    Ok(Arc::new(FullZipCacheableState { rep_index_buffer })
+                        as Arc<dyn CachedPageData>)
+                };
 
-            future.boxed()
-        } else {
-            // Caching disabled or no repetition index, skip caching
-            std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
+                return future.boxed();
+            }
         }
+        // Caching disabled or no repetition index, skip caching
+        std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
 
     /// Loads previously cached repetition index data from the cache system.
@@ -4582,6 +4583,11 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    /// Probe whether a page looks near-unique before attempting dictionary encoding.
+    ///
+    /// The probe uses deterministic stride sampling (not RNG sampling), which keeps
+    /// the check cheap and reproducible across runs. The result is only a gate for
+    /// whether we try dictionary encoding, not a cardinality statistic.
     fn sample_is_near_unique(
         data_block: &DataBlock,
         max_samples: usize,
@@ -4599,6 +4605,7 @@ impl PrimitiveStructuralEncoder {
         }
 
         let sample_count = num_values.min(max_samples).max(1);
+        // Uniform stride sampling across the page.
         let step = (num_values / sample_count).max(1);
 
         match data_block {
@@ -4611,6 +4618,7 @@ impl PrimitiveStructuralEncoder {
                         unique.insert(values.get(idx).copied()?);
                     }
                     let ratio = unique.len() as f64 / sample_count as f64;
+                    // Avoid overreacting to tiny pages with too few samples.
                     Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
                 }
                 128 => {
@@ -4628,6 +4636,7 @@ impl PrimitiveStructuralEncoder {
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
+                // Hash variable-width slices instead of storing borrowed slice keys.
                 let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
                 match var.bits_per_offset {
                     32 => {
@@ -6188,9 +6197,7 @@ mod tests {
                 crate::buffer::LanceBuffer::reinterpret_vec(values)
             }
             64 => {
-                let values = (0..num_values)
-                    .map(|i| (i % cardinality) as u64)
-                    .collect::<Vec<_>>();
+                let values = (0..num_values).map(|i| i % cardinality).collect::<Vec<_>>();
                 crate::buffer::LanceBuffer::reinterpret_vec(values)
             }
             128 => {
