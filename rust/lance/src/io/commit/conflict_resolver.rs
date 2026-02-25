@@ -178,8 +178,7 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
         location: Location,
     ) -> Error {
-        Error::CommitConflict {
-            version: other_version,
+        Error::IncompatibleTransaction {
             source: format!(
                 "This {} transaction is incompatible with concurrent transaction {} at version {}.",
                 self.transaction.operation, other_transaction.operation, other_version
@@ -2731,7 +2730,7 @@ mod tests {
                     NotCompatible => {
                         let result = rebase.check_txn(other, 1);
                         assert!(
-                            matches!(result, Err(Error::CommitConflict { .. })),
+                            matches!(result, Err(Error::IncompatibleTransaction { .. })),
                             "Transaction {:?} should be {:?} with {:?}, but was: {:?}",
                             operation,
                             expected_conflict,
@@ -2826,8 +2825,8 @@ mod tests {
             .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected CommitConflict error for duplicate name, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected IncompatibleTransaction error for duplicate name, got {:?}",
             result
         );
     }
@@ -2867,8 +2866,8 @@ mod tests {
             .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected CommitConflict error for duplicate path, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected IncompatibleTransaction error for duplicate path, got {:?}",
             result
         );
     }
@@ -2908,8 +2907,8 @@ mod tests {
             .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected CommitConflict error for duplicate ID, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected IncompatibleTransaction error for duplicate ID, got {:?}",
             result
         );
     }
@@ -3007,8 +3006,8 @@ mod tests {
             .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected CommitConflict error, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected IncompatibleTransaction error, got {:?}",
             result
         );
     }
@@ -3299,8 +3298,8 @@ mod tests {
 
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict for lower generation, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction for lower generation, got {:?}",
             result
         );
     }
@@ -3337,8 +3336,8 @@ mod tests {
 
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict for equal generation, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction for equal generation, got {:?}",
             result
         );
     }
@@ -3465,8 +3464,8 @@ mod tests {
 
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
-            matches!(result, Err(Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
             result
         );
 

@@ -2021,7 +2021,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
-    ):
+    ) -> DeleteResult:
         """
         Delete rows from the dataset.
 
@@ -2042,6 +2042,12 @@ class LanceDataset(pa.dataset.Dataset):
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
 
+        Returns
+        -------
+        dict
+            A dictionary containing the number of rows deleted, with the key
+            ``num_deleted_rows``.
+
         Examples
         --------
         >>> import lance
@@ -2049,17 +2055,11 @@ class LanceDataset(pa.dataset.Dataset):
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
-        >>> dataset.to_table()
-        pyarrow.Table
-        a: int64
-        b: string
-        ----
-        a: [[3]]
-        b: [["c"]]
+        {'num_deleted_rows': 2}
         """
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
-        self._ds.delete(predicate, conflict_retries, retry_timeout)
+        return self._ds.delete(predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -3399,6 +3399,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        namespace: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3465,6 +3467,12 @@ class LanceDataset(pa.dataset.Dataset):
             row IDs assign each row a monotonically increasing id that persists
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
+        namespace : LanceNamespace, optional
+            A namespace instance. Must be provided together with table_id.
+            Use lance.namespace.connect() to create a namespace.
+        table_id : List[str], optional
+            The table identifier within the namespace (e.g., ["workspace", "table"]).
+            Must be provided together with namespace.
 
         Returns
         -------
@@ -3535,6 +3543,8 @@ class LanceDataset(pa.dataset.Dataset):
                 detached=detached,
                 max_retries=max_retries,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3549,6 +3559,8 @@ class LanceDataset(pa.dataset.Dataset):
                 max_retries=max_retries,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         else:
             raise TypeError(
@@ -4170,6 +4182,10 @@ class Version(TypedDict):
 
 class UpdateResult(TypedDict):
     num_rows_updated: int
+
+
+class DeleteResult(TypedDict):
+    num_deleted_rows: int
 
 
 class AlterColumn(TypedDict):

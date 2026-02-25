@@ -9,4 +9,4 @@ For the complete specification, see:
 
 - [MemWAL Index Overview](../../mem_wal.md#memwal-index) - Purpose and high-level description
 - [MemWAL Index Details](../../mem_wal.md#memwal-index-details) - Storage format, schemas, and staleness handling
-- [MemWAL Index Builder](../../mem_wal.md#memwal-index-builder) - Background process and configuration updates
+- [MemWAL Implementation](../../mem_wal.md#implementation-expectation) - Implementation details and expectations

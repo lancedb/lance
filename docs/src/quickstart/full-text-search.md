@@ -58,6 +58,7 @@ print(ds.schema)
 ```
 
 This prints the PyArrow schema of the dataset:
+
 ```
 id: int64
 text: large_string
@@ -77,7 +78,7 @@ ds.create_scalar_index(
 The index creation process builds an efficient lookup structure that maps words to the documents containing them. This enables high-performance keyword-based search, even on large datasets.
 
 !!! warning "Index Creation Time"
-    Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
+Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
 
 ## Advanced Index Configuration
 
@@ -195,6 +196,7 @@ query_result = ds.to_table(
 You can use boolean search operators by constructing a structured query object.
 
 #### All terms: `AND`
+
 ```python
 from lance.query import FullTextOperator, MatchQuery
 
@@ -207,6 +209,7 @@ query_result = ds.to_table(full_text_query=and_query)
 ```
 
 #### Any terms: `OR`
+
 ```python
 from lance.query import FullTextOperator, MatchQuery
 
@@ -278,7 +281,7 @@ table = ds.to_table(full_text_query="'train to boston'")
 ```
 
 !!! warning "Stop Words Are Removed by Default"
-    Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set `remove_stop_words=False` when creating the index.
+Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set `remove_stop_words=False` when creating the index.
 
 ### Substring matches with N-gram indexing
 
@@ -385,8 +388,8 @@ print(stats["num_unindexed_rows"], stats["num_indexed_rows"])
 ```
 
 !!! info
-    If you used a custom index name, replace `"text_idx"` with your index name.
-    If you did not set `name=...` when creating the FTS index on column `"text"`, the default index name is `"text_idx"`.
+If you used a custom index name, replace `"text_idx"` with your index name.
+If you did not set `name=...` when creating the FTS index on column `"text"`, the default index name is `"text_idx"`.
 
 If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, stop words, or stemming), rebuild the index with `create_scalar_index(..., replace=True)` so the full dataset is indexed with the new configuration.
 
@@ -406,6 +409,10 @@ Using specific, targeted search terms often yields better performance than broad
 
 Combining full-text search with metadata filters can significantly reduce the search space and improve performance. Use structured data filters to narrow down results before applying text search, or vice versa. This approach is particularly effective for large datasets where you can eliminate many irrelevant documents early in the query process.
 
+### Further Reading
+
+For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the [full-text index](../format/table/index/scalar/fts.md) specification.
+
 ## Next Steps
 
-Check out the **[User Guide](../guide/read_and_write/)** and explore the Lance API in more detail.
+Check out the **[User Guide](../guide/read_and_write.md)** and explore the Lance API in more detail.

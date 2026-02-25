@@ -1,12 +1,11 @@
-
 # Indices in Lance
 
 Lance supports three main categories of indices to accelerate data access: scalar
 indices, vector indices, and system indices.
 
-**Scalar indices** are traditional indices that speed up queries on scalar data types, such as 
+**Scalar indices** are traditional indices that speed up queries on scalar data types, such as
 integers and strings. Examples include [B-trees](scalar/btree.md) and
-[full-text search indices](scalar/full_text.md). Typically, scalar indices receive a
+[full-text search indices](scalar/fts.md). Typically, scalar indices receive a
 query predicate, such as equality or range conditions, and output a set of row addresses that
 satisfy the predicate.
 
@@ -59,7 +58,7 @@ all rows in the fragments they cover, with one exception: if a fragment has dele
 of index creation, the index segment is allowed to not contain the deleted rows. The fragments an index
 covers are those recorded in the `fragment_bitmap` field.
 
-Index segments together **do not** need to cover all fragments. This means an index isn't required to 
+Index segments together **do not** need to cover all fragments. This means an index isn't required to
 be fully up-to-date. When this happens, engines can split their queries into indexed and unindexed
 subplans and merge the results.
 
@@ -71,13 +70,13 @@ subplans and merge the results.
 
 Consider the example dataset in the figure above:
 
-* The dataset contains three fragments with ids 0, 1, 2. Fragment 1 has 10 deleted rows, indicated
+- The dataset contains three fragments with ids 0, 1, 2. Fragment 1 has 10 deleted rows, indicated
   by the deletion file.
-* There is an index called "id_idx", which has two segments: one covering fragments 0 and another covering
+- There is an index called "id_idx", which has two segments: one covering fragments 0 and another covering
   fragment 1. Fragment 2 is not covered by the index. Queries using this index will need to query both
   segments and then scan fragment 2 directly. Additionally, when querying the segment covering fragment 1,
   the engine will need to filter out the 10 deleted rows.
-* There is another index called "vec_idx", which has a single segment covering all three fragments.
+- There is another index called "vec_idx", which has a single segment covering all three fragments.
   Because it covers all fragments, queries using this index do not need to scan any fragments directly.
   They do, however, need to filter out the 10 deleted rows from fragment 1.
 
@@ -99,13 +98,13 @@ Index segments are created and updated through a transactional process:
    directory, where `{UUID}` is a newly generated unique identifier.
 
 2. **Prepare the metadata**: Create an `IndexMetadata` message with:
-    - `uuid`: The newly generated UUID
-    - `name`: The index name (must match existing segments if adding to an existing index)
-    - `fields`: The column(s) being indexed
-    - `fragment_bitmap`: The set of fragment IDs covered by this segment
-    - `index_details`: Index-specific configuration and parameters
-    - `version`: The format version of this index type
-    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
+   - `uuid`: The newly generated UUID
+   - `name`: The index name (must match existing segments if adding to an existing index)
+   - `fields`: The column(s) being indexed
+   - `fragment_bitmap`: The set of fragment IDs covered by this segment
+   - `index_details`: Index-specific configuration and parameters
+   - `version`: The format version of this index type
+   - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
 
 3. **Commit the transaction**: Write a new manifest that includes the new index segment
    in its `IndexSection`. This is done atomically using the same transaction mechanism
@@ -149,12 +148,11 @@ When loading an index:
 
 The `IndexMetadata` message contains important information about the index segment:
 
-* `uuid`: the unique identifier of the index segment.
-* `fields`: the column(s) the index is built on.
-* `fragment_bitmap`: the set of fragment IDs covered by this index segment.
-* `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
+- `uuid`: the unique identifier of the index segment.
+- `fields`: the column(s) the index is built on.
+- `fragment_bitmap`: the set of fragment IDs covered by this index segment.
+- `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
-
 
 <details>
   <summary>Full protobuf definitions</summary>

@@ -1513,7 +1513,7 @@ mod tests {
                     if result.is_err() {
                         first_operation_failed = true;
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );
@@ -1523,7 +1523,7 @@ mod tests {
                     true => assert!(result.is_ok(), "{:?}", result),
                     false => {
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );

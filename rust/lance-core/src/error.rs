@@ -51,6 +51,11 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    #[snafu(display("Incompatible transaction: {source}, {location}"))]
+    IncompatibleTransaction {
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
         version: u64,
