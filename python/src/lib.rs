@@ -32,9 +32,9 @@ use std::ffi::CString;
 
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
-use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
@@ -406,16 +406,18 @@ impl FFILanceTableProvider {
         ));
 
         let codec = ffi_logical_codec_from_pycapsule(session)?;
-        let ffi_provider =
-            FFI_TableProvider::new_with_ffi_codec(a_lance_table_provider, true, rt().get_runtime_handle(), codec);
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(
+            a_lance_table_provider,
+            true,
+            rt().get_runtime_handle(),
+            codec,
+        );
         let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
         capsule
     }
 }
 
-fn ffi_logical_codec_from_pycapsule(
-    obj: Bound<PyAny>,
-) -> PyResult<FFI_LogicalExtensionCodec> {
+fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
     let attr_name = "__datafusion_logical_extension_codec__";
     let capsule = if obj.hasattr(attr_name)? {
         obj.getattr(attr_name)?.call0()?
