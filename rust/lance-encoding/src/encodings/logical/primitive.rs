@@ -1994,6 +1994,8 @@ pub struct FullZipScheduler {
     details: Arc<FullZipDecodeDetails>,
     /// Cached state containing the decoded repetition index
     cached_state: Option<Arc<FullZipCacheableState>>,
+    /// Whether repetition index metadata should be cached during initialize.
+    enable_cache: bool,
 }
 
 impl FullZipScheduler {
@@ -2079,6 +2081,7 @@ impl FullZipScheduler {
             rows_in_page,
             bits_per_offset,
             cached_state: None,
+            enable_cache: false,
         })
     }
 
@@ -2372,14 +2375,26 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
-    /// FullZip does not require eager metadata initialization.
-    ///
-    /// We can avoid an extra round-trip on full page scans by deferring repetition
-    /// index reads until a non-full-page request actually needs them.
     fn initialize<'a>(
         &'a mut self,
-        _io: &Arc<dyn EncodingsIo>,
+        io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        if self.enable_cache {
+            if let Some(rep_index) = self.rep_index {
+                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+                let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+                let io_clone = io.clone();
+                return async move {
+                    let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                    let state = Arc::new(FullZipCacheableState {
+                        rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
+                    });
+                    self.cached_state = Some(state.clone());
+                    Ok(state as Arc<dyn CachedPageData>)
+                }
+                .boxed();
+            }
+        }
         std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
 
@@ -3087,6 +3102,7 @@ impl StructuralPrimitiveFieldScheduler {
     pub fn try_new(
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Self> {
         let page_schedulers = column_info
@@ -3094,7 +3110,13 @@ impl StructuralPrimitiveFieldScheduler {
             .iter()
             .enumerate()
             .map(|(page_index, page_info)| {
-                Self::page_info_to_scheduler(page_info, page_index, decompressors, target_field)
+                Self::page_info_to_scheduler(
+                    page_info,
+                    page_index,
+                    decompressors,
+                    cache_repetition_index,
+                    target_field,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -3107,6 +3129,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_info: &PageInfo,
         page_layout: &PageLayout,
         decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
@@ -3118,13 +3141,17 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
-            Layout::FullZipLayout(full_zip) => Box::new(FullZipScheduler::try_new(
-                &page_info.buffer_offsets_and_sizes,
-                page_info.priority,
-                page_info.num_rows,
-                full_zip,
-                decompressors,
-            )?),
+            Layout::FullZipLayout(full_zip) => {
+                let mut scheduler = FullZipScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    page_info.num_rows,
+                    full_zip,
+                    decompressors,
+                )?;
+                scheduler.enable_cache = cache_repetition_index;
+                Box::new(scheduler)
+            }
             Layout::ConstantLayout(constant_layout) => {
                 let def_meaning = constant_layout
                     .layers
@@ -3157,6 +3184,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_info,
                     blob.inner_layout.as_ref().expect_ok()?.as_ref(),
                     decompressors,
+                    cache_repetition_index,
                     target_field,
                 )?;
                 let def_meaning = blob
@@ -3187,11 +3215,17 @@ impl StructuralPrimitiveFieldScheduler {
         page_info: &PageInfo,
         page_index: usize,
         decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
-        let scheduler =
-            Self::page_layout_to_scheduler(page_info, page_layout, decompressors, target_field)?;
+        let scheduler = Self::page_layout_to_scheduler(
+            page_info,
+            page_layout,
+            decompressors,
+            cache_repetition_index,
+            target_field,
+        )?;
         Ok(PageInfoAndScheduler {
             page_index,
             num_rows: page_info.num_rows,
@@ -4944,9 +4978,9 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails,
-        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
-        StructuralPageScheduler,
+        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
+        FullZipRepIndexDetails, FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor,
+        PreambleAction, StructuralPageScheduler,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
@@ -5734,6 +5768,7 @@ mod tests {
                 max_visible_def: 0,
             }),
             cached_state: None,
+            enable_cache: false,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -5768,6 +5803,107 @@ mod tests {
         let mut data = source.fetch(&ranges, 0).await.unwrap();
         assert_eq!(data.pop_front().unwrap().as_ref(), &[0, 1, 2]);
         assert_eq!(data.pop_front().unwrap().as_ref(), &[4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_initialize_caches_rep_index_when_enabled() {
+        use futures::{future::BoxFuture, FutureExt};
+        use std::ops::Range;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Clone)]
+        struct RecordingScheduler {
+            data: bytes::Bytes,
+            requests: Arc<Mutex<Vec<Vec<Range<u64>>>>>,
+        }
+
+        impl RecordingScheduler {
+            fn new(data: bytes::Bytes) -> Self {
+                Self {
+                    data,
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn requests(&self) -> Vec<Vec<Range<u64>>> {
+                self.requests.lock().unwrap().clone()
+            }
+        }
+
+        impl crate::EncodingsIo for RecordingScheduler {
+            fn submit_request(
+                &self,
+                ranges: Vec<Range<u64>>,
+                _priority: u64,
+            ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
+                self.requests.lock().unwrap().push(ranges.clone());
+                let data = ranges
+                    .into_iter()
+                    .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                    .collect::<Vec<_>>();
+                std::future::ready(Ok(data)).boxed()
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestFixedDecompressor;
+
+        impl FixedPerValueDecompressor for TestFixedDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                unimplemented!("Test decompressor")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        let rows_in_page = 100_u64;
+        let bytes_per_value = 4_u64;
+        let rep_start = 1000_u64;
+        let rep_size = ((rows_in_page + 1) * bytes_per_value) as usize;
+        let mut data = vec![0_u8; 16 * 1024];
+        data[rep_start as usize..rep_start as usize + rep_size].fill(7);
+        let io = Arc::new(RecordingScheduler::new(bytes::Bytes::from(data)));
+
+        let mut scheduler = FullZipScheduler {
+            data_buf_position: 0,
+            data_buf_size: 4096,
+            rep_index: Some(FullZipRepIndexDetails {
+                buf_position: rep_start,
+                bytes_per_value,
+            }),
+            priority: 0,
+            rows_in_page,
+            bits_per_offset: 32,
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            cached_state: None,
+            enable_cache: true,
+        };
+
+        let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
+        let cached_data = scheduler.initialize(&io_dyn).await.unwrap();
+        assert!(cached_data
+            .as_arc_any()
+            .downcast_ref::<FullZipCacheableState>()
+            .is_some());
+        assert!(scheduler.cached_state.is_some());
+        assert_eq!(
+            io.requests(),
+            vec![vec![
+                rep_start..(rep_start + (rows_in_page + 1) * bytes_per_value)
+            ]]
+        );
     }
 
     #[tokio::test]
@@ -5859,6 +5995,7 @@ mod tests {
                 max_visible_def: 0,
             }),
             cached_state: None,
+            enable_cache: false,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
