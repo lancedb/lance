@@ -1148,6 +1148,7 @@ impl ManifestNamespace {
                         LanceError::DatasetAlreadyExists { .. }
                             | LanceError::CommitConflict { .. }
                             | LanceError::IncompatibleTransaction { .. }
+                            | LanceError::RetryableCommitConflict { .. }
                     ) =>
                 {
                     // Another process created the manifest concurrently, try to load it
