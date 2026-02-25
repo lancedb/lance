@@ -1,10 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt;
+
 use arrow_schema::ArrowError;
 use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Error for when a requested field is not found in a schema.
+///
+/// This error computes suggestions lazily (only when displayed) to avoid
+/// computing Levenshtein distance when the error is created but never shown.
+#[derive(Debug)]
+pub struct FieldNotFoundError {
+    pub field_name: String,
+    pub candidates: Vec<String>,
+}
+
+impl fmt::Display for FieldNotFoundError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Field '{}' not found.", self.field_name)?;
+        let suggestion =
+            crate::levenshtein::find_best_suggestion(&self.field_name, &self.candidates);
+        if let Some(suggestion) = suggestion {
+            write!(f, " Did you mean '{}'?", suggestion)?;
+        }
+        write!(f, "\nAvailable fields: [")?;
+        for (i, candidate) in self.candidates.iter().take(10).enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "'{}'", candidate)?;
+        }
+        if self.candidates.len() > 10 {
+            let remaining = self.candidates.len() - 10;
+            write!(f, ", ... and {} more]", remaining)?;
+        } else {
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FieldNotFoundError {}
 
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
@@ -130,6 +169,10 @@ pub enum Error {
     /// or inspected using [`Error::external_source`].
     #[snafu(transparent)]
     External { source: BoxedError },
+
+    /// A requested field was not found in a schema.
+    #[snafu(transparent)]
+    FieldNotFound { source: FieldNotFoundError },
 }
 
 impl Error {
@@ -200,6 +243,16 @@ impl Error {
     /// Create an External error from a boxed error source.
     pub fn external(source: BoxedError) -> Self {
         Self::External { source }
+    }
+
+    /// Create a FieldNotFound error with the given field name and available candidates.
+    pub fn field_not_found(field_name: impl Into<String>, candidates: Vec<String>) -> Self {
+        Self::FieldNotFound {
+            source: FieldNotFoundError {
+                field_name: field_name.into(),
+                candidates,
+            },
+        }
     }
 
     /// Returns a reference to the external error source if this is an `External` variant.
