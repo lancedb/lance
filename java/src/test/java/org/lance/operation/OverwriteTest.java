@@ -65,6 +65,7 @@ public class OverwriteTest extends OperationTestBase {
       }
 
       // Commit fragment again
+      dataset.checkoutLatest();
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
       transaction =
