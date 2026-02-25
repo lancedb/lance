@@ -259,7 +259,7 @@ pub struct ManifestNamespace {
     /// after every write. Defaults to true.
     inline_optimization_enabled: bool,
     /// Number of retries for commit operations on the manifest table.
-    /// If None, defaults to [`lance_table::io::commit::CommitConfig::default().num_retries`].
+    /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     commit_retries: Option<u32>,
 }
 

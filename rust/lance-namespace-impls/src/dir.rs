@@ -375,7 +375,7 @@ impl DirectoryNamespaceBuilder {
     }
 
     /// Set the number of retries for commit operations on the manifest table.
-    /// If not set, defaults to [`lance_table::io::commit::CommitConfig::default().num_retries`].
+    /// If not set, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     pub fn commit_retries(mut self, retries: u32) -> Self {
         self.commit_retries = Some(retries);
         self
