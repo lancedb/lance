@@ -29,6 +29,8 @@ import java.nio.file.Path;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OverwriteTest extends OperationTestBase {
 
@@ -64,8 +66,7 @@ public class OverwriteTest extends OperationTestBase {
         }
       }
 
-      // Commit fragment again
-      dataset.checkoutLatest();
+      // Try to commit from stale version (v1) - should fail with retryable error
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
       transaction =
@@ -81,6 +82,26 @@ public class OverwriteTest extends OperationTestBase {
               .build();
       assertEquals(
           "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
+
+      RuntimeException ex =
+          assertThrows(RuntimeException.class, () -> transaction.commit().close());
+      assertTrue(
+          ex.getMessage().contains("Retryable commit conflict"),
+          "Expected retryable commit conflict error, got: " + ex.getMessage());
+
+      // Checkout latest and retry - should succeed
+      dataset.checkoutLatest();
+      transaction =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(testDataset.getSchema())
+                      .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
+                      .build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
+              .build();
       try (Dataset dataset = transaction.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
