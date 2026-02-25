@@ -3339,6 +3339,9 @@ impl Scanner {
 
                 // If all target fragments are unindexed, skip index entirely
                 if unindexed_fragments.len() == target_fragments.len() {
+                    if self.fast_search {
+                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                    }
                     let flat_match_plan = self
                         .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
                         .await?;
@@ -3353,7 +3356,7 @@ impl Scanner {
                     prefilter_source.clone(),
                 ));
 
-                if unindexed_fragments.is_empty() {
+                if self.fast_search || unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
                     let flat_match_plan = self
@@ -3363,6 +3366,9 @@ impl Scanner {
                 }
             }
             None => {
+                if self.fast_search {
+                    return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
                     .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
@@ -8492,6 +8498,25 @@ mod test {
         )
         .await?;
 
+        log::info!("Test case: Full text search with unindexed rows and fast_search");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      MatchQuery: column=s, query=hello"#;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                let scan = scan
+                    .project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))?;
+                scan.fast_search();
+                Ok(scan)
+            },
+            expected,
+        )
+        .await?;
+
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
@@ -8945,6 +8970,40 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_fts_fast_search_excludes_unindexed_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Append rows after index build so they stay unindexed.
+        test_ds.append_data_with_range(10, 20).await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap()
+            .fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 2);
+        assert_eq!(fast_rows, 1);
     }
 
     async fn test_row_offset_read_helper(
