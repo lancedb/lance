@@ -601,6 +601,7 @@ impl ScalarIndex for BitmapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         let mut state = HashMap::new();
 
@@ -803,6 +804,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {

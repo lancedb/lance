@@ -31,6 +31,7 @@ use lance_file::{version::LanceFileVersion, LanceEncodingsIo};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
+    traits::Writer,
     utils::CachedFileSize,
     ReadBatchParams,
 };
@@ -577,8 +578,7 @@ impl LanceFileSession {
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .map_err(|e| PyIOError::new_err(format!("Failed to upload file: {}", e)))?;
-            writer
-                .shutdown()
+            Writer::shutdown(writer.as_mut())
                 .await
                 .map_err(|e| PyIOError::new_err(format!("Failed to finalize upload: {}", e)))?;
 

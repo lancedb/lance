@@ -12,17 +12,19 @@ use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    CountTableRowsRequest, CreateEmptyTableRequest, CreateEmptyTableResponse,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
+    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
     DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
     DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
-    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
-    DropTableResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -390,6 +392,77 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<ListTableVersionsResponse> {
         Err(Error::NotSupported {
             source: "list_table_versions not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Create a new table version entry.
+    ///
+    /// This operation supports `put_if_not_exists` semantics, where the operation
+    /// fails if the version already exists. This is used to coordinate concurrent
+    /// writes to a table through an external manifest store.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier, version number, manifest path,
+    ///   and optional metadata like size and ETag.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the version already exists (conflict).
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    async fn create_table_version(
+        &self,
+        _request: CreateTableVersionRequest,
+    ) -> Result<CreateTableVersionResponse> {
+        Err(Error::NotSupported {
+            source: "create_table_version not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Describe a specific table version.
+    ///
+    /// Returns metadata about a specific version of a table, including the
+    /// manifest path, size, ETag, and timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier and optionally the version
+    ///   number. If version is not specified, returns the latest version.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    /// - Returns an error if the specified version does not exist.
+    async fn describe_table_version(
+        &self,
+        _request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        Err(Error::NotSupported {
+            source: "describe_table_version not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Batch delete table versions.
+    ///
+    /// Deletes multiple version records from a table. This operation supports
+    /// deleting ranges of versions for efficient bulk cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier and version ranges to delete.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    async fn batch_delete_table_versions(
+        &self,
+        _request: BatchDeleteTableVersionsRequest,
+    ) -> Result<BatchDeleteTableVersionsResponse> {
+        Err(Error::NotSupported {
+            source: "batch_delete_table_versions not implemented".into(),
             location: Location::new(file!(), line!(), column!()),
         })
     }

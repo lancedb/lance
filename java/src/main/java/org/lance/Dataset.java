@@ -30,6 +30,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
@@ -193,27 +194,7 @@ public class Dataset implements Closeable {
       String path,
       WriteParams params,
       StorageOptionsProvider storageOptionsProvider) {
-    Preconditions.checkNotNull(allocator);
-    Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(params);
-    Dataset dataset =
-        createWithFfiStreamAndProvider(
-            stream.memoryAddress(),
-            path,
-            params.getMaxRowsPerFile(),
-            params.getMaxRowsPerGroup(),
-            params.getMaxBytesPerFile(),
-            params.getMode(),
-            params.getEnableStableRowIds(),
-            params.getDataStorageVersion(),
-            params.getEnableV2ManifestPaths(),
-            params.getStorageOptions(),
-            Optional.ofNullable(storageOptionsProvider),
-            params.getInitialBases(),
-            params.getTargetBases());
-    dataset.allocator = allocator;
-    return dataset;
+    return create(allocator, stream, path, params, storageOptionsProvider, null, null);
   }
 
   private static native Dataset createWithFfiSchema(
@@ -257,7 +238,57 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
+      Optional<List<String>> targetBases,
+      LanceNamespace namespace,
+      List<String> tableId);
+
+  /**
+   * Creates a dataset with optional namespace support for managed versioning.
+   *
+   * <p>When a namespace is provided, the commit handler will use the namespace's
+   * create_table_version method for version tracking.
+   *
+   * @param allocator buffer allocator
+   * @param stream arrow stream
+   * @param path dataset uri
+   * @param params write parameters
+   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
+   * @param namespace optional namespace implementation for managed versioning (can be null)
+   * @param tableId optional table identifier within the namespace (can be null)
+   * @return Dataset
+   */
+  static Dataset create(
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(params);
+    Dataset dataset =
+        createWithFfiStreamAndProvider(
+            stream.memoryAddress(),
+            path,
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getEnableStableRowIds(),
+            params.getDataStorageVersion(),
+            params.getEnableV2ManifestPaths(),
+            params.getStorageOptions(),
+            Optional.ofNullable(storageOptionsProvider),
+            params.getInitialBases(),
+            params.getTargetBases(),
+            namespace,
+            tableId);
+    dataset.allocator = allocator;
+    return dataset;
+  }
 
   /**
    * Open a dataset from the specified path.
@@ -328,6 +359,26 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
+    return open(allocator, selfManagedAllocator, path, options, session, null, null);
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options and namespace commit handler.
+   *
+   * @param path file path
+   * @param options the open options
+   * @param namespace the LanceNamespace to use for managed versioning (null if not using namespace)
+   * @param tableId table identifier (null if not using namespace)
+   * @return Dataset
+   */
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session,
+      LanceNamespace namespace,
+      List<String> tableId) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
@@ -348,7 +399,9 @@ public class Dataset implements Closeable {
             options.getStorageOptions(),
             options.getSerializedManifest(),
             options.getStorageOptionsProvider(),
-            sessionHandle);
+            sessionHandle,
+            namespace,
+            tableId);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     if (effectiveSession != null) {
@@ -369,7 +422,9 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      long sessionHandle);
+      long sessionHandle,
+      LanceNamespace namespace,
+      List<String> tableId);
 
   /**
    * Creates a builder for opening a dataset.

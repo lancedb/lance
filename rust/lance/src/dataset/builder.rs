@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::dataset::branch_location::BranchLocation;
+use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{session::Session, Dataset, Error, Result};
 use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
@@ -18,6 +19,7 @@ use lance_namespace::models::DescribeTableRequest;
 use lance_namespace::LanceNamespace;
 use lance_table::{
     format::Manifest,
+    io::commit::external_manifest::ExternalManifestCommitHandler,
     io::commit::{commit_handler_from_url, CommitHandler},
 };
 #[cfg(feature = "aws")]
@@ -141,7 +143,17 @@ impl DatasetBuilder {
             location: location!(),
         })?;
 
-        let mut builder = Self::from_uri(table_uri);
+        let mut builder = Self::from_uri(&table_uri);
+
+        // Check managed_versioning flag to determine if namespace-managed commits should be used
+        if response.managed_versioning == Some(true) {
+            let external_store =
+                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder.commit_handler = Some(commit_handler);
+        }
 
         // Use namespace storage options if available
         let namespace_storage_options = response.storage_options;

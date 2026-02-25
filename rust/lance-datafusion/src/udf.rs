@@ -27,7 +27,52 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
     // GEO functions
+    #[cfg(feature = "geo")]
     lance_geo::register_functions(ctx);
+    #[cfg(not(feature = "geo"))]
+    register_geo_stub_functions(ctx);
+}
+
+/// When the `geo` feature is disabled, register stub UDFs for spatial SQL functions
+/// so that users get a clear error mentioning the feature flag instead of
+/// DataFusion's generic "Unknown function" error.
+#[cfg(not(feature = "geo"))]
+fn register_geo_stub_functions(ctx: &SessionContext) {
+    let geo_funcs = [
+        "st_intersects",
+        "st_contains",
+        "st_within",
+        "st_touches",
+        "st_crosses",
+        "st_overlaps",
+        "st_covers",
+        "st_coveredby",
+        "st_distance",
+        "st_area",
+        "st_length",
+    ];
+
+    for name in geo_funcs {
+        let func_name = name.to_string();
+        let stub = Arc::new(make_scalar_function(
+            move |_args: &[ArrayRef]| {
+                Err(datafusion::error::DataFusionError::Plan(format!(
+                    "Function '{}' requires the `geo` feature. \
+                     Rebuild with `--features geo` to enable geospatial functions.",
+                    func_name
+                )))
+            },
+            vec![],
+        ));
+
+        ctx.register_udf(create_udf(
+            name,
+            vec![DataType::Binary, DataType::Binary],
+            DataType::Boolean,
+            Volatility::Immutable,
+            stub,
+        ));
+    }
 }
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by

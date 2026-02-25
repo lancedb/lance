@@ -68,6 +68,7 @@ pub mod conflict_resolver;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+pub mod namespace_manifest;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
 
@@ -1512,7 +1513,7 @@ mod tests {
                     if result.is_err() {
                         first_operation_failed = true;
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );
@@ -1522,7 +1523,7 @@ mod tests {
                     true => assert!(result.is_ok(), "{:?}", result),
                     false => {
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );

@@ -153,10 +153,25 @@ print(dataset.schema)
 # id: int64
 ```
 
+Starting with Lance file format `2.2`, nested sub-column removal is supported for
+nested types (for example `people.item.city` on `list<struct<...>>`), instead of
+being limited to `struct` only.
+
 To actually remove the data from disk, the files must be rewritten to remove the
 columns and then the old files must be deleted. This can be done using
 `lance.dataset.DatasetOptimizer.compact_files()` followed by
 `lance.LanceDataset.cleanup_old_versions()`.
+
+!!! warning
+
+    `drop_columns` is metadata-only and remains reversible as long as old versions are retained.
+    After `compact_files()` rewrites data files and `cleanup_old_versions()` removes old manifests/files,
+    removed data may become permanently unrecoverable.
+
+    For production workflows, use a rollback window:
+    - create a tag (or snapshot/backup) before nested column drops
+    - delay cleanup until the rollback window has passed
+    - only run aggressive cleanup after rollback validation
 
 ## Renaming columns
 

@@ -15,4 +15,5 @@ message TableIdentifier {
   uint64 version = 2;
   optional string manifest_etag = 3;
   optional bytes serialized_manifest = 4;
+  map<string, string> storage_options = 5;
 }
