@@ -69,7 +69,7 @@ public class OverwriteTest extends OperationTestBase {
       // Try to commit from stale version (v1) - should fail with retryable error
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
-      transaction =
+      Transaction staleTxn =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -80,18 +80,16 @@ public class OverwriteTest extends OperationTestBase {
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
-      assertEquals(
-          "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
+      assertEquals("value", staleTxn.transactionProperties().map(m -> m.get("key")).orElse(null));
 
-      RuntimeException ex =
-          assertThrows(RuntimeException.class, () -> transaction.commit().close());
+      RuntimeException ex = assertThrows(RuntimeException.class, () -> staleTxn.commit().close());
       assertTrue(
           ex.getMessage().contains("Retryable commit conflict"),
           "Expected retryable commit conflict error, got: " + ex.getMessage());
 
       // Checkout latest and retry - should succeed
       dataset.checkoutLatest();
-      transaction =
+      Transaction retryTxn =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -102,7 +100,7 @@ public class OverwriteTest extends OperationTestBase {
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = retryTxn.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
@@ -113,7 +111,7 @@ public class OverwriteTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
-        assertEquals(transaction, dataset.readTransaction().orElse(null));
+        assertEquals(retryTxn, dataset.readTransaction().orElse(null));
       }
     }
   }
