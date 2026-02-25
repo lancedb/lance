@@ -1,6 +1,6 @@
 # Vector Indices
 
-Lance provides a powerful and extensible secondary index system for efficient vector similarity search. 
+Lance provides a powerful and extensible secondary index system for efficient vector similarity search.
 All vector indices are stored as regular Lance files, making them portable and easy to manage.
 It is designed for efficient similarity search across large-scale vector datasets.
 
@@ -12,7 +12,7 @@ Lance splits each vector index into 3 parts - clustering, sub-index and quantiza
 
 Clustering divides all the vectors into different disjoint clusters (a.k.a. partitions).
 Lance currently supports using Inverted File (IVF) as the primary clustering mechanism.
-IVF partitions the vectors into clusters using the k-means clustering algorithm. 
+IVF partitions the vectors into clusters using the k-means clustering algorithm.
 Each cluster contains vectors that are similar to the cluster centroid.
 During search, only the most relevant clusters are examined, dramatically reducing search time.
 IVF can be combined with any sub-index type and quantization method.
@@ -51,7 +51,7 @@ Here are the commonly used combinations:
 
 The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
-The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#index-metadata).
+The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
 ## Storage Layout (V3)
 
@@ -68,7 +68,7 @@ The index file stores the search structure with graph or flat organization.
 The Arrow schema of the Lance file varies depending on the sub-index type used.
 
 !!! note
-    All partitions are stored in the same file, and partitions must be written in order.
+All partitions are stored in the same file, and partitions must be written in order.
 
 ##### FLAT
 
@@ -89,7 +89,7 @@ HNSW (Hierarchical Navigable Small World) indices provide fast approximate searc
 | `_distance`   | list<float32> | false    | Distances to neighbors |
 
 !!! note
-    HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
+HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
 
 #### Arrow Schema Metadata
 
@@ -111,8 +111,8 @@ References the IVF metadata stored in the Lance file global buffer.
 This value records the global buffer index, currently this is always "1".
 
 !!! note
-    Global buffer indices in Lance files are 1-based, 
-    so you need to subtract 1 when accessing them through code.
+Global buffer indices in Lance files are 1-based,
+so you need to subtract 1 when accessing them through code.
 
 ##### "lance:flat"
 
@@ -159,7 +159,7 @@ Since the auxiliary file stores the actual (quantized) vectors,
 the Arrow schema of the Lance file varies depending on the quantization method used.
 
 !!! note
-    All partitions are stored in the same file, and partitions must be written in order.
+All partitions are stored in the same file, and partitions must be written in order.
 
 ##### FLAT
 
@@ -205,11 +205,12 @@ The auxiliary file also contains metadata in its Arrow schema metadata for vecto
 Here are the metadata keys and their corresponding values:
 
 ##### "distance_type"
+
 The distance metric used to compute similarity between vectors (e.g., "l2", "cosine", "dot").
 
 ##### "lance:ivf"
 
-Similar to the index file's "lance:ivf" but focused on vector storage layout. 
+Similar to the index file's "lance:ivf" but focused on vector storage layout.
 This doesn't contain the partitions' centroids.
 It's only used for tracking each partition's offset and length in the auxiliary file.
 
@@ -254,7 +255,7 @@ For **RabitQ (RQ)**:
 
 ##### Quantization Codebook
 
-For product quantization, the codebook is stored in `Tensor` format 
+For product quantization, the codebook is stored in `Tensor` format
 in the auxiliary file's global buffer for efficient access:
 
 ```protobuf
@@ -264,7 +265,7 @@ in the auxiliary file's global buffer for efficient access:
 ##### Rotation Matrix
 
 For RabitQ, the rotation matrix is stored in `Tensor` format
-in the auxiliary file's global buffer. The rotation matrix is an orthogonal matrix used 
+in the auxiliary file's global buffer. The rotation matrix is an orthogonal matrix used
 to rotate vectors before binary quantization:
 
 ```protobuf
@@ -283,26 +284,26 @@ PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance ty
 #### Index File
 
 - Arrow Schema Metadata:
-    - `"lance:index"` → `{ "type": "IVF_PQ", "distance_type": "l2" }`
-    - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
-    - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_PQ uses a FLAT sub-index inside each partition)
+  - `"lance:index"` → `{ "type": "IVF_PQ", "distance_type": "l2" }`
+  - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
+  - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_PQ uses a FLAT sub-index inside each partition)
 
 - Lance File Global buffer (Protobuf):
-    - `Ivf` message containing:
-        - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
-        - `offsets`: start offset (row) of each partition in `auxiliary.idx`
-        - `lengths`: number of vectors in each partition
-        - `loss`: k-means loss (optional)
+  - `Ivf` message containing:
+    - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
+    - `offsets`: start offset (row) of each partition in `auxiliary.idx`
+    - `lengths`: number of vectors in each partition
+    - `loss`: k-means loss (optional)
 
 #### Auxiliary File
 
 - Arrow Schema Metadata:
-    - `"distance_type"` → `"l2"`
-    - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
-    - `"storage_metadata"` → `[ "{"pq":{"num_sub_vectors":16,"nbits":8,"dimension":128,"transposed":true}}" ]`
+  - `"distance_type"` → `"l2"`
+  - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
+  - `"storage_metadata"` → `[ "{"pq":{"num_sub_vectors":16,"nbits":8,"dimension":128,"transposed":true}}" ]`
 - Lance File Global buffer:
-    - `Tensor` codebook with shape `[256, num_sub_vectors, dim/num_sub_vectors]` = `[256, 16, 8]` (float32)
-- Rows with Arrow schema: 
+  - `Tensor` codebook with shape `[256, num_sub_vectors, dim/num_sub_vectors]` = `[256, 16, 8]` (float32)
+- Rows with Arrow schema:
 
 ```python
 pa.schema([
@@ -319,26 +320,26 @@ RQ uses 1 bit per dimension (num_bits=1), and distance type is "l2".
 #### Index File
 
 - Arrow Schema Metadata:
-    - `"lance:index"` → `{ "type": "IVF_RQ", "distance_type": "l2" }`
-    - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
-    - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_RQ uses a FLAT sub-index inside each partition)
+  - `"lance:index"` → `{ "type": "IVF_RQ", "distance_type": "l2" }`
+  - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
+  - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_RQ uses a FLAT sub-index inside each partition)
 
 - Lance File Global buffer (Protobuf):
-    - `Ivf` message containing:
-        - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
-        - `offsets`: start offset (row) of each partition in `auxiliary.idx`
-        - `lengths`: number of vectors in each partition
-        - `loss`: k-means loss (optional)
+  - `Ivf` message containing:
+    - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
+    - `offsets`: start offset (row) of each partition in `auxiliary.idx`
+    - `lengths`: number of vectors in each partition
+    - `loss`: k-means loss (optional)
 
 #### Auxiliary File
 
 - Arrow Schema Metadata:
-    - `"distance_type"` → `"l2"`
-    - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
-    - `"lance:rabit"` → `"{"rotate_mat_position":1,"num_bits":1,"packed":true}"`
+  - `"distance_type"` → `"l2"`
+  - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
+  - `"lance:rabit"` → `"{"rotate_mat_position":1,"num_bits":1,"packed":true}"`
 - Lance File Global buffer:
-    - `Tensor` rotation matrix with shape `[code_dim, code_dim]` = `[128, 128]` (float32)
-- Rows with Arrow schema: 
+  - `Tensor` rotation matrix with shape `[code_dim, code_dim]` = `[128, 128]` (float32)
+- Rows with Arrow schema:
 
 ```python
 pa.schema([

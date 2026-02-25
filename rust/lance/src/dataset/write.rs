@@ -52,7 +52,7 @@ mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
-pub use delete::DeleteBuilder;
+pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
