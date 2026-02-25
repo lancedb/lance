@@ -678,6 +678,34 @@ impl ProtobufUtils21 {
             layout: Some(crate::format::pb21::page_layout::Layout::ConstantLayout(
                 crate::format::pb21::ConstantLayout {
                     inline_value: inline_value.map(bytes::Bytes::from),
+                    rep_compression: None,
+                    def_compression: None,
+                    num_rep_values: 0,
+                    num_def_values: 0,
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    pub fn compressed_all_null_constant_layout(
+        def_meaning: &[DefinitionInterpretation],
+        rep_compression: Option<crate::format::pb21::CompressiveEncoding>,
+        def_compression: Option<crate::format::pb21::CompressiveEncoding>,
+        num_rep_values: u64,
+        num_def_values: u64,
+    ) -> crate::format::pb21::PageLayout {
+        crate::format::pb21::PageLayout {
+            layout: Some(crate::format::pb21::page_layout::Layout::ConstantLayout(
+                crate::format::pb21::ConstantLayout {
+                    inline_value: None,
+                    rep_compression,
+                    def_compression,
+                    num_rep_values,
+                    num_def_values,
                     layers: def_meaning
                         .iter()
                         .map(|&def| Self::def_inter_to_repdef_layer(def))

@@ -87,10 +87,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
-        let index = dataset
+        match dataset
             .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
-            .await?;
-        indices.push(index);
+            .await
+        {
+            Ok(index) => indices.push(index),
+            Err(e) => {
+                log::warn!(
+                    "Cannot open index on column '{}': {}. \
+                     Skipping index merge for this column.",
+                    field_path,
+                    e
+                );
+                return Ok(None);
+            }
+        }
     }
 
     if indices

@@ -81,7 +81,6 @@ use lance_index::{
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use lance_namespace::LanceNamespace;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
@@ -90,7 +89,7 @@ use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
-use crate::namespace::{PyDirectoryNamespace, PyLanceNamespace, PyRestNamespace};
+use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -601,21 +600,7 @@ impl Dataset {
 
         // Set up namespace commit handler if namespace and table_id are provided
         if let (Some(ns), Some(tid)) = (namespace, table_id) {
-            // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
-            // or create a PyLanceNamespace wrapper for custom Python implementations
-            let ns_arc: Arc<dyn LanceNamespace> =
-                if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
-                    // Native DirectoryNamespace - use inner directly (bypass Python layer)
-                    dir_ns.borrow().inner.clone()
-                } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
-                    // Native RestNamespace - use inner directly (bypass Python layer)
-                    rest_ns.borrow().inner.clone()
-                } else {
-                    // Custom Python implementation - wrap with PyLanceNamespace
-                    // This calls back into Python for namespace methods
-                    PyLanceNamespace::create_arc(py, ns)?
-                };
-
+            let ns_arc = extract_namespace_arc(py, ns)?;
             let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
@@ -1361,10 +1346,11 @@ impl Dataset {
     #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
     fn delete(
         &mut self,
+        py: Python<'_>,
         predicate: String,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<PyAny>> {
         let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
 
         if let Some(retries) = conflict_retries {
@@ -1375,11 +1361,13 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        let new_dataset = rt()
+        let result = rt()
             .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = new_dataset;
-        Ok(())
+        self.ds = result.new_dataset;
+        let dict = PyDict::new(py);
+        dict.set_item("num_deleted_rows", result.num_deleted_rows)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
@@ -2146,7 +2134,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2159,6 +2147,8 @@ impl Dataset {
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2179,13 +2169,15 @@ impl Dataset {
             detached,
             max_retries,
             enable_stable_row_ids,
+            namespace,
+            table_id,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2196,6 +2188,8 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2211,14 +2205,25 @@ impl Dataset {
             None
         };
 
-        let commit_handler = commit_lock
-            .as_ref()
-            .map(|commit_lock| {
-                commit_lock
-                    .into_py_any(commit_lock.py())
-                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-            })
-            .transpose()?;
+        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        let commit_handler: Option<Arc<dyn CommitHandler>> =
+            if let Some(commit_lock) = commit_lock.as_ref() {
+                // User provided a commit_lock
+                Some(
+                    commit_lock
+                        .into_py_any(commit_lock.py())
+                        .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
+                )
+            } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
+                // Create ExternalManifestCommitHandler from namespace and table_id
+                let ns_arc = extract_namespace_arc(ns.py(), ns)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            } else {
+                None
+            };
 
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
@@ -3169,21 +3174,7 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
 
             if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
-                let py = options.py();
-                // Extract the inner namespace Arc from PyDirectoryNamespace, PyRestNamespace,
-                // or create a PyLanceNamespace wrapper for custom Python implementations
-                let ns_arc: Arc<dyn LanceNamespace> =
-                    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
-                        // Native DirectoryNamespace - use inner directly (bypass Python layer)
-                        dir_ns.borrow().inner.clone()
-                    } else if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
-                        // Native RestNamespace - use inner directly (bypass Python layer)
-                        rest_ns.borrow().inner.clone()
-                    } else {
-                        // Custom Python implementation - wrap with PyLanceNamespace
-                        PyLanceNamespace::create_arc(py, &ns)?
-                    };
-
+                let ns_arc = extract_namespace_arc(options.py(), &ns)?;
                 let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
                 let commit_handler: Arc<dyn CommitHandler> =
                     Arc::new(ExternalManifestCommitHandler {

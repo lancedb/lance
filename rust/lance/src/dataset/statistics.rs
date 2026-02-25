@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
+use futures::{StreamExt, TryStreamExt};
 use lance_core::Result;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
@@ -51,12 +52,26 @@ impl DatasetStatisticsExt for Dataset {
                 self.object_store.clone(),
                 SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
             );
-            for fragment in self.fragments().as_ref() {
-                let file_fragment = FileFragment::new(self.clone(), fragment.clone());
-                file_fragment
-                    .update_storage_stats(&mut field_stats, self.schema(), scan_scheduler.clone())
-                    .await?;
-            }
+            let schema = self.schema().clone();
+            let dataset = self.clone();
+            let fragments = self.fragments().as_ref().clone();
+            futures::stream::iter(fragments)
+                .map(|fragment| {
+                    let file_fragment = FileFragment::new(dataset.clone(), fragment);
+                    let schema = schema.clone();
+                    let scan_scheduler = scan_scheduler.clone();
+                    async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
+                })
+                .buffer_unordered(self.object_store.io_parallelism())
+                .try_for_each(|fragment_stats| {
+                    for (field_id, bytes) in fragment_stats {
+                        if let Some(stats) = field_stats.get_mut(&field_id) {
+                            stats.bytes_on_disk += bytes;
+                        }
+                    }
+                    futures::future::ready(Ok(()))
+                })
+                .await?;
         }
         let field_stats = field_ids
             .into_iter()
