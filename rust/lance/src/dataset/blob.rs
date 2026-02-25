@@ -1191,6 +1191,42 @@ mod tests {
         assert_eq!(second.as_ref(), b"world");
     }
 
+    #[tokio::test]
+    async fn test_blob_v2_requires_v2_2() {
+        let test_dir = TempStrDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(b"hello").unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: arrow_array::ArrayRef = Arc::new(UInt32Array::from(vec![0]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let result = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Blob v2 should be rejected for file version 2.1"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blob v2 requires file version >= 2.2"));
+    }
+
     async fn preprocess_kind_with_schema_metadata(metadata_value: &str, data_len: usize) -> u8 {
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
