@@ -873,6 +873,11 @@ impl ManifestNamespace {
         // conflict_retries=0: no outer loop retry on semantic conflicts (handled by caller)
         // commit_retries: inner retry for manifest version conflicts (uses lance default if not set)
         merge_builder.conflict_retries(0);
+        // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
+        // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
+        // results in (Some, None) filter mismatch when rebasing against V2 operations.
+        // Setting use_index=false ensures all operations consistently use V2 path.
+        merge_builder.use_index(false);
         if let Some(retries) = self.commit_retries {
             merge_builder.commit_retries(retries);
         }
