@@ -534,7 +534,7 @@ mod tests {
             err.to_string()
                 .contains("Field 'non_existent_field' not found"),
             "Expected error message to contain field name, got: {}",
-            err.to_string()
+            err
         );
     }
 
