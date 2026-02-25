@@ -87,9 +87,9 @@ use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
-    knn::new_knn_exec, project, AddRowAddrExec, FilterPlan as ExprFilterPlan,
-    KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource,
-    ScanConfig, TakeExec,
+    knn::{new_knn_exec, KNN_INDEX_SCHEMA},
+    project, AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec,
+    LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
@@ -3562,6 +3562,9 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.fast_search {
+                return Ok(Arc::new(EmptyExec::new(KNN_INDEX_SCHEMA.clone())));
+            }
             // Resolve metric type for flat search (use default if not specified)
             let metric = q
                 .metric_type
@@ -8632,6 +8635,25 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_without_vector_index_returns_empty() {
+        let dataset = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap().fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 10);
+        assert_eq!(fast_rows, 0);
     }
 
     #[rstest]
