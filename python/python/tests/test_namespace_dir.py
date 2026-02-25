@@ -911,12 +911,7 @@ class TestConcurrentOperations:
     """
 
     def test_concurrent_create_and_drop_single_instance(self, temp_namespace):
-        """Test concurrent create/drop with single namespace instance.
-
-        Mirrors:
-        - Rust: test_concurrent_create_and_drop_single_instance
-        - Java: testConcurrentCreateAndDropWithSingleInstance
-        """
+        """Test concurrent create/drop with single namespace instance."""
         import concurrent.futures
 
         num_tables = 10
@@ -964,12 +959,7 @@ class TestConcurrentOperations:
         assert len(response.tables) == 0, "All tables should be dropped"
 
     def test_concurrent_create_and_drop_multiple_instances(self):
-        """Test concurrent create/drop with multiple namespace instances.
-
-        Mirrors:
-        - Rust: test_concurrent_create_and_drop_multiple_instances
-        - Java: testConcurrentCreateAndDropWithMultipleInstances
-        """
+        """Test concurrent create/drop with multiple namespace instances."""
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1030,12 +1020,7 @@ class TestConcurrentOperations:
             assert len(response.tables) == 0, "All tables should be dropped"
 
     def test_concurrent_create_then_drop_from_different_instance(self):
-        """Test creating from one set of instances, dropping from different ones.
-
-        Mirrors:
-        - Rust: test_concurrent_create_then_drop_from_different_instance
-        - Java: testConcurrentCreateThenDropFromDifferentInstance
-        """
+        """Test creating from one set of instances, dropping from different ones."""
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:

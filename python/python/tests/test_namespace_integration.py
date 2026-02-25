@@ -903,12 +903,7 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str):
 
 @pytest.mark.integration
 def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
-    """Test concurrent create/drop with single namespace instance on S3.
-
-    Mirrors:
-    - Rust: test_concurrent_create_and_drop_single_instance
-    - Java: testConcurrentCreateAndDropWithSingleInstanceOnS3
-    """
+    """Test concurrent create/drop with single namespace instance on S3."""
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
@@ -963,12 +958,7 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
 
 @pytest.mark.integration
 def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
-    """Test concurrent create/drop with multiple namespace instances on S3.
-
-    Mirrors:
-    - Rust: test_concurrent_create_and_drop_multiple_instances
-    - Java: testConcurrentCreateAndDropWithMultipleInstancesOnS3
-    """
+    """Test concurrent create/drop with multiple namespace instances on S3."""
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
@@ -1030,12 +1020,7 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
 
 @pytest.mark.integration
 def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: str):
-    """Test creating from one set of instances, dropping from different ones on S3.
-
-    Mirrors:
-    - Rust: test_concurrent_create_then_drop_from_different_instance
-    - Java: testConcurrentCreateThenDropFromDifferentInstanceOnS3
-    """
+    """Test creating from one set of instances, dropping from different ones on S3."""
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
