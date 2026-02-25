@@ -889,8 +889,35 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
-            // Overwrite only conflicts with another operation modifying the same update config
-            Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+            Operation::Overwrite { .. } => {
+                // Two concurrent creates (read_version == 0) are incompatible -
+                // only one can create the dataset, the other must fail.
+                if self.transaction.read_version == 0 && other_transaction.read_version == 0 {
+                    return Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ));
+                }
+
+                // Upsert key conflicts are incompatible
+                if self
+                    .transaction
+                    .operation
+                    .upsert_key_conflict(&other_transaction.operation)
+                {
+                    Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ))
+                } else {
+                    // Two concurrent overwrites (on existing dataset) are retryable
+                    // so user can decide if their overwrite should still proceed
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                }
+            }
+            Operation::UpdateConfig { .. } => {
                 if self
                     .transaction
                     .operation
@@ -2412,9 +2439,22 @@ mod tests {
                     config_upsert_values: None,
                     initial_bases: None,
                 },
-                // No conflicts: overwrite can always happen since it doesn't
-                // depend on previous state of the table.
-                [Compatible; 9],
+                // Note: In this test, both transactions have read_version == 0,
+                // so both overwrites are "creates". Two concurrent creates are
+                // incompatible (only one can create the dataset).
+                // For overwrites on existing datasets (read_version > 0), the
+                // conflict would be Retryable instead.
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite (both are creates with read_version == 0)
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::CreateIndex {
@@ -3546,5 +3586,119 @@ mod tests {
         assert_eq!(rebase.conflicting_mem_wal_merged_gens.len(), 1);
         assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].region_id, region);
         assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].generation, 10);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_overwrites_retryable() {
+        use crate::dataset::write::{WriteMode, WriteParams};
+        use crate::dataset::{CommitBuilder, InsertBuilder};
+
+        // Create initial dataset at version 1
+        let dataset = test_dataset(5, 1).await;
+
+        // Simulate two concurrent readers at version 1
+        let dataset_v1_reader1 = Arc::new(dataset.checkout_version(1).await.unwrap());
+        let dataset_v1_reader2 = Arc::new(dataset.checkout_version(1).await.unwrap());
+
+        // Prepare data for overwrite
+        let data = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(10..15)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(1, 5))),
+            ],
+        )
+        .unwrap();
+
+        // First overwrite: write uncommitted transaction
+        let txn1 = InsertBuilder::new(dataset_v1_reader1.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![data.clone()])
+            .await
+            .unwrap();
+
+        // Commit first overwrite - should succeed
+        let dataset_v2 = CommitBuilder::new(dataset_v1_reader1)
+            .execute(txn1)
+            .await
+            .unwrap();
+        assert_eq!(dataset_v2.manifest.version, 2);
+
+        // Second overwrite: write uncommitted transaction
+        let txn2 = InsertBuilder::new(dataset_v1_reader2.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![data])
+            .await
+            .unwrap();
+
+        // Commit second overwrite - should fail with retryable conflict
+        let result = CommitBuilder::new(dataset_v1_reader2).execute(txn2).await;
+
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected RetryableCommitConflict but got: {:?}",
+            result
+        );
+
+        // Verify the first overwrite succeeded and dataset is at version 2
+        assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[test]
+    fn test_concurrent_create_incompatible() {
+        // Two concurrent creates (read_version == 0) should be incompatible.
+        // Only one can create the dataset, the other must fail without retry option.
+
+        let fragment0 = Fragment::new(0);
+
+        // First create transaction (read_version == 0)
+        let create_txn1 = Transaction::new(
+            0, // read_version == 0 means this is a create
+            Operation::Overwrite {
+                fragments: vec![fragment0.clone()],
+                schema: lance_core::datatypes::Schema::default(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+
+        // Second create transaction (also read_version == 0)
+        let create_txn2 = Transaction::new(
+            0, // read_version == 0 means this is also a create
+            Operation::Overwrite {
+                fragments: vec![fragment0],
+                schema: lance_core::datatypes::Schema::default(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: create_txn1,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        // Check conflict: two creates should be incompatible (not retryable)
+        let result = rebase.check_txn(&create_txn2, 1);
+        assert!(
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "Expected IncompatibleTransaction for concurrent creates, got: {:?}",
+            result
+        );
     }
 }
