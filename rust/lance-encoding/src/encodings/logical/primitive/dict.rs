@@ -115,7 +115,8 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,
-    cardinality: u64,
+    max_dict_entries: u32,
+    max_encoded_size: usize,
 ) -> Option<(DataBlock, DataBlock)>
 where
     T: ArrowNativeType,
@@ -134,21 +135,17 @@ where
     let max_len = max_len.as_primitive::<UInt64Type>().value(0);
 
     let max_dict_data_len = variable_width_data_block.data.len();
-    let expected_dict_data_len = max_len
-        .checked_mul(cardinality)
-        .and_then(|v| <usize as std::convert::TryFrom<u64>>::try_from(v).ok());
-    let dict_data_capacity = expected_dict_data_len
-        .map(|len| len.min(max_dict_data_len))
-        .unwrap_or(max_dict_data_len);
+    let max_len: usize = max_len.try_into().unwrap_or(usize::MAX);
+    let dict_data_capacity = max_len
+        .saturating_mul(32)
+        .max(1024)
+        .min(max_dict_data_len)
+        .min(max_encoded_size);
 
     let mut dictionary_buffer: Vec<u8> = Vec::with_capacity(dict_data_capacity);
     let mut dictionary_offsets_buffer = vec![T::default()];
     let mut curr_idx = 0;
     let mut indices_buffer = Vec::with_capacity(variable_width_data_block.num_values as usize);
-    let original_size = variable_width_data_block
-        .data_size()
-        .try_into()
-        .unwrap_or(usize::MAX);
     let bytes_per_offset = (bits_per_offset / 8) as usize;
 
     for window in offsets.windows(2) {
@@ -163,6 +160,9 @@ where
         let idx = match map.entry(U8SliceKey(key)) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
+                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
+                    return None;
+                }
                 if curr_idx == i32::MAX {
                     return None;
                 }
@@ -188,7 +188,7 @@ where
             .len()
             .saturating_add(indices_bytes)
             .saturating_add(offsets_bytes);
-        if encoded_size > original_size {
+        if encoded_size > max_encoded_size {
             return None;
         }
     }
@@ -218,15 +218,13 @@ where
 /// Currently only supported for some common cases (string / binary / 64-bit / 128-bit)
 ///
 /// Returns a block of indices (will always be a fixed width data block) and a block of dictionary
-pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBlock)> {
-    let cardinality = data_block
-        .get_stat(Stat::Cardinality)
-        .unwrap()
-        .as_primitive::<UInt64Type>()
-        .value(0);
-    let data_block_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+pub fn dictionary_encode(
+    data_block: &DataBlock,
+    max_dict_entries: u32,
+    max_encoded_size: usize,
+) -> Option<(DataBlock, DataBlock)> {
     match data_block {
-        DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
+        DataBlock::FixedWidth(fixed_width_data_block) => {
             use std::collections::hash_map::Entry;
 
             let bytes_per_value = match fixed_width_data_block.bits_per_value {
@@ -240,7 +238,8 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                     let mut map = HashMap::new();
                     let u64_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u64>();
                     let u64_slice = u64_slice.as_ref();
-                    let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
+                    let mut dictionary_buffer =
+                        Vec::with_capacity((fixed_width_data_block.num_values as usize).min(1024));
                     let mut indices_buffer =
                         Vec::with_capacity(fixed_width_data_block.num_values as usize);
                     let mut curr_idx: i32 = 0;
@@ -249,6 +248,9 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                         let idx = match map.entry(value) {
                             Entry::Occupied(entry) => *entry.get(),
                             Entry::Vacant(entry) => {
+                                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
+                                    return None;
+                                }
                                 if curr_idx == i32::MAX {
                                     return None;
                                 }
@@ -265,7 +267,7 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                             .len()
                             .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
                         let encoded_size = dict_bytes.saturating_add(indices_bytes);
-                        if encoded_size > data_block_size {
+                        if encoded_size > max_encoded_size {
                             return None;
                         }
                     }
@@ -292,7 +294,8 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                     let mut map = HashMap::new();
                     let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
                     let u128_slice = u128_slice.as_ref();
-                    let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
+                    let mut dictionary_buffer =
+                        Vec::with_capacity((fixed_width_data_block.num_values as usize).min(1024));
                     let mut indices_buffer =
                         Vec::with_capacity(fixed_width_data_block.num_values as usize);
                     let mut curr_idx: i32 = 0;
@@ -301,6 +304,9 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                         let idx = match map.entry(value) {
                             Entry::Occupied(entry) => *entry.get(),
                             Entry::Vacant(entry) => {
+                                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
+                                    return None;
+                                }
                                 if curr_idx == i32::MAX {
                                     return None;
                                 }
@@ -317,7 +323,7 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                             .len()
                             .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
                         let encoded_size = dict_bytes.saturating_add(indices_bytes);
-                        if encoded_size > data_block_size {
+                        if encoded_size > max_encoded_size {
                             return None;
                         }
                     }
@@ -342,10 +348,20 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                 _ => None,
             }
         }
-        DataBlock::VariableWidth(ref variable_width_data_block) => {
+        DataBlock::VariableWidth(variable_width_data_block) => {
             match variable_width_data_block.bits_per_offset {
-                32 => dict_encode_variable_width::<u32>(variable_width_data_block, 32, cardinality),
-                64 => dict_encode_variable_width::<u64>(variable_width_data_block, 64, cardinality),
+                32 => dict_encode_variable_width::<u32>(
+                    variable_width_data_block,
+                    32,
+                    max_dict_entries,
+                    max_encoded_size,
+                ),
+                64 => dict_encode_variable_width::<u64>(
+                    variable_width_data_block,
+                    64,
+                    max_dict_entries,
+                    max_encoded_size,
+                ),
                 _ => None,
             }
         }
@@ -386,7 +402,8 @@ mod tests {
         data_block.compute_stat();
 
         // Dictionary encoding should abort and return None
-        let result = dictionary_encode(data_block);
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        let result = dictionary_encode(&data_block, 1000, max_encoded_size);
         assert!(
             result.is_none(),
             "Dictionary encoding should abort for high cardinality u128 data"
@@ -416,7 +433,8 @@ mod tests {
         data_block.compute_stat();
 
         // Dictionary encoding should succeed and return Some
-        let result = dictionary_encode(data_block);
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        let result = dictionary_encode(&data_block, 1000, max_encoded_size);
         assert!(
             result.is_some(),
             "Dictionary encoding should succeed for low cardinality u128 data"
@@ -455,7 +473,8 @@ mod tests {
         let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
 
         // Dictionary encoding should abort and return None
-        let result = dictionary_encode(data_block);
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        let result = dictionary_encode(&data_block, 10, max_encoded_size);
         assert!(
             result.is_none(),
             "Dictionary encoding should abort for high cardinality string data"
@@ -477,7 +496,8 @@ mod tests {
         let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
 
         // Dictionary encoding should succeed and return Some
-        let result = dictionary_encode(data_block);
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        let result = dictionary_encode(&data_block, 100, max_encoded_size);
         assert!(
             result.is_some(),
             "Dictionary encoding should succeed for low cardinality data"
@@ -512,6 +532,44 @@ mod tests {
             }
             other => panic!("Expected VariableWidth data block, got {:?}", other),
         };
-        assert!(dictionary_encode(invalid_block).is_none());
+        let max_encoded_size = usize::try_from(invalid_block.data_size()).unwrap_or(usize::MAX);
+        assert!(dictionary_encode(&invalid_block, 100, max_encoded_size).is_none());
+    }
+
+    #[test]
+    fn test_dictionary_encode_respects_size_limit() {
+        let num_values = 10_000u64;
+        let cardinality = 50u64;
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..num_values {
+            values.push(format!("value_{:08}", i % cardinality));
+        }
+
+        let array = StringArray::from(values);
+        let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
+
+        let full_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        let too_small_limit = full_size / 10;
+        assert!(dictionary_encode(&data_block, 1000, too_small_limit).is_none());
+        assert!(dictionary_encode(&data_block, 1000, full_size).is_some());
+    }
+
+    #[test]
+    fn test_dictionary_encode_respects_entry_limit() {
+        let num_values = 10_000u64;
+        let cardinality = 200u64;
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..num_values {
+            values.push(format!("value_{:08}", i % cardinality));
+        }
+
+        let array = StringArray::from(values);
+        let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
+
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        assert!(dictionary_encode(&data_block, 10, max_encoded_size).is_none());
+        assert!(dictionary_encode(&data_block, 500, max_encoded_size).is_some());
     }
 }
