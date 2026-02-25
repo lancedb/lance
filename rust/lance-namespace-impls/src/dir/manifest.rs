@@ -1137,56 +1137,54 @@ impl ManifestNamespace {
                     );
                     Ok(DatasetConsistencyWrapper::new(dataset))
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    // Check if the error indicates the manifest already exists
-                    if error_msg.contains("already exists")
-                        || error_msg.contains("TableAlreadyExists")
-                        || error_msg.contains("CommitConflict")
-                        || error_msg.contains("Commit conflict")
-                    {
-                        log::info!(
-                            "Manifest table was created by another process, loading it: {}",
-                            manifest_path
-                        );
-                        // Try to load the manifest that was created by another process
-                        let recovery_store_options = ObjectStoreParams {
-                            storage_options_accessor: storage_options.as_ref().map(|opts| {
-                                Arc::new(
-                                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                                        opts.clone(),
-                                    ),
-                                )
-                            }),
-                            ..Default::default()
-                        };
-                        let recovery_read_params = ReadParams {
-                            session,
-                            store_options: Some(recovery_store_options),
-                            ..Default::default()
-                        };
-                        let dataset = DatasetBuilder::from_uri(&manifest_path)
-                            .with_read_params(recovery_read_params)
-                            .load()
-                            .await
-                            .map_err(|e| Error::IO {
-                                source: box_error(std::io::Error::other(format!(
-                                    "Failed to load manifest dataset after creation conflict: {}",
-                                    e
-                                ))),
-                                location: location!(),
-                            })?;
-                        Ok(DatasetConsistencyWrapper::new(dataset))
-                    } else {
-                        Err(Error::IO {
+                Err(ref e)
+                    if matches!(
+                        e,
+                        LanceError::DatasetAlreadyExists { .. }
+                            | LanceError::CommitConflict { .. }
+                            | LanceError::IncompatibleTransaction { .. }
+                    ) =>
+                {
+                    // Another process created the manifest concurrently, try to load it
+                    log::info!(
+                        "Manifest table was created by another process, loading it: {}",
+                        manifest_path
+                    );
+                    let recovery_store_options = ObjectStoreParams {
+                        storage_options_accessor: storage_options.as_ref().map(|opts| {
+                            Arc::new(
+                                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                    opts.clone(),
+                                ),
+                            )
+                        }),
+                        ..Default::default()
+                    };
+                    let recovery_read_params = ReadParams {
+                        session,
+                        store_options: Some(recovery_store_options),
+                        ..Default::default()
+                    };
+                    let dataset = DatasetBuilder::from_uri(&manifest_path)
+                        .with_read_params(recovery_read_params)
+                        .load()
+                        .await
+                        .map_err(|e| Error::IO {
                             source: box_error(std::io::Error::other(format!(
-                                "Failed to create manifest dataset: {}",
+                                "Failed to load manifest dataset after creation conflict: {}",
                                 e
                             ))),
                             location: location!(),
-                        })
-                    }
+                        })?;
+                    Ok(DatasetConsistencyWrapper::new(dataset))
                 }
+                Err(e) => Err(Error::IO {
+                    source: box_error(std::io::Error::other(format!(
+                        "Failed to create manifest dataset: {}",
+                        e
+                    ))),
+                    location: location!(),
+                }),
             }
         }
     }
