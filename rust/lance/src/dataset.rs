@@ -131,7 +131,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder,
+    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder,
     WriteDestination, WriteMode, WriteParams,
 };
 
@@ -1550,14 +1550,14 @@ impl Dataset {
     }
 
     /// Delete rows based on a predicate.
-    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+    pub async fn delete(&mut self, predicate: &str) -> Result<write::delete::DeleteResult> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
     }
 
     /// Truncate the dataset by deleting all rows.
     pub async fn truncate_table(&mut self) -> Result<()> {
-        self.delete("true").await
+        self.delete("true").await.map(|_| ())
     }
 
     /// Add new base paths to the dataset.

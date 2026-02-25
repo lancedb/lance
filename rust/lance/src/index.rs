@@ -292,9 +292,22 @@ pub(crate) async fn remap_index(
 
     let new_id = Uuid::new_v4();
 
-    let generic = dataset
+    let generic = match dataset
         .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
-        .await?;
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!(
+                "Cannot open index '{}' on '{}': {}. \
+                 Index will be dropped during compaction.",
+                index_id,
+                field_path,
+                e
+            );
+            return Ok(RemapResult::Drop);
+        }
+    };
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
@@ -1022,7 +1035,7 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
         "Detecting out-dated fragment metadata, migrating dataset. \
                         To disable migration, set LANCE_AUTO_MIGRATION=false"
     );
-    ds.delete("false").await.map_err(|err| Error::Execution {
+    ds.delete("false").await.map(|_| ()).map_err(|err| Error::Execution {
         message: format!(
             "Failed to migrate dataset while calculating index statistics. \
                             To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
@@ -1718,7 +1731,19 @@ impl DatasetIndexInternalExt for Dataset {
                 continue;
             }
 
-            let plugin = index_details.get_plugin()?;
+            let plugin = match index_details.get_plugin() {
+                Ok(plugin) => plugin,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping index '{}' on column '{}': {}. \
+                         Queries on this column will fall back to a full scan.",
+                        index.name,
+                        field_path,
+                        e
+                    );
+                    continue;
+                }
+            };
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {

@@ -189,8 +189,8 @@ mod tests {
         let result = CommitBuilder::new(Arc::new(dataset)).execute(txn2).await;
 
         assert!(
-            matches!(result, Err(crate::Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict for lower generation, got {:?}",
+            matches!(result, Err(crate::Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction for lower generation, got {:?}",
             result
         );
     }
@@ -225,8 +225,8 @@ mod tests {
         let result = CommitBuilder::new(Arc::new(dataset)).execute(txn2).await;
 
         assert!(
-            matches!(result, Err(crate::Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict for equal generation, got {:?}",
+            matches!(result, Err(crate::Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction for equal generation, got {:?}",
             result
         );
     }
@@ -418,8 +418,8 @@ mod tests {
         let result = CommitBuilder::new(Arc::new(dataset)).execute(txn2).await;
 
         assert!(
-            matches!(result, Err(crate::Error::CommitConflict { .. })),
-            "Expected non-retryable CommitConflict when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
+            matches!(result, Err(crate::Error::IncompatibleTransaction { .. })),
+            "Expected non-retryable IncompatibleTransaction when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
             result
         );
     }
