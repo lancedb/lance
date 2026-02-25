@@ -268,6 +268,91 @@ impl LanceBuffer {
         Self(Buffer::from_vec(Vec::from(array)))
     }
 
+    fn slice_and_rebase_offsets_typed<T>(data: &Self, offsets: &Self) -> Result<(Self, Self)>
+    where
+        T: ArrowNativeType
+            + Copy
+            + PartialOrd
+            + std::ops::Sub<Output = T>
+            + std::fmt::Display
+            + TryInto<usize>,
+    {
+        let offsets_slice = offsets.borrow_to_typed_slice::<T>();
+        let offsets_slice = offsets_slice.as_ref();
+        if offsets_slice.is_empty() {
+            return Err(Error::Internal {
+                message: "Variable offsets cannot be empty".to_string(),
+                location: location!(),
+            });
+        }
+
+        let base = offsets_slice[0];
+        let end = *offsets_slice.last().unwrap();
+        if end < base {
+            return Err(Error::Internal {
+                message: format!(
+                    "Invalid variable offsets: end ({end}) is less than base ({base})"
+                ),
+                location: location!(),
+            });
+        }
+
+        let data_start = base.try_into().map_err(|_| Error::Internal {
+            message: format!("Variable offset ({base}) does not fit into usize"),
+            location: location!(),
+        })?;
+        let data_end = end.try_into().map_err(|_| Error::Internal {
+            message: format!("Variable offset ({end}) does not fit into usize"),
+            location: location!(),
+        })?;
+        if data_end > data.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "Invalid variable offsets: end ({data_end}) exceeds data len ({})",
+                    data.len()
+                ),
+                location: location!(),
+            });
+        }
+
+        let mut rebased_offsets = Vec::with_capacity(offsets_slice.len());
+        for &offset in offsets_slice {
+            if offset < base {
+                return Err(Error::Internal {
+                    message: format!(
+                        "Invalid variable offsets: offset ({offset}) is less than base ({base})"
+                    ),
+                    location: location!(),
+                });
+            }
+            rebased_offsets.push(offset - base);
+        }
+
+        let sliced_data = data.slice_with_length(data_start, data_end - data_start);
+        // Copy into a compact buffer so each output batch owns only what it references.
+        let sliced_data = Self::copy_slice(&sliced_data);
+        let rebased_offsets = Self::reinterpret_vec(rebased_offsets);
+        Ok((sliced_data, rebased_offsets))
+    }
+
+    /// Slices variable-width data to the range referenced by `offsets` and rebases offsets to 0.
+    ///
+    /// Returns `(sliced_data, rebased_offsets)`.
+    pub(crate) fn slice_and_rebase_offsets(
+        data: &Self,
+        offsets: &Self,
+        bits_per_offset: u8,
+    ) -> Result<(Self, Self)> {
+        match bits_per_offset {
+            32 => Self::slice_and_rebase_offsets_typed::<u32>(data, offsets),
+            64 => Self::slice_and_rebase_offsets_typed::<u64>(data, offsets),
+            _ => Err(Error::Internal {
+                message: format!("Unsupported bits_per_offset={bits_per_offset}"),
+                location: location!(),
+            }),
+        }
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()

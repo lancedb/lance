@@ -2670,20 +2670,14 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         let start = self.current_idx;
         let end = start + num_rows as usize;
 
-        // This might seem a little peculiar.  We are returning the entire data for every single
-        // batch.  This is because the offsets are relative to the start of the data.  In other words
-        // imagine we have a data buffer that is 100 bytes long and the offsets are [0, 10, 20, 30, 40]
-        // and we return in batches of two.  The second set of offsets will be [20, 30, 40].
-        //
-        // So either we pay for a copy to normalize the offsets or we just return the entire data buffer
-        // which is slightly cheaper.
-        let data = self.data.clone();
-
         let offset_start = self.offset_starts[start];
         let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
         let offsets = self
             .offsets
             .slice_with_length(offset_start, offset_end - offset_start);
+        // Keep each batch's variable data buffer bounded to the selected rows.
+        let (data, offsets) =
+            LanceBuffer::slice_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
 
         let repdef_start = self.repdef_starts[start];
         let repdef_end = self.repdef_starts[end];
@@ -4902,6 +4896,7 @@ mod tests {
         FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
         StructuralPageScheduler,
     };
+    use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::BlockInfo;
@@ -5296,6 +5291,42 @@ mod tests {
         };
 
         check(2..3, 2..4, 5..7);
+    }
+
+    #[test]
+    fn test_slice_and_rebase_offsets_u32() {
+        let data = LanceBuffer::copy_slice(b"0123456789abcdefghij");
+        let offsets = LanceBuffer::reinterpret_vec(vec![6_u32, 8_u32, 8_u32, 12_u32]);
+
+        let (sliced_data, normalized_offsets) =
+            LanceBuffer::slice_and_rebase_offsets(&data, &offsets, 32).unwrap();
+
+        assert_eq!(sliced_data.as_ref(), b"6789ab");
+        let normalized = normalized_offsets.borrow_to_typed_slice::<u32>();
+        assert_eq!(normalized.as_ref(), &[0, 2, 2, 6]);
+    }
+
+    #[test]
+    fn test_slice_and_rebase_offsets_u64() {
+        let data = LanceBuffer::copy_slice(b"abcdefghijklmnopqrstuvwxyz");
+        let offsets = LanceBuffer::reinterpret_vec(vec![10_u64, 12_u64, 16_u64, 20_u64]);
+
+        let (sliced_data, normalized_offsets) =
+            LanceBuffer::slice_and_rebase_offsets(&data, &offsets, 64).unwrap();
+
+        assert_eq!(sliced_data.as_ref(), b"klmnopqrst");
+        let normalized = normalized_offsets.borrow_to_typed_slice::<u64>();
+        assert_eq!(normalized.as_ref(), &[0, 2, 6, 10]);
+    }
+
+    #[test]
+    fn test_slice_and_rebase_offsets_rejects_invalid_offsets() {
+        let data = LanceBuffer::copy_slice(b"abcd");
+        let offsets = LanceBuffer::reinterpret_vec(vec![3_u32, 2_u32]);
+
+        let err = LanceBuffer::slice_and_rebase_offsets(&data, &offsets, 32)
+            .expect_err("offset end before start should error");
+        assert!(err.to_string().contains("less than base"));
     }
 
     #[test]
