@@ -333,6 +333,21 @@ mod tests {
 
     #[test]
     fn test_calculate_cache_ttl() {
+        const CLOCK_SKEW_TOLERANCE_SECS: u64 = 2;
+
+        fn assert_ttl_close_to(ttl: Option<Duration>, expected_secs: u64) {
+            let actual_secs = ttl.map(|duration| duration.as_secs());
+            assert!(
+                matches!(
+                    actual_secs,
+                    Some(actual)
+                        if actual <= expected_secs
+                            && expected_secs.saturating_sub(actual) <= CLOCK_SKEW_TOLERANCE_SECS
+                ),
+                "expected ttl close to {expected_secs}s, got {actual_secs:?}"
+            );
+        }
+
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -341,12 +356,12 @@ mod tests {
         // Credentials with 1 hour remaining -> TTL should be 30 minutes (capped)
         let creds_1h = VendedCredentials::new(HashMap::new(), now_millis + 3600 * 1000);
         let ttl = CachingCredentialVendor::calculate_cache_ttl(&creds_1h);
-        assert_eq!(ttl, Some(Duration::from_secs(MAX_CACHE_TTL_SECS)));
+        assert_ttl_close_to(ttl, MAX_CACHE_TTL_SECS);
 
         // Credentials with 10 minutes remaining -> TTL should be 5 minutes
         let creds_10m = VendedCredentials::new(HashMap::new(), now_millis + 10 * 60 * 1000);
         let ttl = CachingCredentialVendor::calculate_cache_ttl(&creds_10m);
-        assert_eq!(ttl, Some(Duration::from_secs(5 * 60)));
+        assert_ttl_close_to(ttl, 5 * 60);
 
         // Credentials with 1 minute remaining -> TTL should be None (too short)
         let creds_1m = VendedCredentials::new(HashMap::new(), now_millis + 60 * 1000);
