@@ -914,8 +914,8 @@ class TestConcurrentOperations:
         """Test concurrent create/drop with single namespace instance."""
         import concurrent.futures
 
-        # Initialize namespace first - create parent namespace to ensure __manifest table
-        # is created before concurrent operations
+        # Initialize namespace first - create parent namespace to ensure __manifest
+        # table is created before concurrent operations
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
         temp_namespace.create_namespace(create_ns_req)
 
