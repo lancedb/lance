@@ -41,7 +41,7 @@ use snafu::location;
 use tracing::{instrument, span, Level};
 // Re-export
 pub use lance_index::vector::pq::PQBuildParams;
-use lance_linalg::kernels::normalize_fsl;
+use lance_linalg::kernels::normalize_fsl_owned;
 
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
@@ -561,7 +561,7 @@ pub async fn build_pq_model(
 
     if metric_type == MetricType::Cosine {
         info!("Normalize training data for PQ training: Cosine");
-        training_data = normalize_fsl(&training_data)?;
+        training_data = normalize_fsl_owned(training_data)?;
     }
 
     let training_data = if let Some(ivf) = ivf {
@@ -638,6 +638,7 @@ mod tests {
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_linalg::kernels::normalize_fsl;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowAddrMask;

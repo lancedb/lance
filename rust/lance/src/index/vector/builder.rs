@@ -43,7 +43,6 @@ use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{write_unified_ivf_and_index_metadata, SupportedIvfIndexType};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
-use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{ivf::storage::IvfModel, PART_ID_FIELD};
@@ -453,14 +452,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // If metric type is cosine, normalize the training data, and after this point,
         // treat the metric type as L2.
         let training_data = if self.distance_type == DistanceType::Cosine {
-            lance_linalg::kernels::normalize_fsl(&training_data)?
+            lance_linalg::kernels::normalize_fsl_owned(training_data)?
         } else {
             training_data
         };
 
         // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-        let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
-        let training_data = training_data.as_fixed_size_list();
+        let training_data = utils::filter_finite_training_data(training_data)?;
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
@@ -470,9 +468,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
-                    .in_scope(|| ivf_transformer.compute_residual(training_data))?
+                    .in_scope(|| ivf_transformer.compute_residual(&training_data))?
             }
-            _ => training_data.clone(),
+            _ => training_data,
         };
 
         info!("Start to train quantizer");
