@@ -69,7 +69,10 @@ def temp_namespace():
     """Create a temporary DirectoryNamespace for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Use lance.namespace.connect() for consistency
-        ns = connect("dir", {"root": f"file://{tmpdir}"})
+        # Use high commit_retries for concurrent operation tests
+        ns = connect(
+            "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
+        )
         yield ns
 
 
@@ -894,3 +897,239 @@ def test_external_manifest_store_invokes_namespace_apis():
         assert namespace.describe_table_version_count == describe_count_before_v1 + 1, (
             "describe_table_version should be called once when opening version 1"
         )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows file locking prevents reliable concurrent filesystem operations",
+)
+class TestConcurrentOperations:
+    """Tests for concurrent table operations.
+
+    These tests mirror the Rust and Java concurrent tests to ensure
+    the DirectoryNamespace handles concurrent create/drop operations correctly.
+    """
+
+    def test_concurrent_create_and_drop_single_instance(self, temp_namespace):
+        """Test concurrent create/drop with single namespace instance."""
+        import concurrent.futures
+
+        # Initialize namespace first - create parent namespace to ensure __manifest
+        # table is created before concurrent operations
+        create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+        temp_namespace.create_namespace(create_ns_req)
+
+        num_tables = 10
+        success_count = 0
+        fail_count = 0
+        lock = Lock()
+
+        def create_and_drop_table(table_index):
+            nonlocal success_count, fail_count
+            try:
+                table_name = f"concurrent_table_{table_index}"
+                table_id = ["test_ns", table_name]
+                table_data = create_test_data()
+                ipc_data = table_to_ipc_bytes(table_data)
+
+                # Create table
+                create_req = CreateTableRequest(id=table_id)
+                temp_namespace.create_table(create_req, ipc_data)
+
+                # Drop table
+                drop_req = DropTableRequest(id=table_id)
+                temp_namespace.drop_table(drop_req)
+
+                with lock:
+                    success_count += 1
+            except Exception as e:
+                with lock:
+                    fail_count += 1
+                raise e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_tables) as executor:
+            futures = [
+                executor.submit(create_and_drop_table, i) for i in range(num_tables)
+            ]
+            concurrent.futures.wait(futures)
+
+        assert success_count == num_tables, (
+            f"Expected {num_tables} successes, got {success_count}"
+        )
+        assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
+
+        # Verify all tables are dropped
+        list_req = ListTablesRequest(id=["test_ns"])
+        response = temp_namespace.list_tables(list_req)
+        assert len(response.tables) == 0, "All tables should be dropped"
+
+    def test_concurrent_create_and_drop_multiple_instances(self):
+        """Test concurrent create/drop with multiple namespace instances."""
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize namespace first with a single instance to ensure __manifest
+            # table is created and parent namespace exists before concurrent operations
+            init_ns = connect(
+                "dir",
+                {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+            )
+            create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+            init_ns.create_namespace(create_ns_req)
+
+            num_tables = 10
+            success_count = 0
+            fail_count = 0
+            lock = Lock()
+
+            def create_and_drop_table(table_index):
+                nonlocal success_count, fail_count
+                try:
+                    # Each thread creates its own namespace instance
+                    # Use high commit_retries to handle version collisions
+                    ns = connect(
+                        "dir",
+                        {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+                    )
+
+                    table_name = f"multi_ns_table_{table_index}"
+                    table_id = ["test_ns", table_name]
+                    table_data = create_test_data()
+                    ipc_data = table_to_ipc_bytes(table_data)
+
+                    # Create table
+                    create_req = CreateTableRequest(id=table_id)
+                    ns.create_table(create_req, ipc_data)
+
+                    # Drop table
+                    drop_req = DropTableRequest(id=table_id)
+                    ns.drop_table(drop_req)
+
+                    with lock:
+                        success_count += 1
+                except Exception as e:
+                    with lock:
+                        fail_count += 1
+                    raise e
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_tables
+            ) as executor:
+                futures = [
+                    executor.submit(create_and_drop_table, i) for i in range(num_tables)
+                ]
+                concurrent.futures.wait(futures)
+
+            assert success_count == num_tables, (
+                f"Expected {num_tables} successes, got {success_count}"
+            )
+            assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
+
+            # Verify with a fresh namespace instance
+            verify_ns = connect(
+                "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
+            )
+            list_req = ListTablesRequest(id=["test_ns"])
+            response = verify_ns.list_tables(list_req)
+            assert len(response.tables) == 0, "All tables should be dropped"
+
+    def test_concurrent_create_then_drop_from_different_instance(self):
+        """Test creating from one set of instances, dropping from different ones."""
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize namespace first with a single instance to ensure __manifest
+            # table is created and parent namespace exists before concurrent operations
+            init_ns = connect(
+                "dir",
+                {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+            )
+            create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+            init_ns.create_namespace(create_ns_req)
+
+            num_tables = 10
+
+            # Phase 1: Create all tables concurrently using separate namespace instances
+            create_success_count = 0
+            create_fail_count = 0
+            create_lock = Lock()
+
+            def create_table(table_index):
+                nonlocal create_success_count, create_fail_count
+                try:
+                    # Use high commit_retries to handle version collisions
+                    ns = connect(
+                        "dir",
+                        {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+                    )
+
+                    table_name = f"cross_instance_table_{table_index}"
+                    table_id = ["test_ns", table_name]
+                    table_data = create_test_data()
+                    ipc_data = table_to_ipc_bytes(table_data)
+
+                    create_req = CreateTableRequest(id=table_id)
+                    ns.create_table(create_req, ipc_data)
+
+                    with create_lock:
+                        create_success_count += 1
+                except Exception as e:
+                    with create_lock:
+                        create_fail_count += 1
+                    raise e
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_tables
+            ) as executor:
+                futures = [executor.submit(create_table, i) for i in range(num_tables)]
+                concurrent.futures.wait(futures)
+
+            assert create_success_count == num_tables, (
+                f"All creates should succeed, got {create_success_count}"
+            )
+
+            # Phase 2: Drop all tables concurrently using NEW namespace instances
+            drop_success_count = 0
+            drop_fail_count = 0
+            drop_lock = Lock()
+
+            def drop_table(table_index):
+                nonlocal drop_success_count, drop_fail_count
+                try:
+                    # Use high commit_retries to handle version collisions
+                    ns = connect(
+                        "dir",
+                        {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+                    )
+
+                    table_name = f"cross_instance_table_{table_index}"
+                    table_id = ["test_ns", table_name]
+
+                    drop_req = DropTableRequest(id=table_id)
+                    ns.drop_table(drop_req)
+
+                    with drop_lock:
+                        drop_success_count += 1
+                except Exception as e:
+                    with drop_lock:
+                        drop_fail_count += 1
+                    raise e
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_tables
+            ) as executor:
+                futures = [executor.submit(drop_table, i) for i in range(num_tables)]
+                concurrent.futures.wait(futures)
+
+            assert drop_success_count == num_tables, (
+                f"All drops should succeed, got {drop_success_count}"
+            )
+            assert drop_fail_count == 0, f"No drops should fail, got {drop_fail_count}"
+
+            # Verify all tables are dropped
+            verify_ns = connect(
+                "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
+            )
+            list_req = ListTablesRequest(id=["test_ns"])
+            response = verify_ns.list_tables(list_req)
+            assert len(response.tables) == 0, "All tables should be dropped"

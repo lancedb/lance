@@ -13,15 +13,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream::StreamExt, FutureExt};
 use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::{builder::DatasetBuilder, WriteParams};
+use lance::dataset::{builder::DatasetBuilder, ReadParams, WriteParams};
 use lance::session::Session;
 use lance::{dataset::scanner::Scanner, Dataset};
+use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::Error as LanceError;
 use lance_core::{box_error, Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::traits::DatasetIndexExt;
 use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
@@ -238,7 +241,6 @@ impl DerefMut for DatasetWriteGuard<'_> {
 /// Manifest-based namespace implementation
 ///
 /// Uses a special `__manifest` Lance table to track tables and nested namespaces.
-#[derive(Debug)]
 pub struct ManifestNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
@@ -256,10 +258,87 @@ pub struct ManifestNamespace {
     /// Whether to perform inline optimization (compaction and indexing) on the __manifest table
     /// after every write. Defaults to true.
     inline_optimization_enabled: bool,
+    /// Number of retries for commit operations on the manifest table.
+    /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
+    commit_retries: Option<u32>,
+}
+
+impl std::fmt::Debug for ManifestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManifestNamespace")
+            .field("root", &self.root)
+            .field("storage_options", &self.storage_options)
+            .field("dir_listing_enabled", &self.dir_listing_enabled)
+            .field(
+                "inline_optimization_enabled",
+                &self.inline_optimization_enabled,
+            )
+            .finish()
+    }
+}
+
+/// Convert a Lance commit error to an appropriate namespace error.
+///
+/// Maps lance commit errors to namespace errors:
+/// - `CommitConflict`: version collision retries exhausted -> Throttled (safe to retry)
+/// - `TooMuchWriteContention`: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
+/// - `IncompatibleTransaction`: incompatible concurrent change -> ConcurrentModification
+/// - Errors containing "matched/duplicate/already exists": ConcurrentModification (from WhenMatched::Fail)
+/// - Other errors: IO error with the operation description
+fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
+    match e {
+        // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
+        LanceError::CommitConflict { .. } => NamespaceError::Throttled {
+            message: format!("Too many concurrent writes, please retry later: {:?}", e),
+        }
+        .into(),
+        // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
+        // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification
+        LanceError::TooMuchWriteContention { .. } | LanceError::IncompatibleTransaction { .. } => {
+            let message = if let Some(id) = object_id {
+                format!(
+                    "Object '{}' was concurrently modified by another operation: {:?}",
+                    id, e
+                )
+            } else {
+                format!(
+                    "Object was concurrently modified by another operation: {:?}",
+                    e
+                )
+            };
+            NamespaceError::ConcurrentModification { message }.into()
+        }
+        // Other errors: check message for semantic conflicts (matched/duplicate from WhenMatched::Fail)
+        _ => {
+            let error_msg = e.to_string();
+            if error_msg.contains("matched")
+                || error_msg.contains("duplicate")
+                || error_msg.contains("already exists")
+            {
+                let message = if let Some(id) = object_id {
+                    format!(
+                        "Object '{}' was concurrently created by another operation: {:?}",
+                        id, e
+                    )
+                } else {
+                    format!(
+                        "Object was concurrently created by another operation: {:?}",
+                        e
+                    )
+                };
+                return NamespaceError::ConcurrentModification { message }.into();
+            }
+            Error::IO {
+                source: box_error(std::io::Error::other(format!("{}: {:?}", operation, e))),
+                location: location!(),
+            }
+        }
+    }
 }
 
 impl ManifestNamespace {
     /// Create a new ManifestNamespace from an existing DirectoryNamespace
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_directory(
         root: String,
         storage_options: Option<HashMap<String, String>>,
@@ -268,9 +347,11 @@ impl ManifestNamespace {
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
     ) -> Result<Self> {
         let manifest_dataset =
-            Self::create_or_get_manifest(&root, &storage_options, session.clone()).await?;
+            Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
+                .await?;
 
         Ok(Self {
             root,
@@ -281,6 +362,7 @@ impl ManifestNamespace {
             manifest_dataset,
             dir_listing_enabled,
             inline_optimization_enabled,
+            commit_retries,
         })
     }
 
@@ -519,7 +601,15 @@ impl ManifestNamespace {
     /// Get the manifest schema
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            Field::new("object_id", DataType::Utf8, false),
+            // Set unenforced primary key on object_id for bloom filter conflict detection
+            Field::new("object_id", DataType::Utf8, false).with_metadata(
+                [(
+                    LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                    "0".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
             Field::new("object_type", DataType::Utf8, false),
             Field::new("location", DataType::Utf8, true),
             Field::new("metadata", DataType::Utf8, true),
@@ -780,6 +870,17 @@ impl ManifestNamespace {
 
         merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
         merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // conflict_retries=0: no outer loop retry on semantic conflicts (handled by caller)
+        // commit_retries: inner retry for manifest version conflicts (uses lance default if not set)
+        merge_builder.conflict_retries(0);
+        // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
+        // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
+        // results in (Some, None) filter mismatch when rebasing against V2 operations.
+        // Setting use_index=false ensures all operations consistently use V2 path.
+        merge_builder.use_index(false);
+        if let Some(retries) = self.commit_retries {
+            merge_builder.commit_retries(retries);
+        }
 
         let (new_dataset_arc, _merge_stats) = merge_builder
             .try_build()
@@ -793,25 +894,7 @@ impl ManifestNamespace {
             .execute_reader(Box::new(reader))
             .await
             .map_err(|e| {
-                // Check if this is a "matched row" error from WhenMatched::Fail
-                let error_msg = e.to_string();
-                if error_msg.contains("matched")
-                    || error_msg.contains("duplicate")
-                    || error_msg.contains("already exists")
-                {
-                    Error::io(
-                        format!("Object with id '{}' already exists in manifest", object_id),
-                        location!(),
-                    )
-                } else {
-                    Error::IO {
-                        source: box_error(std::io::Error::other(format!(
-                            "Failed to execute merge: {}",
-                            e
-                        ))),
-                        location: location!(),
-                    }
-                }
+                convert_lance_commit_error(&e, "Failed to execute merge", Some(&object_id))
             })?;
 
         let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
@@ -830,19 +913,24 @@ impl ManifestNamespace {
 
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
-        {
-            let predicate = format!("object_id = '{}'", object_id);
-            let mut dataset_guard = self.manifest_dataset.get_mut().await?;
-            dataset_guard
-                .delete(&predicate)
-                .await
-                .map_err(|e| Error::IO {
-                    source: box_error(std::io::Error::other(format!("Failed to delete: {}", e))),
-                    location: location!(),
-                })?;
-        } // Drop the guard here
+        let predicate = format!("object_id = '{}'", object_id);
 
-        self.manifest_dataset.reload().await?;
+        // Get dataset and use DeleteBuilder with configured retries
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard); // Drop read guard before delete
+
+        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &predicate)
+            .execute()
+            .await
+            .map_err(|e| convert_lance_commit_error(&e, "Failed to delete", None))?;
+
+        // Update the wrapper with the new dataset
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
 
         // Run inline optimization after delete
         if let Err(e) = self.run_inline_optimization().await {
@@ -952,26 +1040,71 @@ impl ManifestNamespace {
         Ok(found_result)
     }
 
-    /// Create or get the manifest dataset
-    async fn create_or_get_manifest(
+    /// Create or load the manifest dataset, ensuring it has the latest schema setup.
+    ///
+    /// This function will:
+    /// 1. Try to load an existing manifest table
+    /// 2. If it exists, check and migrate the schema if needed (e.g., add primary key metadata)
+    /// 3. If it doesn't exist, create a new manifest table with the current schema
+    async fn ensure_manifest_table_up_to_date(
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
-        let mut builder = DatasetBuilder::from_uri(&manifest_path);
+        let store_options = ObjectStoreParams {
+            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let read_params = ReadParams {
+            session: session.clone(),
+            store_options: Some(store_options.clone()),
+            ..Default::default()
+        };
+        let dataset_result = DatasetBuilder::from_uri(&manifest_path)
+            .with_read_params(read_params)
+            .load()
+            .await;
+        if let Ok(mut dataset) = dataset_result {
+            // Check if the object_id field has primary key metadata, migrate if not
+            let needs_pk_migration = dataset
+                .schema()
+                .field("object_id")
+                .map(|f| {
+                    !f.metadata
+                        .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                })
+                .unwrap_or(false);
 
-        if let Some(sess) = session.clone() {
-            builder = builder.with_session(sess);
-        }
+            if needs_pk_migration {
+                log::info!("Migrating __manifest table to add primary key metadata on object_id");
+                dataset
+                    .update_field_metadata()
+                    .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
+                    .map_err(|e| Error::IO {
+                        source: box_error(std::io::Error::other(format!(
+                            "Failed to find object_id field for migration: {}",
+                            e
+                        ))),
+                        location: location!(),
+                    })?
+                    .await
+                    .map_err(|e| Error::IO {
+                        source: box_error(std::io::Error::other(format!(
+                            "Failed to migrate primary key metadata: {}",
+                            e
+                        ))),
+                        location: location!(),
+                    })?;
+            }
 
-        if let Some(opts) = storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-
-        let dataset_result = builder.load().await;
-        if let Ok(dataset) = dataset_result {
             Ok(DatasetConsistencyWrapper::new(dataset))
         } else {
             log::info!("Creating new manifest table at {}", manifest_path);
@@ -979,36 +1112,86 @@ impl ManifestNamespace {
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
 
-            let write_params = WriteParams {
-                session,
-                store_params: storage_options.as_ref().map(|opts| ObjectStoreParams {
-                    storage_options_accessor: Some(Arc::new(
+            let store_params = ObjectStoreParams {
+                storage_options_accessor: storage_options.as_ref().map(|opts| {
+                    Arc::new(
                         lance_io::object_store::StorageOptionsAccessor::with_static_options(
                             opts.clone(),
                         ),
-                    )),
-                    ..Default::default()
+                    )
                 }),
                 ..Default::default()
             };
+            let write_params = WriteParams {
+                session: session.clone(),
+                store_params: Some(store_params),
+                ..Default::default()
+            };
 
-            let dataset = Dataset::write(Box::new(reader), &manifest_path, Some(write_params))
-                .await
-                .map_err(|e| Error::IO {
+            let dataset =
+                Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
+
+            // Handle race condition where another process created the manifest concurrently
+            match dataset {
+                Ok(dataset) => {
+                    log::info!(
+                        "Successfully created manifest table at {}, version={}, uri={}",
+                        manifest_path,
+                        dataset.version().version,
+                        dataset.uri()
+                    );
+                    Ok(DatasetConsistencyWrapper::new(dataset))
+                }
+                Err(ref e)
+                    if matches!(
+                        e,
+                        LanceError::DatasetAlreadyExists { .. }
+                            | LanceError::CommitConflict { .. }
+                            | LanceError::IncompatibleTransaction { .. }
+                            | LanceError::RetryableCommitConflict { .. }
+                    ) =>
+                {
+                    // Another process created the manifest concurrently, try to load it
+                    log::info!(
+                        "Manifest table was created by another process, loading it: {}",
+                        manifest_path
+                    );
+                    let recovery_store_options = ObjectStoreParams {
+                        storage_options_accessor: storage_options.as_ref().map(|opts| {
+                            Arc::new(
+                                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                    opts.clone(),
+                                ),
+                            )
+                        }),
+                        ..Default::default()
+                    };
+                    let recovery_read_params = ReadParams {
+                        session,
+                        store_options: Some(recovery_store_options),
+                        ..Default::default()
+                    };
+                    let dataset = DatasetBuilder::from_uri(&manifest_path)
+                        .with_read_params(recovery_read_params)
+                        .load()
+                        .await
+                        .map_err(|e| Error::IO {
+                            source: box_error(std::io::Error::other(format!(
+                                "Failed to load manifest dataset after creation conflict: {}",
+                                e
+                            ))),
+                            location: location!(),
+                        })?;
+                    Ok(DatasetConsistencyWrapper::new(dataset))
+                }
+                Err(e) => Err(Error::IO {
                     source: box_error(std::io::Error::other(format!(
                         "Failed to create manifest dataset: {}",
                         e
                     ))),
                     location: location!(),
-                })?;
-
-            log::info!(
-                "Successfully created manifest table at {}, version={}, uri={}",
-                manifest_path,
-                dataset.version().version,
-                dataset.uri()
-            );
-            Ok(DatasetConsistencyWrapper::new(dataset))
+                }),
+            }
         }
     }
 }
@@ -1258,7 +1441,21 @@ impl LanceNamespace for ManifestNamespace {
             batches.into_iter().map(Ok).collect();
         let reader = RecordBatchIterator::new(batch_results, schema);
 
-        let write_params = WriteParams::default();
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: self.storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let write_params = WriteParams {
+            session: self.session.clone(),
+            store_params: Some(store_params),
+            ..Default::default()
+        };
         let _dataset = Dataset::write(Box::new(reader), &table_uri, Some(write_params))
             .await
             .map_err(|e| Error::IO {
@@ -1889,8 +2086,8 @@ mod tests {
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{
-        CreateTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
-        TableExistsRequest,
+        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
+        ListTablesRequest, TableExistsRequest,
     };
     use lance_namespace::LanceNamespace;
     use rstest::rstest;
@@ -2569,6 +2766,249 @@ mod tests {
             response.properties.unwrap().get("key1"),
             Some(&"value1".to_string())
         );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_and_drop_single_instance(#[case] inline_optimization: bool) {
+        use futures::future::join_all;
+        use std::sync::Arc;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .inline_optimization_enabled(inline_optimization)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Initialize namespace first - create parent namespace to ensure __manifest table
+        // is created before concurrent operations
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        dir_namespace
+            .create_namespace(create_ns_request)
+            .await
+            .unwrap();
+
+        let num_tables = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..num_tables {
+            let ns = dir_namespace.clone();
+            let handle = async move {
+                let table_name = format!("concurrent_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                // Create table
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id.clone());
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                // Drop table
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        for result in results {
+            assert!(result.is_ok(), "All concurrent operations should succeed");
+        }
+
+        // Verify all tables are dropped
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = dir_namespace.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_and_drop_multiple_instances(#[case] inline_optimization: bool) {
+        use futures::future::join_all;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
+
+        let num_tables = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                // Each task creates its own namespace instance
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("multi_ns_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                // Create table
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id.clone());
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                // Drop table
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        for result in results {
+            assert!(result.is_ok(), "All concurrent operations should succeed");
+        }
+
+        // Verify with a fresh namespace instance
+        let verify_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = verify_ns.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_then_drop_from_different_instance(
+        #[case] inline_optimization: bool,
+    ) {
+        use futures::future::join_all;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
+
+        let num_tables = 10;
+
+        // Phase 1: Create all tables concurrently using separate namespace instances
+        let mut create_handles = Vec::new();
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("cross_instance_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id);
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            create_handles.push(handle);
+        }
+
+        let create_results = join_all(create_handles).await;
+        for result in create_results {
+            assert!(result.is_ok(), "All create operations should succeed");
+        }
+
+        // Phase 2: Drop all tables concurrently using NEW namespace instances
+        let mut drop_handles = Vec::new();
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("cross_instance_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            drop_handles.push(handle);
+        }
+
+        let drop_results = join_all(drop_handles).await;
+        for result in drop_results {
+            assert!(result.is_ok(), "All drop operations should succeed");
+        }
+
+        // Verify all tables are dropped
+        let verify_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = verify_ns.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
     }
 
     #[test]

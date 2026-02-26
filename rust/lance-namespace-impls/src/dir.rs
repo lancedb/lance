@@ -103,6 +103,7 @@ pub struct DirectoryNamespaceBuilder {
     table_version_tracking_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    commit_retries: Option<u32>,
 }
 
 impl std::fmt::Debug for DirectoryNamespaceBuilder {
@@ -145,6 +146,7 @@ impl DirectoryNamespaceBuilder {
             table_version_tracking_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
+            commit_retries: None,
         }
     }
 
@@ -315,6 +317,10 @@ impl DirectoryNamespaceBuilder {
             })
             .collect();
 
+        let commit_retries = properties
+            .get("commit_retries")
+            .and_then(|v| v.parse::<u32>().ok());
+
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
             storage_options,
@@ -325,6 +331,7 @@ impl DirectoryNamespaceBuilder {
             table_version_tracking_enabled,
             credential_vendor_properties,
             context_provider: None,
+            commit_retries,
         })
     }
 
@@ -364,6 +371,13 @@ impl DirectoryNamespaceBuilder {
     /// * `session` - Arc-wrapped Lance session
     pub fn session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Set the number of retries for commit operations on the manifest table.
+    /// If not set, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
+    pub fn commit_retries(mut self, retries: u32) -> Self {
+        self.commit_retries = Some(retries);
         self
     }
 
@@ -455,6 +469,7 @@ impl DirectoryNamespaceBuilder {
                 base_path.clone(),
                 self.dir_listing_enabled,
                 self.inline_optimization_enabled,
+                self.commit_retries,
             )
             .await
             {

@@ -838,3 +838,307 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
 
     final_describe_count = namespace.get_describe_call_count()
     assert final_describe_count == describe_count_after_second_write
+
+
+def create_test_table_data():
+    """Create test PyArrow table data for concurrent tests."""
+    return pa.Table.from_pylist(
+        [
+            {"id": 1, "name": "Alice", "age": 30},
+            {"id": 2, "name": "Bob", "age": 25},
+            {"id": 3, "name": "Charlie", "age": 35},
+        ]
+    )
+
+
+def table_to_ipc_bytes(table):
+    """Convert PyArrow table to IPC bytes."""
+    import io
+
+    sink = io.BytesIO()
+    with pa.ipc.RecordBatchStreamWriter(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue()
+
+
+@pytest.mark.integration
+def test_basic_create_and_drop_on_s3(s3_bucket: str):
+    """Test basic create and drop table operations on S3.
+
+    Mirrors Java: testBasicCreateAndDropOnS3
+    """
+    from lance.namespace import DirectoryNamespace
+    from lance_namespace import (
+        DropTableRequest,
+        TableExistsRequest,
+    )
+
+    test_prefix = f"test-{uuid.uuid4().hex[:8]}"
+    storage_options = copy.deepcopy(CONFIG)
+    dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
+    namespace = DirectoryNamespace(**dir_props)
+
+    table_name = "basic_test_table"
+    table_data = create_test_table_data()
+    table_id = ["test_ns", table_name]
+
+    # Create table using lance.write_dataset (same as other passing tests)
+    ds = lance.write_dataset(
+        table_data, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds is not None
+    assert ds.count_rows() == 3
+
+    # Drop table
+    drop_req = DropTableRequest(id=table_id)
+    drop_resp = namespace.drop_table(drop_req)
+    assert drop_resp is not None
+
+    # Verify table no longer exists
+    exists_req = TableExistsRequest(id=table_id)
+    with pytest.raises(Exception):
+        namespace.table_exists(exists_req)
+
+
+@pytest.mark.integration
+def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
+    """Test concurrent create/drop with single namespace instance on S3."""
+    import concurrent.futures
+
+    from lance.namespace import DirectoryNamespace
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+    )
+
+    test_prefix = f"test-{uuid.uuid4().hex[:8]}"
+    storage_options = copy.deepcopy(CONFIG)
+    dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
+    # Very high retry count to guarantee all operations succeed
+    dir_props["commit_retries"] = "2147483647"
+    namespace = DirectoryNamespace(**dir_props)
+
+    # Initialize namespace first - create parent namespace to ensure __manifest table
+    # is created before concurrent operations
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    namespace.create_namespace(create_ns_req)
+
+    num_tables = 10
+    success_count = 0
+    fail_count = 0
+    lock = Lock()
+
+    def create_and_drop_table(table_index):
+        nonlocal success_count, fail_count
+        try:
+            table_name = f"s3_concurrent_table_{table_index}"
+            table_data = create_test_table_data()
+            table_id = ["test_ns", table_name]
+            ipc_data = table_to_ipc_bytes(table_data)
+
+            # Create table using atomic create_table API
+            create_req = CreateTableRequest(id=table_id)
+            namespace.create_table(create_req, ipc_data)
+
+            # Drop table
+            drop_req = DropTableRequest(id=table_id)
+            namespace.drop_table(drop_req)
+
+            with lock:
+                success_count += 1
+        except Exception:
+            with lock:
+                fail_count += 1
+            raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_tables) as executor:
+        futures = [executor.submit(create_and_drop_table, i) for i in range(num_tables)]
+        concurrent.futures.wait(futures)
+
+    # All operations must succeed with very high retry count
+    assert success_count == num_tables, (
+        f"Expected {num_tables} successes, got {success_count}"
+    )
+    assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
+
+
+@pytest.mark.integration
+def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
+    """Test concurrent create/drop with multiple namespace instances on S3."""
+    import concurrent.futures
+
+    from lance.namespace import DirectoryNamespace
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+        ListTablesRequest,
+    )
+
+    test_prefix = f"test-{uuid.uuid4().hex[:8]}"
+    storage_options = copy.deepcopy(CONFIG)
+    base_dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    base_dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
+    # Very high retry count to guarantee all operations succeed
+    base_dir_props["commit_retries"] = "2147483647"
+
+    # Initialize namespace first with a single instance to ensure __manifest
+    # table is created and parent namespace exists before concurrent operations
+    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    init_ns.create_namespace(create_ns_req)
+
+    num_tables = 10
+    success_count = 0
+    fail_count = 0
+    lock = Lock()
+
+    def create_and_drop_table(table_index):
+        nonlocal success_count, fail_count
+        try:
+            # Each thread creates its own namespace instance
+            ns = DirectoryNamespace(**base_dir_props.copy())
+
+            table_name = f"s3_multi_ns_table_{table_index}"
+            table_data = create_test_table_data()
+            table_id = ["test_ns", table_name]
+            ipc_data = table_to_ipc_bytes(table_data)
+
+            # Create table using atomic create_table API
+            create_req = CreateTableRequest(id=table_id)
+            ns.create_table(create_req, ipc_data)
+
+            # Drop table
+            drop_req = DropTableRequest(id=table_id)
+            ns.drop_table(drop_req)
+
+            with lock:
+                success_count += 1
+        except Exception:
+            with lock:
+                fail_count += 1
+            raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_tables) as executor:
+        futures = [executor.submit(create_and_drop_table, i) for i in range(num_tables)]
+        concurrent.futures.wait(futures)
+
+    # All operations must succeed with very high retry count
+    assert success_count == num_tables, (
+        f"Expected {num_tables} successes, got {success_count}"
+    )
+    assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
+
+    # Verify remaining state is consistent (no corruption)
+    verify_ns = DirectoryNamespace(**base_dir_props)
+    list_req = ListTablesRequest(id=["test_ns"])
+    _ = verify_ns.list_tables(list_req)  # Should not error
+
+
+@pytest.mark.integration
+def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: str):
+    """Test creating from one set of instances, dropping from different ones on S3."""
+    import concurrent.futures
+
+    from lance.namespace import DirectoryNamespace
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+        ListTablesRequest,
+    )
+
+    test_prefix = f"test-{uuid.uuid4().hex[:8]}"
+    storage_options = copy.deepcopy(CONFIG)
+    base_dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    base_dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
+    # Very high retry count to guarantee all operations succeed
+    base_dir_props["commit_retries"] = "2147483647"
+
+    # Initialize namespace first with a single instance to ensure __manifest
+    # table is created and parent namespace exists before concurrent operations
+    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    init_ns.create_namespace(create_ns_req)
+
+    num_tables = 10
+
+    # Phase 1: Create all tables concurrently using separate namespace instances
+    create_success_count = 0
+    create_fail_count = 0
+    create_lock = Lock()
+
+    def create_table(table_index):
+        nonlocal create_success_count, create_fail_count
+        table_name = f"s3_cross_instance_table_{table_index}"
+        try:
+            ns = DirectoryNamespace(**base_dir_props.copy())
+
+            table_data = create_test_table_data()
+            table_id = ["test_ns", table_name]
+            ipc_data = table_to_ipc_bytes(table_data)
+
+            # Create table using atomic create_table API
+            create_req = CreateTableRequest(id=table_id)
+            ns.create_table(create_req, ipc_data)
+
+            with create_lock:
+                create_success_count += 1
+        except Exception:
+            with create_lock:
+                create_fail_count += 1
+            raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_tables) as executor:
+        futures = [executor.submit(create_table, i) for i in range(num_tables)]
+        concurrent.futures.wait(futures)
+
+    # All creates must succeed with very high retry count
+    assert create_success_count == num_tables, (
+        f"Expected {num_tables} create successes, got {create_success_count}"
+    )
+    assert create_fail_count == 0, (
+        f"Expected 0 create failures, got {create_fail_count}"
+    )
+
+    # Phase 2: Drop all tables using NEW namespace instances
+    drop_success_count = 0
+    drop_fail_count = 0
+    drop_lock = Lock()
+
+    def drop_table(table_index):
+        nonlocal drop_success_count, drop_fail_count
+        try:
+            ns = DirectoryNamespace(**base_dir_props.copy())
+
+            table_name = f"s3_cross_instance_table_{table_index}"
+            table_id = ["test_ns", table_name]
+
+            drop_req = DropTableRequest(id=table_id)
+            ns.drop_table(drop_req)
+
+            with drop_lock:
+                drop_success_count += 1
+        except Exception:
+            with drop_lock:
+                drop_fail_count += 1
+            raise
+
+    # Drop all tables
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_tables) as executor:
+        futures = [executor.submit(drop_table, i) for i in range(num_tables)]
+        concurrent.futures.wait(futures)
+
+    # All drops must succeed with very high retry count
+    assert drop_success_count == num_tables, (
+        f"Expected {num_tables} drop successes, got {drop_success_count}"
+    )
+    assert drop_fail_count == 0, f"Expected 0 drop failures, got {drop_fail_count}"
+
+    # Verify remaining state is consistent (no corruption)
+    verify_ns = DirectoryNamespace(**base_dir_props)
+    list_req = ListTablesRequest(id=["test_ns"])
+    _ = verify_ns.list_tables(list_req)  # Should not error
