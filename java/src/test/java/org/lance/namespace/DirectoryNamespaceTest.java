@@ -697,6 +697,11 @@ public class DirectoryNamespaceTest {
 
   @Test
   void testConcurrentCreateAndDropWithSingleInstance() throws Exception {
+    // Initialize namespace first - create parent namespace to ensure __manifest table
+    // is created before concurrent operations
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    namespace.createNamespace(createNsReq);
+
     int numTables = 10;
     ExecutorService executor = Executors.newFixedThreadPool(numTables);
     CountDownLatch startLatch = new CountDownLatch(1);
@@ -714,10 +719,12 @@ public class DirectoryNamespaceTest {
               String tableName = "concurrent_table_" + tableIndex;
               byte[] tableData = createTestTableData();
 
-              CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList(tableName));
+              CreateTableRequest createReq =
+                  new CreateTableRequest().id(Arrays.asList("test_ns", tableName));
               namespace.createTable(createReq, tableData);
 
-              DropTableRequest dropReq = new DropTableRequest().id(Arrays.asList(tableName));
+              DropTableRequest dropReq =
+                  new DropTableRequest().id(Arrays.asList("test_ns", tableName));
               namespace.dropTable(dropReq);
 
               successCount.incrementAndGet();
@@ -738,13 +745,25 @@ public class DirectoryNamespaceTest {
     assertEquals(numTables, successCount.get(), "All tasks should succeed");
     assertEquals(0, failCount.get(), "No tasks should fail");
 
-    ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList());
+    ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList("test_ns"));
     ListTablesResponse listResp = namespace.listTables(listReq);
     assertEquals(0, listResp.getTables().size(), "All tables should be dropped");
   }
 
   @Test
   void testConcurrentCreateAndDropWithMultipleInstances() throws Exception {
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    Map<String, String> initConfig = new HashMap<>();
+    initConfig.put("root", tempDir.toString());
+    initConfig.put("inline_optimization_enabled", "false");
+    initNs.initialize(initConfig, allocator);
+
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
     int numTables = 10;
     ExecutorService executor = Executors.newFixedThreadPool(numTables);
     CountDownLatch startLatch = new CountDownLatch(1);
@@ -754,6 +773,7 @@ public class DirectoryNamespaceTest {
     List<DirectoryNamespace> namespaces = new ArrayList<>();
 
     for (int i = 0; i < numTables; i++) {
+      final int tableIndex = i;
       executor.submit(
           () -> {
             DirectoryNamespace localNs = null;
@@ -770,13 +790,15 @@ public class DirectoryNamespaceTest {
                 namespaces.add(localNs);
               }
 
-              String tableName = "multi_ns_table_" + Thread.currentThread().getId();
+              String tableName = "multi_ns_table_" + tableIndex;
               byte[] tableData = createTestTableData();
 
-              CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList(tableName));
+              CreateTableRequest createReq =
+                  new CreateTableRequest().id(Arrays.asList("test_ns", tableName));
               localNs.createTable(createReq, tableData);
 
-              DropTableRequest dropReq = new DropTableRequest().id(Arrays.asList(tableName));
+              DropTableRequest dropReq =
+                  new DropTableRequest().id(Arrays.asList("test_ns", tableName));
               localNs.dropTable(dropReq);
 
               successCount.incrementAndGet();
@@ -812,7 +834,7 @@ public class DirectoryNamespaceTest {
     config.put("root", tempDir.toString());
     verifyNs.initialize(config, allocator);
 
-    ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList());
+    ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList("test_ns"));
     ListTablesResponse listResp = verifyNs.listTables(listReq);
     assertEquals(0, listResp.getTables().size(), "All tables should be dropped");
 
@@ -821,6 +843,18 @@ public class DirectoryNamespaceTest {
 
   @Test
   void testConcurrentCreateThenDropFromDifferentInstance() throws Exception {
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    Map<String, String> initConfig = new HashMap<>();
+    initConfig.put("root", tempDir.toString());
+    initConfig.put("inline_optimization_enabled", "false");
+    initNs.initialize(initConfig, allocator);
+
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
     int numTables = 10;
 
     // First, create all tables using separate namespace instances
@@ -851,7 +885,8 @@ public class DirectoryNamespaceTest {
               String tableName = "cross_instance_table_" + tableIndex;
               byte[] tableData = createTestTableData();
 
-              CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList(tableName));
+              CreateTableRequest createReq =
+                  new CreateTableRequest().id(Arrays.asList("test_ns", tableName));
               localNs.createTable(createReq, tableData);
 
               createSuccessCount.incrementAndGet();
@@ -906,7 +941,8 @@ public class DirectoryNamespaceTest {
 
               String tableName = "cross_instance_table_" + tableIndex;
 
-              DropTableRequest dropReq = new DropTableRequest().id(Arrays.asList(tableName));
+              DropTableRequest dropReq =
+                  new DropTableRequest().id(Arrays.asList("test_ns", tableName));
               localNs.dropTable(dropReq);
 
               dropSuccessCount.incrementAndGet();

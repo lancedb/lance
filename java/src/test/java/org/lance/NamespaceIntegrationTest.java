@@ -18,6 +18,7 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateTableRequest;
 import org.lance.namespace.model.CreateTableResponse;
 import org.lance.namespace.model.DeclareTableRequest;
@@ -1560,6 +1561,12 @@ public class NamespaceIntegrationTest {
     namespace.initialize(createDirectoryNamespaceS3Config(), testAllocator);
 
     try {
+      // Initialize namespace first - create parent namespace to ensure __manifest table
+      // is created before concurrent operations
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+      namespace.createNamespace(createNsReq);
+
       int numTables = 10;
       ExecutorService executor = Executors.newFixedThreadPool(numTables);
       CountDownLatch startLatch = new CountDownLatch(1);
@@ -1608,6 +1615,16 @@ public class NamespaceIntegrationTest {
 
   @Test
   void testConcurrentCreateAndDropWithMultipleInstancesOnS3() throws Exception {
+    Map<String, String> baseConfig = createDirectoryNamespaceS3Config();
+
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    initNs.initialize(new HashMap<>(baseConfig), testAllocator);
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
     int numTables = 10;
     ExecutorService executor = Executors.newFixedThreadPool(numTables);
     CountDownLatch startLatch = new CountDownLatch(1);
@@ -1615,8 +1632,6 @@ public class NamespaceIntegrationTest {
     AtomicInteger successCount = new AtomicInteger(0);
     AtomicInteger failCount = new AtomicInteger(0);
     List<DirectoryNamespace> namespaces = new ArrayList<>();
-
-    Map<String, String> baseConfig = createDirectoryNamespaceS3Config();
 
     for (int i = 0; i < numTables; i++) {
       final int tableIndex = i;
@@ -1672,8 +1687,17 @@ public class NamespaceIntegrationTest {
 
   @Test
   void testConcurrentCreateThenDropFromDifferentInstanceOnS3() throws Exception {
-    int numTables = 10;
     Map<String, String> baseConfig = createDirectoryNamespaceS3Config();
+
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    initNs.initialize(new HashMap<>(baseConfig), testAllocator);
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
+    int numTables = 10;
 
     // First, create all tables using separate namespace instances
     ExecutorService createExecutor = Executors.newFixedThreadPool(numTables);

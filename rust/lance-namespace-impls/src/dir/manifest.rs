@@ -2086,8 +2086,8 @@ mod tests {
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{
-        CreateTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
-        TableExistsRequest,
+        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
+        ListTablesRequest, TableExistsRequest,
     };
     use lance_namespace::LanceNamespace;
     use rstest::rstest;
@@ -2787,6 +2787,15 @@ mod tests {
                 .unwrap(),
         );
 
+        // Initialize namespace first - create parent namespace to ensure __manifest table
+        // is created before concurrent operations
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        dir_namespace
+            .create_namespace(create_ns_request)
+            .await
+            .unwrap();
+
         let num_tables = 10;
         let mut handles = Vec::new();
 
@@ -2823,7 +2832,7 @@ mod tests {
 
         // Verify all tables are dropped
         let mut request = ListTablesRequest::new();
-        request.id = Some(vec![]);
+        request.id = Some(vec!["test_ns".to_string()]);
         let response = dir_namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0, "All tables should be dropped");
     }
@@ -2837,6 +2846,17 @@ mod tests {
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
 
         let num_tables = 10;
         let mut handles = Vec::new();
@@ -2887,7 +2907,7 @@ mod tests {
             .unwrap();
 
         let mut request = ListTablesRequest::new();
-        request.id = Some(vec![]);
+        request.id = Some(vec!["test_ns".to_string()]);
         let response = verify_ns.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0, "All tables should be dropped");
     }
@@ -2903,6 +2923,17 @@ mod tests {
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
 
         let num_tables = 10;
 
@@ -2975,7 +3006,7 @@ mod tests {
             .unwrap();
 
         let mut request = ListTablesRequest::new();
-        request.id = Some(vec![]);
+        request.id = Some(vec!["test_ns".to_string()]);
         let response = verify_ns.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0, "All tables should be dropped");
     }

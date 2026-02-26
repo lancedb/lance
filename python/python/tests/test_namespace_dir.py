@@ -914,6 +914,11 @@ class TestConcurrentOperations:
         """Test concurrent create/drop with single namespace instance."""
         import concurrent.futures
 
+        # Initialize namespace first - create parent namespace to ensure __manifest table
+        # is created before concurrent operations
+        create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+        temp_namespace.create_namespace(create_ns_req)
+
         num_tables = 10
         success_count = 0
         fail_count = 0
@@ -954,7 +959,7 @@ class TestConcurrentOperations:
         assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
         # Verify all tables are dropped
-        list_req = ListTablesRequest(id=[])
+        list_req = ListTablesRequest(id=["test_ns"])
         response = temp_namespace.list_tables(list_req)
         assert len(response.tables) == 0, "All tables should be dropped"
 
@@ -963,6 +968,15 @@ class TestConcurrentOperations:
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize namespace first with a single instance to ensure __manifest
+            # table is created and parent namespace exists before concurrent operations
+            init_ns = connect(
+                "dir",
+                {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+            )
+            create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+            init_ns.create_namespace(create_ns_req)
+
             num_tables = 10
             success_count = 0
             fail_count = 0
@@ -1015,7 +1029,7 @@ class TestConcurrentOperations:
             verify_ns = connect(
                 "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
             )
-            list_req = ListTablesRequest(id=[])
+            list_req = ListTablesRequest(id=["test_ns"])
             response = verify_ns.list_tables(list_req)
             assert len(response.tables) == 0, "All tables should be dropped"
 
@@ -1024,6 +1038,15 @@ class TestConcurrentOperations:
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize namespace first with a single instance to ensure __manifest
+            # table is created and parent namespace exists before concurrent operations
+            init_ns = connect(
+                "dir",
+                {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
+            )
+            create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+            init_ns.create_namespace(create_ns_req)
+
             num_tables = 10
 
             # Phase 1: Create all tables concurrently using separate namespace instances
@@ -1107,6 +1130,6 @@ class TestConcurrentOperations:
             verify_ns = connect(
                 "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
             )
-            list_req = ListTablesRequest(id=[])
+            list_req = ListTablesRequest(id=["test_ns"])
             response = verify_ns.list_tables(list_req)
             assert len(response.tables) == 0, "All tables should be dropped"

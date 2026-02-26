@@ -907,7 +907,11 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
-    from lance_namespace import CreateTableRequest, DropTableRequest
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -916,6 +920,11 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
     # Very high retry count to guarantee all operations succeed
     dir_props["commit_retries"] = "2147483647"
     namespace = DirectoryNamespace(**dir_props)
+
+    # Initialize namespace first - create parent namespace to ensure __manifest table
+    # is created before concurrent operations
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    namespace.create_namespace(create_ns_req)
 
     num_tables = 10
     success_count = 0
@@ -962,7 +971,12 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
-    from lance_namespace import CreateTableRequest, DropTableRequest, ListTablesRequest
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+        ListTablesRequest,
+    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -970,6 +984,12 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
     base_dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
     # Very high retry count to guarantee all operations succeed
     base_dir_props["commit_retries"] = "2147483647"
+
+    # Initialize namespace first with a single instance to ensure __manifest
+    # table is created and parent namespace exists before concurrent operations
+    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    init_ns.create_namespace(create_ns_req)
 
     num_tables = 10
     success_count = 0
@@ -1024,7 +1044,12 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
     import concurrent.futures
 
     from lance.namespace import DirectoryNamespace
-    from lance_namespace import CreateTableRequest, DropTableRequest, ListTablesRequest
+    from lance_namespace import (
+        CreateNamespaceRequest,
+        CreateTableRequest,
+        DropTableRequest,
+        ListTablesRequest,
+    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -1032,6 +1057,12 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
     base_dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
     # Very high retry count to guarantee all operations succeed
     base_dir_props["commit_retries"] = "2147483647"
+
+    # Initialize namespace first with a single instance to ensure __manifest
+    # table is created and parent namespace exists before concurrent operations
+    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+    init_ns.create_namespace(create_ns_req)
 
     num_tables = 10
 
