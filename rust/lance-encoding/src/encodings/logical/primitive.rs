@@ -2207,12 +2207,6 @@ impl FullZipScheduler {
         match &details.value_decompressor {
             PerValueDecompressor::Fixed(decompressor) => {
                 let bits_per_value = decompressor.bits_per_value();
-                if bits_per_value == 0 {
-                    return Err(lance_core::Error::Internal {
-                        message: "Invalid encoding: bits_per_value must be greater than 0".into(),
-                        location: location!(),
-                    });
-                }
                 if bits_per_value % 8 != 0 {
                     return Err(lance_core::Error::NotSupported {
                         source: "Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into(),
@@ -2222,6 +2216,12 @@ impl FullZipScheduler {
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
+                if total_bytes_per_value == 0 {
+                    return Err(lance_core::Error::Internal {
+                        message: "Invalid encoding: per-row byte width must be greater than 0".into(),
+                        location: location!(),
+                    });
+                }
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
                     data,
