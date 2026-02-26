@@ -324,6 +324,8 @@ struct MergeInsertParams {
     use_index: bool,
     // Controls how to handle duplicate source rows that match the same target row.
     source_dedupe_behavior: SourceDedupeBehavior,
+    // Number of inner commit retries for manifest version conflicts. Default is 20.
+    commit_retries: Option<u32>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -447,6 +449,7 @@ impl MergeInsertBuilder {
                 skip_auto_cleanup: false,
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
+                commit_retries: None,
             },
         })
     }
@@ -534,6 +537,14 @@ impl MergeInsertBuilder {
     /// This updates the merged_generations in the MemWAL Index atomically with the data commit.
     pub fn mark_generations_as_merged(&mut self, generations: Vec<MergedGeneration>) -> &mut Self {
         self.params.merged_generations.extend(generations);
+        self
+    }
+
+    /// Set the number of inner commit retries for manifest version conflicts.
+    /// Different from `conflict_retries` which handles semantic conflicts.
+    /// Default: 20
+    pub fn commit_retries(&mut self, retries: u32) -> &mut Self {
+        self.params.commit_retries = Some(retries);
         self
     }
 
@@ -1873,6 +1884,9 @@ impl RetryExecutor for MergeInsertJobWithIterator {
 
         let mut commit_builder =
             CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
+        if let Some(commit_retries) = self.job.params.commit_retries {
+            commit_builder = commit_builder.with_max_retries(commit_retries);
+        }
         if let Some(affected_rows) = data.affected_rows {
             commit_builder = commit_builder.with_affected_rows(affected_rows);
         }

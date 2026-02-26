@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
 import org.lance.TestUtils;
@@ -90,36 +91,36 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          try (Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
                           .schema(evolvedSchema)
                           .build())
-                  .build();
-
-          try (Dataset evolvedDataset = mergeTransaction.commit()) {
-            Assertions.assertEquals(3, evolvedDataset.version());
-            Assertions.assertEquals(rowCount, evolvedDataset.countRows());
-            Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
-            Assertions.assertEquals(3, evolvedDataset.getSchema().getFields().size());
-            // Verify merged data
-            try (LanceScanner scanner = evolvedDataset.newScan()) {
-              try (ArrowReader resultReader = scanner.scanBatches()) {
-                Assertions.assertTrue(resultReader.loadNextBatch());
-                VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
-                Assertions.assertEquals(rowCount, batch.getRowCount());
-                Assertions.assertEquals(3, batch.getSchema().getFields().size());
-                // Verify age column
-                IntVector ageResultVector = (IntVector) batch.getVector("age");
-                for (int i = 0; i < rowCount; i++) {
-                  Assertions.assertEquals(20 + i, ageResultVector.get(i));
-                }
-                IntVector idResultVector = (IntVector) batch.getVector("id");
-                for (int i = 0; i < rowCount; i++) {
-                  Assertions.assertEquals(i, idResultVector.get(i));
+                  .build()) {
+            try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
+              Assertions.assertEquals(3, evolvedDataset.version());
+              Assertions.assertEquals(rowCount, evolvedDataset.countRows());
+              Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
+              Assertions.assertEquals(3, evolvedDataset.getSchema().getFields().size());
+              // Verify merged data
+              try (LanceScanner scanner = evolvedDataset.newScan()) {
+                try (ArrowReader resultReader = scanner.scanBatches()) {
+                  Assertions.assertTrue(resultReader.loadNextBatch());
+                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                  Assertions.assertEquals(rowCount, batch.getRowCount());
+                  Assertions.assertEquals(3, batch.getSchema().getFields().size());
+                  // Verify age column
+                  IntVector ageResultVector = (IntVector) batch.getVector("age");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(20 + i, ageResultVector.get(i));
+                  }
+                  IntVector idResultVector = (IntVector) batch.getVector("id");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(i, idResultVector.get(i));
+                  }
                 }
               }
             }
@@ -169,36 +170,36 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          try (Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
                           .schema(evolvedSchema)
                           .build())
-                  .build();
-
-          try (Dataset evolvedDataset = mergeTransaction.commit()) {
-            Assertions.assertEquals(3, evolvedDataset.version());
-            Assertions.assertEquals(rowCount, evolvedDataset.countRows());
-            Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
-            Assertions.assertEquals(2, evolvedDataset.getSchema().getFields().size());
-            // Verify merged data
-            try (LanceScanner scanner = evolvedDataset.newScan()) {
-              try (ArrowReader resultReader = scanner.scanBatches()) {
-                Assertions.assertTrue(resultReader.loadNextBatch());
-                VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
-                Assertions.assertEquals(rowCount, batch.getRowCount());
-                Assertions.assertEquals(2, batch.getSchema().getFields().size());
-                // Verify age column
-                IntVector ageResultVector = (IntVector) batch.getVector("age");
-                for (int i = 0; i < rowCount; i++) {
-                  Assertions.assertEquals(20 + i, ageResultVector.get(i));
-                }
-                IntVector idResultVector = (IntVector) batch.getVector("id");
-                for (int i = 0; i < rowCount; i++) {
-                  Assertions.assertEquals(i, idResultVector.get(i));
+                  .build()) {
+            try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
+              Assertions.assertEquals(3, evolvedDataset.version());
+              Assertions.assertEquals(rowCount, evolvedDataset.countRows());
+              Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
+              Assertions.assertEquals(2, evolvedDataset.getSchema().getFields().size());
+              // Verify merged data
+              try (LanceScanner scanner = evolvedDataset.newScan()) {
+                try (ArrowReader resultReader = scanner.scanBatches()) {
+                  Assertions.assertTrue(resultReader.loadNextBatch());
+                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                  Assertions.assertEquals(rowCount, batch.getRowCount());
+                  Assertions.assertEquals(2, batch.getSchema().getFields().size());
+                  // Verify age column
+                  IntVector ageResultVector = (IntVector) batch.getVector("age");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(20 + i, ageResultVector.get(i));
+                  }
+                  IntVector idResultVector = (IntVector) batch.getVector("id");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(i, idResultVector.get(i));
+                  }
                 }
               }
             }
@@ -254,31 +255,31 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          try (Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
                           .schema(testDataset.getSchema())
                           .build())
-                  .build();
+                  .build()) {
+            try (Dataset mergedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
+              Assertions.assertEquals(3, mergedDataset.version());
+              Assertions.assertEquals(rowCount, mergedDataset.countRows());
 
-          try (Dataset mergedDataset = mergeTransaction.commit()) {
-            Assertions.assertEquals(3, mergedDataset.version());
-            Assertions.assertEquals(rowCount, mergedDataset.countRows());
+              // Verify updated data
+              try (LanceScanner scanner = mergedDataset.newScan()) {
+                try (ArrowReader resultReader = scanner.scanBatches()) {
+                  Assertions.assertTrue(resultReader.loadNextBatch());
+                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
 
-            // Verify updated data
-            try (LanceScanner scanner = mergedDataset.newScan()) {
-              try (ArrowReader resultReader = scanner.scanBatches()) {
-                Assertions.assertTrue(resultReader.loadNextBatch());
-                VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
-
-                VarCharVector nameResultVector = (VarCharVector) batch.getVector("name");
-                for (int i = 0; i < rowCount; i++) {
-                  String expectedName = "UpdatedName_" + i;
-                  String actualName = new String(nameResultVector.get(i), StandardCharsets.UTF_8);
-                  Assertions.assertEquals(expectedName, actualName);
+                  VarCharVector nameResultVector = (VarCharVector) batch.getVector("name");
+                  for (int i = 0; i < rowCount; i++) {
+                    String expectedName = "UpdatedName_" + i;
+                    String actualName = new String(nameResultVector.get(i), StandardCharsets.UTF_8);
+                    Assertions.assertEquals(expectedName, actualName);
+                  }
                 }
               }
             }

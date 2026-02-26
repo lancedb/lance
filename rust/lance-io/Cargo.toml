@@ -36,6 +36,7 @@ bytes.workspace = true
 chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
+http.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
