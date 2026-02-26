@@ -20,6 +20,7 @@ mod schema;
 use crate::{Error, Result};
 pub use field::{
     BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 pub use schema::{
     escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,

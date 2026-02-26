@@ -324,6 +324,8 @@ struct MergeInsertParams {
     use_index: bool,
     // Controls how to handle duplicate source rows that match the same target row.
     source_dedupe_behavior: SourceDedupeBehavior,
+    // Number of inner commit retries for manifest version conflicts. Default is 20.
+    commit_retries: Option<u32>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -447,6 +449,7 @@ impl MergeInsertBuilder {
                 skip_auto_cleanup: false,
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
+                commit_retries: None,
             },
         })
     }
@@ -534,6 +537,14 @@ impl MergeInsertBuilder {
     /// This updates the merged_generations in the MemWAL Index atomically with the data commit.
     pub fn mark_generations_as_merged(&mut self, generations: Vec<MergedGeneration>) -> &mut Self {
         self.params.merged_generations.extend(generations);
+        self
+    }
+
+    /// Set the number of inner commit retries for manifest version conflicts.
+    /// Different from `conflict_retries` which handles semantic conflicts.
+    /// Default: 20
+    pub fn commit_retries(&mut self, retries: u32) -> &mut Self {
+        self.params.commit_retries = Some(retries);
         self
     }
 
@@ -1873,6 +1884,9 @@ impl RetryExecutor for MergeInsertJobWithIterator {
 
         let mut commit_builder =
             CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
+        if let Some(commit_retries) = self.job.params.commit_retries {
+            commit_builder = commit_builder.with_max_retries(commit_retries);
+        }
         if let Some(affected_rows) = data.affected_rows {
             commit_builder = commit_builder.with_affected_rows(affected_rows);
         }
@@ -4185,13 +4199,12 @@ mod tests {
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@2 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@2 IS NOT NULL THEN 1 ELSE 0 END as __action]
       ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
-        CoalesceBatchesExec...
-          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-            CooperativeExec
-              LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-              row_id=true, row_addr=true, full_filter=--, refine_filter=--
-            RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
-              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+          CooperativeExec
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+            row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
@@ -4233,12 +4246,11 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      CoalesceBatchesExec...
-        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          CooperativeExec
-            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-          RepartitionExec...
-            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+        CooperativeExec
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec...
+          StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
@@ -4280,12 +4292,11 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      CoalesceBatchesExec...
-        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          CooperativeExec
-            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-          RepartitionExec...
-            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+        CooperativeExec
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec...
+          StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
