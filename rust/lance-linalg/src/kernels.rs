@@ -533,6 +533,7 @@ mod tests {
     /// Zero vectors yield NaN (cosine is undefined; downstream is_finite filters them).
     #[test]
     fn test_normalize_fsl_owned_values() {
+        #[allow(clippy::type_complexity)]
         let cases: &[(&str, &[f32], &[Option<f32>])] = &[
             (
                 "basic",
