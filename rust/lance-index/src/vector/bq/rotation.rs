@@ -4,10 +4,30 @@
 use num_traits::AsPrimitive;
 use rand::RngCore;
 
+// Fast random rotation used by the RabitQ "fast" path.
+//
+// The transform is a composition of:
+// 1) random diagonal sign flips (Rademacher variables),
+// 2) FWHT-style mixing on a power-of-two window,
+// 3) a Kac-style pairwise mixing step for non-power-of-two dimensions.
+//
+// Background:
+// - Hadamard transform: https://en.wikipedia.org/wiki/Hadamard_transform
+// - Fast Walsh-Hadamard transform (FWHT):
+//   https://en.wikipedia.org/wiki/Fast_Walsh%E2%80%93Hadamard_transform
+// - Rademacher random signs:
+//   https://en.wikipedia.org/wiki/Rademacher_distribution
+// - Kac-walk-based fast dimension reduction (uses fixed-angle pair rotations):
+//   https://arxiv.org/abs/2003.10069
+// - Givens / plane rotation:
+//   https://en.wikipedia.org/wiki/Givens_rotation
 const FAST_ROTATION_ROUNDS: usize = 4;
 
 #[inline]
 fn fwht_in_place(values: &mut [f32]) {
+    // In-place FWHT butterfly network.
+    // For each stage, pair entries (x, y) and map to (x + y, x - y).
+    // Complexity: O(n log n) operations, no extra heap allocation.
     debug_assert!(values.len().is_power_of_two());
     let mut half = 1usize;
     while half < values.len() {
@@ -27,6 +47,8 @@ fn fwht_in_place(values: &mut [f32]) {
 
 #[inline]
 fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
+    // Apply a random diagonal matrix with +/-1 entries by toggling the f32 sign bit.
+    // One bit in `signs` controls one element in `values`.
     for (byte_idx, &mask) in signs.iter().enumerate() {
         let start = byte_idx * 8;
         if start >= values.len() {
@@ -48,6 +70,8 @@ unsafe fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
+    // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
+    // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
     let full_chunks = values.len() / 8;
     let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
     let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
@@ -88,6 +112,9 @@ fn flip_signs(values: &mut [f32], signs: &[u8]) {
 
 #[inline]
 fn kacs_walk(values: &mut [f32]) {
+    // A fixed-angle (pi/4) plane-rotation-like sweep over paired coordinates:
+    // (x, y) -> (x + y, x - y). Up to normalization, this is a 2x2 Hadamard block
+    // and corresponds to one Kac-style mixing step.
     let half = values.len() / 2;
     let (left, right) = values.split_at_mut(half);
     for (x, y) in left.iter_mut().zip(right.iter_mut()) {
@@ -100,6 +127,7 @@ fn kacs_walk(values: &mut [f32]) {
 
 #[inline]
 fn rescale(values: &mut [f32], factor: f32) {
+    // Keep the transform numerically stable and approximately orthonormal.
     for value in values.iter_mut() {
         *value *= factor;
     }
@@ -111,12 +139,18 @@ fn sign_bytes_per_round(dim: usize) -> usize {
 }
 
 pub fn random_fast_rotation_signs(dim: usize) -> Vec<u8> {
+    // Each round needs one random sign bit per dimension.
     let mut signs = vec![0u8; FAST_ROTATION_ROUNDS * sign_bytes_per_round(dim)];
     rand::rng().fill_bytes(&mut signs);
     signs
 }
 
 pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32], signs: &[u8]) {
+    // Fast random rotation pipeline, aligned with RaBitQ-Library's FhtKacRotator:
+    // - power-of-two dims: repeat [random signs -> FWHT -> scale] for 4 rounds
+    // - non-power-of-two dims: alternate FWHT on head/tail + Kac mixing
+    //
+    // This keeps the fast path matrix-free: no dense orthogonal matrix materialization.
     let dim = output.len();
     let bytes_per_round = sign_bytes_per_round(dim);
     debug_assert_eq!(signs.len(), FAST_ROTATION_ROUNDS * bytes_per_round);
@@ -164,6 +198,7 @@ pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32],
     }
 
     // Matches RaBitQ-Library FhtKacRotator behavior for non-power-of-two dimensions.
+    // The extra factor compensates the alternating truncated FWHT + Kac steps above.
     rescale(output, 0.25);
 }
 
