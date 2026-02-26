@@ -13,6 +13,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use lance_core::Result;
 
+use crate::object_writer::WriteResult;
+
 pub trait ProtoStruct {
     type Proto: Message;
 }
@@ -22,6 +24,21 @@ pub trait ProtoStruct {
 pub trait Writer: AsyncWrite + Unpin + Send {
     /// Tell the current offset.
     async fn tell(&mut self) -> Result<usize>;
+
+    /// Flush all buffered data and finalize the write, returning metadata about
+    /// the written object.
+    async fn shutdown(&mut self) -> Result<WriteResult>;
+}
+
+#[async_trait]
+impl Writer for Box<dyn Writer> {
+    async fn tell(&mut self) -> Result<usize> {
+        self.as_mut().tell().await
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        self.as_mut().shutdown().await
+    }
 }
 
 /// Lance Write Extension.

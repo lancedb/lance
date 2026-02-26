@@ -52,7 +52,7 @@ def _get_field_id_by_name(lance_schema, field_name):
 def test_commit_index(dataset_with_index, test_table, tmp_path):
     from lance.dataset import Index
 
-    index_id = dataset_with_index.list_indices()[0]["uuid"]
+    index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
 
     # Create a new dataset without index
     dataset_without_index = lance.write_dataset(
@@ -90,13 +90,13 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         read_version=dataset_without_index.version,
     )
 
-    # Verify that both datasets have the index
-    assert len(dataset_with_index.list_indices()) == 1
-    assert len(dataset_without_index.list_indices()) == 1
+    # Verify the manually committed index matches the original index stats
+    stats_with = dataset_with_index.stats.index_stats("meta_idx")
+    stats_without = dataset_without_index.stats.index_stats("meta_idx")
 
-    assert (
-        dataset_without_index.list_indices()[0] == dataset_with_index.list_indices()[0]
-    )
+    assert stats_without["name"] == stats_with["name"]
+    assert stats_without["index_type"] == stats_with["index_type"]
+    assert stats_without["num_indexed_rows"] == stats_with["num_indexed_rows"]
 
     # Check if the index is used in scans
     for dataset in [dataset_with_index, dataset_without_index]:

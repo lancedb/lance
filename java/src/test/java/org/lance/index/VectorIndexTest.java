@@ -13,12 +13,14 @@
  */
 package org.lance.index;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestVectorDataset;
 import org.lance.Transaction;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
@@ -36,14 +38,13 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class VectorIndexTest {
 
-  @TempDir Path tempDir;
-
   @Test
-  public void testCreateIvfFlatIndexDistributively() throws Exception {
+  public void testCreateIvfFlatIndexDistributively(@TempDir Path tempDir) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfflat_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -130,19 +131,22 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
       }
     }
   }
 
   @Test
-  public void testCreateIvfPqIndexDistributively() throws Exception {
+  public void testCreateIvfPqIndexDistributively(@TempDir Path tempDir) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfpq_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -248,19 +252,22 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
       }
     }
   }
 
   @Test
-  public void testCreateIvfSqIndexDistributively() throws Exception {
+  public void testCreateIvfSqIndexDistributively(@TempDir Path tempDir) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfsq_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -350,13 +357,60 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
+      }
+    }
+  }
+
+  @Test
+  public void testCreateIvfRqIndex(@TempDir Path tempDir) throws Exception {
+    Path datasetPath = tempDir.resolve("ivf_rq_index");
+
+    try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
+
+        VectorIndexParams vectorIndexParams =
+            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_RQ,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        List<Index> indexes = dataset.getIndexes();
+        Index rqIndex =
+            indexes.stream()
+                .filter(idx -> TestVectorDataset.indexName.equals(idx.name()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(rqIndex, "Expected IVF_RQ index to be present");
+
+        IndexType indexType = rqIndex.indexType();
+        assertNotNull(indexType, "IndexType should be set for IVF_RQ index");
+
+        // Today all vector indices share the same VectorIndexDetails type and map to VECTOR.
+        // This assertion allows both VECTOR and IVF_RQ so it remains valid if the mapping
+        // is refined in the future.
+        assertTrue(
+            indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
+            "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
       }
     }
   }

@@ -163,6 +163,14 @@ impl SchemaAdapter {
         schema.fields().iter().any(|field| is_json_field(field))
     }
 
+    pub fn to_physical_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.requires_physical_conversion() {
+            Ok(convert_json_columns(&batch)?)
+        } else {
+            Ok(batch)
+        }
+    }
+
     /// Convert a logical stream into a physical stream.
     pub fn to_physical_stream(
         &self,

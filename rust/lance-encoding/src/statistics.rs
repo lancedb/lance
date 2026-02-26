@@ -78,13 +78,10 @@ impl ComputeStat for VariableWidthBlock {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
-        let cardinality_array = self.cardinality();
-
         let max_length_array = self.max_length();
 
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
-        info.insert(Stat::Cardinality, cardinality_array);
         info.insert(Stat::MaxLength, max_length_array);
     }
 }
@@ -189,12 +186,31 @@ impl GetStat for NullableDataBlock {
 
 impl GetStat for VariableWidthBlock {
     fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
-        let block_info = self.block_info.0.read().unwrap();
+        {
+            let block_info = self.block_info.0.read().unwrap();
+            if block_info.is_empty() {
+                panic!("get_stat should be called after statistics are computed.");
+            }
+            if let Some(stat_value) = block_info.get(&stat) {
+                return Some(stat_value.clone());
+            }
+        }
 
+        if stat != Stat::Cardinality {
+            return None;
+        }
+
+        let computed = self.compute_cardinality();
+        let mut block_info = self.block_info.0.write().unwrap();
         if block_info.is_empty() {
             panic!("get_stat should be called after statistics are computed.");
         }
-        block_info.get(&stat).cloned()
+        Some(
+            block_info
+                .entry(stat)
+                .or_insert_with(|| computed.clone())
+                .clone(),
+        )
     }
 }
 
@@ -216,7 +232,7 @@ impl GetStat for FixedSizeListBlock {
 impl VariableWidthBlock {
     // Caveat: the computation here assumes VariableWidthBlock.offsets maps directly to VariableWidthBlock.data
     // without any adjustment(for example, no null_adjustment for offsets)
-    fn cardinality(&mut self) -> Arc<dyn Array> {
+    fn compute_cardinality(&self) -> Arc<dyn Array> {
         const PRECISION: u8 = 4;
         // The default hasher (currently sip hash 1-3) does not seem to give good results
         // with HLL.
@@ -1225,6 +1241,29 @@ mod tests {
         };
 
         let info = fixed.block_info.0.read().unwrap();
+        assert!(info.contains_key(&Stat::Cardinality));
+    }
+
+    #[test]
+    fn test_variable_width_cardinality_is_lazy() {
+        let string_array = StringArray::from(vec!["a", "b", "a"]);
+        let block = DataBlock::from_array(string_array);
+
+        let DataBlock::VariableWidth(var) = &block else {
+            panic!("Expected VariableWidth datablock");
+        };
+
+        {
+            let info = var.block_info.0.read().unwrap();
+            assert!(info.contains_key(&Stat::DataSize));
+            assert!(info.contains_key(&Stat::MaxLength));
+            assert!(!info.contains_key(&Stat::Cardinality));
+        }
+
+        let cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
+        assert_eq!(cardinality, 2);
+
+        let info = var.block_info.0.read().unwrap();
         assert!(info.contains_key(&Stat::Cardinality));
     }
 }

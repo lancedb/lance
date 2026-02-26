@@ -296,6 +296,7 @@ impl ExecutionPlan for AddRowAddrExec {
             sum_value: Precision::Absent,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
+            byte_size: Precision::Absent,
         };
 
         let base_size = std::mem::size_of::<UInt64Array>();

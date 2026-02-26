@@ -533,7 +533,13 @@ impl SerializerContext {
         // are reading.
 
         let mut new_len = 0;
-        assert!(self.rep_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1);
+        let expected_len = offset_desc.num_values + self.current_num_specials;
+        if expected_len == 0 {
+            // Offsets [0] mean no list values, so no levels.
+            self.current_len = 0;
+            return;
+        }
+        assert!(self.rep_levels.len() >= expected_len - 1);
         if self.def_levels.is_empty() {
             let mut write_itr = self.spare_rep.iter_mut();
             let mut read_iter = self.rep_levels.iter().copied();
@@ -552,9 +558,7 @@ impl SerializerContext {
             }
             std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
         } else {
-            assert!(
-                self.def_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1
-            );
+            assert!(self.def_levels.len() >= expected_len - 1);
             let mut def_write_itr = self.spare_def.iter_mut();
             let mut rep_write_itr = self.spare_rep.iter_mut();
             let mut rep_read_itr = self.rep_levels.iter().copied();
@@ -1274,7 +1278,7 @@ impl RepDefUnraveler {
         // This is the highest def level that is still visible.  Once we hit a list then
         // we stop looking because any null / empty list (or list masked by a higher level
         // null) will not be visible
-        let mut max_level = null_level.max(empty_level);
+        let mut max_level = null_level.max(empty_level).max(valid_level);
         // Anything higher than this (but less than max_level) is a null struct masking our
         // list.  We will materialize this is a null list.
         let upper_null = max_level;
@@ -2260,6 +2264,16 @@ mod tests {
     }
 
     #[test]
+    fn test_repdef_empty_offsets() {
+        // Empty offsets should serialize without panicking.
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(offsets_32(&[0]), None);
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        assert!(repdefs.repetition_levels.is_none());
+        assert!(repdefs.definition_levels.is_none());
+    }
+
+    #[test]
     fn test_repdef_basic() {
         // Basic case, rep & def
         let mut builder = RepDefBuilder::default();
@@ -2676,6 +2690,40 @@ mod tests {
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
+    }
+
+    #[test]
+    fn test_repdef_null_struct_valid_list() {
+        // This regresses a bug
+
+        let rep = vec![1, 0, 0, 0];
+        let def = vec![2, 0, 2, 2];
+        // AllValidList<NullableStruct<NullableItem>>
+        let def_meaning = vec![
+            DefinitionInterpretation::NullableItem,
+            DefinitionInterpretation::NullableItem,
+            DefinitionInterpretation::AllValidList,
+        ];
+        let num_items = 4;
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep),
+            Some(def),
+            def_meaning.into(),
+            num_items,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(4),
+            Some(validity(&[false, true, false, false]))
+        );
+        assert_eq!(
+            unraveler.unravel_validity(4),
+            Some(validity(&[false, true, false, false]))
+        );
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 4]).inner());
+        assert_eq!(val, None);
     }
 
     #[test]

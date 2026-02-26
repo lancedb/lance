@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.TestUtils;
 import org.lance.Transaction;
@@ -43,29 +44,27 @@ public class ProjectTest extends OperationTestBase {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn1 =
-          dataset
-              .newTransactionBuilder()
+      try (Transaction txn1 =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(Project.builder().schema(new Schema(fieldList)).build())
-              .build();
-      try (Dataset committedDataset = txn1.commit()) {
-        assertEquals(1, txn1.readVersion());
-        assertEquals(1, dataset.version());
-        assertEquals(2, committedDataset.version());
-        assertEquals(new Schema(fieldList), committedDataset.getSchema());
-        fieldList.remove(1);
-        Transaction txn2 =
-            committedDataset
-                .newTransactionBuilder()
-                .operation(Project.builder().schema(new Schema(fieldList)).build())
-                .build();
-        try (Dataset committedDataset2 = txn2.commit()) {
-          assertEquals(2, txn2.readVersion());
+              .build()) {
+        try (Dataset committedDataset = new CommitBuilder(dataset).execute(txn1)) {
+          assertEquals(1, dataset.version());
           assertEquals(2, committedDataset.version());
-          assertEquals(3, committedDataset2.version());
-          assertEquals(new Schema(fieldList), committedDataset2.getSchema());
-          assertEquals(txn1, committedDataset.readTransaction().orElse(null));
-          assertEquals(txn2, committedDataset2.readTransaction().orElse(null));
+          assertEquals(new Schema(fieldList), committedDataset.getSchema());
+          fieldList.remove(1);
+          try (Transaction txn2 =
+              new Transaction.Builder()
+                  .readVersion(committedDataset.version())
+                  .operation(Project.builder().schema(new Schema(fieldList)).build())
+                  .build()) {
+            try (Dataset committedDataset2 = new CommitBuilder(committedDataset).execute(txn2)) {
+              assertEquals(2, committedDataset.version());
+              assertEquals(3, committedDataset2.version());
+              assertEquals(new Schema(fieldList), committedDataset2.getSchema());
+            }
+          }
         }
       }
     }

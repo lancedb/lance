@@ -757,3 +757,23 @@ def test_session_contains(tmp_path):
 
     assert session.contains("subdir/nested.lance")
     assert not session.contains("subdir/nonexistent.lance")
+
+
+def test_struct_null_regression():
+    import lance
+
+    # Create struct array where 2nd element is null
+    tag_array = pa.array(["valid", "null_struct", "valid", "valid"])
+    struct_array = pa.StructArray.from_arrays(
+        [tag_array],
+        fields=[pa.field("tag", pa.string(), nullable=True)],
+        mask=pa.array([True, False, True, True]),  # False = null struct element
+    )
+
+    # Create list containing these structs
+    offsets = pa.array([0, 4], type=pa.int32())
+    list_array = pa.ListArray.from_arrays(offsets, struct_array)
+    batch = pa.record_batch([pa.array([0]), list_array], names=["id", "value"])
+
+    ds = lance.write_dataset(batch, "memory://", data_storage_version="2.2")
+    ds.to_table()

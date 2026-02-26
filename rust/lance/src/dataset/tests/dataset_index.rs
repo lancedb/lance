@@ -928,6 +928,50 @@ async fn test_fts_unindexed_data() {
 }
 
 #[tokio::test]
+async fn test_fts_unindexed_data_with_stop_words() {
+    // When indexed data has avg_doc_length < 1.0 (e.g. single-word stop words
+    // that get filtered), the BM25 scorer must still produce non-zero scores
+    // for unindexed rows. Regression test for #5871.
+    let params = InvertedIndexParams::default();
+    let text_col = StringArray::from(vec!["a", "is", "the", "bug"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://stop_words.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Append unindexed rows with a term not in the index
+    let unindexed: Vec<String> = (0..10).map(|i| format!("hello_{i}")).collect();
+    let text_col = StringArray::from(unindexed);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
+}
+
+#[tokio::test]
 async fn test_fts_unindexed_data_on_empty_index() {
     // Empty dataset with fts index
     let params = InvertedIndexParams::default();

@@ -405,6 +405,39 @@ class TestTableOperations:
             rest_namespace.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
+    def test_rename_table(self, rest_namespace):
+        """Test renaming a table."""
+        # Create parent namespace
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        rest_namespace.create_namespace(create_ns_req)
+
+        # Create table
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        rest_namespace.create_table(create_req, ipc_data)
+
+        # TODO: underlying dir namespace doesn't support rename yet...
+
+        # # Rename the table
+        # rename_req = RenameTableRequest(
+        #     id=["workspace", "test_table"],
+        #     new_namespace_id=["workspace"],
+        #     new_table_name="test_table_renamed",
+        # )
+
+        # response = rest_namespace.rename_table(rename_req)
+        # assert response is not None
+
+        # # Verify table with old name no longer exists
+        # exists_req = TableExistsRequest(id=["workspace", "test_table"])
+        # with pytest.raises(Exception):
+        #     rest_namespace.table_exists(exists_req)
+
+        # # Verify table with new name exists
+        # exists_req = TableExistsRequest(id=["workspace", "test_table_renamed"])
+        # rest_namespace.table_exists(exists_req)
+
 
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors DirectoryNamespace tests."""

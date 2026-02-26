@@ -10,6 +10,8 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
 use lance_datafusion::udf::register_functions;
+use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+use lance_index::scalar::FullTextSearchQuery;
 
 /// Creates a fresh SessionContext with Lance UDFs registered
 fn create_datafusion_context() -> SessionContext {
@@ -18,6 +20,7 @@ fn create_datafusion_context() -> SessionContext {
     ctx
 }
 
+mod inverted;
 mod primitives;
 mod vectors;
 
@@ -92,6 +95,106 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
     let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
 
     assert_eq!(&expected, &scanned);
+}
+
+// Rebuild a batch using only columns present in the schema (drops _score from FTS results).
+fn strip_score_column(batch: &RecordBatch, schema: &arrow_schema::Schema) -> RecordBatch {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| batch.column_by_name(field.name()).unwrap().clone())
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap()
+}
+
+/// Full text search should match results computed in DataFusion using the constructed SQL
+async fn test_fts(
+    original: &RecordBatch,
+    ds: &Dataset,
+    column: &str,
+    query: &str,
+    filter: Option<&str>,
+    lower_case: bool,
+    phrase_query: bool,
+) {
+    // Scan with FTS and order
+    let mut scanner = ds.scan();
+    let fts_query = if phrase_query {
+        let phrase = PhraseQuery::new(query.to_string()).with_column(Some(column.to_string()));
+        FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase))
+    } else {
+        FullTextSearchQuery::new(query.to_string())
+            .with_column(column.to_string())
+            .unwrap()
+    };
+    scanner.full_text_search(fts_query).unwrap();
+    if let Some(predicate) = filter {
+        scanner.filter(predicate).unwrap();
+    }
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap();
+    let scanned = scanner.try_into_batch().await.unwrap();
+    let scanned = strip_score_column(&scanned, original.schema().as_ref());
+
+    let ctx = create_datafusion_context();
+    let table = MemTable::try_new(original.schema(), vec![vec![original.clone()]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+
+    let col_expr = if lower_case {
+        format!("lower(t.{})", column)
+    } else {
+        format!("t.{}", column)
+    };
+    let normalized_query = if lower_case {
+        query.to_lowercase()
+    } else {
+        query.to_string()
+    };
+    let expected_from_where = |where_clause: String| async move {
+        let sql = format!("SELECT * FROM t WHERE {} ORDER BY id", where_clause);
+        let df = ctx.sql(&sql).await.unwrap();
+        let expected_batches = df.collect().await.unwrap();
+        concat_batches(&original.schema(), &expected_batches).unwrap()
+    };
+    let expected = if normalized_query.is_empty() {
+        expected_from_where(filter.unwrap_or("true").to_string()).await
+    } else if phrase_query {
+        let predicate = format!("{} LIKE '%{}%'", col_expr, normalized_query);
+        let where_clause = if let Some(extra) = filter {
+            format!("{} AND {}", predicate, extra)
+        } else {
+            predicate
+        };
+        expected_from_where(where_clause).await
+    } else {
+        let tokens = collect_tokens(&normalized_query);
+        if tokens.is_empty() {
+            expected_from_where(filter.unwrap_or("true").to_string()).await
+        } else {
+            let predicate = tokens
+                .into_iter()
+                .map(|token| format!("{} LIKE '%{}%'", col_expr, token))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let where_clause = if let Some(extra) = filter {
+                format!("{} AND {}", predicate, extra)
+            } else {
+                predicate
+            };
+            expected_from_where(where_clause).await
+        }
+    };
+
+    assert_eq!(&expected, &scanned);
+}
+
+fn collect_tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 /// Test that an exhaustive ANN query gives the same results as brute force

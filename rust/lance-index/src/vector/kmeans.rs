@@ -56,7 +56,6 @@ pub enum KMeanInit {
 }
 
 /// KMean Training Parameters
-#[derive(Debug)]
 pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
@@ -87,6 +86,24 @@ pub struct KMeansParams {
     /// Higher would split the clusters more aggressively, which would be more accurate but slower.
     /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
+
+    /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
+    pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for KMeansParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KMeansParams")
+            .field("max_iters", &self.max_iters)
+            .field("tolerance", &self.tolerance)
+            .field("redos", &self.redos)
+            .field("init", &self.init)
+            .field("distance_type", &self.distance_type)
+            .field("balance_factor", &self.balance_factor)
+            .field("hierarchical_k", &self.hierarchical_k)
+            .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Default for KMeansParams {
@@ -99,6 +116,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            on_progress: None,
         }
     }
 }
@@ -130,6 +148,11 @@ impl KMeansParams {
     /// which is the same as normal kmeans clustering.
     pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
         self.balance_factor = balance_factor;
+        self
+    }
+
+    pub fn with_on_progress(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
+        self.on_progress = Some(cb);
         self
     }
 
@@ -663,6 +686,9 @@ impl KMeans {
 
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
+                if let Some(cb) = &params.on_progress {
+                    cb(i, params.max_iters);
+                }
                 if i % 10 == 0 {
                     info!(
                         "KMeans training: iteration {} / {}, redo={}",

@@ -58,8 +58,15 @@ impl BackgroundExecutor {
         if let Some(py) = py {
             py.detach(|| self.spawn_impl(task))
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::attach(|py| py.detach(|| self.spawn_impl(task)))
+            let mut task = Some(task);
+            if let Some(result) = Python::try_attach(|py| {
+                let task = task.take().expect("task should not be taken");
+                py.detach(|| self.spawn_impl(task))
+            }) {
+                result
+            } else {
+                self.spawn_impl(task.expect("task should still be available"))
+            }
         }
     }
 
@@ -83,7 +90,13 @@ impl BackgroundExecutor {
 
         loop {
             // Check for keyboard interrupts
-            match Python::attach(|py| py.check_signals()) {
+            let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                Some(result) => result,
+                // Python may be finalizing or unavailable. In this state we can't
+                // observe KeyboardInterrupt reliably, but we should not panic.
+                None => Ok(()),
+            };
+            match signal_check {
                 Ok(_) => {}
                 Err(err) => {
                     handle.abort();
@@ -113,12 +126,18 @@ impl BackgroundExecutor {
                 self.runtime.spawn(task);
             })
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::attach(|py| {
+            let mut task = Some(task);
+            if Python::try_attach(|py| {
+                let task = task.take().expect("task should not be taken");
                 py.detach(|| {
                     self.runtime.spawn(task);
                 })
             })
+            .is_none()
+            {
+                self.runtime
+                    .spawn(task.expect("task should still be available"));
+            }
         }
     }
 
@@ -141,8 +160,16 @@ impl BackgroundExecutor {
         if let Some(py) = py {
             py.detach(move || self.runtime.block_on(future))
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::attach(|py| py.detach(|| self.runtime.block_on(future)))
+            let mut future = Some(future);
+            if let Some(result) = Python::try_attach(|py| {
+                let future = future.take().expect("future should not be taken");
+                py.detach(|| self.runtime.block_on(future))
+            }) {
+                result
+            } else {
+                self.runtime
+                    .block_on(future.expect("future should still be available"))
+            }
         }
     }
 
@@ -154,7 +181,13 @@ impl BackgroundExecutor {
         let interrupt_future = async {
             loop {
                 // Check for keyboard interrupts
-                match Python::attach(|py| py.check_signals()) {
+                let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                    Some(result) => result,
+                    // Python may be finalizing or unavailable. In this state we can't
+                    // observe KeyboardInterrupt reliably, but we should not panic.
+                    None => Ok(()),
+                };
+                match signal_check {
                     Ok(_) => {
                         // Wait for 100ms before checking signals again
                         tokio::time::sleep(SIGNAL_CHECK_INTERVAL).await;

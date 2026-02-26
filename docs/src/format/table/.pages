@@ -1,5 +1,6 @@
 nav:
   - index.md
+  - Schema: schema.md
   - Versioning: versioning.md
   - Transactions: transaction.md
   - Layout: layout.md

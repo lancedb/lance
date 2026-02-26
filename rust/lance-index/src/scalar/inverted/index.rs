@@ -624,6 +624,7 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
@@ -2538,7 +2539,7 @@ pub fn flat_bm25_search_stream(
                     token_docs.insert(token.clone(), token_nq);
                 }
                 MemBM25Scorer::new(
-                    index_bm25_scorer.avg_doc_length() as u64 * index_bm25_scorer.num_docs() as u64,
+                    index_bm25_scorer.total_tokens(),
                     index_bm25_scorer.num_docs(),
                     token_docs,
                 )

@@ -19,9 +19,11 @@ use datafusion_expr::{
 use tokio::try_join;
 
 use super::{
-    AnyQuery, BloomFilterQuery, GeoQuery, LabelListQuery, MetricsCollector, RelationQuery,
-    SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
+    SearchResult, TextQuery, TokenQuery,
 };
+#[cfg(feature = "geo")]
+use super::{GeoQuery, RelationQuery};
 use lance_core::{
     utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
@@ -513,6 +515,9 @@ impl ScalarQueryParser for LabelListQueryParser {
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
+            if list_values.is_empty() {
+                return None;
+            }
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
@@ -689,17 +694,20 @@ impl ScalarQueryParser for FtsQueryParser {
 }
 
 /// A parser for geo indices that handles spatial queries
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone)]
 pub struct GeoQueryParser {
     index_name: String,
 }
 
+#[cfg(feature = "geo")]
 impl GeoQueryParser {
     pub fn new(index_name: String) -> Self {
         Self { index_name }
     }
 }
 
+#[cfg(feature = "geo")]
 impl ScalarQueryParser for GeoQueryParser {
     fn visit_between(
         &self,

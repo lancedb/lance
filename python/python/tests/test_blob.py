@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import io
+import subprocess
+import sys
+import tarfile
+import textwrap
+
 import lance
 import pyarrow as pa
 import pytest
-from lance import BlobColumn
+from lance import Blob, BlobColumn
 
 
 def test_blob_read_from_binary():
@@ -138,6 +144,43 @@ def test_blob_files(dataset_with_blobs):
     for expected in [b"foo", b"bar", b"baz"]:
         with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_files_close_no_shutdown_panic(tmp_path):
+    script = textwrap.dedent(
+        f"""
+        import pyarrow as pa
+        import lance
+
+        table = pa.table(
+            [pa.array([b"foo", b"bar"], pa.large_binary())],
+            schema=pa.schema(
+                [
+                    pa.field(
+                        "blob",
+                        pa.large_binary(),
+                        metadata={{"lance-encoding:blob": "true"}},
+                    )
+                ]
+            ),
+        )
+        ds = lance.write_dataset(table, {str(tmp_path / "ds")!r})
+        row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+        blobs = ds.take_blobs("blob", ids=row_ids)
+        for blob in blobs:
+            blob.close()
+        print("done")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "interpreter_lifecycle.rs" not in result.stderr
+    assert "The Python interpreter is not initialized" not in result.stderr
 
 
 def test_blob_files_by_address(dataset_with_blobs):
@@ -332,3 +375,47 @@ def test_blob_extension_write_external(tmp_path):
     assert blob.size() == 5
     with blob as f:
         assert f.read() == b"hello"
+
+
+def test_blob_extension_write_external_slice(tmp_path):
+    tar_path = tmp_path / "container.tar"
+    names = ["a.bin", "b.bin", "c.bin"]
+    payloads = [b"alpha", b"bravo", b"charlie"]
+
+    # Build a tar container with three distinct binary entries.
+    with tarfile.open(tar_path, "w") as tf:
+        for name, data in zip(names, payloads):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    # Re-open the tar to obtain offsets and sizes for each member.
+    positions: list[int] = []
+    sizes: list[int] = []
+    with tarfile.open(tar_path, "r") as tf:
+        for name in names:
+            member = tf.getmember(name)
+            positions.append(member.offset_data)
+            sizes.append(member.size)
+
+    uri = tar_path.as_uri()
+
+    blob_values = [
+        Blob.from_uri(uri, position, size) for position, size in zip(positions, sizes)
+    ]
+
+    table = pa.table({"blob": lance.blob_array(blob_values)})
+
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "ds",
+        data_storage_version="2.2",
+    )
+
+    blobs = ds.take_blobs("blob", indices=[0, 1, 2])
+    assert len(blobs) == len(payloads)
+
+    for expected, blob_file in zip(payloads, blobs):
+        assert blob_file.size() == len(expected)
+        with blob_file as f:
+            assert f.read() == expected
