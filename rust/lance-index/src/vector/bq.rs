@@ -83,17 +83,12 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RQRotationType {
+    #[default]
     Fast,
     Matrix,
-}
-
-impl Default for RQRotationType {
-    fn default() -> Self {
-        Self::Fast
-    }
 }
 
 impl FromStr for RQRotationType {

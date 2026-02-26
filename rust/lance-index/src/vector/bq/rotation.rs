@@ -76,8 +76,8 @@ unsafe fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
     let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
     let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
 
-    for chunk_idx in 0..full_chunks {
-        let mask = signs[chunk_idx] as i32;
+    for (chunk_idx, &mask) in signs.iter().take(full_chunks).enumerate() {
+        let mask = mask as i32;
         let mask_bits = _mm256_set1_epi32(mask);
         let test = _mm256_and_si256(mask_bits, bit_select);
         let cmp = _mm256_cmpeq_epi32(test, bit_select);
