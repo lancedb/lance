@@ -37,6 +37,16 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
+use std::sync::LazyLock;
+
+const DEFAULT_PARTITION_WINDOW_SIZE: usize = 512;
+const PARTITION_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE";
+static PARTITION_WINDOW_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var(PARTITION_WINDOW_SIZE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PARTITION_WINDOW_SIZE)
+});
 
 /// Strict bitwise equality check for FixedSizeListArray values.
 /// Returns true only if length, value_length and all underlying primitive values are equal.
@@ -1202,10 +1212,10 @@ pub async fn merge_partial_vector_auxiliary_files(
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
             // For PQ-backed indices, transpose PQ codes while merging partitions
             // so that the unified file stores column-major PQ codes.
-            const PARTITION_WINDOW_SIZE: usize = 32;
+            let partition_window_size = *PARTITION_WINDOW_SIZE;
 
-            for window_start in (0..nlist).step_by(PARTITION_WINDOW_SIZE) {
-                let window_end = std::cmp::min(window_start + PARTITION_WINDOW_SIZE, nlist);
+            for window_start in (0..nlist).step_by(partition_window_size) {
+                let window_end = std::cmp::min(window_start + partition_window_size, nlist);
                 let window_len = window_end - window_start;
                 let mut per_partition_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); window_len];
 
