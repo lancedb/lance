@@ -2218,7 +2218,8 @@ impl FullZipScheduler {
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
                 if total_bytes_per_value == 0 {
                     return Err(lance_core::Error::Internal {
-                        message: "Invalid encoding: per-row byte width must be greater than 0".into(),
+                        message: "Invalid encoding: per-row byte width must be greater than 0"
+                            .into(),
                         location: location!(),
                     });
                 }
