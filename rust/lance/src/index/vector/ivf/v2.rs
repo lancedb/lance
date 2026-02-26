@@ -625,7 +625,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::vector::bq::RQBuildParams;
+    use lance_index::vector::bq::{
+        storage::RabitQuantizationMetadata, RQBuildParams, RQRotationType,
+    };
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
@@ -733,6 +735,49 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         dataset.append(batches, None).await.unwrap();
         vectors
+    }
+
+    async fn get_rq_metadata(
+        dataset: &Dataset,
+        scheduler: Arc<ScanScheduler>,
+        index_uuid: &str,
+    ) -> RabitQuantizationMetadata {
+        let index_path = dataset
+            .indices_dir()
+            .child(index_uuid)
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let file_scheduler = scheduler
+            .open_file(&index_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
+        let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
+        serde_json::from_str(&metadata_entries[0]).unwrap()
+    }
+
+    async fn assert_rq_rotation_type(dataset: &Dataset, expected: RQRotationType) {
+        let obj_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.is_empty(), "Expected at least one vector index");
+        for index in indices.iter() {
+            let rq_meta =
+                get_rq_metadata(dataset, scheduler.clone(), &index.uuid.to_string()).await;
+            assert_eq!(
+                rq_meta.rotation_type, expected,
+                "RQ rotation type mismatch for index {}",
+                index.uuid
+            );
+        }
     }
 
     fn generate_batch<T: ArrowPrimitiveType>(
@@ -2061,16 +2106,63 @@ mod tests {
         #[case] nlist: usize,
         #[case] distance_type: DistanceType,
         #[case] recall_requirement: f32,
+        #[values(RQRotationType::Fast, RQRotationType::Matrix)] rotation_type: RQRotationType,
     ) {
         let _ = env_logger::try_init();
         let ivf_params = IvfBuildParams::new(nlist);
-        let rq_params = RQBuildParams::new(1);
+        let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_remap(params.clone(), nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case::fast(RQRotationType::Fast)]
+    #[case::matrix(RQRotationType::Matrix)]
+    #[tokio::test]
+    async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotationType) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(4);
+        let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
+        let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        assert_rq_rotation_type(&dataset, rotation_type).await;
+
+        append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            2,
+            "Expected append optimize to create one delta index"
+        );
+        assert_rq_rotation_type(&dataset, rotation_type).await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        let indices_after_merge = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_merge.len(),
+            1,
+            "Expected merge optimize to merge indices into one"
+        );
+        assert_rq_rotation_type(&dataset, rotation_type).await;
     }
 
     #[rstest]
