@@ -321,6 +321,14 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
         params: &Self::BuildParams,
     ) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length() as usize;
+        if !dim.is_multiple_of(u8::BITS as usize) {
+            return Err(Error::invalid_input(
+                "vector dimension must be divisible by 8 for IVF_RQ",
+                location!(),
+            ));
+        }
+
         let q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
                 params.num_bits,
@@ -511,6 +519,8 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
     use arrow::datatypes::Float32Type;
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use lance_linalg::distance::DistanceType;
     use rstest::rstest;
 
     #[rstest]
@@ -562,5 +572,20 @@ mod tests {
             RabitQuantizer::new_with_rotation::<Float32Type>(1, 128, RQRotationType::Matrix);
         assert_eq!(matrix_q.rotation_type(), RQRotationType::Matrix);
         assert_eq!(matrix_q.dim(), 128);
+    }
+
+    #[test]
+    fn test_rabit_quantizer_requires_dim_divisible_by_8() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 30]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 30).unwrap();
+        let params = RQBuildParams::new(1);
+
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vector dimension must be divisible by 8 for IVF_RQ"),
+            "{}",
+            err
+        );
     }
 }
