@@ -34,6 +34,7 @@ use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
@@ -43,7 +44,7 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery};
+use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
     stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -276,6 +277,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
+    m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
     m.add_class::<namespace::PyRestNamespace>()?;
     m.add_class::<namespace::PyRestAdapter>()?;
@@ -394,6 +396,7 @@ impl FFILanceTableProvider {
     fn __datafusion_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
         let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
@@ -402,9 +405,28 @@ impl FFILanceTableProvider {
             self.with_row_addr,
         ));
 
-        let ffi_provider =
-            FFI_TableProvider::new(a_lance_table_provider, true, rt().get_runtime_handle());
+        let codec = ffi_logical_codec_from_pycapsule(session)?;
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(
+            a_lance_table_provider,
+            true,
+            rt().get_runtime_handle(),
+            codec,
+        );
         let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
         capsule
     }
+}
+
+fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
+    let attr_name = "__datafusion_logical_extension_codec__";
+    let capsule = if obj.hasattr(attr_name)? {
+        obj.getattr(attr_name)?.call0()?
+    } else {
+        obj
+    };
+
+    let capsule = capsule.downcast::<PyCapsule>()?;
+    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+
+    Ok(codec.clone())
 }

@@ -7,6 +7,7 @@ use futures::FutureExt;
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
@@ -86,10 +87,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
-        let index = dataset
+        match dataset
             .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
-            .await?;
-        indices.push(index);
+            .await
+        {
+            Ok(index) => indices.push(index),
+            Err(e) => {
+                log::warn!(
+                    "Cannot open index on column '{}': {}. \
+                     Skipping index merge for this column.",
+                    field_path,
+                    e
+                );
+                return Ok(None);
+            }
+        }
     }
 
     if indices
@@ -110,11 +122,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     let index_type = indices[0].index_type();
     let (new_uuid, indices_merged, created_index) = match index_type {
         it if it.is_scalar() => {
-            // There are no delta indices for scalar, so adding all indexed
-            // fragments to the new index.
-            old_indices.iter().for_each(|idx| {
-                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-            });
+            // Use effective bitmap (intersected with existing dataset fragments)
+            // to avoid carrying stale data from pruned indices.
+            let effective_old_frags: RoaringBitmap = old_indices
+                .iter()
+                .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
+                .fold(RoaringBitmap::new(), |mut acc, b| {
+                    acc |= &b;
+                    acc
+                });
+            frag_bitmap |= &effective_old_frags;
 
             let index = dataset
                 .open_scalar_index(
@@ -143,8 +160,28 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-            let created_index = index.update(new_data_stream, &new_store).await?;
+            let created_index = if effective_old_frags.is_empty() {
+                // Old data is fully stale (bitmap pruned to empty). Rebuild
+                // from scratch instead of merging stale entries.
+                let params = index.derive_index_params()?;
+                super::scalar::build_scalar_index(
+                    dataset.as_ref(),
+                    column.name.as_str(),
+                    &new_uuid.to_string(),
+                    &params,
+                    true,
+                    None,
+                    Some(new_data_stream),
+                    Arc::new(NoopIndexBuildProgress),
+                )
+                .await?
+            } else {
+                let new_store =
+                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                index
+                    .update(new_data_stream, &new_store, Some(&effective_old_frags))
+                    .await?
+            };
 
             // TODO: don't hard-code index version
             Ok((new_uuid, 1, created_index))
@@ -202,7 +239,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
     for removed in removed_indices.iter() {
-        frag_bitmap |= removed.fragment_bitmap.as_ref().unwrap();
+        if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap) {
+            frag_bitmap |= &effective;
+        }
     }
 
     Ok(Some(IndexMergeResults {

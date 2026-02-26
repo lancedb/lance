@@ -52,7 +52,7 @@ mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
-pub use delete::DeleteBuilder;
+pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
@@ -2593,7 +2593,9 @@ mod tests {
 
         let object_store = Arc::new(lance_io::object_store::ObjectStore::new(
             Arc::new(DiskFullObjectStore) as Arc<dyn object_store::ObjectStore>,
-            url::Url::parse("file:///test").unwrap(),
+            // Use a non-"file" scheme so writes go through ObjectWriter (which
+            // uses the DiskFullObjectStore) instead of the optimized LocalWriter.
+            url::Url::parse("mock:///test").unwrap(),
             None,
             None,
             false,

@@ -1168,19 +1168,12 @@ def test_count_rows_via_scanner(tmp_path: Path):
     ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
 
     assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(with_row_id=True).count_rows()
-
-    with pytest.raises(ValueError, match="with_row_id is false"):
-        ds.scanner(columns=[]).count_rows()
+    assert (
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows() == 50
+    )
+    assert ds.scanner(with_row_id=True).count_rows() == 100
+    assert ds.scanner(columns=[]).count_rows() == 100
+    assert ds.scanner().count_rows() == 100
 
 
 def test_select_none(tmp_path: Path):
@@ -4695,6 +4688,36 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
+
+
+def test_commit_with_stable_row_ids(tmp_path: Path):
+    """Test that commit() with enable_stable_row_ids creates stable row IDs."""
+    base_uri = str(tmp_path)
+    table = pa.table({"a": range(10)})
+
+    # Create dataset via commit with Overwrite and enable_stable_row_ids
+    fragments = lance.fragment.write_fragments(table, base_uri)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        operation,
+        enable_stable_row_ids=True,
+    )
+
+    # Append more data
+    table2 = pa.table({"a": range(10, 20)})
+    fragments2 = lance.fragment.write_fragments(table2, base_uri)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        lance.LanceOperation.Append(fragments2),
+        read_version=ds.version,
+    )
+
+    # Verify row IDs are sequential (stable row IDs assign monotonic IDs)
+    result = ds.scanner(with_row_id=True).to_table()
+    assert len(result) == 20
+    row_ids = [result["_rowid"][i].as_py() for i in range(20)]
+    assert row_ids == list(range(20))
 
 
 def test_table_metadata_updates(tmp_path: Path):

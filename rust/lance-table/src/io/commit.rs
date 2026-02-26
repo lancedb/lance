@@ -37,7 +37,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
+use lance_io::object_writer::{get_etag, ObjectWriter, WriteResult};
 use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
@@ -51,7 +51,7 @@ pub mod external_manifest;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
-use lance_io::traits::WriteExt;
+use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
@@ -204,7 +204,7 @@ pub fn write_manifest_file_to_path<'a>(
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let res = object_writer.shutdown().await?;
+        let res = Writer::shutdown(&mut object_writer).await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
@@ -424,36 +424,6 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     } else {
         Ok(None)
     }
-}
-
-// Based on object store's implementation.
-fn get_etag(metadata: &std::fs::Metadata) -> String {
-    let inode = get_inode(metadata);
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .unwrap_or_default()
-        .as_micros();
-
-    // Use an ETag scheme based on that used by many popular HTTP servers
-    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
-    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
-    format!("{inode:x}-{mtime:x}-{size:x}")
-}
-
-#[cfg(unix)]
-/// We include the inode when available to yield an ETag more resistant to collisions
-/// and as used by popular web servers such as [Apache](https://httpd.apache.org/docs/2.2/mod/core.html#fileetag)
-fn get_inode(metadata: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(metadata)
-}
-
-#[cfg(not(unix))]
-/// On platforms where an inode isn't available, fallback to just relying on size and mtime
-fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
-    0
 }
 
 fn list_manifests<'a>(

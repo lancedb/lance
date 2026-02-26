@@ -1147,8 +1147,8 @@ public class DatasetTest {
         long baseRowCount = base.countRows();
         FragmentMetadata fragment = suite.createNewFragment(5);
         Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
-        Transaction transaction = base.newTransactionBuilder().operation(append).build();
-        try (Dataset committed = base.commitTransaction(transaction, true, false)) {
+        SourcedTransaction transaction = base.newTransactionBuilder().operation(append).build();
+        try (Dataset committed = base.commitTransaction(transaction.transaction(), true, false)) {
           // Original dataset is not refreshed to the new version.
           assertEquals(baseVersion, base.version());
           assertEquals(baseRowCount, base.countRows());
@@ -1176,11 +1176,11 @@ public class DatasetTest {
 
         FragmentMetadata fragment = suite.createNewFragment(3);
         Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
-        Transaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        SourcedTransaction transaction = dataset.newTransactionBuilder().operation(append).build();
         UnsupportedOperationException ex =
             assertThrows(
                 UnsupportedOperationException.class,
-                () -> dataset.commitTransaction(transaction, true, false));
+                () -> dataset.commitTransaction(transaction.transaction(), true, false));
 
         // Error should indicate detached commits are not supported on v1 manifests.
         assertNotNull(ex.getMessage());
@@ -1210,9 +1210,10 @@ public class DatasetTest {
         FragmentMetadata frag1 = testDataset.createNewFragment(10);
         FragmentMetadata frag2 = testDataset.createNewFragment(10);
 
-        Transaction.Builder builder = new Transaction.Builder(dataset);
+        SourcedTransaction.Builder builder = new SourcedTransaction.Builder(dataset);
         Append append = Append.builder().fragments(Arrays.asList(frag1, frag2)).build();
-        Transaction transaction = builder.operation(append).readVersion(dataset.version()).build();
+        SourcedTransaction transaction =
+            builder.operation(append).readVersion(dataset.version()).build();
 
         // Step2: if move-stable-rowid is enabled, the rowids of new fragments should be
         // consecutive.

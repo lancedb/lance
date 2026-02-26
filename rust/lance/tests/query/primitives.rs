@@ -79,6 +79,20 @@ async fn test_query_integer(#[case] data_type: DataType) {
             test_filter(&original, &ds, "NOT (value > 20)").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
+            test_filter(&original, &ds, "(value != 0) OR (value < 20)").await;
+            test_filter(&original, &ds, "NOT ((value != 0) OR (value < 20))").await;
+            test_filter(
+                &original,
+                &ds,
+                "(value != 5) OR ((value != 52) OR (value IS NULL))",
+            )
+            .await;
+            test_filter(
+                &original,
+                &ds,
+                "NOT ((value != 5) OR ((value != 52) OR (value IS NULL)))",
+            )
+            .await;
         })
         .await
 }

@@ -19,8 +19,10 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
+import org.lance.operation.Overwrite;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,41 +38,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TransactionTest {
-
-  @Test
-  public void testTransaction(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("testTransaction").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      try (Dataset dataset = testDataset.createEmptyDataset()) {
-        FragmentMetadata fragmentMeta = testDataset.createNewFragment(20);
-
-        Map<String, String> properties = new HashMap<>();
-        properties.put("transactionType", "APPEND");
-        properties.put("createdBy", "testUser");
-        Transaction appendTxn =
-            dataset
-                .newTransactionBuilder()
-                .operation(
-                    Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
-                .transactionProperties(properties)
-                .build();
-        try (Dataset committedDataset = appendTxn.commit()) {
-          assertEquals(2, committedDataset.version());
-          assertEquals(2, committedDataset.latestVersion());
-          assertEquals(20, committedDataset.countRows());
-          assertEquals(dataset.version(), appendTxn.readVersion());
-          assertNotNull(appendTxn.uuid());
-
-          // Verify transaction properties
-          Map<String, String> txnProps = appendTxn.transactionProperties().orElse(new HashMap<>());
-          assertEquals("APPEND", txnProps.get("transactionType"));
-          assertEquals("testUser", txnProps.get("createdBy"));
-        }
-      }
-    }
-  }
 
   @Test
   public void testReadTransactionCreateIndex(@TempDir Path tempDir) {
@@ -106,6 +73,124 @@ public class TransactionTest {
         assertTrue(
             op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
         assertEquals("btree_id_index", (op.getNewIndices().get(0).name()));
+      }
+    }
+  }
+
+  @Test
+  public void testCommitToUri(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testCommitToUri").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      Schema schema = testDataset.getSchema();
+
+      // Create fragments at the dataset path
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(20);
+
+      // Build a transaction targeting a URI (no existing dataset)
+      try (Transaction txn =
+          new Transaction.Builder()
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(schema)
+                      .build())
+              .build()) {
+        try (Dataset committedDataset = new CommitBuilder(datasetPath, allocator).execute(txn)) {
+          assertEquals(1, committedDataset.version());
+          assertEquals(20, committedDataset.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testTagRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testTagRoundTrip").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
+
+        try (Transaction txn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .tag("v1.0")
+                .operation(
+                    Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+                .build()) {
+          assertEquals("v1.0", txn.tag().orElse(null));
+
+          try (Dataset committed = new CommitBuilder(dataset).execute(txn)) {
+            Transaction readTx = committed.readTransaction().orElse(null);
+            assertNotNull(readTx);
+            assertEquals("v1.0", readTx.tag().orElse(null));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testTransactionPropertiesRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testTransactionPropertiesRoundTrip").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
+
+        Map<String, String> properties = new HashMap<>();
+        properties.put("source", "ingestion-pipeline");
+        properties.put("batchId", "42");
+
+        try (Transaction txn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .transactionProperties(properties)
+                .operation(
+                    Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+                .build()) {
+          try (Dataset committed = new CommitBuilder(dataset).execute(txn)) {
+            Transaction readTx = committed.readTransaction().orElse(null);
+            assertNotNull(readTx);
+            Map<String, String> readProps = readTx.transactionProperties().orElse(null);
+            assertNotNull(readProps);
+            assertEquals("ingestion-pipeline", readProps.get("source"));
+            assertEquals("42", readProps.get("batchId"));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testCustomUuid(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testCustomUuid").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
+
+        String customUuid = "custom-uuid-12345";
+        try (Transaction txn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .uuid(customUuid)
+                .operation(
+                    Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+                .build()) {
+          assertEquals(customUuid, txn.uuid());
+
+          try (Dataset committed = new CommitBuilder(dataset).execute(txn)) {
+            Transaction readTx = committed.readTransaction().orElse(null);
+            assertNotNull(readTx);
+            assertEquals(customUuid, readTx.uuid());
+          }
+        }
       }
     }
   }

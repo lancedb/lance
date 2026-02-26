@@ -271,7 +271,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (Int64(_), _) => panic!("Attempt to compare Int16 with non-Int64"),
+            (Int64(_), _) => panic!("Attempt to compare Int64 with non-Int64"),
             (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
             (UInt8(v1), Null) => {
                 if v1.is_none() {
@@ -307,7 +307,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
+            (UInt64(_), _) => panic!("Attempt to compare UInt64 with non-UInt64"),
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
                 v1.cmp(v2)
             }
@@ -1295,20 +1295,21 @@ impl BTreeIndex {
         )))
     }
 
-    async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
-        let stream = self.into_data_stream().await?;
-        Ok(Arc::new(OneShotExec::new(stream)))
-    }
-
     async fn combine_old_new(
         self,
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
+        valid_old_fragments: Option<RoaringBitmap>,
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_input = self.into_old_data().await?;
+        let old_stream = self.into_data_stream().await?;
+        let old_stream = match valid_old_fragments {
+            Some(valid_frags) => filter_row_ids_by_fragments(old_stream, valid_frags),
+            None => old_stream,
+        };
+        let old_input = Arc::new(OneShotExec::new(old_stream));
         debug_assert_eq!(
             old_input.schema().flattened_fields().len(),
             new_input.schema().flattened_fields().len()
@@ -1335,6 +1336,29 @@ impl BTreeIndex {
         )?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
+}
+
+/// Filter a stream of record batches to only include rows whose row address
+/// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
+/// ID in the upper 32 bits.
+fn filter_row_ids_by_fragments(
+    stream: SendableRecordBatchStream,
+    valid_fragments: RoaringBitmap,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .expect("expected UInt64Array for row_id column");
+        let mask: arrow_array::BooleanArray = row_ids
+            .iter()
+            .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+            .collect();
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
@@ -1594,11 +1618,12 @@ impl ScalarIndex for BTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, self.batch_size)
+            .combine_old_new(new_data, self.batch_size, valid_old_fragments.cloned())
             .await?;
         train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
 
@@ -2543,6 +2568,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
@@ -4010,7 +4036,7 @@ mod tests {
 
         // update the ranged index
         ranged_index
-            .update(update_data_source, new_store.as_ref())
+            .update(update_data_source, new_store.as_ref(), None)
             .await
             .expect("Error in updating ranged index");
 

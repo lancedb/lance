@@ -21,6 +21,7 @@ use lance_core::{Error, Result};
 use tracing::Instrument;
 
 use crate::traits::Writer;
+use crate::utils::tracking_store::IOTracker;
 use snafu::location;
 use tokio::runtime::Handle;
 
@@ -298,21 +299,6 @@ impl ObjectWriter {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> Result<WriteResult> {
-        AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(
-                format!("failed to shutdown object writer for {}: {}", self.path, e),
-                // and wrap it in here.
-                location!(),
-            )
-        })?;
-        if let UploadState::Done(result) = &self.state {
-            Ok(result.clone())
-        } else {
-            unreachable!()
-        }
-    }
-
     pub async fn abort(&mut self) {
         let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
         if let UploadState::InProgress { mut upload, .. } = state {
@@ -498,6 +484,151 @@ impl Writer for ObjectWriter {
     async fn tell(&mut self) -> Result<usize> {
         Ok(self.cursor)
     }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        AsyncWriteExt::shutdown(self).await.map_err(|e| {
+            Error::io(
+                format!("failed to shutdown object writer for {}: {}", self.path, e),
+                location!(),
+            )
+        })?;
+        if let UploadState::Done(result) = &self.state {
+            Ok(result.clone())
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+pub struct LocalWriter {
+    inner: tokio::io::BufWriter<tokio::fs::File>,
+    cursor: usize,
+    path: Path,
+    /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
+    temp_path: Option<tempfile::TempPath>,
+    io_tracker: Arc<IOTracker>,
+}
+
+impl LocalWriter {
+    pub fn new(
+        file: tokio::fs::File,
+        path: Path,
+        temp_path: tempfile::TempPath,
+        io_tracker: Arc<IOTracker>,
+    ) -> Self {
+        Self {
+            inner: tokio::io::BufWriter::new(file),
+            cursor: 0,
+            path,
+            temp_path: Some(temp_path),
+            io_tracker,
+        }
+    }
+}
+
+impl AsyncWrite for LocalWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            self.cursor += *n;
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl Writer for LocalWriter {
+    async fn tell(&mut self) -> Result<usize> {
+        Ok(self.cursor)
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        AsyncWriteExt::shutdown(self).await.map_err(|e| {
+            Error::io(
+                format!("failed to shutdown local writer for {}: {}", self.path, e),
+                location!(),
+            )
+        })?;
+
+        let final_path = crate::local::to_local_path(&self.path);
+        let temp_path = self.temp_path.take().ok_or_else(|| {
+            Error::io(
+                format!("local writer for {} already shut down", self.path),
+                location!(),
+            )
+        })?;
+        let path_clone = self.path.clone();
+        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+            temp_path.persist(&final_path).map_err(|e| {
+                Error::io(
+                    format!("failed to persist temp file to {}: {}", final_path, e.error),
+                    location!(),
+                )
+            })?;
+
+            let metadata = std::fs::metadata(&final_path).map_err(|e| {
+                Error::io(
+                    format!("failed to read metadata for {}: {}", path_clone, e),
+                    location!(),
+                )
+            })?;
+            Ok(get_etag(&metadata))
+        })
+        .await
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e), location!()))??;
+
+        self.io_tracker
+            .record_write("put", self.path.clone(), self.cursor as u64);
+
+        Ok(WriteResult {
+            size: self.cursor,
+            e_tag: Some(e_tag),
+        })
+    }
+}
+
+// Based on object store's implementation.
+pub fn get_etag(metadata: &std::fs::Metadata) -> String {
+    let inode = get_inode(metadata);
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+
+    // Use an ETag scheme based on that used by many popular HTTP servers
+    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
+    format!("{inode:x}-{mtime:x}-{size:x}")
+}
+
+#[cfg(unix)]
+fn get_inode(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(metadata)
+}
+
+#[cfg(not(unix))]
+fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -525,7 +656,7 @@ mod tests {
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
         assert_eq!(object_writer.tell().await.unwrap(), 256 * 3);
 
-        let res = object_writer.shutdown().await.unwrap();
+        let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, 256 * 3);
 
         // Trigger multi part upload
@@ -540,7 +671,7 @@ mod tests {
             // Check the cursor
             assert_eq!(object_writer.tell().await.unwrap(), (i + 1) * buf.len());
         }
-        let res = object_writer.shutdown().await.unwrap();
+        let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
     }
 
@@ -552,5 +683,62 @@ mod tests {
             .await
             .unwrap();
         object_writer.abort().await;
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_shutdown() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("test_local_writer.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let io_tracker = Arc::new(IOTracker::default());
+
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, io_tracker.clone());
+
+        let data = b"hello local writer";
+        writer.write_all(data).await.unwrap();
+
+        // Before shutdown, the final path should not exist
+        assert!(!file_path.exists());
+        // But the temp file should exist
+        assert!(temp_file_path.exists());
+
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, data.len());
+        assert!(result.e_tag.is_some());
+        assert!(!result.e_tag.as_ref().unwrap().is_empty());
+
+        // After shutdown, the final path should exist and temp should be gone
+        assert!(file_path.exists());
+        assert!(!temp_file_path.exists());
+
+        let stats = io_tracker.stats();
+        assert_eq!(stats.write_iops, 1);
+        assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_drop_cleans_up() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("test_drop.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let io_tracker = Arc::new(IOTracker::default());
+
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, io_tracker);
+
+        writer.write_all(b"some data").await.unwrap();
+        assert!(temp_file_path.exists());
+
+        // Drop without shutdown should clean up the temp file
+        drop(writer);
+        assert!(!temp_file_path.exists());
+        assert!(!file_path.exists());
     }
 }

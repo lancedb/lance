@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
@@ -10,6 +11,7 @@ use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
+use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
@@ -141,6 +143,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        Arc::new(NoopIndexBuildProgress),
     )
     .await
     .infer_error()?;

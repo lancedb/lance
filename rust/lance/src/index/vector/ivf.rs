@@ -82,7 +82,6 @@ use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
-    object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
@@ -97,6 +96,7 @@ use serde_json::json;
 use snafu::location;
 use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -574,7 +574,7 @@ async fn optimize_ivf_pq_indices(
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-    mut writer: ObjectWriter,
+    mut writer: Box<dyn Writer>,
     dataset_version: u64,
 ) -> Result<usize> {
     let metric_type = first_idx.metric_type;
@@ -621,7 +621,13 @@ async fn optimize_ivf_pq_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    write_pq_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
+    write_pq_partitions(
+        writer.as_mut(),
+        &mut ivf_mut,
+        shuffled,
+        Some(&indices_to_merge),
+    )
+    .await?;
     let metadata = IvfPQIndexMetadata {
         name: format!("_{}_idx", vector_column),
         column: vector_column.to_string(),
@@ -638,7 +644,7 @@ async fn optimize_ivf_pq_indices(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(existing_indices.len() - start_pos)
 }
@@ -652,8 +658,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-    writer: ObjectWriter,
-    aux_writer: ObjectWriter,
+    writer: Box<dyn Writer>,
+    aux_writer: Box<dyn Writer>,
 ) -> Result<usize> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
@@ -1228,6 +1234,7 @@ pub async fn build_ivf_model(
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
@@ -1276,7 +1283,7 @@ pub async fn build_ivf_model(
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, training_data, mt, params).await?;
+    let ivf = train_ivf_model(centroids, training_data, mt, params, progress).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1290,6 +1297,7 @@ async fn build_ivf_model_and_pq(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
@@ -1306,7 +1314,8 @@ async fn build_ivf_model_and_pq(
     get_vector_type(dataset.schema(), column)?;
     let dim = get_vector_dim(dataset.schema(), column)?;
 
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
+    let ivf_model =
+        build_ivf_model(dataset, column, dim, metric_type, ivf_params, progress).await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -1349,6 +1358,7 @@ pub async fn load_precomputed_partitions_if_available(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
     column: &str,
@@ -1357,9 +1367,17 @@ pub async fn build_ivf_pq_index(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
-    let (ivf_model, pq) =
-        build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
+    let (ivf_model, pq) = build_ivf_model_and_pq(
+        dataset,
+        column,
+        metric_type,
+        ivf_params,
+        pq_params,
+        progress,
+    )
+    .await?;
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
@@ -1393,8 +1411,15 @@ pub async fn build_ivf_hnsw_pq_index(
     hnsw_params: &HnswBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    let (ivf_model, pq) =
-        build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
+    let (ivf_model, pq) = build_ivf_model_and_pq(
+        dataset,
+        column,
+        metric_type,
+        ivf_params,
+        pq_params,
+        lance_index::progress::noop_progress(),
+    )
+    .await?;
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
@@ -1448,7 +1473,7 @@ impl RemapPageTask {
         Ok(self)
     }
 
-    async fn write(self, writer: &mut ObjectWriter, ivf: &mut IvfModel) -> Result<()> {
+    async fn write(self, writer: &mut dyn Writer, ivf: &mut IvfModel) -> Result<()> {
         let page = self.page.as_ref().expect("Load was not called");
         let page: &PQIndex = page
             .as_any()
@@ -1596,7 +1621,7 @@ pub(crate) async fn remap_index_file(
         loss: index.ivf.loss,
     };
     while let Some(write_task) = task_stream.try_next().await? {
-        write_task.write(&mut writer, &mut ivf).await?;
+        write_task.write(writer.as_mut(), &mut ivf).await?;
     }
 
     let pq_sub_index = index
@@ -1624,7 +1649,7 @@ pub(crate) async fn remap_index_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }
@@ -1654,7 +1679,7 @@ async fn write_ivf_pq_file(
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
     builder::build_partitions(
-        &mut writer,
+        writer.as_mut(),
         stream,
         column,
         &mut ivf,
@@ -1685,7 +1710,7 @@ async fn write_ivf_pq_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }
@@ -1705,7 +1730,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
         .child(index_id.to_string())
         .child("index.idx");
     let mut writer = obj_store.create(&path).await?;
-    write_pq_partitions(&mut writer, &mut ivf, Some(streams), None).await?;
+    write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
     let metadata = IvfPQIndexMetadata::new(
         index_name.to_string(),
@@ -1720,7 +1745,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
     writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    Writer::shutdown(writer.as_mut()).await?;
 
     Ok(())
 }
@@ -2099,21 +2124,51 @@ async fn do_train_ivf_model<T: ArrowPrimitiveType>(
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel>
 where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     const REDOS: usize = 1;
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
+    let progress_worker = {
+        let progress = progress.clone();
+        tokio::spawn(async move {
+            while let Some(iter) = progress_rx.recv().await {
+                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
+                    warn!("Progress callback error during train_ivf: {e}");
+                }
+            }
+        })
+    };
+
+    let on_progress: Arc<dyn Fn(u32, u32) + Send + Sync> = {
+        let progress_tx = progress_tx.clone();
+        let cumulative_iters = std::sync::atomic::AtomicU64::new(0);
+        Arc::new(move |_iter: u32, _max_iters: u32| {
+            // Track cumulative iterations across all kmeans runs in this stage
+            // (flat and hierarchical both invoke the callback per-iteration).
+            let total = cumulative_iters.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // Non-blocking send from sync kmeans loop into async progress worker.
+            let _ = progress_tx.send(total);
+        })
+    };
     let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
-        .with_balance_factor(1.0);
+        .with_balance_factor(1.0)
+        .with_on_progress(on_progress);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
         kmeans_params,
         dimension,
         params.num_partitions.unwrap_or(32),
         params.sample_rate,
-    )?;
+    );
+    drop(progress_tx);
+    if let Err(e) = progress_worker.await {
+        warn!("Progress worker join error during train_ivf: {e}");
+    }
+    let kmeans = kmeans?;
     Ok(IvfModel::new(
         FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?,
         Some(kmeans.loss),
@@ -2126,6 +2181,7 @@ async fn train_ivf_model(
     data: &FixedSizeListArray,
     distance_type: DistanceType,
     params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     assert!(
         distance_type != DistanceType::Cosine,
@@ -2141,6 +2197,7 @@ async fn train_ivf_model(
                 dim,
                 distance_type,
                 params,
+                progress.clone(),
             )
             .await
         }
@@ -2151,6 +2208,7 @@ async fn train_ivf_model(
                 dim,
                 distance_type,
                 params,
+                progress.clone(),
             )
             .await
         }
@@ -2161,6 +2219,7 @@ async fn train_ivf_model(
                 dim,
                 distance_type,
                 params,
+                progress.clone(),
             )
             .await
         }
@@ -2175,6 +2234,7 @@ async fn train_ivf_model(
                 dim,
                 distance_type,
                 params,
+                progress.clone(),
             )
             .await
         }
@@ -2185,6 +2245,7 @@ async fn train_ivf_model(
                 dim,
                 distance_type,
                 params,
+                progress.clone(),
             )
             .await
         }
@@ -2609,6 +2670,7 @@ mod tests {
             MetricType::L2,
             &ivf_params,
             &pq_params,
+            lance_index::progress::noop_progress(),
         )
         .await
         .unwrap();
@@ -3059,9 +3121,16 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::L2,
+            &ivf_params,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
@@ -3087,9 +3156,16 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
@@ -3644,6 +3720,76 @@ mod tests {
         assert!(object_store.exists(&partialx_file).await.unwrap());
         assert!(object_store.exists(&shard_file).await.unwrap());
         assert!(object_store.exists(&keep_root_file).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_ivf_model_progress_callback() {
+        use lance_index::progress::IndexBuildProgress;
+        use tokio::sync::Mutex;
+
+        #[derive(Debug)]
+        struct RecordingProgress {
+            calls: Arc<Mutex<Vec<(String, u64)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for RecordingProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
+                self.calls.lock().await.push((stage.to_string(), completed));
+                Ok(())
+            }
+            async fn stage_complete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
+
+        let ivf_params = IvfBuildParams::new(2);
+        let calls: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let progress: Arc<dyn IndexBuildProgress> = Arc::new(RecordingProgress {
+            calls: calls.clone(),
+        });
+
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::L2,
+            &ivf_params,
+            progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(2, ivf_model.num_partitions());
+
+        // Let spawned progress tasks complete.
+        tokio::task::yield_now().await;
+
+        let recorded = calls.lock().await;
+        assert!(
+            !recorded.is_empty(),
+            "Expected progress callbacks to be called"
+        );
+        // All calls should be for train_ivf stage
+        for (stage, _) in recorded.iter() {
+            assert_eq!(stage, "train_ivf");
+        }
+        // Completed values should be monotonically increasing
+        for window in recorded.windows(2) {
+            assert!(
+                window[1].1 >= window[0].1,
+                "Expected monotonically increasing progress: {} >= {}",
+                window[1].1,
+                window[0].1,
+            );
+        }
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
@@ -76,6 +77,8 @@ public class Dataset implements Closeable {
 
   private BufferAllocator allocator;
   private boolean selfManagedAllocator = false;
+  private Session session;
+  private boolean ownsSession = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -191,27 +194,7 @@ public class Dataset implements Closeable {
       String path,
       WriteParams params,
       StorageOptionsProvider storageOptionsProvider) {
-    Preconditions.checkNotNull(allocator);
-    Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(params);
-    Dataset dataset =
-        createWithFfiStreamAndProvider(
-            stream.memoryAddress(),
-            path,
-            params.getMaxRowsPerFile(),
-            params.getMaxRowsPerGroup(),
-            params.getMaxBytesPerFile(),
-            params.getMode(),
-            params.getEnableStableRowIds(),
-            params.getDataStorageVersion(),
-            params.getEnableV2ManifestPaths(),
-            params.getStorageOptions(),
-            Optional.ofNullable(storageOptionsProvider),
-            params.getInitialBases(),
-            params.getTargetBases());
-    dataset.allocator = allocator;
-    return dataset;
+    return create(allocator, stream, path, params, storageOptionsProvider, null, null);
   }
 
   private static native Dataset createWithFfiSchema(
@@ -255,7 +238,57 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
+      Optional<List<String>> targetBases,
+      LanceNamespace namespace,
+      List<String> tableId);
+
+  /**
+   * Creates a dataset with optional namespace support for managed versioning.
+   *
+   * <p>When a namespace is provided, the commit handler will use the namespace's
+   * create_table_version method for version tracking.
+   *
+   * @param allocator buffer allocator
+   * @param stream arrow stream
+   * @param path dataset uri
+   * @param params write parameters
+   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
+   * @param namespace optional namespace implementation for managed versioning (can be null)
+   * @param tableId optional table identifier within the namespace (can be null)
+   * @return Dataset
+   */
+  static Dataset create(
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(params);
+    Dataset dataset =
+        createWithFfiStreamAndProvider(
+            stream.memoryAddress(),
+            path,
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getEnableStableRowIds(),
+            params.getDataStorageVersion(),
+            params.getEnableV2ManifestPaths(),
+            params.getStorageOptions(),
+            Optional.ofNullable(storageOptionsProvider),
+            params.getInitialBases(),
+            params.getTargetBases(),
+            namespace,
+            tableId);
+    dataset.allocator = allocator;
+    return dataset;
+  }
 
   /**
    * Open a dataset from the specified path.
@@ -266,7 +299,8 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
   }
 
   /**
@@ -280,7 +314,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
   }
 
   /**
@@ -309,7 +343,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options);
+    return open(allocator, false, path, options, null);
   }
 
   /**
@@ -320,10 +354,41 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   static Dataset open(
-      BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session) {
+    return open(allocator, selfManagedAllocator, path, options, session, null, null);
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options and namespace commit handler.
+   *
+   * @param path file path
+   * @param options the open options
+   * @param namespace the LanceNamespace to use for managed versioning (null if not using namespace)
+   * @param tableId table identifier (null if not using namespace)
+   * @return Dataset
+   */
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session,
+      LanceNamespace namespace,
+      List<String> tableId) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
+
+    Session effectiveSession = session;
+    if (effectiveSession == null && options.getSession().isPresent()) {
+      effectiveSession = options.getSession().get();
+    }
+    long sessionHandle = effectiveSession != null ? effectiveSession.getNativeHandle() : 0;
+
     Dataset dataset =
         openNative(
             path,
@@ -333,9 +398,18 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider());
+            options.getStorageOptionsProvider(),
+            sessionHandle,
+            namespace,
+            tableId);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
+    if (effectiveSession != null) {
+      dataset.session = effectiveSession;
+    } else {
+      dataset.session = Session.fromHandle(dataset.nativeGetSessionHandle());
+      dataset.ownsSession = true;
+    }
     return dataset;
   }
 
@@ -347,7 +421,10 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider);
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      long sessionHandle,
+      LanceNamespace namespace,
+      List<String> tableId);
 
   /**
    * Creates a builder for opening a dataset.
@@ -434,14 +511,19 @@ public class Dataset implements Closeable {
     return allocator;
   }
 
+  /** Package-private setter for allocator, used by {@link CommitBuilder}. */
+  void setAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
    *
-   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   * @return A new instance of {@link SourcedTransaction.Builder} linked to the opened dataset.
    */
-  public Transaction.Builder newTransactionBuilder() {
-    return new Transaction.Builder(this).readVersion(version());
+  public SourcedTransaction.Builder newTransactionBuilder() {
+    return new SourcedTransaction.Builder(this);
   }
 
   /**
@@ -471,21 +553,18 @@ public class Dataset implements Closeable {
   public Dataset commitTransaction(
       Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
-    try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
-      if (selfManagedAllocator) {
-        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        dataset.allocator = allocator;
-      }
-      return dataset;
-    } finally {
-      transaction.release();
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(transaction);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
     }
+    return dataset;
   }
-
-  private native Dataset nativeCommitTransaction(
-      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.
@@ -955,6 +1034,26 @@ public class Dataset implements Closeable {
   private native long nativeCountRows(Optional<String> filter);
 
   /**
+   * Returns the session associated with this dataset.
+   *
+   * <p>The session holds runtime state for the dataset, including index and metadata caches. If a
+   * session was provided when opening the dataset, that session is returned. Otherwise, a new
+   * session was created automatically.
+   *
+   * <p>The returned session can be used to open other datasets to share caches.
+   *
+   * @return the session associated with this dataset
+   */
+  public Session session() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return session;
+    }
+  }
+
+  private native long nativeGetSessionHandle();
+
+  /**
    * Count rows matching a filter using a specific scalar index. This directly queries the index and
    * counts matching row addresses, which is more efficient than scanning when the index covers the
    * filter column.
@@ -1258,6 +1357,11 @@ public class Dataset implements Closeable {
       }
       if (selfManagedAllocator) {
         allocator.close();
+      }
+      if (ownsSession && session != null) {
+        session.close();
+        session = null;
+        ownsSession = false;
       }
     }
   }

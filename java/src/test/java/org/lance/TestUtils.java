@@ -760,14 +760,16 @@ public class TestUtils {
           fragments.add(createBlobFragment(batchRows, Integer.MAX_VALUE));
         }
 
-        Transaction txn =
-            ds.newTransactionBuilder()
+        try (Transaction txn =
+            new Transaction.Builder()
+                .readVersion(ds.version())
                 .operation(org.lance.operation.Append.builder().fragments(fragments).build())
-                .build();
-        Dataset newDs = txn.commit();
-        Preconditions.checkArgument(
-            newDs.countRows() == totalRows, "dataset row count mismatch after append");
-        return newDs;
+                .build()) {
+          Dataset newDs = new CommitBuilder(ds).execute(txn);
+          Preconditions.checkArgument(
+              newDs.countRows() == totalRows, "dataset row count mismatch after append");
+          return newDs;
+        }
       }
     }
   }

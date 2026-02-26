@@ -16,10 +16,10 @@ def test_create_empty_scalar_index():
     dataset.create_scalar_index("id", "BTREE", train=False)
 
     # Verify index exists and has correct stats
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "BTree"
-    stats = dataset.stats.index_stats(indices[0]["name"])
+    assert indices[0].index_type == "BTree"
+    stats = dataset.stats.index_stats(indices[0].name)
     assert stats["num_indexed_rows"] == 0
     assert stats["num_unindexed_rows"] == dataset.count_rows()
 

@@ -1131,7 +1131,16 @@ mod tests {
         fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
-            let dataset_path = format!("{}/my_db", tmpdir_path);
+            // Use file-object-store:// scheme so that writes go through the ObjectStore
+            // wrapper chain (MockObjectStore) instead of the optimized local writer path.
+            // The path must always start with "/" (three slashes after the scheme) so that
+            // on Windows, a drive letter like "C:" isn't parsed as the URL authority.
+            let path_prefix = if tmpdir_path.starts_with('/') {
+                ""
+            } else {
+                "/"
+            };
+            let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
                 _tmpdir: tmpdir,
                 dataset_path,

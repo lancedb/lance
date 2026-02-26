@@ -24,6 +24,7 @@ use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
+use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
@@ -250,6 +251,7 @@ impl IndexDetails {
 }
 
 /// Build a Scalar Index (returns details to store in the manifest)
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
     dataset: &Dataset,
@@ -259,6 +261,7 @@ pub(super) async fn build_scalar_index(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     preprocessed_data: Option<SendableRecordBatchStream>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -272,6 +275,7 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
+    progress.stage_start("load_data", None, "rows").await?;
     let training_data = match preprocessed_data {
         Some(preprocessed_data) => preprocessed_data,
         None => {
@@ -286,9 +290,16 @@ pub(super) async fn build_scalar_index(
             .await?
         }
     };
+    progress.stage_complete("load_data").await?;
 
     plugin
-        .train_index(training_data, &index_store, training_request, fragment_ids)
+        .train_index(
+            training_data,
+            &index_store,
+            training_request,
+            fragment_ids,
+            progress,
+        )
         .await
 }
 

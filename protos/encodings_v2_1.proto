@@ -166,6 +166,17 @@ message ConstantLayout {
   // - MUST be absent for an all-null page
   // - MUST be <= 32 bytes if present
   optional bytes inline_value = 6;
+
+  // Optional compression algorithm used for the repetition buffer.
+  // If absent, repetition levels are stored as raw u16 values.
+  CompressiveEncoding rep_compression = 7;
+  // Optional compression algorithm used for the definition buffer.
+  // If absent, definition levels are stored as raw u16 values.
+  CompressiveEncoding def_compression = 8;
+  // Number of values in repetition buffer after decompression.
+  uint64 num_rep_values = 9;
+  // Number of values in definition buffer after decompression.
+  uint64 num_def_values = 10;
 }
 
 // A layout where large binary data is encoded externally and only
