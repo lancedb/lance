@@ -13,6 +13,7 @@
  */
 package org.lance.index;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestUtils;
@@ -167,13 +168,16 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          // new dataset should contain that index
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains("test_index"));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(datasetVersion)
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            // new dataset should contain that index
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains("test_index"));
+          }
         }
       }
     }
@@ -244,30 +248,33 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(datasetVersion)
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            // new dataset should contain that index
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains("test_index"));
 
-        try (Dataset newDataset = createIndexTx.commit()) {
-          // new dataset should contain that index
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains("test_index"));
-
-          // 7. compare results
-          // force use index should get the right value
-          ScanOptions scanOptions =
-              new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
-          try (LanceScanner scanner = newDataset.newScan(scanOptions);
-              ArrowReader arrowReader = scanner.scanBatches(); ) {
-            List<Integer> ids = new ArrayList<>();
-            while (arrowReader.loadNextBatch()) {
-              VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              IntVector idVec = (IntVector) root.getVector("id");
-              for (int i = 0; i < idVec.getValueCount(); i++) {
-                ids.add(idVec.get(i));
+            // 7. compare results
+            // force use index should get the right value
+            ScanOptions scanOptions =
+                new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
+            try (LanceScanner scanner = newDataset.newScan(scanOptions);
+                ArrowReader arrowReader = scanner.scanBatches(); ) {
+              List<Integer> ids = new ArrayList<>();
+              while (arrowReader.loadNextBatch()) {
+                VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+                IntVector idVec = (IntVector) root.getVector("id");
+                for (int i = 0; i < idVec.getValueCount(); i++) {
+                  ids.add(idVec.get(i));
+                }
               }
+              Collections.sort(ids);
+              Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
             }
-            Collections.sort(ids);
-            Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
           }
         }
       }

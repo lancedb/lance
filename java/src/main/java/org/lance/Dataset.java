@@ -511,14 +511,19 @@ public class Dataset implements Closeable {
     return allocator;
   }
 
+  /** Package-private setter for allocator, used by {@link CommitBuilder}. */
+  void setAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
    *
-   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   * @return A new instance of {@link SourcedTransaction.Builder} linked to the opened dataset.
    */
-  public Transaction.Builder newTransactionBuilder() {
-    return new Transaction.Builder(this).readVersion(version());
+  public SourcedTransaction.Builder newTransactionBuilder() {
+    return new SourcedTransaction.Builder(this);
   }
 
   /**
@@ -548,21 +553,18 @@ public class Dataset implements Closeable {
   public Dataset commitTransaction(
       Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
-    try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
-      if (selfManagedAllocator) {
-        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        dataset.allocator = allocator;
-      }
-      return dataset;
-    } finally {
-      transaction.release();
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(transaction);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
     }
+    return dataset;
   }
-
-  private native Dataset nativeCommitTransaction(
-      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.

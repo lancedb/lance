@@ -126,13 +126,9 @@ fn inner_list_transactions<'local>(
         RT.block_on(delta_guard.inner.list_transactions())?
     };
 
-    let java_dataset = env
-        .get_field(&j_delta, "dataset", "Lorg/lance/Dataset;")?
-        .l()?;
-
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for tx in txs.into_iter() {
-        let jtx = convert_to_java_transaction(env, tx, &java_dataset)?;
+        let jtx = convert_to_java_transaction(env, tx)?;
         env.call_method(
             &array_list,
             "add",

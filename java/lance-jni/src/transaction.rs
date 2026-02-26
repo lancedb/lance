@@ -1,25 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
+use crate::blocking_dataset::{extract_namespace_info, BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{export_vec, import_vec_from_method, FromJObjectWithEnv, IntoJava, JLance};
+use crate::storage_options::JavaStorageOptionsProvider;
+use crate::traits::{
+    export_vec, import_vec_from_method, FromJObjectWithEnv, FromJString, IntoJava, JLance,
+};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
+use crate::RT;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jboolean;
+use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
+use lance::dataset::CommitBuilder;
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::ObjectStoreParams;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::version::LanceFileVersion;
+use lance_io::object_store::StorageOptionsProvider;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::io::commit::CommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -286,7 +296,7 @@ fn inner_read_transaction<'local>(
     };
 
     let transaction = match transaction {
-        Some(transaction) => convert_to_java_transaction(env, transaction, &java_dataset)?,
+        Some(transaction) => convert_to_java_transaction(env, transaction)?,
         None => JObject::null(),
     };
     Ok(transaction)
@@ -295,9 +305,12 @@ fn inner_read_transaction<'local>(
 pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
-    java_dataset: &JObject,
 ) -> Result<JObject<'local>> {
     let uuid = env.new_string(transaction.uuid)?;
+    let tag = match transaction.tag {
+        Some(tag) => JObject::from(env.new_string(tag)?),
+        None => JObject::null(),
+    };
     let transaction_properties = match transaction.transaction_properties {
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
@@ -306,13 +319,12 @@ pub(crate) fn convert_to_java_transaction<'local>(
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(Lorg/lance/Dataset;JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
-            JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&JObject::null()),
+            JValue::Object(&tag),
             JValue::Object(&transaction_properties),
         ],
     )?;
@@ -579,38 +591,90 @@ pub(crate) fn convert_to_java_schema<'local>(
         .l()?)
 }
 
+fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
+    match name.to_lowercase().as_str() {
+        "legacy" => Ok(LanceFileVersion::Legacy),
+        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
+        "stable" => Ok(LanceFileVersion::Stable),
+        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
+        "next" => Ok(LanceFileVersion::Next),
+        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
+        _ => Err(Error::input_error(format!(
+            "Unknown storage format: {}",
+            name
+        ))),
+    }
+}
+
 #[no_mangle]
-pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
+    _cls: JObject,
     java_dataset: JObject,
     java_transaction: JObject,
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(
+        inner_commit_to_dataset(
             &mut env,
             java_dataset,
             java_transaction,
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
+            write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
         )
     )
 }
 
-fn inner_commit_transaction<'local>(
+#[allow(clippy::too_many_arguments)]
+fn inner_commit_to_dataset<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
     detached: bool,
     enable_v2_manifest_paths: bool,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
 ) -> Result<JObject<'local>> {
-    let write_param_jobj = env
-        .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
-        .l()?;
-    let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let write_param = to_rust_map(env, &write_param_jmap)?;
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
+
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
+    };
 
     // Get the Dataset's storage_options_accessor and merge with write_param
     let storage_options_accessor = {
@@ -656,7 +720,15 @@ fn inner_commit_transaction<'local>(
         ..Default::default()
     };
 
-    let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_dataset))?;
+    let java_allocator = env
+        .call_method(
+            &java_dataset,
+            "allocator",
+            "()Lorg/apache/arrow/memory/BufferAllocator;",
+            &[],
+        )?
+        .l()?;
+    let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_allocator))?;
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
@@ -665,6 +737,10 @@ fn inner_commit_transaction<'local>(
             store_params,
             detached,
             enable_v2_manifest_paths,
+            use_stable_row_ids,
+            storage_format,
+            max_retries,
+            skip_auto_cleanup,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -673,7 +749,7 @@ fn inner_commit_transaction<'local>(
 fn convert_to_rust_transaction(
     env: &mut JNIEnv,
     java_transaction: JObject,
-    java_dataset: Option<&JObject>,
+    allocator: Option<&JObject>,
 ) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
@@ -685,7 +761,12 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, &op, java_dataset)?;
+    let op = convert_to_rust_operation(env, &op, allocator)?;
+
+    let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
+        let tag_str = JString::from(tag_obj);
+        tag_str.extract(env)
+    })?;
 
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
@@ -697,6 +778,7 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
+        .tag(tag)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }
@@ -704,42 +786,44 @@ fn convert_to_rust_transaction(
 fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
-    java_dataset: &JObject,
+    java_allocator: &JObject,
 ) -> Result<LanceSchema> {
-    let java_buffer_allocator = env
-        .call_method(
-            java_dataset,
-            "allocator",
-            "()Lorg/apache/arrow/memory/BufferAllocator;",
-            &[],
-        )?
-        .l()?;
     let schema_ptr = env
         .call_method(
             java_operation,
             "exportSchema",
             "(Lorg/apache/arrow/memory/BufferAllocator;)J",
-            &[JValue::Object(&java_buffer_allocator)],
+            &[JValue::Object(java_allocator)],
         )?
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+    LanceSchema::try_from(&schema).map_err(|e| {
+        Error::input_error(format!(
+            "Failed to convert Arrow schema to Lance schema: {}",
+            e
+        ))
+    })
 }
 
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
-    java_dataset: Option<&JObject<'_>>,
+    allocator: Option<&JObject<'_>>,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+            schema: convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Project operations".to_string(),
+                    )
+                })?,
+            )?,
         },
         "UpdateConfig" => {
             let config_updates_obj = env
@@ -860,7 +944,15 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?;
+            let schema = convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Overwrite operations".to_string(),
+                    )
+                })?,
+            )?;
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -954,7 +1046,15 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
-                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+                schema: convert_schema_from_operation(
+                    env,
+                    java_operation,
+                    allocator.ok_or_else(|| {
+                        Error::input_error(
+                            "BufferAllocator is required for Merge operations".to_string(),
+                        )
+                    })?,
+                )?,
             }
         }
         "Restore" => {
@@ -1067,4 +1167,158 @@ fn export_update_map<'a>(
             Ok(update_map_obj)
         }
     }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JObject,
+    uri: JString,
+    java_transaction: JObject,
+    detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
+    storage_options_provider_obj: JObject,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_to_uri(
+            &mut env,
+            uri,
+            java_transaction,
+            detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
+            storage_options_provider_obj,
+            namespace_obj,
+            table_id_obj,
+            allocator_obj,
+            write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_commit_to_uri<'local>(
+    env: &mut JNIEnv<'local>,
+    uri: JString,
+    java_transaction: JObject,
+    detached: bool,
+    enable_v2_manifest_paths: bool,
+    storage_options_provider_obj: JObject,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
+) -> Result<JObject<'local>> {
+    let uri_str: String = uri.extract(env)?;
+
+    // Extract write params from parameter
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
+
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
+    };
+
+    // Build storage options accessor
+    let storage_options_provider: Option<JavaStorageOptionsProvider> = env
+        .get_optional(&storage_options_provider_obj, |env, provider_obj| {
+            JavaStorageOptionsProvider::new(env, provider_obj)
+        })?;
+
+    let accessor = match (write_param.is_empty(), storage_options_provider) {
+        (false, Some(provider)) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(
+                write_param,
+                Arc::new(provider) as Arc<dyn StorageOptionsProvider>,
+            ),
+        )),
+        (false, None) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(write_param),
+        )),
+        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
+            Arc::new(provider) as Arc<dyn StorageOptionsProvider>,
+        ))),
+        (true, None) => None,
+    };
+
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: accessor,
+        ..Default::default()
+    };
+
+    // Convert Java transaction to Rust
+    let allocator_ref = if allocator_obj.is_null() {
+        None
+    } else {
+        Some(allocator_obj)
+    };
+    let transaction = convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref())?;
+
+    // Build CommitBuilder with URI
+    let mut builder = CommitBuilder::new(&*uri_str)
+        .with_store_params(store_params)
+        .with_detached(detached)
+        .enable_v2_manifest_paths(enable_v2_manifest_paths);
+
+    if let Some(use_stable) = use_stable_row_ids {
+        builder = builder.use_stable_row_ids(use_stable);
+    }
+    if let Some(format) = storage_format {
+        builder = builder.with_storage_format(format);
+    }
+    if max_retries > 0 {
+        builder = builder.with_max_retries(max_retries);
+    }
+    if skip_auto_cleanup {
+        builder = builder.with_skip_auto_cleanup(true);
+    }
+
+    // Set namespace commit handler if provided
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    if let Some((ns, tid)) = namespace_info {
+        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+        let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        builder = builder.with_commit_handler(commit_handler);
+    }
+
+    let dataset = RT.block_on(builder.execute(transaction))?;
+    let blocking_ds = BlockingDataset { inner: dataset };
+    blocking_ds.into_java(env)
 }

@@ -1414,15 +1414,16 @@ public class NamespaceIntegrationTest {
 
         // Create and commit transaction
         Append appendOp = Append.builder().fragments(newFragments).build();
-        Transaction transaction =
-            new Transaction.Builder(datasetWithProvider)
+        try (Transaction transaction =
+            new Transaction.Builder()
                 .readVersion(datasetWithProvider.version())
                 .operation(appendOp)
-                .build();
-
-        try (Dataset committedDataset = transaction.commit()) {
-          assertEquals(2, committedDataset.version());
-          assertEquals(4, committedDataset.countRows());
+                .build()) {
+          try (Dataset committedDataset =
+              new CommitBuilder(datasetWithProvider).execute(transaction)) {
+            assertEquals(2, committedDataset.version());
+            assertEquals(4, committedDataset.countRows());
+          }
         }
       }
 
