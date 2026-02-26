@@ -6,7 +6,7 @@
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
-    utils::maybe_sample_training_data,
+    utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -57,7 +57,6 @@ use lance_index::vector::ivf::storage::{IvfModel, IVF_METADATA_KEY};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::vector::DISTANCE_TYPE_KEY;
@@ -86,7 +85,7 @@ use lance_io::{
     traits::{Reader, WriteExt, Writer},
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
-use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
+use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
@@ -1271,19 +1270,18 @@ pub async fn build_ivf_model(
     // If metric type is cosine, normalize the training data, and after this point,
     // treat the metric type as L2.
     let (training_data, mt) = if metric_type == MetricType::Cosine {
-        let training_data = normalize_fsl(&training_data)?;
+        let training_data = normalize_fsl_owned(training_data)?;
         (training_data, MetricType::L2)
     } else {
         (training_data, metric_type)
     };
 
     // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-    let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
-    let training_data = training_data.as_fixed_size_list();
+    let training_data = filter_finite_training_data(training_data)?;
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, training_data, mt, params, progress).await?;
+    let ivf = train_ivf_model(centroids, &training_data, mt, params, progress).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()

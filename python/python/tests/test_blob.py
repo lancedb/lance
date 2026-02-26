@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import io
+import subprocess
+import sys
 import tarfile
+import textwrap
 
 import lance
 import pyarrow as pa
@@ -141,6 +144,43 @@ def test_blob_files(dataset_with_blobs):
     for expected in [b"foo", b"bar", b"baz"]:
         with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_files_close_no_shutdown_panic(tmp_path):
+    script = textwrap.dedent(
+        f"""
+        import pyarrow as pa
+        import lance
+
+        table = pa.table(
+            [pa.array([b"foo", b"bar"], pa.large_binary())],
+            schema=pa.schema(
+                [
+                    pa.field(
+                        "blob",
+                        pa.large_binary(),
+                        metadata={{"lance-encoding:blob": "true"}},
+                    )
+                ]
+            ),
+        )
+        ds = lance.write_dataset(table, {str(tmp_path / "ds")!r})
+        row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+        blobs = ds.take_blobs("blob", ids=row_ids)
+        for blob in blobs:
+            blob.close()
+        print("done")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "interpreter_lifecycle.rs" not in result.stderr
+    assert "The Python interpreter is not initialized" not in result.stderr
 
 
 def test_blob_files_by_address(dataset_with_blobs):
