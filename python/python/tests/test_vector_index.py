@@ -803,26 +803,6 @@ def test_create_ivf_rq_index():
     )
     assert ds.list_indices()[0]["fields"] == ["vector"]
 
-    ds = ds.create_index(
-        "vector",
-        index_type="IVF_RQ",
-        num_partitions=4,
-        num_bits=1,
-        rq_rotation_type="matrix",
-        replace=True,
-    )
-    assert ds.list_indices()[0]["fields"] == ["vector"]
-
-    with pytest.raises(ValueError, match="Unknown RQ rotation type"):
-        ds.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            num_partitions=4,
-            num_bits=1,
-            rq_rotation_type="not-a-rotation",
-            replace=True,
-        )
-
     with pytest.raises(
         NotImplementedError,
         match="Creating empty vector indices with train=False is not yet implemented",

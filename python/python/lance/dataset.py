@@ -2866,9 +2866,6 @@ class LanceDataset(pa.dataset.Dataset):
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 1.
-            - rq_rotation_type / rabitq_rotation_type
-                Rotation implementation for RabitQ. One of ``"fast"`` (default)
-                or ``"matrix"``.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
