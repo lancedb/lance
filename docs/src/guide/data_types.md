@@ -283,6 +283,7 @@ ds = lance.write_dataset(table, "./with_metadata.lance")
 ### Map Types
 
 Store key-value pairs with dynamic keys:
+Map writes require Lance file format version 2.2 or later.
 
 ```python
 import lance
@@ -301,7 +302,7 @@ table = pa.Table.from_pydict({
     ],
 }, schema=schema)
 
-ds = lance.write_dataset(table, "./with_maps.lance")
+ds = lance.write_dataset(table, "./with_maps.lance", data_storage_version="2.2")
 ```
 
 ## Data Type Mapping for Integrations
