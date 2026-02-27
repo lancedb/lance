@@ -100,6 +100,9 @@ pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 
+// Just a heuristic when we need to pre-allocate memory for tokens
+pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
+
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
@@ -2420,9 +2423,10 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, Some(&query_tokens));
-            if !doc_tokens.is_empty() {
+            if has_query_token(doc, &mut tokenizer, &query_tokens) {
                 results.push(row_id_array.value(i));
+                // What is this assertion for?  Why would doc contain query?  Don't we reach
+                // here only if they share at least one token?  Why is it not debug_assert?
                 assert!(doc.contains(query));
             }
         }
@@ -2448,21 +2452,12 @@ pub fn flat_bm25_search(
             continue;
         };
 
-        let doc_tokens = collect_doc_tokens(doc, tokenizer, None);
-        scorer.update(&doc_tokens);
-        let doc_tokens = doc_tokens
-            .into_iter()
-            .filter(|t| query_tokens.contains(t))
-            .collect::<Vec<_>>();
+        let mut doc_token_count = HashMap::with_capacity(query_tokens.len());
+        let (num_tokens, num_matching_tokens) =
+            collect_doc_tokens(doc, tokenizer, &query_tokens, &mut doc_token_count);
+        scorer.update(&doc_token_count, num_tokens);
 
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / scorer.avg_doc_length());
-        let mut doc_token_count = HashMap::new();
-        for token in doc_tokens {
-            doc_token_count
-                .entry(token)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-        }
+        let doc_norm = K1 * (1.0 - B + B * num_matching_tokens as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
         for token in query_tokens {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
@@ -2498,12 +2493,17 @@ pub fn flat_bm25_search_stream(
     };
     let tokens = collect_query_tokens(&query, &mut tokenizer, None);
 
-    let mut bm25_scorer = match index {
+    let bm25_scorer = match index {
         Some(index) => {
             let index_bm25_scorer =
                 IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
             if index_bm25_scorer.num_docs() == 0 {
-                MemBM25Scorer::new(0, 0, HashMap::new())
+                let mut token_docs = HashMap::with_capacity(tokens.len());
+                let num_tokens = tokens.len() as u64;
+                for token in &tokens {
+                    *token_docs.entry(token.clone()).or_insert(0) += 1;
+                }
+                MemBM25Scorer::new(num_tokens, 1, token_docs)
             } else {
                 let mut token_docs = HashMap::with_capacity(tokens.len());
                 for token in &tokens {
@@ -2520,30 +2520,119 @@ pub fn flat_bm25_search_stream(
         None => MemBM25Scorer::new(0, 0, HashMap::new()),
     };
 
+    let input_schema = input.schema();
     let batch_schema = schema.clone();
-    let stream = input.map(move |batch| {
-        let batch = batch?;
 
-        let batch = flat_bm25_search(
-            batch,
-            &doc_col,
-            &tokens,
-            &mut tokenizer,
-            &mut bm25_scorer,
-            batch_schema.clone(),
-        )?;
+    // Accumulate small batches until this threshold before dispatching a task.
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    // Slice oversized batches down to roughly this size.
+    const SLICE_BYTES: usize = 512 * 1024;
 
-        // filter out rows with score 0
-        let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
-        let mask = score_col
-            .iter()
-            .map(|score| score.is_some_and(|score| score > 0.0))
-            .collect::<Vec<_>>();
-        let mask = BooleanArray::from(mask);
-        let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
-        Ok(batch)
+    // Phase 1: accumulate small batches into >=SLICE_BYTES chunks, and slice
+    // oversized chunks down to ~SLICE_BYTES pieces.
+    let chunked = futures::stream::try_unfold((input, Vec::<RecordBatch>::new(), 0usize, false), {
+        let input_schema = input_schema.clone();
+        move |(mut input, mut accumulated, mut acc_bytes, mut done)| {
+            let input_schema = input_schema.clone();
+            async move {
+                if done && accumulated.is_empty() {
+                    return Ok(None);
+                }
+
+                // Pull batches until we reach the byte target or exhaust input.
+                while !done && acc_bytes < ACCUMULATE_BYTES {
+                    match input.next().await {
+                        Some(Ok(batch)) => {
+                            acc_bytes += batch.get_array_memory_size();
+                            accumulated.push(batch);
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            done = true;
+                        }
+                    }
+                }
+
+                if accumulated.is_empty() {
+                    return Ok(None);
+                }
+
+                let batch = if accumulated.len() == 1 {
+                    accumulated.pop().unwrap()
+                } else {
+                    let b = arrow::compute::concat_batches(&input_schema, &accumulated)?;
+                    accumulated.clear();
+                    b
+                };
+                acc_bytes = 0;
+
+                // Slice the batch into ~SLICE_BYTES pieces assuming uniform row sizes.
+                let batch_bytes = batch.get_array_memory_size();
+                let num_rows = batch.num_rows();
+                let mut slices = Vec::new();
+                if batch_bytes <= SLICE_BYTES || num_rows <= 1 {
+                    slices.push(batch);
+                } else {
+                    let rows_per_chunk =
+                        (SLICE_BYTES as u64 * num_rows as u64 / batch_bytes as u64).max(1) as usize;
+                    let mut offset = 0;
+                    while offset < num_rows {
+                        let len = rows_per_chunk.min(num_rows - offset);
+                        slices.push(batch.slice(offset, len));
+                        offset += len;
+                    }
+                }
+
+                let rest = slices.split_off(1);
+                let first = slices.into_iter().next().unwrap();
+
+                // Stash leftover slices for the next iteration.
+                accumulated = rest;
+                for a in &accumulated {
+                    acc_bytes += a.get_array_memory_size();
+                }
+
+                Ok(Some((first, (input, accumulated, acc_bytes, done))))
+            }
+        }
     });
+
+    // Phase 2: score each chunk on the CPU thread pool in parallel.
+    let stream = chunked
+        .map(move |batch_result| {
+            let doc_col = doc_col.clone();
+            let tokens = tokens.clone();
+            let mut tokenizer = tokenizer.clone();
+            let mut bm25_scorer = bm25_scorer.clone();
+            let batch_schema = batch_schema.clone();
+            async move {
+                let batch = batch_result?;
+                spawn_cpu(move || {
+                    let batch = flat_bm25_search(
+                        batch,
+                        &doc_col,
+                        &tokens,
+                        &mut tokenizer,
+                        &mut bm25_scorer,
+                        batch_schema,
+                    )?;
+
+                    // filter out rows with score 0
+                    let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
+                    let mask = score_col
+                        .iter()
+                        .map(|score| score.is_some_and(|score| score > 0.0))
+                        .collect::<Vec<_>>();
+                    let mask = BooleanArray::from(mask);
+                    let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+                    debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
+                    Ok(batch)
+                })
+                .await
+                .map_err(DataFusionError::from)
+            }
+        })
+        .buffered(get_num_compute_intensive_cpus());
 
     Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
 }

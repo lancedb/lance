@@ -6,7 +6,8 @@ use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use snafu::location;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -796,20 +797,34 @@ pub fn collect_query_tokens(
 pub fn collect_doc_tokens(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&Tokens>,
-) -> Tokens {
-    let token_type = tokenizer.doc_type();
+    query_tokens: &Tokens,
+    doc_token_count: &mut HashMap<String, usize>,
+) -> (u64, u64) {
+    let mut num_tokens = 0;
+    let mut num_matching_tokens = 0;
     let mut stream = tokenizer.token_stream_for_doc(text);
-    let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive
-            && !inclusive.contains(&token.text)
-        {
-            continue;
+        num_tokens += 1;
+        if query_tokens.contains(&token.text) {
+            num_matching_tokens += 1;
+            *doc_token_count.entry(token.text.clone()).or_insert(0) += 1;
         }
-        tokens.push(token.text.clone());
     }
-    Tokens::new(tokens, token_type)
+    (num_tokens, num_matching_tokens)
+}
+
+pub fn has_query_token(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    query_tokens: &Tokens,
+) -> bool {
+    let mut stream = tokenizer.token_stream_for_doc(text);
+    while let Some(token) = stream.next() {
+        if query_tokens.contains(&token.text) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn fill_fts_query_column(
