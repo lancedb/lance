@@ -4,17 +4,20 @@
 //! Binary Quantization (BQ)
 
 use std::iter::once;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
 use lance_core::{Error, Result};
 use num_traits::Float;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
+pub mod rotation;
 pub mod storage;
 pub mod transform;
 
@@ -80,14 +83,51 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         }))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RQRotationType {
+    #[default]
+    Fast,
+    Matrix,
+}
+
+impl FromStr for RQRotationType {
+    type Err = Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.to_lowercase().as_str() {
+            "fast" | "fht_kac" | "fht-kac" => Ok(Self::Fast),
+            "matrix" | "dense" => Ok(Self::Matrix),
+            _ => Err(Error::invalid_input(
+                format!(
+                    "Unknown RQ rotation type: {}. Expected one of: fast, matrix",
+                    value
+                ),
+                location!(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RQBuildParams {
     pub num_bits: u8,
+    pub rotation_type: RQRotationType,
 }
 
 impl RQBuildParams {
     pub fn new(num_bits: u8) -> Self {
-        Self { num_bits }
+        Self {
+            num_bits,
+            rotation_type: RQRotationType::default(),
+        }
+    }
+
+    pub fn with_rotation_type(num_bits: u8, rotation_type: RQRotationType) -> Self {
+        Self {
+            num_bits,
+            rotation_type,
+        }
     }
 }
 
@@ -99,7 +139,10 @@ impl QuantizerBuildParams for RQBuildParams {
 
 impl Default for RQBuildParams {
     fn default() -> Self {
-        Self { num_bits: 1 }
+        Self {
+            num_bits: 1,
+            rotation_type: RQRotationType::default(),
+        }
     }
 }
 
@@ -125,5 +168,18 @@ mod tests {
         test_bq::<f16>();
         test_bq::<f32>();
         test_bq::<f64>();
+    }
+
+    #[test]
+    fn test_rotation_type_parse() {
+        assert_eq!(
+            "fast".parse::<RQRotationType>().unwrap(),
+            RQRotationType::Fast
+        );
+        assert_eq!(
+            "matrix".parse::<RQRotationType>().unwrap(),
+            RQRotationType::Matrix
+        );
+        assert!("invalid".parse::<RQRotationType>().is_err());
     }
 }

@@ -843,6 +843,24 @@ def test_create_ivf_rq_index():
     assert res["_distance"].to_numpy().max() == 0.0
 
 
+def test_create_ivf_rq_requires_dim_divisible_by_8():
+    vectors = np.zeros((1000, 30), dtype=np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(vectors, type=pa.list_(pa.float32(), 30))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+
+    with pytest.raises(
+        ValueError, match="vector dimension must be divisible by 8 for IVF_RQ"
+    ):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+        )
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")

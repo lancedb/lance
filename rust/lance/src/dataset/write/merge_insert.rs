@@ -5536,7 +5536,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     async fn test_duplicate_rowid_detection(
         #[values(false, true)] is_full_schema: bool,
         #[values(true, false)] enable_stable_row_ids: bool,
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
         data_storage_version: LanceFileVersion,
     ) {
         let test_uri = "memory://test_duplicate_rowid_multi_fragment.lance";
@@ -5604,7 +5604,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     async fn test_source_dedupe_behavior_first_seen(
         #[values(false, true)] is_full_schema: bool,
         #[values(true, false)] enable_stable_row_ids: bool,
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
         data_storage_version: LanceFileVersion,
     ) {
         let test_uri = format!(

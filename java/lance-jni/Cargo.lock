@@ -2390,7 +2390,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3439,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -3448,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3604,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3618,7 +3618,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3685,7 +3685,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3726,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3760,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3788,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7374,18 +7374,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.39"
+version = "0.8.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a"
+checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.39"
+version = "0.8.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4122cd3169e94605190e77839c9a40d40ed048d305bfdc146e7df40ab0f3e517"
+checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -48,6 +48,11 @@ assert dataset.schema == pa.schema([
 
 This operation is very fast, as it only updates the metadata of the dataset.
 
+For Lance file format `<= 2.1`, adding sub-columns under an existing `struct` is not supported.
+Starting with Lance file format `2.2`, schema-only add can also extend nested `struct` fields
+(including `struct` fields nested inside list types), for example by adding
+`people.item.location` under `list<struct<...>>`.
+
 ### With data backfill
 
 New columns can be added and populated within a single operation using the

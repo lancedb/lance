@@ -28,7 +28,9 @@ use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
+use crate::vector::bq::rotation::apply_fast_rotation;
 use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+use crate::vector::bq::RQRotationType;
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{DistCalculator, VectorStore};
@@ -45,9 +47,21 @@ pub struct RabitQuantizationMetadata {
     // in the global buffer, which is a binary format (protobuf for now) for efficiency.
     #[serde(skip)]
     pub rotate_mat: Option<FixedSizeListArray>,
-    pub rotate_mat_position: u32,
+    #[serde(default)]
+    pub rotate_mat_position: Option<u32>,
+    #[serde(default)]
+    pub fast_rotation_signs: Option<Vec<u8>>,
+    #[serde(default = "default_rotation_type_compat")]
+    pub rotation_type: RQRotationType,
+    #[serde(default)]
+    pub code_dim: u32,
     pub num_bits: u8,
     pub packed: bool,
+}
+
+fn default_rotation_type_compat() -> RQRotationType {
+    // Older metadata does not have this field and always used dense matrices.
+    RQRotationType::Matrix
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
@@ -56,34 +70,57 @@ impl DeepSizeOf for RabitQuantizationMetadata {
             .as_ref()
             .map(|inv_p| inv_p.get_array_memory_size())
             .unwrap_or(0)
+            + self
+                .fast_rotation_signs
+                .as_ref()
+                .map(|signs| signs.len())
+                .unwrap_or(0)
     }
 }
 
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
-        Some(self.rotate_mat_position)
+        match self.rotation_type {
+            RQRotationType::Matrix => self.rotate_mat_position,
+            RQRotationType::Fast => None,
+        }
     }
 
     fn set_buffer_index(&mut self, index: u32) {
-        self.rotate_mat_position = index;
+        self.rotate_mat_position = Some(index);
     }
 
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
+        if self.rotation_type != RQRotationType::Matrix {
+            return Ok(());
+        }
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
         self.rotate_mat = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        if self.code_dim == 0 {
+            self.code_dim = self
+                .rotate_mat
+                .as_ref()
+                .map(|rotate_mat| rotate_mat.len() as u32)
+                .unwrap_or(0);
+        }
         Ok(())
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        if let Some(inv_p) = &self.rotate_mat {
-            let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
-            let mut bytes = BytesMut::new();
-            inv_p_tensor.encode(&mut bytes)?;
-            Ok(Some(bytes.freeze()))
-        } else {
-            Ok(None)
+        match self.rotation_type {
+            RQRotationType::Matrix => {
+                if let Some(inv_p) = &self.rotate_mat {
+                    let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
+                    let mut bytes = BytesMut::new();
+                    inv_p_tensor.encode(&mut bytes)?;
+                    Ok(Some(bytes.freeze()))
+                } else {
+                    Ok(None)
+                }
+            }
+            RQRotationType::Fast => Ok(None),
         }
     }
 
@@ -127,7 +164,7 @@ impl DeepSizeOf for RabitQuantizationStorage {
 }
 
 impl RabitQuantizationStorage {
-    fn rotate_query_vector<T: ArrowFloatType>(
+    fn rotate_query_vector_dense<T: ArrowFloatType>(
         rotate_mat: &FixedSizeListArray,
         qr: &dyn Array,
     ) -> Vec<f32>
@@ -153,6 +190,25 @@ impl RabitQuantizationStorage {
             .chunks_exact(code_dim)
             .map(|chunk| lance_linalg::distance::dot(&chunk[..d], qr))
             .collect()
+    }
+
+    fn rotate_query_vector_fast<T: ArrowFloatType>(
+        code_dim: usize,
+        signs: &[u8],
+        qr: &dyn Array,
+    ) -> Vec<f32>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        let qr = qr
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+
+        let mut output = vec![0.0f32; code_dim];
+        apply_fast_rotation(qr, &mut output, signs);
+        output
     }
 }
 
@@ -408,17 +464,56 @@ impl VectorStore for RabitQuantizationStorage {
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        let rotate_mat = self
-            .metadata
-            .rotate_mat
-            .as_ref()
-            .expect("RabitQ metadata not loaded");
+        let code_dim = if self.metadata.code_dim > 0 {
+            self.metadata.code_dim as usize
+        } else {
+            self.metadata
+                .rotate_mat
+                .as_ref()
+                .map(|rotate_mat| rotate_mat.len())
+                .unwrap_or_default()
+        };
 
-        let rotated_qr = match rotate_mat.value_type() {
-            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
-            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
-            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
-            dt => unimplemented!("RabitQ does not support data type: {}", dt),
+        let rotated_qr = match self.metadata.rotation_type {
+            RQRotationType::Matrix => {
+                let rotate_mat = self
+                    .metadata
+                    .rotate_mat
+                    .as_ref()
+                    .expect("RabitQ dense rotation metadata not loaded");
+
+                match rotate_mat.value_type() {
+                    DataType::Float16 => {
+                        Self::rotate_query_vector_dense::<Float16Type>(rotate_mat, &qr)
+                    }
+                    DataType::Float32 => {
+                        Self::rotate_query_vector_dense::<Float32Type>(rotate_mat, &qr)
+                    }
+                    DataType::Float64 => {
+                        Self::rotate_query_vector_dense::<Float64Type>(rotate_mat, &qr)
+                    }
+                    dt => unimplemented!("RabitQ does not support data type: {}", dt),
+                }
+            }
+            RQRotationType::Fast => {
+                let signs = self
+                    .metadata
+                    .fast_rotation_signs
+                    .as_ref()
+                    .expect("RabitQ fast rotation metadata not loaded");
+                match qr.data_type() {
+                    DataType::Float16 => {
+                        Self::rotate_query_vector_fast::<Float16Type>(code_dim, signs, &qr)
+                    }
+                    DataType::Float32 => {
+                        Self::rotate_query_vector_fast::<Float32Type>(code_dim, signs, &qr)
+                    }
+                    DataType::Float64 => {
+                        Self::rotate_query_vector_fast::<Float64Type>(code_dim, signs, &qr)
+                    }
+                    dt => unimplemented!("RabitQ does not support data type: {}", dt),
+                }
+            }
         };
 
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
