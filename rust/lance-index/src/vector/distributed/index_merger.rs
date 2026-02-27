@@ -37,15 +37,26 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::LazyLock;
 
 const DEFAULT_PARTITION_WINDOW_SIZE: usize = 512;
 const PARTITION_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE";
+const DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT: usize = 2;
+const PARTITION_PREFETCH_WINDOW_COUNT_ENV: &str =
+    "LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT";
 static PARTITION_WINDOW_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var(PARTITION_WINDOW_SIZE_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PARTITION_WINDOW_SIZE)
+});
+static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var(PARTITION_PREFETCH_WINDOW_COUNT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
 
 /// Strict bitwise equality check for FixedSizeListArray values.
@@ -467,6 +478,253 @@ async fn compute_shard_content_key(
     Ok((min_fragment_id, min_row_id, parent_name))
 }
 
+#[derive(Debug)]
+struct ShardInfo {
+    reader: Arc<V2Reader>,
+    lengths: Vec<u32>,
+    partition_offsets: Vec<usize>,
+    total_rows: usize,
+    sort_key: (u32, u64, String),
+}
+
+#[derive(Debug)]
+struct ShardWindowReadJob {
+    reader: Arc<V2Reader>,
+    window_lengths: Vec<u32>,
+    window_total_rows: usize,
+    start_offset: usize,
+    end_offset: usize,
+}
+
+#[derive(Debug)]
+struct PartitionWindowBatches {
+    window_start: usize,
+    per_partition_batches: Vec<Vec<RecordBatch>>,
+}
+
+type PartitionWindowFuture = Pin<Box<dyn Future<Output = Result<PartitionWindowBatches>> + Send>>;
+
+struct ShardMergeReader {
+    shard_infos: Arc<Vec<ShardInfo>>,
+    nlist: usize,
+    partition_window_size: usize,
+    prefetch_window_count: usize,
+    next_window_start: usize,
+    in_flight_windows: futures::stream::FuturesOrdered<PartitionWindowFuture>,
+    current_window: Option<PartitionWindowBatches>,
+    current_partition_offset: usize,
+}
+
+impl ShardMergeReader {
+    fn new(
+        shard_infos: Vec<ShardInfo>,
+        nlist: usize,
+        partition_window_size: usize,
+        prefetch_window_count: usize,
+    ) -> Self {
+        let mut this = Self {
+            shard_infos: Arc::new(shard_infos),
+            nlist,
+            partition_window_size: partition_window_size.max(1),
+            prefetch_window_count: prefetch_window_count.max(1),
+            next_window_start: 0,
+            in_flight_windows: futures::stream::FuturesOrdered::new(),
+            current_window: None,
+            current_partition_offset: 0,
+        };
+        this.fill_prefetch();
+        this
+    }
+
+    fn fill_prefetch(&mut self) {
+        while self.in_flight_windows.len() < self.prefetch_window_count
+            && self.next_window_start < self.nlist
+        {
+            let window_start = self.next_window_start;
+            let window_end = std::cmp::min(window_start + self.partition_window_size, self.nlist);
+            self.next_window_start = window_end;
+
+            let shard_infos = Arc::clone(&self.shard_infos);
+            let nlist = self.nlist;
+            let fut: PartitionWindowFuture = Box::pin(async move {
+                read_partition_window(shard_infos, nlist, window_start, window_end).await
+            });
+            self.in_flight_windows.push_back(fut);
+        }
+    }
+
+    async fn next_partition(&mut self) -> Result<Option<(usize, Vec<RecordBatch>)>> {
+        loop {
+            if let Some(window) = self.current_window.as_mut() {
+                if self.current_partition_offset < window.per_partition_batches.len() {
+                    let partition_id = window.window_start + self.current_partition_offset;
+                    let batches = std::mem::take(
+                        &mut window.per_partition_batches[self.current_partition_offset],
+                    );
+                    self.current_partition_offset += 1;
+                    if self.current_partition_offset == window.per_partition_batches.len() {
+                        self.current_window = None;
+                        self.current_partition_offset = 0;
+                    }
+                    self.fill_prefetch();
+                    return Ok(Some((partition_id, batches)));
+                }
+                self.current_window = None;
+                self.current_partition_offset = 0;
+                continue;
+            }
+
+            self.fill_prefetch();
+            match self.in_flight_windows.next().await {
+                Some(window) => {
+                    self.current_window = Some(window?);
+                    self.current_partition_offset = 0;
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+async fn read_partition_window(
+    shard_infos: Arc<Vec<ShardInfo>>,
+    nlist: usize,
+    window_start: usize,
+    window_end: usize,
+) -> Result<PartitionWindowBatches> {
+    let window_len = window_end - window_start;
+
+    let shard_jobs: Vec<ShardWindowReadJob> = shard_infos
+        .iter()
+        .map(|shard| {
+            let window_lengths = shard.lengths[window_start..window_end].to_vec();
+            let window_total_rows = window_lengths.iter().map(|len| *len as usize).sum();
+            let start_offset = shard.partition_offsets[window_start];
+            let end_offset = if window_end < nlist {
+                shard.partition_offsets[window_end]
+            } else {
+                shard.total_rows
+            };
+
+            ShardWindowReadJob {
+                reader: Arc::clone(&shard.reader),
+                window_lengths,
+                window_total_rows,
+                start_offset,
+                end_offset,
+            }
+        })
+        .collect();
+
+    let shard_parallelism = shard_jobs.len().max(1);
+    let mut shard_results_stream = futures::stream::iter(shard_jobs.into_iter().enumerate().map(
+        |(shard_idx, shard_job)| async move {
+            let per_partition_batches =
+                read_shard_window_partitions(shard_job, window_start, window_end, window_len)
+                    .await?;
+            Ok::<(usize, Vec<Vec<RecordBatch>>), Error>((shard_idx, per_partition_batches))
+        },
+    ))
+    .buffer_unordered(shard_parallelism);
+
+    let mut shard_results: Vec<(usize, Vec<Vec<RecordBatch>>)> =
+        Vec::with_capacity(shard_parallelism);
+    while let Some(shard_result) = shard_results_stream.next().await {
+        shard_results.push(shard_result?);
+    }
+    shard_results.sort_by_key(|(shard_idx, _)| *shard_idx);
+
+    let mut per_partition_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); window_len];
+    for (_, mut shard_partition_batches) in shard_results {
+        for rel_partition in 0..window_len {
+            per_partition_batches[rel_partition]
+                .append(&mut shard_partition_batches[rel_partition]);
+        }
+    }
+
+    Ok(PartitionWindowBatches {
+        window_start,
+        per_partition_batches,
+    })
+}
+
+async fn read_shard_window_partitions(
+    shard_job: ShardWindowReadJob,
+    window_start: usize,
+    window_end: usize,
+    window_len: usize,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    let mut per_partition_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); window_len];
+    if shard_job.window_total_rows == 0 {
+        return Ok(per_partition_batches);
+    }
+
+    let mut stream = shard_job.reader.read_stream(
+        lance_io::ReadBatchParams::Range(shard_job.start_offset..shard_job.end_offset),
+        u32::MAX,
+        4,
+        lance_encoding::decoder::FilterExpression::no_filter(),
+    )?;
+
+    let mut rel_partition = 0usize;
+    while rel_partition < window_len && shard_job.window_lengths[rel_partition] == 0 {
+        rel_partition += 1;
+    }
+    let mut remaining = if rel_partition < window_len {
+        shard_job.window_lengths[rel_partition] as usize
+    } else {
+        0
+    };
+
+    while let Some(rb) = stream.next().await {
+        let rb = rb?;
+        let mut consumed = 0usize;
+
+        while consumed < rb.num_rows() {
+            while rel_partition < window_len && remaining == 0 {
+                rel_partition += 1;
+                if rel_partition < window_len {
+                    remaining = shard_job.window_lengths[rel_partition] as usize;
+                }
+            }
+
+            if rel_partition >= window_len {
+                return Err(Error::Index {
+                    message: format!(
+                        "Shard has more rows than declared lengths in partition window [{}, {})",
+                        window_start, window_end
+                    ),
+                    location: location!(),
+                });
+            }
+
+            let to_take = std::cmp::min(remaining, rb.num_rows() - consumed);
+            per_partition_batches[rel_partition].push(rb.slice(consumed, to_take));
+            consumed += to_take;
+            remaining -= to_take;
+        }
+    }
+
+    while rel_partition < window_len && remaining == 0 {
+        rel_partition += 1;
+        if rel_partition < window_len {
+            remaining = shard_job.window_lengths[rel_partition] as usize;
+        }
+    }
+
+    if rel_partition != window_len {
+        return Err(Error::Index {
+            message: format!(
+                "Shard has fewer rows than declared lengths in partition window [{}, {})",
+                window_start, window_end
+            ),
+            location: location!(),
+        });
+    }
+
+    Ok(per_partition_batches)
+}
+
 /// Merge all partial_* vector index auxiliary files under `index_dir/{uuid}/partial_*/auxiliary.idx`
 /// into `index_dir/{uuid}/auxiliary.idx`.
 ///
@@ -477,14 +735,6 @@ pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     index_dir: &object_store::path::Path,
 ) -> Result<()> {
-    struct ShardInfo {
-        reader: Arc<V2Reader>,
-        lengths: Vec<u32>,
-        partition_offsets: Vec<usize>,
-        total_rows: usize,
-        sort_key: (u32, u64, String),
-    }
-
     let mut aux_paths: Vec<object_store::path::Path> = Vec::new();
     let mut stream = object_store.list(Some(index_dir.clone()));
     while let Some(item) = stream.next().await {
@@ -1213,115 +1463,29 @@ pub async fn merge_partial_vector_auxiliary_files(
             // For PQ-backed indices, transpose PQ codes while merging partitions
             // so that the unified file stores column-major PQ codes.
             let partition_window_size = *PARTITION_WINDOW_SIZE;
+            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
+            let mut shard_merge_reader = ShardMergeReader::new(
+                shard_infos,
+                nlist,
+                partition_window_size,
+                prefetch_window_count,
+            );
 
-            for window_start in (0..nlist).step_by(partition_window_size) {
-                let window_end = std::cmp::min(window_start + partition_window_size, nlist);
-                let window_len = window_end - window_start;
-                let mut per_partition_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); window_len];
-
-                for shard in shard_infos.iter() {
-                    let window_total_rows: usize = shard.lengths[window_start..window_end]
-                        .iter()
-                        .map(|len| *len as usize)
-                        .sum();
-                    if window_total_rows == 0 {
-                        continue;
-                    }
-
-                    let start_offset = shard.partition_offsets[window_start];
-                    let end_offset = if window_end < nlist {
-                        shard.partition_offsets[window_end]
-                    } else {
-                        shard.total_rows
-                    };
-
-                    let mut stream = shard.reader.read_stream(
-                        lance_io::ReadBatchParams::Range(start_offset..end_offset),
-                        u32::MAX,
-                        4,
-                        lance_encoding::decoder::FilterExpression::no_filter(),
-                    )?;
-
-                    let mut rel_partition = 0usize;
-                    while rel_partition < window_len
-                        && shard.lengths[window_start + rel_partition] == 0
-                    {
-                        rel_partition += 1;
-                    }
-                    let mut remaining = if rel_partition < window_len {
-                        shard.lengths[window_start + rel_partition] as usize
-                    } else {
-                        0
-                    };
-
-                    while let Some(rb) = stream.next().await {
-                        let rb = rb?;
-                        let mut consumed = 0usize;
-
-                        while consumed < rb.num_rows() {
-                            while rel_partition < window_len && remaining == 0 {
-                                rel_partition += 1;
-                                if rel_partition < window_len {
-                                    remaining =
-                                        shard.lengths[window_start + rel_partition] as usize;
-                                }
-                            }
-
-                            if rel_partition >= window_len {
-                                return Err(Error::Index {
-                                    message: format!(
-                                        "Shard has more rows than declared lengths in partition window [{}, {})",
-                                        window_start, window_end
-                                    ),
-                                    location: location!(),
-                                });
-                            }
-
-                            let to_take = std::cmp::min(remaining, rb.num_rows() - consumed);
-                            per_partition_batches[rel_partition].push(rb.slice(consumed, to_take));
-                            consumed += to_take;
-                            remaining -= to_take;
-                        }
-                    }
-
-                    while rel_partition < window_len && remaining == 0 {
-                        rel_partition += 1;
-                        if rel_partition < window_len {
-                            remaining = shard.lengths[window_start + rel_partition] as usize;
-                        }
-                    }
-
-                    if rel_partition != window_len {
-                        return Err(Error::Index {
-                            message: format!(
-                                "Shard has fewer rows than declared lengths in partition window [{}, {})",
-                                window_start, window_end
-                            ),
-                            location: location!(),
-                        });
-                    }
+            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
+                if accumulated_lengths[pid] == 0 {
+                    continue;
+                }
+                if batches.is_empty() {
+                    return Err(Error::Index {
+                        message: format!("No merged batches found for non-empty partition {}", pid),
+                        location: location!(),
+                    });
                 }
 
-                for (rel_partition, batches) in per_partition_batches.into_iter().enumerate() {
-                    let pid = window_start + rel_partition;
-                    if accumulated_lengths[pid] == 0 {
-                        continue;
-                    }
-                    if batches.is_empty() {
-                        return Err(Error::Index {
-                            message: format!(
-                                "No merged batches found for non-empty partition {} in window [{}, {})",
-                                pid, window_start, window_end
-                            ),
-                            location: location!(),
-                        });
-                    }
-
-                    let schema = batches[0].schema();
-                    let partition_batch = concat_batches(&schema, batches.iter())?;
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows_pq_transposed(w, partition_batch).await?;
-                    }
+                let schema = batches[0].schema();
+                let partition_batch = concat_batches(&schema, batches.iter())?;
+                if let Some(w) = v2w_opt.as_mut() {
+                    write_partition_rows_pq_transposed(w, partition_batch).await?;
                 }
             }
         }

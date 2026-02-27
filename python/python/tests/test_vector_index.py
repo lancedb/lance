@@ -188,6 +188,7 @@ def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch)
     # Keep this before other distributed vector merge tests so the process-level
     # lazy window size initialization reads this override.
     monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT", "2")
 
     data = create_table(nvec=3000, ndim=128)
     q = np.random.randn(128).astype(np.float32)
