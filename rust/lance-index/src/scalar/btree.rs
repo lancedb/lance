@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -1492,7 +1492,7 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let pages = match query {
+        let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
                 .pages_eq(&OrderableScalarValue(val.clone())),
@@ -1508,6 +1508,29 @@ impl ScalarIndex for BTreeIndex {
             )),
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
+
+        // For non-IsNull queries, also include null pages so that null row IDs
+        // are tracked in the result. Any comparison with NULL yields NULL, and
+        // we need this information for correct three-valued logic (e.g. NOT,
+        // OR). Without this, a query like `NOT(x = 0)` on data where 0 doesn't
+        // exist would incorrectly include NULL rows.
+        //
+        // We add them as Matches::Some (not Matches::All) so that
+        // FlatIndex::search() evaluates the predicate and correctly marks
+        // the rows as NULL rather than TRUE.
+        if !matches!(query, SargableQuery::IsNull()) {
+            let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
+            for &page_id in self
+                .page_lookup
+                .null_pages
+                .iter()
+                .chain(self.page_lookup.all_null_pages.iter())
+            {
+                if !existing.contains(&page_id) {
+                    pages.push(Matches::Some(page_id));
+                }
+            }
+        }
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
@@ -4188,6 +4211,111 @@ mod tests {
                     panic!("Btree search result should always be Exact.");
                 }
             }
+        }
+    }
+
+    /// Regression test: BTree search must track null row IDs for non-IsNull
+    /// queries, even when no pages match the queried value.
+    ///
+    /// Without this, `NOT(x = val)` when `val` is absent from the data would
+    /// produce an empty null set, causing NULL rows to incorrectly pass.
+    #[tokio::test]
+    async fn test_search_tracks_nulls_for_absent_value() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create data with 80% nulls so that training produces separate
+        // all-null pages (which are not in the BTree map). Non-null values
+        // are all in [100, 5099], so value 0 never appears.
+        let num_rows = 5000u64;
+        let values: Int32Array = (0..num_rows)
+            .map(|i| {
+                if i % 5 != 0 {
+                    None // 80% null
+                } else {
+                    Some(100 + i as i32) // non-null values in [100, 5099]
+                }
+            })
+            .collect();
+        let row_ids = UInt64Array::from_iter_values(0..num_rows);
+        let data = arrow_array::RecordBatch::try_from_iter(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+
+        let schema = data.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(data)]),
+        ));
+        train_btree_index(stream, test_store.as_ref(), num_rows, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Verify we have all-null pages (the bug depends on this)
+        assert!(
+            !index.page_lookup.all_null_pages.is_empty(),
+            "Test setup requires all-null pages; got null_pages={}, all_null_pages={}",
+            index.page_lookup.null_pages.len(),
+            index.page_lookup.all_null_pages.len(),
+        );
+
+        let metrics = NoOpMetricsCollector;
+
+        // Search for Equals(0) — value 0 doesn't exist in any page
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+                &metrics,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            SearchResult::Exact(set) => {
+                // No rows should be TRUE (value 0 doesn't exist)
+                assert!(set.true_rows().is_empty(), "No rows should match Equals(0)");
+                // NULL rows MUST be tracked as null
+                assert!(
+                    !set.null_rows().is_empty(),
+                    "Null rows must be tracked even when no pages match the value"
+                );
+            }
+            _ => panic!("BTree search should return Exact"),
+        }
+
+        // Also verify Range query tracks nulls when no values match
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(ScalarValue::Int32(Some(50))),
+                ),
+                &metrics,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            SearchResult::Exact(set) => {
+                assert!(set.true_rows().is_empty(), "No rows should be < 50");
+                assert!(
+                    !set.null_rows().is_empty(),
+                    "Null rows must be tracked for range queries too"
+                );
+            }
+            _ => panic!("BTree search should return Exact"),
         }
     }
 }
