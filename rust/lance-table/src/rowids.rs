@@ -422,14 +422,14 @@ impl RowIdSequence {
                     let mut holes_passed = 0;
                     ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
                         |addr| {
-                            let offset_no_holes = addr - range.start + offset_start;
-                            while bitmap_iter_pos < offset_no_holes {
+                            let position_in_range = addr - range.start;
+                            while bitmap_iter_pos < position_in_range {
                                 if !bitmap_iter.next().unwrap() {
                                     holes_passed += 1;
                                 }
                                 bitmap_iter_pos += 1;
                             }
-                            offset_no_holes - holes_passed
+                            offset_start + position_in_range - holes_passed
                         },
                     )));
                 }
