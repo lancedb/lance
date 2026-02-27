@@ -48,7 +48,7 @@ class BasicTypes2_1(UpgradeDowngradeTest):
             writer.write_batch(build_basic_types())
 
 
-@compat_test(min_version="2.0.0")
+@compat_test(min_version="0.39.0")
 class BasicTypes2_2(UpgradeDowngradeTest):
     """Test file format 2.2 compatibility with basic data types."""
 
