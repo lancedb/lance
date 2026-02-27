@@ -762,6 +762,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
             read_version: 1,
             tag: None,

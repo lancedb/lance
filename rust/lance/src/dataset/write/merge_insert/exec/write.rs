@@ -187,9 +187,8 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
-    /// Whether the ON columns match the schema's unenforced primary key.
-    /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
-    is_primary_key: bool,
+    /// Field IDs of the ON columns, used as merge_key_field_ids in the transaction.
+    merge_key_field_ids: Vec<i32>,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -206,19 +205,12 @@ impl FullSchemaMergeInsertExec {
             Boundedness::Bounded,
         );
 
-        // Check if ON columns match the schema's unenforced primary key
-        let field_ids: Vec<i32> = params
+        // Get field IDs for the ON columns to track the merge key in the transaction.
+        let merge_key_field_ids: Vec<i32> = params
             .on
             .iter()
             .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
             .collect();
-        let pk_field_ids: Vec<i32> = dataset
-            .schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
 
         Ok(Self {
             input,
@@ -230,7 +222,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
-            is_primary_key,
+            merge_key_field_ids,
         })
     }
 
@@ -785,7 +777,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
-            is_primary_key: self.is_primary_key,
+            merge_key_field_ids: self.merge_key_field_ids.clone(),
         }))
     }
 
@@ -851,7 +843,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let merged_generations = self.params.merged_generations.clone();
-        let is_primary_key = self.is_primary_key;
+        let merge_key_field_ids = self.merge_key_field_ids.clone();
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -904,13 +896,11 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let merge_state =
                 Mutex::into_inner(merge_state).expect("MergeState lock should be available");
             let delete_row_addrs_clone = merge_state.delete_row_addrs;
-            let inserted_rows_filter = if is_primary_key {
-                Some(KeyExistenceFilter::from_bloom_filter(
-                    &merge_state.inserted_rows_filter,
-                ))
-            } else {
-                None
-            };
+            // Always include the bloom filter for conflict detection.
+            // The merge key is tracked separately in merge_key_field_ids.
+            let inserted_rows_filter = Some(KeyExistenceFilter::from_bloom_filter(
+                &merge_state.inserted_rows_filter,
+            ));
 
             let (updated_fragments, removed_fragment_ids) =
                 apply_deletions(&dataset, &delete_row_addrs_clone).await?;
@@ -930,6 +920,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: inserted_rows_filter.clone(),
+                merge_key_field_ids: merge_key_field_ids.clone(),
             };
 
             // Step 5: Create and store the transaction

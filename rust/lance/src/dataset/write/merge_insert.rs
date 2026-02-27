@@ -1590,6 +1590,7 @@ impl MergeInsertJob {
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
+                merge_key_field_ids: vec![],
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1665,6 +1666,7 @@ impl MergeInsertJob {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: None, // not implemented for v1
+                merge_key_field_ids: vec![],
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));

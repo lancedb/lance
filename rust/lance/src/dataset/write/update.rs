@@ -392,6 +392,7 @@ impl UpdateJob {
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
             inserted_rows_filter: None,
+            merge_key_field_ids: vec![],
         };
 
         let transaction = Transaction::new(dataset.manifest.version, operation, None);

@@ -284,6 +284,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                     .collect(),
                 update_mode: None,
                 inserted_rows_filter: None, // Delete-only operations don't insert rows
+                merge_key_field_ids: vec![],
             };
 
             let transaction = Transaction::new(dataset.manifest.version, operation, None);

@@ -431,6 +431,7 @@ fn convert_to_java_operation_inner<'local>(
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
+            merge_key_field_ids: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -1030,6 +1031,7 @@ fn convert_to_rust_operation(
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             }
         }
         "DataReplacement" => {

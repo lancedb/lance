@@ -355,20 +355,35 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Update {
             inserted_rows_filter: self_inserted_rows_filter,
             merged_generations: self_merged_generations,
+            merge_key_field_ids: self_merge_key,
             ..
         } = &self.transaction.operation
         {
             if let Operation::Update {
                 inserted_rows_filter: other_inserted_rows_filter,
+                merge_key_field_ids: other_merge_key,
                 ..
             } = &other_transaction.operation
             {
-                // The presence of inserted_rows_filter means this is a primary key operation
-                // and strict conflict detection should be applied.
+                // Check merge key compatibility first.
+                // If both transactions are merge inserts (non-empty merge_key_field_ids),
+                // they must use the same merge key for their bloom filters to be comparable.
+                let both_are_merge_inserts =
+                    !self_merge_key.is_empty() && !other_merge_key.is_empty();
+                if both_are_merge_inserts && self_merge_key != other_merge_key {
+                    // Different merge keys — bloom filters are incompatible.
+                    return Err(self.retryable_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ));
+                }
+
+                // Check inserted rows for overlap using bloom filters.
                 match (self_inserted_rows_filter, other_inserted_rows_filter) {
                     (Some(self_keys), Some(other_keys)) => {
                         if self_keys.field_ids != other_keys.field_ids {
-                            // Different key columns - can't verify conflicts
+                            // Different key columns in bloom filter — can't compare.
                             return Err(self.retryable_conflict_err(
                                 other_transaction,
                                 other_version,
@@ -396,17 +411,17 @@ impl<'a> TransactionRebase<'a> {
                             ));
                         }
                     }
-                    (Some(_), None) => {
-                        // Current transaction has primary key conflict detection but
-                        // the already committed transaction doesn't have a filter.
-                        // We can't determine what rows were inserted by the other
-                        // transaction, so we must fail to be safe.
+                    (Some(_), None) | (None, Some(_)) => {
+                        // One transaction has a bloom filter and the other doesn't.
+                        // We can't determine whether the untracked transaction's
+                        // inserts overlap, so we must treat this as a conflict.
                         return Err(self.retryable_conflict_err(
                             other_transaction,
                             other_version,
                             location!(),
                         ));
                     }
+                    // Neither transaction tracks inserts — backward-compatible case.
                     _ => {}
                 }
             }
@@ -1905,6 +1920,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
+            merge_key_field_ids: vec![],
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1917,6 +1933,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1932,6 +1949,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -2034,6 +2052,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -2049,6 +2068,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
         ];
         let transactions =
@@ -2171,6 +2191,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    merge_key_field_ids: vec![],
                 },
             ),
             (
@@ -2184,6 +2205,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    merge_key_field_ids: vec![],
                 },
             ),
             (
@@ -2343,6 +2365,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
             create_update_config_for_test(
                 Some(HashMap::from_iter(vec![(
@@ -2549,6 +2572,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    merge_key_field_ids: vec![],
                 },
                 [
                     Compatible,    // append
@@ -2973,6 +2997,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                merge_key_field_ids: vec![],
             },
         ];
 
@@ -3625,5 +3650,259 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    // =========================================================================
+    // Tests for merge_key_field_ids conflict detection
+    // =========================================================================
+
+    use crate::dataset::write::merge_insert::inserted_rows::{
+        KeyExistenceFilter, KeyExistenceFilterBuilder, KeyValue,
+    };
+
+    /// Build a KeyExistenceFilter with a single UInt32 key.
+    fn make_bloom_filter(field_id: i32, key: u32) -> KeyExistenceFilter {
+        let mut builder = KeyExistenceFilterBuilder::new(vec![field_id]);
+        builder.insert(KeyValue::UInt64(key as u64)).unwrap();
+        KeyExistenceFilter::from_bloom_filter(&builder)
+    }
+
+    #[test]
+    fn test_different_merge_keys_should_conflict() {
+        let filter_on_id = make_bloom_filter(0, 100);
+        let filter_on_name = make_bloom_filter(1, 200);
+
+        let to_commit_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(10)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter_on_id),
+            merge_key_field_ids: vec![0], // merge on field 0 ("id")
+        };
+        let to_commit_txn = Transaction::new(0, to_commit_op.clone(), None);
+
+        let committed_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(20)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter_on_name),
+            merge_key_field_ids: vec![1], // merge on field 1 ("name")
+        };
+        let committed_txn = Transaction::new(0, committed_op, None);
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&to_commit_op).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Different merge keys should conflict. Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_same_merge_key_disjoint_bloom_filters_should_not_conflict() {
+        let filter1 = make_bloom_filter(0, 100);
+        let filter2 = make_bloom_filter(0, 200);
+
+        let to_commit_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(10)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter1),
+            merge_key_field_ids: vec![0],
+        };
+        let to_commit_txn = Transaction::new(0, to_commit_op.clone(), None);
+
+        let committed_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(20)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter2),
+            merge_key_field_ids: vec![0],
+        };
+        let committed_txn = Transaction::new(0, committed_op, None);
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&to_commit_op).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            result.is_ok(),
+            "Same merge key with disjoint bloom filters should not conflict. Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_same_merge_key_overlapping_bloom_filters_should_conflict() {
+        let filter1 = make_bloom_filter(0, 100);
+        let filter2 = make_bloom_filter(0, 100);
+
+        let to_commit_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(10)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter1),
+            merge_key_field_ids: vec![0],
+        };
+        let to_commit_txn = Transaction::new(0, to_commit_op.clone(), None);
+
+        let committed_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(20)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter2),
+            merge_key_field_ids: vec![0],
+        };
+        let committed_txn = Transaction::new(0, committed_op, None);
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&to_commit_op).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Same merge key with overlapping bloom filters should conflict. Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_merge_insert_vs_non_merge_update_with_bloom_filter_should_conflict() {
+        let filter = make_bloom_filter(0, 100);
+
+        // Merge insert (has merge_key_field_ids and bloom filter)
+        let to_commit_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(10)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: Some(filter),
+            merge_key_field_ids: vec![0],
+        };
+        let to_commit_txn = Transaction::new(0, to_commit_op.clone(), None);
+
+        // Regular update (no merge key, no bloom filter)
+        let committed_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(20)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            merge_key_field_ids: vec![],
+        };
+        let committed_txn = Transaction::new(0, committed_op, None);
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&to_commit_op).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "(Some, None) bloom filter asymmetry should conflict. Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_merge_updates_both_none_should_not_conflict() {
+        // Both are regular updates with no bloom filters and no merge keys
+        let to_commit_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(10)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            merge_key_field_ids: vec![],
+        };
+        let to_commit_txn = Transaction::new(0, to_commit_op.clone(), None);
+
+        let committed_op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(20)],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            merge_key_field_ids: vec![],
+        };
+        let committed_txn = Transaction::new(0, committed_op, None);
+
+        let mut rebase = TransactionRebase {
+            transaction: to_commit_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&to_commit_op).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&committed_txn, 1);
+        assert!(
+            result.is_ok(),
+            "(None, None) should not conflict for backward compat. Got: {:?}",
+            result
+        );
     }
 }

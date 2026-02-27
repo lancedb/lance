@@ -233,6 +233,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
+                    merge_key_field_ids: vec![],
                 };
                 Ok(Self(op))
             }

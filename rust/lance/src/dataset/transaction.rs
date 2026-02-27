@@ -255,6 +255,10 @@ pub enum Operation {
         /// Optional filter for detecting conflicts on inserted row keys.
         /// Only tracks keys from INSERT operations during merge insert, not updates.
         inserted_rows_filter: Option<KeyExistenceFilter>,
+        /// Field IDs of the columns used as the merge key (the ON columns).
+        /// Non-empty for merge insert operations; empty for regular updates.
+        /// Concurrent merge inserts with different merge keys are incompatible.
+        merge_key_field_ids: Vec<i32>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -454,6 +458,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
+                    merge_key_field_ids: a_merge_key,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -464,6 +469,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
+                    merge_key_field_ids: b_merge_key,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -477,6 +483,7 @@ impl PartialEq for Operation {
                     )
                     && a_update_mode == b_update_mode
                     && a_inserted_rows_filter == b_inserted_rows_filter
+                    && a_merge_key == b_merge_key
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -2889,6 +2896,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows,
+                merge_key_field_ids,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2913,6 +2921,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows_filter: inserted_rows
                     .map(|ik| KeyExistenceFilter::try_from(&ik))
                     .transpose()?,
+                merge_key_field_ids,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -3212,6 +3221,7 @@ impl From<&Transaction> for pb::Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
+                merge_key_field_ids,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -3233,6 +3243,7 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or(0),
                 inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
+                merge_key_field_ids: merge_key_field_ids.clone(),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
