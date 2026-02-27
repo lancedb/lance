@@ -1617,6 +1617,38 @@ fn inner_get_config<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_lance_file_format_version(&mut env, java_dataset),
+        JObject::null().into()
+    )
+}
+
+fn inner_get_lance_file_format_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JString<'local>> {
+    let version_string = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let version = dataset_guard
+            .inner
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
+        version.to_string()
+    };
+
+    Ok(env
+        .new_string(&version_string)
+        .expect("Failed to create Java String"))
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_lance_Dataset_nativeTake(
     mut env: JNIEnv,
     java_dataset: JObject,

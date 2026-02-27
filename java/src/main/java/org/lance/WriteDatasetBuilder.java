@@ -79,7 +79,7 @@ public class WriteDatasetBuilder {
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
-  private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
+  private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
   private Session session;
@@ -268,10 +268,10 @@ public class WriteDatasetBuilder {
   /**
    * Sets the data storage version.
    *
-   * @param dataStorageVersion The Lance file version to use
+   * @param dataStorageVersion The Lance file version to use (e.g., "legacy", "stable", "2.0")
    * @return this builder instance
    */
-  public WriteDatasetBuilder dataStorageVersion(WriteParams.LanceFileVersion dataStorageVersion) {
+  public WriteDatasetBuilder dataStorageVersion(String dataStorageVersion) {
     this.dataStorageVersion = Optional.of(dataStorageVersion);
     return this;
   }

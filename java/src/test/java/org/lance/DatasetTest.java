@@ -118,6 +118,33 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Test default version (V2_0)
+      String defaultPath = tempDir.resolve("default_version").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, defaultPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_0, dataset.getLanceFileFormatVersion());
+      }
+
+      // Test LEGACY version
+      String legacyPath = tempDir.resolve("legacy_version").toString();
+      try (Dataset legacyDataset =
+          Dataset.write()
+              .allocator(allocator)
+              .uri(legacyPath)
+              .schema(testDataset.getSchema())
+              .mode(WriteParams.WriteMode.CREATE)
+              .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_LEGACY)
+              .execute()) {
+        assertEquals(
+            LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
+      }
+    }
+  }
+
+  @Test
   void testCreateDirNotExist(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
