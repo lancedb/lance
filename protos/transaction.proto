@@ -209,11 +209,9 @@ message Transaction {
   }
 
   // A filter for checking key existence in set of rows inserted by a merge insert operation.
-  // Only created when the merge insert's ON columns match the schema's unenforced primary key.
-  // The presence of this filter indicates strict primary key conflict detection should be used.
   // Can use either an exact set (for small row counts) or a Bloom filter (for large row counts).
   message KeyExistenceFilter {
-    // Field IDs of columns participating in the key (must match unenforced primary key).
+    // Field IDs of columns participating in the key.
     repeated int32 field_ids = 1;
     // The underlying data structure storing the key hashes.
     oneof data {
@@ -245,6 +243,11 @@ message Transaction {
     // Filter for checking existence of keys in newly inserted rows, used for conflict detection.
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
+    // Field IDs of the columns used as the merge key (the ON columns in merge insert).
+    // When non-empty, this indicates a merge insert operation. Concurrent merge inserts
+    // with different merge keys are always treated as conflicts because their bloom
+    // filters are incompatible. Empty for non-merge-insert updates.
+    repeated int32 merge_key_field_ids = 9;
   }
 
   // The mode of update operation
