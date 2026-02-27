@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -1303,11 +1303,43 @@ impl BTreeIndex {
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
-        let new_input = Arc::new(OneShotExec::new(new_data));
+        // Collect new data row IDs so we can remove stale entries from the old
+        // index. When stable row IDs are used, the _rowid values are stable row
+        // IDs (not physical addresses), so fragment-based filtering alone is
+        // insufficient — an updated row keeps its stable row ID but moves to a
+        // new fragment. Without this dedup step, both the old (stale) and new
+        // entries would survive, causing duplicate row IDs in the merged index.
+        let new_schema = new_data.schema();
+        let new_batches: Vec<RecordBatch> = new_data.try_collect().await?;
+        let new_row_ids: HashSet<u64> = new_batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .expect("expected UInt64Array for row_id column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let new_input = Arc::new(OneShotExec::new(Box::pin(
+            RecordBatchStreamAdapter::new(
+                new_schema,
+                futures::stream::iter(new_batches.into_iter().map(Ok)),
+            ),
+        )));
+
         let old_stream = self.into_data_stream().await?;
         let old_stream = match valid_old_fragments {
             Some(valid_frags) => filter_row_ids_by_fragments(old_stream, valid_frags),
             None => old_stream,
+        };
+        // Remove old entries for row IDs that appear in the new data
+        let old_stream = if new_row_ids.is_empty() {
+            old_stream
+        } else {
+            filter_out_row_ids(old_stream, new_row_ids)
         };
         let old_input = Arc::new(OneShotExec::new(old_stream));
         debug_assert_eq!(
@@ -1355,6 +1387,28 @@ fn filter_row_ids_by_fragments(
         let mask: arrow_array::BooleanArray = row_ids
             .iter()
             .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+            .collect();
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// Filter a stream to remove rows whose row IDs are in the given set.
+/// Used during index optimization to remove stale entries for updated rows.
+fn filter_out_row_ids(
+    stream: SendableRecordBatchStream,
+    row_ids_to_remove: HashSet<u64>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .expect("expected UInt64Array for row_id column");
+        let mask: arrow_array::BooleanArray = row_ids
+            .iter()
+            .map(|id| id.map(|id| !row_ids_to_remove.contains(&id)))
             .collect();
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });

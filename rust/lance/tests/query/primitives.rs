@@ -9,10 +9,11 @@ use arrow_array::{
     LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
+use lance::dataset::{InsertBuilder, UpdateBuilder, WriteParams};
 use lance::Dataset;
 
 use lance_datagen::{array, gen_batch, ArrayGeneratorExt, RowCount};
-use lance_index::IndexType;
+use lance_index::{DatasetIndexExt, IndexType};
 
 use super::{test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
@@ -402,4 +403,75 @@ async fn test_query_decimal(#[case] data_type: DataType) {
             test_filter(&original, &ds, "value is not null").await;
         })
         .await
+}
+
+/// Regression test: BTree index optimize after update should not panic with
+/// "RowAddrTreeMap::from_sorted_iter called with non-sorted input".
+///
+/// Sequence: Write(SRID) → BTree(int_col) → Update(int_col) → OptimizeIndices →
+/// filtered scan. The optimize merges old and new index data; the merged pages
+/// must have properly sorted row addresses.
+#[tokio::test]
+async fn test_btree_optimize_after_update() {
+    use lance_index::scalar::ScalarIndexParams;
+
+    // Create 100 rows with an int_col and a category column for selective updates
+    let ids: Vec<i32> = (0..100).collect();
+    let values: Vec<i32> = (0..100).collect();
+    let categories: Vec<&str> = (0..100)
+        .map(|i| if i % 5 == 0 { "A" } else { "B" })
+        .collect();
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+        ("int_col", Arc::new(Int32Array::from(values)) as ArrayRef),
+        (
+            "category",
+            Arc::new(StringArray::from(categories)) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    // Write with stable row IDs
+    let mut ds = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    // Create BTree index on int_col
+    ds.create_index_builder(
+        &["int_col"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .await
+    .unwrap();
+
+    // Update int_col for category='A' rows (20% of data)
+    let result = UpdateBuilder::new(Arc::new(ds))
+        .update_where("category = 'A'")
+        .unwrap()
+        .set("int_col", "-1")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    ds = result.new_dataset.as_ref().clone();
+
+    // Optimize indices — merges old BTree pages with new data
+    ds.optimize_indices(&Default::default()).await.unwrap();
+
+    // Filtered scan should not panic
+    let mut scanner = ds.scan();
+    scanner.filter("int_col < 200").unwrap();
+    let result = scanner.try_into_batch().await.unwrap();
+
+    // All 100 rows should pass (20 updated to -1, 80 unchanged, all < 200)
+    assert_eq!(result.num_rows(), 100);
 }
