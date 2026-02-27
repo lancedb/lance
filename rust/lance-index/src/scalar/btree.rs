@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -59,7 +59,7 @@ use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
 use object_store::path::Path;
 use rangemap::RangeInclusiveMap;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
 use tracing::{info, instrument};
@@ -1311,7 +1311,7 @@ impl BTreeIndex {
         // entries would survive, causing duplicate row IDs in the merged index.
         let new_schema = new_data.schema();
         let new_batches: Vec<RecordBatch> = new_data.try_collect().await?;
-        let new_row_ids: HashSet<u64> = new_batches
+        let new_row_ids: RoaringTreemap = new_batches
             .iter()
             .flat_map(|batch| {
                 batch[ROW_ID]
@@ -1323,12 +1323,10 @@ impl BTreeIndex {
                     .copied()
             })
             .collect();
-        let new_input = Arc::new(OneShotExec::new(Box::pin(
-            RecordBatchStreamAdapter::new(
-                new_schema,
-                futures::stream::iter(new_batches.into_iter().map(Ok)),
-            ),
-        )));
+        let new_input = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema,
+            futures::stream::iter(new_batches.into_iter().map(Ok)),
+        ))));
 
         let old_stream = self.into_data_stream().await?;
         let old_stream = match valid_old_fragments {
@@ -1397,7 +1395,7 @@ fn filter_row_ids_by_fragments(
 /// Used during index optimization to remove stale entries for updated rows.
 fn filter_out_row_ids(
     stream: SendableRecordBatchStream,
-    row_ids_to_remove: HashSet<u64>,
+    row_ids_to_remove: RoaringTreemap,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let filtered = stream.map(move |batch_result| {
@@ -1408,7 +1406,7 @@ fn filter_out_row_ids(
             .expect("expected UInt64Array for row_id column");
         let mask: arrow_array::BooleanArray = row_ids
             .iter()
-            .map(|id| id.map(|id| !row_ids_to_remove.contains(&id)))
+            .map(|id| id.map(|id| !row_ids_to_remove.contains(id)))
             .collect();
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
