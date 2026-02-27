@@ -539,6 +539,7 @@ mod tests {
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Legacy,
             LanceFileVersion::Stable
         )]
@@ -570,6 +571,7 @@ mod tests {
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Legacy,
             LanceFileVersion::Stable
         )]

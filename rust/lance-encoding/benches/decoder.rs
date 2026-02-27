@@ -95,7 +95,11 @@ fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_fsl");
     const NUM_BYTES: u64 = 1024 * 1024 * 128;
-    for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+    for version in [
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ] {
         for data_type in PRIMITIVE_TYPES_FOR_FSL {
             for dimension in [4, 16, 32, 64, 128] {
                 let nullable_choices: &[bool] = if version == LanceFileVersion::V2_0 {
