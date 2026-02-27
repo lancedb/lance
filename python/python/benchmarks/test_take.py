@@ -127,7 +127,9 @@ def gen_ranges(total_rows, num_rows):
 @pytest.mark.benchmark()
 @pytest.mark.parametrize("file_size", [1024 * 1024], ids=["1MB"])
 @pytest.mark.parametrize(
-    "lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")], ids=["V2_0", "V2_1"]
+    "lance_format_version",
+    [("2.0", "V2_0"), ("2.1", "V2_1"), ("2.2", "V2_2")],
+    ids=["V2_0", "V2_1", "V2_2"],
 )
 @pytest.mark.parametrize("num_rows", [100, 1000], ids=["100rows", "1000rows"])
 @pytest.mark.parametrize(

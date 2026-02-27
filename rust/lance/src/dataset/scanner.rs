@@ -3386,7 +3386,7 @@ impl Scanner {
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }

@@ -184,9 +184,9 @@ must be loaded at initialization time and placed in the search cache.
 | 12               | Number of 8-byte words in block N   |
 | 4                | Log2 of number of values in block N |
 
-The last 4 bits are special and we just store 0 today. This is because the protobuf contains the number of
-values (not required to be a power of 2) in the entire disk page. We can subtract the values in the other blocks
-to get the number of values in the last block.
+For all chunks except the last, the lower 4 bits store `log2(num_values)` and `num_values` must be a power of two.
+For the last chunk, these bits are set to `0`. The protobuf stores the total number of values in the page, so readers
+can derive the final chunk size by subtracting the values from earlier chunks.
 
 #### Buffer 2 (Dictionary, optional)
 
@@ -402,7 +402,8 @@ are always accessed together.
 
 Packed struct is always opt-in (see section on configuration below).
 
-Currently packed struct is limited to fixed-width data.
+In Lance 2.1, packed struct is limited to fixed-width children (`PackedStruct`).
+Starting with Lance 2.2, variable-width children are also supported via `VariablePackedStruct`.
 
 ### Fixed Size List
 
@@ -445,9 +446,9 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
-| Rle             | ❓                    | ❌                       | ✅ (2.1)                   |
+| Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
-| General         | ❓                    | ☑️ (2.1)                 | ✅ (2.1)                   |
+| General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
 in various contexts.

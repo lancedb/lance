@@ -64,6 +64,7 @@ use crate::{
 };
 
 use arrow_array::{cast::AsArray, types::UInt64Type};
+use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
@@ -463,9 +464,11 @@ impl DefaultCompressionStrategy {
     /// Build compressor based on parameters for variable-width data
     fn build_variable_width_compressor(
         &self,
-        params: &CompressionFieldParams,
+        field: &Field,
         data: &VariableWidthBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
+        let params = self.get_merged_field_params(field);
+        let compression = params.compression.as_deref();
         if data.bits_per_offset != 32 && data.bits_per_offset != 64 {
             return Err(Error::invalid_input(
                 format!(
@@ -480,33 +483,28 @@ impl DefaultCompressionStrategy {
         let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
         let max_len = data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
-        // 1. Check for explicit "none" compression
-        if params.compression.as_deref() == Some("none") {
+        // Explicitly disable all compression.
+        if compression == Some("none") {
             return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
         }
 
-        // 2. Check for explicit "fsst" compression
-        if params.compression.as_deref() == Some("fsst") {
-            return Ok(Box::new(FsstMiniBlockEncoder::new(params.minichunk_size)));
-        }
+        let use_fsst = compression == Some("fsst")
+            || (!matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+                && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                && data_size >= FSST_LEAST_INPUT_SIZE as u64);
 
-        // 3. Choose base encoder (FSST or Binary) based on data characteristics
-        let mut base_encoder: Box<dyn MiniBlockCompressor> = if max_len
-            >= FSST_LEAST_INPUT_MAX_LENGTH
-            && data_size >= FSST_LEAST_INPUT_SIZE as u64
-        {
+        // Choose base encoder (FSST or Binary) once.
+        let mut base_encoder: Box<dyn MiniBlockCompressor> = if use_fsst {
             Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
         } else {
             Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
         };
 
-        // 4. Apply general compression if configured
-        if let Some(compression_scheme) = &params.compression {
-            if compression_scheme != "none" && compression_scheme != "fsst" {
-                let scheme: CompressionScheme = compression_scheme.parse()?;
-                let config = CompressionConfig::new(scheme, params.compression_level);
-                base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
-            }
+        // Wrap with general compression when configured (except FSST / none).
+        if let Some(compression_scheme) = compression.filter(|scheme| *scheme != "fsst") {
+            let scheme: CompressionScheme = compression_scheme.parse()?;
+            let config = CompressionConfig::new(scheme, params.compression_level);
+            base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
         }
 
         Ok(base_encoder)
@@ -533,14 +531,13 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        let field_params = self.get_merged_field_params(field);
-
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
+                let field_params = self.get_merged_field_params(field);
                 self.build_fixed_width_compressor(&field_params, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
-                self.build_variable_width_compressor(&field_params, variable_width_data)
+                self.build_variable_width_compressor(field, variable_width_data)
             }
             DataBlock::Struct(struct_data_block) => {
                 // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
@@ -611,8 +608,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
             }
             DataBlock::VariableWidth(variable_width) => {
+                let compression = field_params.compression.as_deref();
                 // Check for explicit "none" compression
-                if field_params.compression.as_deref() == Some("none") {
+                if compression == Some("none") {
                     return Ok(Box::new(VariableEncoder::default()));
                 }
 
@@ -624,11 +622,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // TODO: Could maybe use median here
 
                 let per_value_requested =
-                    if let Some(compression) = field_params.compression.as_deref() {
-                        compression != "fsst"
-                    } else {
-                        false
-                    };
+                    compression.is_some_and(|compression| compression != "fsst");
 
                 if (max_len > 32 * 1024 || per_value_requested)
                     && data_size >= FSST_LEAST_INPUT_SIZE as u64
@@ -637,16 +631,14 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
 
                 if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
-                    let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
-                    let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-
                     let variable_compression = Box::new(VariableEncoder::default());
+                    let use_fsst = compression == Some("fsst")
+                        || (!matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+                            && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                            && data_size >= FSST_LEAST_INPUT_SIZE as u64);
 
-                    // Use FSST if explicitly requested or if data characteristics warrant it
-                    if field_params.compression.as_deref() == Some("fsst")
-                        || (max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                            && data_size >= FSST_LEAST_INPUT_SIZE as u64)
-                    {
+                    // Use FSST if explicitly requested or if data characteristics warrant it.
+                    if use_fsst {
                         Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
                     } else {
                         Ok(variable_compression)
@@ -1229,6 +1221,10 @@ mod tests {
         DataBlock::VariableWidth(block)
     }
 
+    fn create_fsst_candidate_variable_width_block() -> DataBlock {
+        create_variable_width_block(32, 4096, FSST_LEAST_INPUT_MAX_LENGTH as usize + 16)
+    }
+
     #[test]
     fn test_parameter_based_compression() {
         let mut params = CompressionParams::new();
@@ -1414,6 +1410,92 @@ mod tests {
         let compressor = strategy.create_per_value(&field, &variable_data).unwrap();
         let (_block, encoding) = compressor.compress(variable_data).unwrap();
         check_uncompressed_encoding(&encoding, true);
+    }
+
+    #[test]
+    fn test_auto_fsst_disabled_for_binary_fields() {
+        let strategy = DefaultCompressionStrategy::new();
+        let field = create_test_field("bytes", DataType::Binary);
+        let variable_data = create_fsst_candidate_variable_width_block();
+
+        let miniblock = strategy
+            .create_miniblock_compressor(&field, &variable_data)
+            .unwrap();
+        let miniblock_debug = format!("{:?}", miniblock);
+        assert!(
+            miniblock_debug.contains("BinaryMiniBlockEncoder"),
+            "expected BinaryMiniBlockEncoder, got: {miniblock_debug}"
+        );
+        assert!(
+            !miniblock_debug.contains("FsstMiniBlockEncoder"),
+            "did not expect FsstMiniBlockEncoder, got: {miniblock_debug}"
+        );
+
+        let per_value = strategy.create_per_value(&field, &variable_data).unwrap();
+        let per_value_debug = format!("{:?}", per_value);
+        assert!(
+            per_value_debug.contains("VariableEncoder"),
+            "expected VariableEncoder, got: {per_value_debug}"
+        );
+        assert!(
+            !per_value_debug.contains("FsstPerValueEncoder"),
+            "did not expect FsstPerValueEncoder, got: {per_value_debug}"
+        );
+    }
+
+    #[test]
+    fn test_auto_fsst_still_enabled_for_utf8_fields() {
+        let strategy = DefaultCompressionStrategy::new();
+        let field = create_test_field("text", DataType::Utf8);
+        let variable_data = create_fsst_candidate_variable_width_block();
+
+        let miniblock = strategy
+            .create_miniblock_compressor(&field, &variable_data)
+            .unwrap();
+        let miniblock_debug = format!("{:?}", miniblock);
+        assert!(
+            miniblock_debug.contains("FsstMiniBlockEncoder"),
+            "expected FsstMiniBlockEncoder, got: {miniblock_debug}"
+        );
+
+        let per_value = strategy.create_per_value(&field, &variable_data).unwrap();
+        let per_value_debug = format!("{:?}", per_value);
+        assert!(
+            per_value_debug.contains("FsstPerValueEncoder"),
+            "expected FsstPerValueEncoder, got: {per_value_debug}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_fsst_still_supported_for_binary_fields() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "bytes".to_string(),
+            CompressionFieldParams {
+                compression: Some("fsst".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy = DefaultCompressionStrategy::with_params(params);
+        let field = create_test_field("bytes", DataType::Binary);
+        let variable_data = create_fsst_candidate_variable_width_block();
+
+        let miniblock = strategy
+            .create_miniblock_compressor(&field, &variable_data)
+            .unwrap();
+        let miniblock_debug = format!("{:?}", miniblock);
+        assert!(
+            miniblock_debug.contains("FsstMiniBlockEncoder"),
+            "expected FsstMiniBlockEncoder, got: {miniblock_debug}"
+        );
+
+        let per_value = strategy.create_per_value(&field, &variable_data).unwrap();
+        let per_value_debug = format!("{:?}", per_value);
+        assert!(
+            per_value_debug.contains("FsstPerValueEncoder"),
+            "expected FsstPerValueEncoder, got: {per_value_debug}"
+        );
     }
 
     #[test]

@@ -32,9 +32,44 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 
 ### Blob Type for Large Binary Objects
 
-Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Unlike regular binary columns, blobs are stored out-of-line and support lazy loading, which means you can read portions of the data without loading everything into memory.
+Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Unlike regular binary columns, blobs support lazy loading, which means you can read portions of the data without loading everything into memory.
 
-To create a blob column, add the `lance-encoding:blob` metadata to a `LargeBinary` field:
+For new datasets, use blob v2 (`lance.blob.v2`) via `blob_field` and `blob_array`.
+
+Blob versioning follows dataset file format rules:
+
+- `data_storage_version` is the Lance file format version of a dataset.
+- A dataset's `data_storage_version` is fixed once created.
+- For `data_storage_version >= 2.2`, legacy blob metadata (`lance-encoding:blob`) is rejected on write.
+- Legacy metadata-based blob write remains available for `0.1`, `2.0`, and `2.1`.
+
+```python
+import lance
+import pyarrow as pa
+from lance import blob_array, blob_field
+
+schema = pa.schema([
+    pa.field("id", pa.int64()),
+    blob_field("video"),
+])
+
+table = pa.table(
+    {
+        "id": [1],
+        "video": blob_array([b"sample-video-bytes"]),
+    },
+    schema=schema,
+)
+
+ds = lance.write_dataset(table, "./videos_v22.lance", data_storage_version="2.2")
+blob = ds.take_blobs("video", indices=[0])[0]
+with blob as f:
+    payload = f.read()
+```
+
+For legacy compatibility (`data_storage_version <= 2.1`), you can still write blob columns using `LargeBinary` with `lance-encoding:blob=true`.
+
+To create a blob column with the legacy path, add the `lance-encoding:blob` metadata to a `LargeBinary` field:
 
 ```python
 import pyarrow as pa
@@ -58,7 +93,12 @@ table = pa.table({
     "video": [video_data],
 }, schema=schema)
 
-ds = lance.write_dataset(table, "./videos.lance", schema=schema)
+ds = lance.write_dataset(
+    table,
+    "./videos_legacy.lance",
+    schema=schema,
+    data_storage_version="2.1",
+)
 ```
 
 To read blob data, use `take_blobs()` which returns file-like objects for lazy reading:
@@ -283,6 +323,7 @@ ds = lance.write_dataset(table, "./with_metadata.lance")
 ### Map Types
 
 Store key-value pairs with dynamic keys:
+Map writes require Lance file format version 2.2 or later.
 
 ```python
 import lance
@@ -301,7 +342,7 @@ table = pa.Table.from_pydict({
     ],
 }, schema=schema)
 
-ds = lance.write_dataset(table, "./with_maps.lance")
+ds = lance.write_dataset(table, "./with_maps.lance", data_storage_version="2.2")
 ```
 
 ## Data Type Mapping for Integrations
@@ -326,7 +367,7 @@ When integrating Lance with other systems (like Apache Flink, Spark, or Presto),
 | `TIMESTAMP WITH LOCAL TIMEZONE` | `Timestamp` | With timezone info |
 | `BINARY` / `VARBINARY` | `Binary` | |
 | `BYTES` | `Binary` | |
-| `BLOB` | `LargeBinary` with `lance-encoding:blob` | Large binary objects with lazy loading |
+| `BLOB` | Blob v2 extension type (`lance.blob.v2`) | Use `blob_field` / `blob_array` for new datasets; legacy metadata path applies to `data_storage_version <= 2.1` |
 | `ARRAY<T>` | `List(T)` | Variable-length array |
 | `ARRAY<T>(n)` | `FixedSizeList(T, n)` | Fixed-length array (vectors) |
 | `ROW` / `STRUCT` | `Struct` | Nested structure |
