@@ -184,6 +184,27 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):
+    # Keep this before other distributed vector merge tests so the process-level
+    # lazy window size initialization reads this override.
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
+
+    data = create_table(nvec=3000, ndim=128)
+    q = np.random.randn(128).astype(np.float32)
+    assert_distributed_vector_consistency(
+        data,
+        "vector",
+        index_type="IVF_PQ",
+        index_params={"num_partitions": 10, "num_sub_vectors": 16},
+        queries=[q],
+        topk=10,
+        world=2,
+        tmp_path=tmp_path,
+        similarity_metric="recall",
+        similarity_threshold=0.80,
+    )
+
+
 @pytest.mark.parametrize(
     "fixture_name,index_type,index_params,similarity_threshold",
     [
