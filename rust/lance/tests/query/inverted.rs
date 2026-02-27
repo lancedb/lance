@@ -311,9 +311,7 @@ async fn test_fts_after_delete_with_stable_row_ids() {
         .unwrap();
 
     // Delete some rows — these will still be referenced by the FTS index
-    ds.delete("id IN (0, 1, 2, 3, 4)")
-        .await
-        .unwrap();
+    ds.delete("id IN (0, 1, 2, 3, 4)").await.unwrap();
 
     // FTS query for "shared" — matches ALL rows including deleted ones.
     // Before the fix, this would crash with a merge size mismatch.
