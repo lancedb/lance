@@ -621,7 +621,8 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 //
                 // TODO: Could maybe use median here
 
-                let per_value_requested = compression.is_some_and(|compression| compression != "fsst");
+                let per_value_requested =
+                    compression.is_some_and(|compression| compression != "fsst");
 
                 if (max_len > 32 * 1024 || per_value_requested)
                     && data_size >= FSST_LEAST_INPUT_SIZE as u64
