@@ -26,6 +26,19 @@ pub const DICT_DIVISOR_META_KEY: &str = "lance-encoding:dict-divisor";
 /// Example: 0.8 means use dict if encoded size < 80% of raw size
 /// Default: 0.8
 pub const DICT_SIZE_RATIO_META_KEY: &str = "lance-encoding:dict-size-ratio";
+/// Metadata key for selecting general compression scheme for dictionary values
+/// Valid values: "lz4", "zstd", "none"
+pub const DICT_VALUES_COMPRESSION_META_KEY: &str = "lance-encoding:dict-values-compression";
+/// Metadata key for selecting compression level for dictionary values
+/// Applies to schemes that support levels (e.g. zstd)
+pub const DICT_VALUES_COMPRESSION_LEVEL_META_KEY: &str =
+    "lance-encoding:dict-values-compression-level";
+
+/// Environment variable for selecting general compression scheme for dictionary values
+pub const DICT_VALUES_COMPRESSION_ENV_VAR: &str = "LANCE_ENCODING_DICT_VALUES_COMPRESSION";
+/// Environment variable for selecting compression level for dictionary values
+pub const DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR: &str =
+    "LANCE_ENCODING_DICT_VALUES_COMPRESSION_LEVEL";
 
 // NOTE: BLOB_META_KEY is defined in lance-core to avoid circular dependency
 

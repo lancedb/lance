@@ -348,10 +348,15 @@ fn try_general_compression(
     field_params: &CompressionFieldParams,
     data: &DataBlock,
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressionConfig)>> {
+    // Explicitly disable general compression.
+    if field_params.compression.as_deref() == Some("none") {
+        return Ok(None);
+    }
+
     // User-requested compression (unused today but perhaps still used
     // in the future someday)
     if let Some(compression_scheme) = &field_params.compression {
-        if compression_scheme != "none" && version >= LanceFileVersion::V2_2 {
+        if version >= LanceFileVersion::V2_2 {
             let scheme: CompressionScheme = compression_scheme.parse()?;
             let config = CompressionConfig::new(scheme, field_params.compression_level);
             let compressor = Box::new(CompressedBufferEncoder::try_new(config)?);
