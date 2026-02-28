@@ -29,7 +29,7 @@ const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 
 // Maintains rolling `.blob` sidecar files for packed blobs.
-// Layout: data/{data_file_key}/{blob_id:08x}.blob where each file is an
+// Layout: data/{data_file_key}/{obfuscated_blob_id:032b}.blob where each file is an
 // unframed concatenation of blob payloads; descriptors store (blob_id,
 // position, size) to locate each slice. A dedicated struct keeps path state
 // and rolling size separate from the per-batch preprocessor logic, so we can
