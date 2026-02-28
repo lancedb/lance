@@ -4397,10 +4397,7 @@ impl PrimitiveStructuralEncoder {
             .cloned()
             .or(env_compression_level)
         {
-            metadata.insert(
-                COMPRESSION_LEVEL_META_KEY.to_string(),
-                compression_level,
-            );
+            metadata.insert(COMPRESSION_LEVEL_META_KEY.to_string(), compression_level);
         }
 
         metadata
