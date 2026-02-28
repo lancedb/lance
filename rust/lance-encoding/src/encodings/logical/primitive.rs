@@ -4399,7 +4399,7 @@ impl PrimitiveStructuralEncoder {
         {
             metadata.insert(
                 COMPRESSION_LEVEL_META_KEY.to_string(),
-                compression_level.to_string(),
+                compression_level,
             );
         }
 
@@ -6551,7 +6551,7 @@ mod tests {
                 .map(|i| format!("value_{i:04}_{}", "x".repeat(256)))
                 .collect::<Vec<_>>(),
         )) as ArrayRef;
-        let keys = Int32Array::from_iter_values((0..20_000).map(|i| (i % 128) as i32));
+        let keys = Int32Array::from_iter_values((0..20_000).map(|i| i % 128));
         let dict_array =
             Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef;
 
