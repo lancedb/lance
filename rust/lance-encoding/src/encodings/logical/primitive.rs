@@ -4407,6 +4407,10 @@ impl PrimitiveStructuralEncoder {
     }
 
     fn build_dict_values_compressor_field(field: &Field) -> Result<Field> {
+        // This is an internal synthetic field used only to feed metadata into
+        // `create_block_compressor` for dictionary values. The concrete type/name here
+        // are not semantically meaningful; we rely on explicit metadata below to control
+        // general compression selection for dictionary values.
         let mut dict_values_field = Field::new_arrow("", DataType::UInt16, false)?;
         dict_values_field.metadata = Self::resolve_dict_values_compression_metadata(
             &field.metadata,

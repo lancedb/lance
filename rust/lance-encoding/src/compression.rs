@@ -1843,6 +1843,37 @@ mod tests {
     }
 
     #[test]
+    fn test_none_compression_disables_auto_general_block_compression() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some("none".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 20_000);
+
+        assert!(
+            data.data_size() > MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION,
+            "test requires block size above automatic general compression threshold"
+        );
+
+        let (_compressor, encoding) = strategy
+            .create_block_compressor(&field, &data)
+            .expect("block compressor selection should succeed");
+
+        assert!(
+            !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
+            "compression=none should disable automatic block general compression"
+        );
+    }
+
+    #[test]
     fn test_rle_block_used_for_version_v2_2() {
         let field = create_test_field("test_repdef", DataType::UInt16);
 
