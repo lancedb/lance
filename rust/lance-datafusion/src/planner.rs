@@ -1886,12 +1886,15 @@ mod tests {
             let expr = planner.parse_sql_expr(&ast).unwrap();
             match expr {
                 Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), _) => {
-                    assert_eq!(lance_arrow::json::decode_json(&bytes), expected, "failed for: {sql}");
+                    assert_eq!(
+                        lance_arrow::json::decode_json(&bytes),
+                        expected,
+                        "failed for: {sql}"
+                    );
                 }
                 other => panic!("Expected LargeBinary literal for '{sql}', got: {other:?}"),
             }
         }
-
     }
 
     #[test]
@@ -1906,11 +1909,18 @@ mod tests {
         // Invalid JSON content
         let ast = parse_sql_expr("jsonb 'not valid json'").unwrap();
         let err = planner.parse_sql_expr(&ast).unwrap_err();
-        assert!(err.to_string().contains("Failed to encode JSONB"), "expected JSONB encoding error, got: {err}");
+        assert!(
+            err.to_string().contains("Failed to encode JSONB"),
+            "expected JSONB encoding error, got: {err}"
+        );
 
         // CAST with non-literal expression
         let ast = parse_sql_expr("cast(j as jsonb)").unwrap();
         let err = planner.parse_sql_expr(&ast).unwrap_err();
-        assert!(err.to_string().contains("CAST to JSONB only supports string literals"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("CAST to JSONB only supports string literals"),
+            "got: {err}"
+        );
     }
 }
