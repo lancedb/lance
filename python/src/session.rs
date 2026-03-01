@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use pyo3::{pyclass, pymethods};
+use pyo3::{pyclass, pymethods, PyResult};
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
@@ -70,21 +70,33 @@ impl Session {
 
     /// Lightweight synchronous index cache hit/miss counts.
     ///
-    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    /// Returns a dict with ``hits``, ``misses``, and ``evictions`` keys (cumulative counters).
     fn index_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
         let hm = self.inner.index_cache_hit_miss();
-        [("hits", hm.hits), ("misses", hm.misses)]
+        [("hits", hm.hits), ("misses", hm.misses), ("evictions", hm.evictions)]
             .into_iter()
             .collect()
     }
 
     /// Lightweight synchronous metadata cache hit/miss counts.
     ///
-    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    /// Returns a dict with ``hits``, ``misses``, and ``evictions`` keys (cumulative counters).
     fn metadata_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
         let hm = self.inner.metadata_cache_hit_miss();
-        [("hits", hm.hits), ("misses", hm.misses)]
+        [("hits", hm.hits), ("misses", hm.misses), ("evictions", hm.evictions)]
             .into_iter()
             .collect()
+    }
+
+    /// Full index cache statistics including capacity and utilization.
+    fn index_cache_stats(&self) -> PyResult<crate::dataset::cache_stats::PyCacheStats> {
+        let stats = rt().block_on(None, self.inner.index_cache_stats())?;
+        Ok(crate::dataset::cache_stats::PyCacheStats::from_lance(stats))
+    }
+
+    /// Full metadata cache statistics including capacity and utilization.
+    fn metadata_cache_stats(&self) -> PyResult<crate::dataset::cache_stats::PyCacheStats> {
+        let stats = rt().block_on(None, self.inner.metadata_cache_stats())?;
+        Ok(crate::dataset::cache_stats::PyCacheStats::from_lance(stats))
     }
 }

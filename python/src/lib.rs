@@ -39,6 +39,7 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
+use dataset::cache_stats::PyCacheStats;
 use dataset::cleanup::CleanupStats;
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
@@ -264,6 +265,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
     m.add_class::<IoStats>()?;
+    m.add_class::<PyCacheStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;

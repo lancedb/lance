@@ -238,7 +238,11 @@ mod tests {
     #[test]
     fn test_session_cache_hit_miss_sync() {
         let session = Session::default();
-        let zero = CacheHitMiss { hits: 0, misses: 0 };
+        let zero = CacheHitMiss {
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        };
 
         assert_eq!(session.index_cache_hit_miss(), zero);
         assert_eq!(session.metadata_cache_hit_miss(), zero);

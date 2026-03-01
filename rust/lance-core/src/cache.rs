@@ -57,6 +57,8 @@ pub struct LanceCache {
     prefix: String,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
+    evictions: Arc<AtomicU64>,
+    max_capacity_bytes: u64,
 }
 
 impl std::fmt::Debug for LanceCache {
@@ -78,10 +80,17 @@ impl DeepSizeOf for LanceCache {
 
 impl LanceCache {
     pub fn with_capacity(capacity: usize) -> Self {
+        let evictions = Arc::new(AtomicU64::new(0));
+        let evictions_clone = evictions.clone();
         let cache = Cache::builder()
             .max_capacity(capacity as u64)
             .weigher(|_, v: &SizedRecord| {
                 (v.size_accessor)(&v.record).try_into().unwrap_or(u32::MAX)
+            })
+            .eviction_listener(move |_key, _value, cause| {
+                if cause == moka::notification::RemovalCause::Size {
+                    evictions_clone.fetch_add(1, Ordering::Relaxed);
+                }
             })
             .support_invalidation_closures()
             .build();
@@ -90,15 +99,23 @@ impl LanceCache {
             prefix: String::new(),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
+            evictions,
+            max_capacity_bytes: capacity as u64,
         }
     }
 
     pub fn no_cache() -> Self {
+        let cache = Cache::builder()
+            .max_capacity(0)
+            .support_invalidation_closures()
+            .build();
         Self {
-            cache: Arc::new(Cache::new(0)),
+            cache: Arc::new(cache),
             prefix: String::new(),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
+            evictions: Arc::new(AtomicU64::new(0)),
+            max_capacity_bytes: 0,
         }
     }
 
@@ -115,6 +132,8 @@ impl LanceCache {
             prefix: format!("{}{}/", self.prefix, prefix),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
+            evictions: self.evictions.clone(),
+            max_capacity_bytes: self.max_capacity_bytes,
         }
     }
 
@@ -132,6 +151,7 @@ impl LanceCache {
     /// want to invalidate all at the current prefix, pass an empty string.
     pub fn invalidate_prefix(&self, prefix: &str) {
         let full_prefix = format!("{}{}", self.prefix, prefix);
+        tracing::debug!(target: "lance_cache::invalidate_prefix", prefix = %full_prefix);
         self.cache
             .invalidate_entries_if(move |(key, _typeid), _value| key.starts_with(&full_prefix))
             .expect("Cache configured correctly");
@@ -178,11 +198,17 @@ impl LanceCache {
 
     async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
         let key = self.get_key(key);
-        if let Some(metadata) = self.cache.get(&(key, TypeId::of::<T>())).await {
+        let cache_key = (key, TypeId::of::<T>());
+        if let Some(metadata) = self.cache.get(&cache_key).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(metadata.record.clone().downcast::<T>().unwrap())
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "lance_cache::miss",
+                key = %cache_key.0,
+                type_id = std::any::type_name::<T>(),
+            );
             None
         }
     }
@@ -223,6 +249,11 @@ impl LanceCache {
         let init = Box::pin(async move {
             let _ = init_run_tx.send(());
             misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "lance_cache::miss",
+                key = %key,
+                type_id = std::any::type_name::<T>(),
+            );
             match loader(&key).await {
                 Ok(value) => Some(SizedRecord::new(Arc::new(value))),
                 Err(e) => {
@@ -263,26 +294,31 @@ impl LanceCache {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
             num_entries: self.cache.entry_count() as usize,
             size_bytes: self.cache.weighted_size() as usize,
+            max_capacity_bytes: self.max_capacity_bytes,
         }
     }
 
     pub async fn clear(&self) {
+        tracing::debug!(target: "lance_cache::clear", "cache cleared");
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
     }
 
     /// Lightweight synchronous hit/miss counter read.
     ///
-    /// Cost: two `AtomicU64` loads with `Relaxed` ordering — no async,
+    /// Cost: three `AtomicU64` loads with `Relaxed` ordering — no async,
     /// no `run_pending_tasks()`.
     pub fn hit_miss_counts(&self) -> CacheHitMiss {
         CacheHitMiss {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -341,12 +377,17 @@ impl LanceCache {
 
 /// A weak reference to a LanceCache, used by indices to avoid circular references.
 /// When the original cache is dropped, operations on this will gracefully no-op.
+///
+/// **Note:** Full [`CacheStats`] (including `num_entries`, `size_bytes`, and
+/// `max_capacity_bytes`) require the strong [`LanceCache`] reference. This type
+/// only exposes lightweight [`CacheHitMiss`] counters via [`hit_miss_counts`].
 #[derive(Clone, Debug)]
 pub struct WeakLanceCache {
     inner: std::sync::Weak<Cache<(String, TypeId), SizedRecord>>,
     prefix: String,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
+    evictions: Arc<AtomicU64>,
 }
 
 impl WeakLanceCache {
@@ -357,6 +398,7 @@ impl WeakLanceCache {
             prefix: cache.prefix.clone(),
             hits: cache.hits.clone(),
             misses: cache.misses.clone(),
+            evictions: cache.evictions.clone(),
         }
     }
 
@@ -367,6 +409,7 @@ impl WeakLanceCache {
             prefix: format!("{}{}/", self.prefix, prefix),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
+            evictions: self.evictions.clone(),
         }
     }
 
@@ -382,11 +425,17 @@ impl WeakLanceCache {
     pub async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
         let cache = self.inner.upgrade()?;
         let key = self.get_key(key);
-        if let Some(metadata) = cache.get(&(key, TypeId::of::<T>())).await {
+        let cache_key = (key, TypeId::of::<T>());
+        if let Some(metadata) = cache.get(&cache_key).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(metadata.record.clone().downcast::<T>().unwrap())
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "lance_cache::miss",
+                key = %cache_key.0,
+                type_id = std::any::type_name::<T>(),
+            );
             None
         }
     }
@@ -431,6 +480,11 @@ impl WeakLanceCache {
             let init = Box::pin(async move {
                 let _ = init_run_tx.send(());
                 misses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    target: "lance_cache::miss",
+                    key = %full_key,
+                    type_id = std::any::type_name::<T>(),
+                );
                 match f().await {
                     Ok(value) => Some(SizedRecord::new(Arc::new(value))),
                     Err(e) => {
@@ -564,12 +618,13 @@ impl WeakLanceCache {
 
     /// Lightweight synchronous hit/miss counter read.
     ///
-    /// Cost: two `AtomicU64` loads with `Relaxed` ordering — no async,
+    /// Cost: three `AtomicU64` loads with `Relaxed` ordering — no async,
     /// no `run_pending_tasks()`.
     pub fn hit_miss_counts(&self) -> CacheHitMiss {
         CacheHitMiss {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
         }
     }
 }
@@ -596,6 +651,8 @@ pub struct CacheHitMiss {
     pub hits: u64,
     /// Cumulative cache misses.
     pub misses: u64,
+    /// Cumulative evictions due to capacity pressure.
+    pub evictions: u64,
 }
 
 impl CacheHitMiss {
@@ -626,10 +683,14 @@ pub struct CacheStats {
     pub hits: u64,
     /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
+    /// Cumulative evictions due to capacity pressure.
+    pub evictions: u64,
     /// Number of entries currently in the cache.
     pub num_entries: usize,
     /// Total size in bytes of all entries in the cache.
     pub size_bytes: usize,
+    /// Maximum capacity in bytes configured for this cache.
+    pub max_capacity_bytes: u64,
 }
 
 impl CacheStats {
@@ -646,6 +707,17 @@ impl CacheStats {
             0.0
         } else {
             self.misses as f32 / (self.hits + self.misses) as f32
+        }
+    }
+
+    /// Cache utilization ∈ \[0.0, 1.0\] — `size_bytes / max_capacity_bytes`.
+    ///
+    /// Returns 0.0 when `max_capacity_bytes` is 0 (no-cache mode).
+    pub fn utilization(&self) -> f32 {
+        if self.max_capacity_bytes == 0 {
+            0.0
+        } else {
+            self.size_bytes as f32 / self.max_capacity_bytes as f32
         }
     }
 }
@@ -866,20 +938,41 @@ mod tests {
 
         // Initially zero
         let hm = cache.hit_miss_counts();
-        assert_eq!(hm, CacheHitMiss { hits: 0, misses: 0 });
+        assert_eq!(
+            hm,
+            CacheHitMiss {
+                hits: 0,
+                misses: 0,
+                evictions: 0
+            }
+        );
         assert_eq!(hm.hit_ratio(), 0.0);
 
         // Generate a miss
         let _ = cache.get::<Vec<i32>>("nonexistent").await;
         let hm = cache.hit_miss_counts();
-        assert_eq!(hm, CacheHitMiss { hits: 0, misses: 1 });
+        assert_eq!(
+            hm,
+            CacheHitMiss {
+                hits: 0,
+                misses: 1,
+                evictions: 0
+            }
+        );
         assert_eq!(hm.miss_ratio(), 1.0);
 
         // Insert and generate a hit
         cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
         let _ = cache.get::<Vec<i32>>("key1").await;
         let hm = cache.hit_miss_counts();
-        assert_eq!(hm, CacheHitMiss { hits: 1, misses: 1 });
+        assert_eq!(
+            hm,
+            CacheHitMiss {
+                hits: 1,
+                misses: 1,
+                evictions: 0
+            }
+        );
         assert!((hm.hit_ratio() - 0.5).abs() < f32::EPSILON);
 
         // Verify consistency with stats() (which calls run_pending_tasks)
@@ -895,17 +988,128 @@ mod tests {
         let weak = WeakLanceCache::from(&cache);
 
         // Initially zero
-        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 0 });
+        assert_eq!(
+            weak.hit_miss_counts(),
+            CacheHitMiss {
+                hits: 0,
+                misses: 0,
+                evictions: 0
+            }
+        );
 
         // Counters are shared — miss through weak shows on both
         let _ = weak.get::<Vec<i32>>("nonexistent").await;
-        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 1 });
-        assert_eq!(cache.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 1 });
+        assert_eq!(
+            weak.hit_miss_counts(),
+            CacheHitMiss {
+                hits: 0,
+                misses: 1,
+                evictions: 0
+            }
+        );
+        assert_eq!(
+            cache.hit_miss_counts(),
+            CacheHitMiss {
+                hits: 0,
+                misses: 1,
+                evictions: 0
+            }
+        );
 
         // Hit through strong shows on weak
         cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
         let _ = cache.get::<Vec<i32>>("key1").await;
-        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 1, misses: 1 });
-        assert_eq!(cache.hit_miss_counts(), CacheHitMiss { hits: 1, misses: 1 });
+        assert_eq!(
+            weak.hit_miss_counts(),
+            CacheHitMiss {
+                hits: 1,
+                misses: 1,
+                evictions: 0
+            }
+        );
+        assert_eq!(
+            cache.hit_miss_counts(),
+            CacheHitMiss {
+                hits: 1,
+                misses: 1,
+                evictions: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eviction_counter() {
+        let item = Arc::new(vec![1, 2, 3]);
+        let item_size = item.deep_size_of();
+        // Capacity for exactly 2 items
+        let capacity = 2 * item_size;
+
+        let cache = LanceCache::with_capacity(capacity);
+        assert_eq!(cache.hit_miss_counts().evictions, 0);
+
+        // Insert 2 items — no evictions
+        cache.insert("a", Arc::new(vec![1, 2, 3])).await;
+        cache.insert("b", Arc::new(vec![4, 5, 6])).await;
+        cache.cache.run_pending_tasks().await;
+        assert_eq!(cache.hit_miss_counts().evictions, 0);
+
+        // Insert a 3rd item — triggers eviction of 1
+        cache.insert("c", Arc::new(vec![7, 8, 9])).await;
+        cache.cache.run_pending_tasks().await;
+        assert_eq!(cache.hit_miss_counts().evictions, 1);
+
+        // Stats should agree
+        let stats = cache.stats().await;
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.max_capacity_bytes, capacity as u64);
+    }
+
+    #[tokio::test]
+    async fn test_clear_resets_evictions() {
+        let item = Arc::new(vec![1, 2, 3]);
+        let item_size = item.deep_size_of();
+        let capacity = 2 * item_size;
+
+        let cache = LanceCache::with_capacity(capacity);
+
+        // Fill past capacity to cause evictions
+        cache.insert("a", Arc::new(vec![1, 2, 3])).await;
+        cache.insert("b", Arc::new(vec![4, 5, 6])).await;
+        cache.insert("c", Arc::new(vec![7, 8, 9])).await;
+        cache.cache.run_pending_tasks().await;
+        assert!(cache.hit_miss_counts().evictions > 0);
+
+        // Clear should reset evictions
+        cache.clear().await;
+        assert_eq!(cache.hit_miss_counts().evictions, 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_cache_evictions_zero() {
+        let cache = LanceCache::no_cache();
+        assert_eq!(cache.hit_miss_counts().evictions, 0);
+        assert_eq!(cache.max_capacity_bytes, 0);
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.max_capacity_bytes, 0);
+        assert_eq!(stats.utilization(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_utilization() {
+        let item = Arc::new(vec![1, 2, 3]);
+        let item_size = item.deep_size_of();
+        let capacity = 4 * item_size;
+
+        let cache = LanceCache::with_capacity(capacity);
+        let stats = cache.stats().await;
+        assert_eq!(stats.utilization(), 0.0);
+
+        // Insert 2 of 4 slots worth
+        cache.insert("a", Arc::new(vec![1, 2, 3])).await;
+        cache.insert("b", Arc::new(vec![4, 5, 6])).await;
+        let stats = cache.stats().await;
+        assert!((stats.utilization() - 0.5).abs() < f32::EPSILON);
     }
 }
