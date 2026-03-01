@@ -1756,6 +1756,20 @@ impl Dataset {
         self.session.deep_size_of() as u64
     }
 
+    /// Lightweight synchronous index cache hit/miss counts.
+    ///
+    /// Cost: two `AtomicU64` loads — no async, no `run_pending_tasks()`.
+    pub fn index_cache_hit_miss(&self) -> lance_core::cache::CacheHitMiss {
+        self.session.index_cache_hit_miss()
+    }
+
+    /// Lightweight synchronous metadata cache hit/miss counts.
+    ///
+    /// Cost: two `AtomicU64` loads — no async, no `run_pending_tasks()`.
+    pub fn metadata_cache_hit_miss(&self) -> lance_core::cache::CacheHitMiss {
+        self.session.metadata_cache_hit_miss()
+    }
+
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self

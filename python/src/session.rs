@@ -67,4 +67,24 @@ impl Session {
     pub fn is_same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// Lightweight synchronous index cache hit/miss counts.
+    ///
+    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    fn index_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
+        let hm = self.inner.index_cache_hit_miss();
+        [("hits", hm.hits), ("misses", hm.misses)]
+            .into_iter()
+            .collect()
+    }
+
+    /// Lightweight synchronous metadata cache hit/miss counts.
+    ///
+    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    fn metadata_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
+        let hm = self.inner.metadata_cache_hit_miss();
+        [("hits", hm.hits), ("misses", hm.misses)]
+            .into_iter()
+            .collect()
+    }
 }

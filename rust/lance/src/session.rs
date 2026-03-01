@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheHitMiss, LanceCache};
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -191,6 +191,20 @@ impl Session {
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }
+
+    /// Lightweight synchronous index cache hit/miss counts.
+    ///
+    /// Cost: two `AtomicU64` loads — no async, no `run_pending_tasks()`.
+    pub fn index_cache_hit_miss(&self) -> CacheHitMiss {
+        self.index_cache.0.hit_miss_counts()
+    }
+
+    /// Lightweight synchronous metadata cache hit/miss counts.
+    ///
+    /// Cost: two `AtomicU64` loads — no async, no `run_pending_tasks()`.
+    pub fn metadata_cache_hit_miss(&self) -> CacheHitMiss {
+        self.metadata_cache.0.hit_miss_counts()
+    }
 }
 
 impl Default for Session {
@@ -206,6 +220,7 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::cache::CacheHitMiss;
     use lance_index::vector::VectorIndex;
 
     #[tokio::test]
@@ -218,5 +233,18 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_session_cache_hit_miss_sync() {
+        let session = Session::default();
+        let zero = CacheHitMiss { hits: 0, misses: 0 };
+
+        assert_eq!(session.index_cache_hit_miss(), zero);
+        assert_eq!(session.metadata_cache_hit_miss(), zero);
+
+        // Convenience methods on the struct
+        assert_eq!(session.index_cache_hit_miss().hit_ratio(), 0.0);
+        assert_eq!(session.metadata_cache_hit_miss().hit_ratio(), 0.0);
     }
 }

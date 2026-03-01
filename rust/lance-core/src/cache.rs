@@ -275,6 +275,17 @@ impl LanceCache {
         self.misses.store(0, Ordering::Relaxed);
     }
 
+    /// Lightweight synchronous hit/miss counter read.
+    ///
+    /// Cost: two `AtomicU64` loads with `Relaxed` ordering — no async,
+    /// no `run_pending_tasks()`.
+    pub fn hit_miss_counts(&self) -> CacheHitMiss {
+        CacheHitMiss {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
     // CacheKey-based methods
     pub async fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
@@ -550,6 +561,17 @@ impl WeakLanceCache {
         let key_str = cache_key.key();
         self.insert_unsized(&key_str, value).await
     }
+
+    /// Lightweight synchronous hit/miss counter read.
+    ///
+    /// Cost: two `AtomicU64` loads with `Relaxed` ordering — no async,
+    /// no `run_pending_tasks()`.
+    pub fn hit_miss_counts(&self) -> CacheHitMiss {
+        CacheHitMiss {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub trait CacheKey {
@@ -562,6 +584,40 @@ pub trait UnsizedCacheKey {
     type ValueType: ?Sized;
 
     fn key(&self) -> Cow<'_, str>;
+}
+
+/// Lightweight hit/miss counters — no async, no `run_pending_tasks()`.
+///
+/// Returned by [`LanceCache::hit_miss_counts`] and [`WeakLanceCache::hit_miss_counts`].
+/// Counters are cumulative and monotonic (reset only via [`LanceCache::clear`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheHitMiss {
+    /// Cumulative cache hits.
+    pub hits: u64,
+    /// Cumulative cache misses.
+    pub misses: u64,
+}
+
+impl CacheHitMiss {
+    /// Hit ratio ∈ \[0.0, 1.0\]. Returns 0.0 when no lookups have occurred.
+    pub fn hit_ratio(&self) -> f32 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f32 / total as f32
+        }
+    }
+
+    /// Miss ratio ∈ \[0.0, 1.0\]. Returns 0.0 when no lookups have occurred.
+    pub fn miss_ratio(&self) -> f32 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.misses as f32 / total as f32
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -802,5 +858,54 @@ mod tests {
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 2);
+    }
+
+    #[tokio::test]
+    async fn test_hit_miss_counts_sync() {
+        let cache = LanceCache::with_capacity(1000);
+
+        // Initially zero
+        let hm = cache.hit_miss_counts();
+        assert_eq!(hm, CacheHitMiss { hits: 0, misses: 0 });
+        assert_eq!(hm.hit_ratio(), 0.0);
+
+        // Generate a miss
+        let _ = cache.get::<Vec<i32>>("nonexistent").await;
+        let hm = cache.hit_miss_counts();
+        assert_eq!(hm, CacheHitMiss { hits: 0, misses: 1 });
+        assert_eq!(hm.miss_ratio(), 1.0);
+
+        // Insert and generate a hit
+        cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
+        let _ = cache.get::<Vec<i32>>("key1").await;
+        let hm = cache.hit_miss_counts();
+        assert_eq!(hm, CacheHitMiss { hits: 1, misses: 1 });
+        assert!((hm.hit_ratio() - 0.5).abs() < f32::EPSILON);
+
+        // Verify consistency with stats() (which calls run_pending_tasks)
+        let stats = cache.stats().await;
+        let hm = cache.hit_miss_counts();
+        assert_eq!(hm.hits, stats.hits);
+        assert_eq!(hm.misses, stats.misses);
+    }
+
+    #[tokio::test]
+    async fn test_weak_hit_miss_counts_sync() {
+        let cache = LanceCache::with_capacity(1000);
+        let weak = WeakLanceCache::from(&cache);
+
+        // Initially zero
+        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 0 });
+
+        // Counters are shared — miss through weak shows on both
+        let _ = weak.get::<Vec<i32>>("nonexistent").await;
+        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 1 });
+        assert_eq!(cache.hit_miss_counts(), CacheHitMiss { hits: 0, misses: 1 });
+
+        // Hit through strong shows on weak
+        cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
+        let _ = cache.get::<Vec<i32>>("key1").await;
+        assert_eq!(weak.hit_miss_counts(), CacheHitMiss { hits: 1, misses: 1 });
+        assert_eq!(cache.hit_miss_counts(), CacheHitMiss { hits: 1, misses: 1 });
     }
 }

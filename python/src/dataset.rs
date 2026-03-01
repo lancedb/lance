@@ -2086,6 +2086,26 @@ impl Dataset {
         Session::new(self.ds.session())
     }
 
+    /// Lightweight synchronous index cache hit/miss counts.
+    ///
+    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    fn index_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
+        let hm = self.ds.index_cache_hit_miss();
+        [("hits", hm.hits), ("misses", hm.misses)]
+            .into_iter()
+            .collect()
+    }
+
+    /// Lightweight synchronous metadata cache hit/miss counts.
+    ///
+    /// Returns a dict with ``hits`` and ``misses`` keys (cumulative counters).
+    fn metadata_cache_hit_miss(&self) -> std::collections::HashMap<&'static str, u64> {
+        let hm = self.ds.metadata_cache_hit_miss();
+        [("hits", hm.hits), ("misses", hm.misses)]
+            .into_iter()
+            .collect()
+    }
+
     /// Get a snapshot of current IO statistics without resetting counters
     fn io_stats_snapshot(&self) -> IoStats {
         let stats = self.ds.object_store().io_stats_snapshot();
