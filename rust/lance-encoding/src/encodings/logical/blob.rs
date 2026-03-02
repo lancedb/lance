@@ -359,7 +359,18 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             } else {
                                 blob_size_col.value(i)
                             };
-                            (BlobKind::External as u8, position, size, 0, uri)
+                            let external_base_id = if blob_id_col.is_null(i) {
+                                0
+                            } else {
+                                blob_id_col.value(i)
+                            };
+                            (
+                                BlobKind::External as u8,
+                                position,
+                                size,
+                                external_base_id,
+                                uri,
+                            )
                         }
                         BlobKind::Packed => (
                             BlobKind::Packed as u8,

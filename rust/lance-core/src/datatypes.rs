@@ -438,10 +438,14 @@ pub enum BlobKind {
     Packed = 1,
     /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
     Dedicated = 2,
-    /// Not stored by Lance; `blob_uri` holds an absolute external URI.
+    /// Not stored by Lance data files.
     ///
-    /// External blobs can have a position and a size. Users can specify a range for an external blob.
-    /// If the position is not set, it defaults to 0, which points to the beginning of the blob.
+    /// For external blobs, `blob_uri` can be either:
+    /// - a path relative to a base location selected by `blob_id` (0 means dataset root),
+    /// - or an absolute URI when external writes outside registered bases are enabled.
+    ///
+    /// External blobs can have a position and a size. If the position is not set,
+    /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
 }
 

@@ -10,11 +10,12 @@ use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
 use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use url::Url;
 
 use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
@@ -27,6 +28,91 @@ use lance_io::traits::{Reader, Writer};
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedExternalBase {
+    pub base_id: u32,
+    pub relative_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExternalBaseCandidate {
+    pub base_id: u32,
+    pub store_prefix: String,
+    pub base_path: Path,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalBaseResolver {
+    candidates: Vec<ExternalBaseCandidate>,
+    store_registry: Arc<ObjectStoreRegistry>,
+    store_params: ObjectStoreParams,
+    uri_cache: Mutex<HashMap<String, Option<ResolvedExternalBase>>>,
+}
+
+impl ExternalBaseResolver {
+    pub(crate) fn new(
+        candidates: Vec<ExternalBaseCandidate>,
+        store_registry: Arc<ObjectStoreRegistry>,
+        store_params: ObjectStoreParams,
+    ) -> Self {
+        Self {
+            candidates,
+            store_registry,
+            store_params,
+            uri_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) async fn resolve_external_uri(
+        &self,
+        uri: &str,
+    ) -> Result<Option<ResolvedExternalBase>> {
+        if let Some(cached) = self.uri_cache.lock().await.get(uri).cloned() {
+            return Ok(cached);
+        }
+
+        let uri_store_prefix = self
+            .store_registry
+            .calculate_object_store_prefix(uri, self.store_params.storage_options())?;
+        let uri_path = ObjectStore::extract_path_from_uri(self.store_registry.clone(), uri)?;
+
+        let mut best_match: Option<(usize, ResolvedExternalBase)> = None;
+        for candidate in &self.candidates {
+            if candidate.store_prefix != uri_store_prefix {
+                continue;
+            }
+            let Some(relative_parts) = uri_path.prefix_match(&candidate.base_path) else {
+                continue;
+            };
+            let relative_path = Path::from_iter(relative_parts);
+            if relative_path.as_ref().is_empty() {
+                continue;
+            }
+            let prefix_len = candidate.base_path.parts().count();
+            if best_match
+                .as_ref()
+                .map(|(current_len, _)| prefix_len > *current_len)
+                .unwrap_or(true)
+            {
+                best_match = Some((
+                    prefix_len,
+                    ResolvedExternalBase {
+                        base_id: candidate.base_id,
+                        relative_path: relative_path.to_string(),
+                    },
+                ));
+            }
+        }
+
+        let resolved = best_match.map(|(_, matched)| matched);
+        self.uri_cache
+            .lock()
+            .await
+            .insert(uri.to_string(), resolved.clone());
+        Ok(resolved)
+    }
+}
 
 // Maintains rolling `.blob` sidecar files for packed blobs.
 // Layout: data/{data_file_key}/{obfuscated_blob_id:032b}.blob where each file is an
@@ -124,6 +210,8 @@ pub struct BlobPreprocessor {
     blob_v2_cols: Vec<bool>,
     dedicated_thresholds: Vec<usize>,
     writer_metadata: Vec<HashMap<String, String>>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
 }
 
 impl BlobPreprocessor {
@@ -132,6 +220,8 @@ impl BlobPreprocessor {
         data_dir: Path,
         data_file_key: String,
         schema: &lance_core::datatypes::Schema,
+        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
     ) -> Self {
         let pack_writer = PackWriter::new(
             object_store.clone(),
@@ -159,6 +249,8 @@ impl BlobPreprocessor {
             blob_v2_cols,
             dedicated_thresholds,
             writer_metadata,
+            external_base_resolver,
+            allow_external_blob_outside_bases,
         }
     }
 
@@ -189,6 +281,31 @@ impl BlobPreprocessor {
             )
             .await
     }
+
+    async fn resolve_external_reference(&mut self, uri: &str) -> Result<(u32, String)> {
+        let mapped = if let Some(resolver) = &self.external_base_resolver {
+            resolver.resolve_external_uri(uri).await?
+        } else {
+            None
+        };
+        if let Some(mapped) = mapped {
+            return Ok((mapped.base_id, mapped.relative_path));
+        }
+
+        if self.allow_external_blob_outside_bases {
+            let normalized = normalize_external_absolute_uri(uri)?;
+            return Ok((0, normalized));
+        }
+
+        Err(Error::invalid_input(
+            format!(
+                "External blob URI '{}' is outside dataset bases. Set allow_external_blob_outside_bases=true to permit writing outside registered bases.",
+                uri
+            ),
+            location!(),
+        ))
+    }
+
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let expected_columns = self.blob_v2_cols.len();
         if batch.num_columns() != expected_columns {
@@ -306,10 +423,12 @@ impl BlobPreprocessor {
 
                 if has_uri {
                     let uri_val = uri_col.value(i);
+                    let (external_base_id, external_uri_or_path) =
+                        self.resolve_external_reference(uri_val).await?;
                     kind_builder.append_value(BlobKind::External as u8);
                     data_builder.append_null();
-                    uri_builder.append_value(uri_val);
-                    blob_id_builder.append_null();
+                    uri_builder.append_value(external_uri_or_path);
+                    blob_id_builder.append_value(external_base_id);
                     if has_position && has_size {
                         let position = position_col
                             .as_ref()
@@ -824,6 +943,7 @@ async fn collect_blob_files_v2(
     let mut files = Vec::with_capacity(row_addrs.len());
     let mut fragment_cache = HashMap::<u32, BlobReadLocation>::new();
     let mut store_cache = HashMap::<u32, Arc<ObjectStore>>::new();
+    let mut external_base_path_cache = HashMap::<u32, Path>::new();
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
         let kind = BlobKind::try_from(kinds.value(idx))?;
 
@@ -886,17 +1006,51 @@ async fn collect_blob_files_v2(
                 ));
             }
             BlobKind::External => {
-                let uri = blob_uris.value(idx).to_string();
+                let uri_or_path = blob_uris.value(idx).to_string();
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
-                let registry = dataset.session.store_registry();
-                let params = dataset
-                    .store_params
-                    .as_ref()
-                    .map(|p| Arc::new((**p).clone()))
-                    .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-                let (object_store, path) =
-                    ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
+                let base_id = blob_ids.value(idx);
+                let (object_store, path) = if is_absolute_external_uri(base_id, &uri_or_path) {
+                    let registry = dataset.session.store_registry();
+                    let params = dataset
+                        .store_params
+                        .as_ref()
+                        .map(|p| Arc::new((**p).clone()))
+                        .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+                    ObjectStore::from_uri_and_params(registry, &uri_or_path, &params).await?
+                } else {
+                    let (object_store, base_root) = if base_id == 0 {
+                        (dataset.object_store.clone(), dataset.base.clone())
+                    } else {
+                        let object_store = if let Some(store) = store_cache.get(&base_id) {
+                            store.clone()
+                        } else {
+                            let store = dataset.object_store_for_base(base_id).await?;
+                            store_cache.insert(base_id, store.clone());
+                            store
+                        };
+                        let base_root = if let Some(path) = external_base_path_cache.get(&base_id) {
+                            path.clone()
+                        } else {
+                            let base =
+                                dataset.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                                    Error::invalid_input(
+                                        format!(
+                                            "External blob references unknown base_id {}",
+                                            base_id
+                                        ),
+                                        location!(),
+                                    )
+                                })?;
+                            let path = base.extract_path(dataset.session.store_registry())?;
+                            external_base_path_cache.insert(base_id, path.clone());
+                            path
+                        };
+                        (object_store, base_root)
+                    };
+                    let path = join_base_and_relative_path(&base_root, &uri_or_path)?;
+                    (object_store, path)
+                };
                 let size = if size > 0 {
                     size
                 } else {
@@ -905,7 +1059,7 @@ async fn collect_blob_files_v2(
                 files.push(BlobFile::new_external(
                     object_store,
                     path,
-                    uri,
+                    uri_or_path,
                     position,
                     size,
                 ));
@@ -914,6 +1068,36 @@ async fn collect_blob_files_v2(
     }
 
     Ok(files)
+}
+
+fn normalize_external_absolute_uri(uri: &str) -> Result<String> {
+    let url = Url::parse(uri).map_err(|_| {
+        Error::invalid_input(
+            format!(
+                "External URI '{}' is outside dataset bases and is not a valid absolute URI",
+                uri
+            ),
+            location!(),
+        )
+    })?;
+    Ok(url.to_string())
+}
+
+fn is_absolute_external_uri(base_id: u32, uri: &str) -> bool {
+    base_id == 0 && Url::parse(uri).is_ok()
+}
+
+fn join_base_and_relative_path(base: &Path, relative_path: &str) -> Result<Path> {
+    let relative = Path::parse(relative_path).map_err(|e| {
+        Error::invalid_input(
+            format!(
+                "Invalid relative external blob path '{}': {}",
+                relative_path, e
+            ),
+            location!(),
+        )
+    })?;
+    Ok(Path::from_iter(base.parts().chain(relative.parts())))
 }
 
 /// Resolve the physical read location for a blob row in a base-aware way.
@@ -986,7 +1170,10 @@ fn data_file_key_from_path(path: &str) -> &str {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::{array::AsArray, datatypes::UInt64Type};
+    use arrow::{
+        array::AsArray,
+        datatypes::{UInt32Type, UInt64Type, UInt8Type},
+    };
     use arrow_array::RecordBatch;
     use arrow_array::{RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -1462,6 +1649,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_is_absolute_external_uri_requires_root_base() {
+        assert!(super::is_absolute_external_uri(
+            0,
+            "file:///tmp/external.bin"
+        ));
+        assert!(!super::is_absolute_external_uri(
+            1,
+            "file:///tmp/external.bin"
+        ));
+        assert!(!super::is_absolute_external_uri(0, "objects/mapped.bin"));
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_outside_base_denied_by_default() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"outside").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let result = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("outside dataset bases"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_outside_base_allowed() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"outside").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &dataset_dir.path_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    allow_external_blob_outside_bases: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let desc = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .as_struct()
+            .to_owned();
+        assert_eq!(
+            desc.column(0).as_primitive::<UInt8Type>().value(0),
+            BlobKind::External as u8
+        );
+        assert_eq!(desc.column(3).as_primitive::<UInt32Type>().value(0), 0);
+        assert_eq!(desc.column(4).as_string::<i32>().value(0), external_uri);
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"outside");
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_mapped_to_registered_base() {
+        let test_dir = TempDir::default();
+        let dataset_uri = test_dir.std_path().join("dataset");
+        let external_base = test_dir.std_path().join("external_base");
+        let external_obj_dir = external_base.join("objects");
+        std::fs::create_dir_all(&external_obj_dir).unwrap();
+        let external_path = external_obj_dir.join("mapped.bin");
+        std::fs::write(&external_path, b"mapped").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_base.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                dataset_uri.to_str().unwrap(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    initial_bases: Some(vec![BasePath {
+                        id: 1,
+                        name: Some("external".to_string()),
+                        path: base_uri,
+                        is_dataset_root: false,
+                    }]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let desc = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .as_struct()
+            .to_owned();
+        assert_eq!(
+            desc.column(0).as_primitive::<UInt8Type>().value(0),
+            BlobKind::External as u8
+        );
+        assert_eq!(desc.column(3).as_primitive::<UInt32Type>().value(0), 1);
+        assert_eq!(
+            desc.column(4).as_string::<i32>().value(0),
+            "objects/mapped.bin"
+        );
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"mapped");
+    }
+
     #[tokio::test]
     async fn test_blob_v2_requires_v2_2() {
         let test_dir = TempStrDir::default();
@@ -1525,6 +1868,8 @@ mod tests {
             data_dir,
             "data_file_key".to_string(),
             &writer_schema,
+            None,
+            false,
         );
 
         let mut blob_builder = BlobArrayBuilder::new(1);
