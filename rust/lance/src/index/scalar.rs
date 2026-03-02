@@ -412,10 +412,10 @@ pub fn index_matches_criteria(
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
-    if let Some(name) = &criteria.has_name {
-        if &index.name != name {
-            return Ok(false);
-        }
+    if let Some(name) = &criteria.has_name
+        && &index.name != name
+    {
+        return Ok(false);
     }
 
     if let Some(for_column) = criteria.for_column {

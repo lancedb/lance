@@ -821,29 +821,29 @@ impl DatasetIndexExt for Dataset {
             let has_multiple = indices.len() > 1;
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
-                if let Some(field) = field {
-                    if index_matches_criteria(
+                if let Some(field) = field
+                    && index_matches_criteria(
                         idx,
                         &criteria,
                         &[field],
                         has_multiple,
                         self.schema(),
-                    )? {
-                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
-                        });
-                        let is_fts_index = if let Some(details) = &idx.index_details {
-                            IndexDetails(details.clone()).supports_fts()
-                        } else {
-                            false
-                        };
-                        // FTS indices must always be returned even if empty, because FTS queries
-                        // require an index to exist. The query execution will handle the empty
-                        // bitmap appropriately and fall back to scanning unindexed data.
-                        // Other index types can be skipped if empty since they're optional optimizations.
-                        if non_empty || is_fts_index {
-                            return Ok(Some(idx.clone()));
-                        }
+                    )?
+                {
+                    let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                        bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                    });
+                    let is_fts_index = if let Some(details) = &idx.index_details {
+                        IndexDetails(details.clone()).supports_fts()
+                    } else {
+                        false
+                    };
+                    // FTS indices must always be returned even if empty, because FTS queries
+                    // require an index to exist. The query execution will handle the empty
+                    // bitmap appropriately and fall back to scanning unindexed data.
+                    // Other index types can be skipped if empty since they're optional optimizations.
+                    if non_empty || is_fts_index {
+                        return Ok(Some(idx.clone()));
                     }
                 }
             }
@@ -1124,14 +1124,13 @@ async fn collect_regular_indices_statistics(
         }
 
         let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-        if let Ok(plugin) = index_details_wrapper.get_plugin() {
-            if let Some(stats) = plugin
+        if let Ok(plugin) = index_details_wrapper.get_plugin()
+            && let Some(stats) = plugin
                 .load_statistics(index_store.clone(), index_details.as_ref())
                 .await?
-            {
-                indices_stats.push(stats);
-                continue;
-            }
+        {
+            indices_stats.push(stats);
+            continue;
         }
 
         let index = ds

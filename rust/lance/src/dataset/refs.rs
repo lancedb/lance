@@ -530,22 +530,21 @@ impl Branches<'_> {
 
         if let Some(delete_path) =
             Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
+            && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
         {
-            if let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await {
-                match &e {
-                    Error::IO { source, .. } => {
-                        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                            if io_err.kind() == ErrorKind::NotFound {
-                                log::debug!("Branch directory already deleted: {}", io_err);
-                            } else {
-                                return Err(e);
-                            }
+            match &e {
+                Error::IO { source, .. } => {
+                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == ErrorKind::NotFound {
+                            log::debug!("Branch directory already deleted: {}", io_err);
                         } else {
                             return Err(e);
                         }
+                    } else {
+                        return Err(e);
                     }
-                    _ => return Err(e),
                 }
+                _ => return Err(e),
             }
         }
         Ok(())

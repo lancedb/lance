@@ -1517,11 +1517,10 @@ impl<'a> TransactionRebase<'a> {
                         .initial_fragments
                         .get(fragment_id)
                         .and_then(|(fragment, _)| fragment.physical_rows)
+                        && dv.len() == physical_rows
                     {
-                        if dv.len() == physical_rows {
-                            new_deleted_frag_ids.push(*fragment_id);
-                            continue;
-                        }
+                        new_deleted_frag_ids.push(*fragment_id);
+                        continue;
                     }
 
                     let new_deletion_file = write_deletion_file(
@@ -1838,12 +1837,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+
+        InsertBuilder::new("memory://")
             .with_params(&write_params)
             .execute(vec![data])
             .await
-            .unwrap();
-        dataset
+            .unwrap()
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters

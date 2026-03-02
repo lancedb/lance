@@ -570,10 +570,11 @@ pub(super) async fn alter_columns(
             ))
         })?;
 
-        if let Some(nullable) = alteration.nullable {
-            if field_src.nullable && !nullable {
-                validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
-            }
+        if let Some(nullable) = alteration.nullable
+            && field_src.nullable
+            && !nullable
+        {
+            validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -751,10 +752,10 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
     let mut fields = vec![];
     for field in source.fields.iter() {
         if let Some(other_field) = other.field(&field.name) {
-            if version.support_remove_sub_column(field) {
-                if let Some(f) = field.exclude(other_field) {
-                    fields.push(f)
-                }
+            if version.support_remove_sub_column(field)
+                && let Some(f) = field.exclude(other_field)
+            {
+                fields.push(f)
             }
         } else {
             fields.push(field.clone());

@@ -125,14 +125,13 @@ impl RowIdSequence {
         // range.
         if let (Some(U64Segment::Range(range1)), Some(U64Segment::Range(range2))) =
             (self.0.last(), other.0.first())
+            && range1.end == range2.start
         {
-            if range1.end == range2.start {
-                let new_range = U64Segment::Range(range1.start..range2.end);
-                self.0.pop();
-                self.0.push(new_range);
-                self.0.extend(other.0.into_iter().skip(1));
-                return;
-            }
+            let new_range = U64Segment::Range(range1.start..range2.end);
+            self.0.pop();
+            self.0.push(new_range);
+            self.0.extend(other.0.into_iter().skip(1));
+            return;
         }
         // TODO: add other optimizations, such as combining two RangeWithHoles.
         self.0.extend(other.0);
@@ -217,10 +216,10 @@ impl RowIdSequence {
             // If we've cycled through all segments, we know the row id is not in the sequence.
             while i < self.0.len() {
                 let (segment_idx, segment) = segment_iter.next().unwrap();
-                if segment.range().is_some_and(|range| range.contains(&row_id)) {
-                    if let Some(offset) = segment.position(row_id) {
-                        segment_matches.get_mut(segment_idx).unwrap().push(offset);
-                    }
+                if segment.range().is_some_and(|range| range.contains(&row_id))
+                    && let Some(offset) = segment.position(row_id)
+                {
+                    segment_matches.get_mut(segment_idx).unwrap().push(offset);
                     // The row id was not found it the segment. It might be in a later segment.
                 }
                 i += 1;

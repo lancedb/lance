@@ -254,10 +254,10 @@ impl Manifest {
                     }
                 }
 
-                if let Some(deletion) = &mut cloned_fragment.deletion_file {
-                    if deletion.base_id.is_none() {
-                        deletion.base_id = Some(ref_base_id);
-                    }
+                if let Some(deletion) = &mut cloned_fragment.deletion_file
+                    && deletion.base_id.is_none()
+                {
+                    deletion.base_id = Some(ref_base_id);
                 }
                 cloned_fragment
             })
@@ -538,10 +538,10 @@ impl Manifest {
                         summary.total_deletion_files += 1;
                     }
                     // Sum the number of deleted rows from the deletion file (if available)
-                    if let Some(deletion_file) = &f.deletion_file {
-                        if let Some(num_deleted) = deletion_file.num_deleted_rows {
-                            summary.total_deletion_file_rows += num_deleted as u64;
-                        }
+                    if let Some(deletion_file) = &f.deletion_file
+                        && let Some(num_deleted) = deletion_file.num_deleted_rows
+                    {
+                        summary.total_deletion_file_rows += num_deleted as u64;
                     }
                     summary
                 });

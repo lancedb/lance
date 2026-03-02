@@ -231,47 +231,47 @@ impl MemTableFlusher {
             let mut dataset = Dataset::open(&uri).await?;
 
             for config in index_configs {
-                if let MemIndexConfig::IvfPq(ivf_pq_config) = config {
-                    if let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name) {
-                        let mut index_meta = self
-                            .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
-                            .await?;
+                if let MemIndexConfig::IvfPq(ivf_pq_config) = config
+                    && let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name)
+                {
+                    let mut index_meta = self
+                        .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
+                        .await?;
 
-                        // Fix up the index metadata with correct field index
-                        let schema = dataset.schema();
-                        let field_idx = schema
-                            .field(&ivf_pq_config.column)
-                            .map(|f| f.id)
-                            .unwrap_or(0);
-                        index_meta.fields = vec![field_idx];
-                        index_meta.dataset_version = dataset.version().version;
-                        // Calculate fragment_bitmap from dataset fragments
-                        let fragment_ids: roaring::RoaringBitmap = dataset
-                            .get_fragments()
-                            .iter()
-                            .map(|f| f.id() as u32)
-                            .collect();
-                        index_meta.fragment_bitmap = Some(fragment_ids);
+                    // Fix up the index metadata with correct field index
+                    let schema = dataset.schema();
+                    let field_idx = schema
+                        .field(&ivf_pq_config.column)
+                        .map(|f| f.id)
+                        .unwrap_or(0);
+                    index_meta.fields = vec![field_idx];
+                    index_meta.dataset_version = dataset.version().version;
+                    // Calculate fragment_bitmap from dataset fragments
+                    let fragment_ids: roaring::RoaringBitmap = dataset
+                        .get_fragments()
+                        .iter()
+                        .map(|f| f.id() as u32)
+                        .collect();
+                    index_meta.fragment_bitmap = Some(fragment_ids);
 
-                        // Commit the index to the dataset
-                        use crate::dataset::transaction::{Operation, Transaction};
-                        let transaction = Transaction::new(
-                            index_meta.dataset_version,
-                            Operation::CreateIndex {
-                                new_indices: vec![index_meta],
-                                removed_indices: vec![],
-                            },
-                            None,
-                        );
-                        dataset
-                            .apply_commit(transaction, &Default::default(), &Default::default())
-                            .await?;
+                    // Commit the index to the dataset
+                    use crate::dataset::transaction::{Operation, Transaction};
+                    let transaction = Transaction::new(
+                        index_meta.dataset_version,
+                        Operation::CreateIndex {
+                            new_indices: vec![index_meta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    );
+                    dataset
+                        .apply_commit(transaction, &Default::default(), &Default::default())
+                        .await?;
 
-                        info!(
-                            "Created IVF-PQ index '{}' on flushed generation {}",
-                            ivf_pq_config.name, generation
-                        );
-                    }
+                    info!(
+                        "Created IVF-PQ index '{}' on flushed generation {}",
+                        ivf_pq_config.name, generation
+                    );
                 }
             }
 
@@ -350,18 +350,18 @@ impl MemTableFlusher {
             )
             .name(btree_cfg.name.clone());
 
-            if let Some(registry) = mem_indexes {
-                if let Some(btree_index) = registry.get_btree(&btree_cfg.name) {
-                    // Use reversed training batches since the flushed data is in reverse order.
-                    // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
-                    let training_batches =
-                        btree_index.to_training_batches_reversed(8192, total_rows)?;
-                    if !training_batches.is_empty() {
-                        let schema = training_batches[0].schema();
-                        let reader =
-                            RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
-                        builder = builder.preprocessed_data(Box::new(reader));
-                    }
+            if let Some(registry) = mem_indexes
+                && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
+            {
+                // Use reversed training batches since the flushed data is in reverse order.
+                // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
+                let training_batches =
+                    btree_index.to_training_batches_reversed(8192, total_rows)?;
+                if !training_batches.is_empty() {
+                    let schema = training_batches[0].schema();
+                    let reader =
+                        RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
+                    builder = builder.preprocessed_data(Box::new(reader));
                 }
             }
 

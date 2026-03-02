@@ -868,10 +868,10 @@ impl KMeans {
         for i in 0..initial_k {
             let mut cluster_indices = Vec::new();
             for (idx, &cluster_id) in membership.iter().enumerate() {
-                if let Some(cid) = cluster_id {
-                    if cid as usize == i {
-                        cluster_indices.push(idx);
-                    }
+                if let Some(cid) = cluster_id
+                    && cid as usize == i
+                {
+                    cluster_indices.push(idx);
                 }
             }
 

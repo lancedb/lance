@@ -277,10 +277,10 @@ impl<'a> FragmentCreateBuilder<'a> {
     ) -> Result<(SendableRecordBatchStream, Schema)> {
         if let Some(schema) = self.schema {
             return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
-            if let Some(schema) = self.existing_dataset_schema().await? {
-                return Ok((source.into_stream(), schema));
-            }
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
+            && let Some(schema) = self.existing_dataset_schema().await?
+        {
+            return Ok((source.into_stream(), schema));
         }
         source.into_stream_and_schema().await
     }

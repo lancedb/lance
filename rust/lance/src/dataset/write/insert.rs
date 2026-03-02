@@ -287,29 +287,29 @@ impl<'a> InsertBuilder<'a> {
         }
 
         // Validate schema
-        if matches!(context.params.mode, WriteMode::Append) {
-            if let WriteDestination::Dataset(dataset) = &context.dest {
-                // If the dataset is already using (or not using) stable row ids, we need to match
-                // and ignore whatever the user provided as input
-                if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
-                    log::info!(
-                        "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
-                        context.params.enable_stable_row_ids,
-                        dataset.manifest.uses_stable_row_ids()
-                    );
-                    context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-                }
-
-                let schema_cmp_opts = SchemaCompareOptions {
-                    compare_dictionary: dataset.manifest.should_use_legacy_format(),
-                    compare_nullability: NullabilityComparison::Ignore,
-                    allow_missing_if_nullable: true,
-                    ignore_field_order: true,
-                    ..Default::default()
-                };
-
-                data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+        if matches!(context.params.mode, WriteMode::Append)
+            && let WriteDestination::Dataset(dataset) = &context.dest
+        {
+            // If the dataset is already using (or not using) stable row ids, we need to match
+            // and ignore whatever the user provided as input
+            if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
+                log::info!(
+                    "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
+                    context.params.enable_stable_row_ids,
+                    dataset.manifest.uses_stable_row_ids()
+                );
+                context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }
+
+            let schema_cmp_opts = SchemaCompareOptions {
+                compare_dictionary: dataset.manifest.should_use_legacy_format(),
+                compare_nullability: NullabilityComparison::Ignore,
+                allow_missing_if_nullable: true,
+                ignore_field_order: true,
+                ..Default::default()
+            };
+
+            data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
         // Make sure we aren't using any reserved column names
@@ -327,18 +327,18 @@ impl<'a> InsertBuilder<'a> {
         }
 
         // Feature flags
-        if let WriteDestination::Dataset(dataset) = &context.dest {
-            if !can_write_dataset(dataset.manifest.writer_feature_flags) {
-                let message = format!(
-                    "This dataset cannot be written by this version of Lance. \
+        if let WriteDestination::Dataset(dataset) = &context.dest
+            && !can_write_dataset(dataset.manifest.writer_feature_flags)
+        {
+            let message = format!(
+                "This dataset cannot be written by this version of Lance. \
                 Please upgrade Lance to write to this dataset.\n Flags: {}",
-                    dataset.manifest.writer_feature_flags
-                );
-                return Err(Error::NotSupported {
-                    source: message.into(),
-                    location: location!(),
-                });
-            }
+                dataset.manifest.writer_feature_flags
+            );
+            return Err(Error::NotSupported {
+                source: message.into(),
+                location: location!(),
+            });
         }
 
         Ok(())

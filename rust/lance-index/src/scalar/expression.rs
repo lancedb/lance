@@ -258,15 +258,15 @@ impl ScalarQueryParser for SargableQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        if let Bound::Included(val) | Bound::Excluded(val) = low {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = low
+            && val.is_null()
+        {
+            return None;
         }
-        if let Bound::Included(val) | Bound::Excluded(val) = high {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = high
+            && val.is_null()
+        {
+            return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query_with_recheck(
@@ -679,15 +679,15 @@ impl ScalarQueryParser for FtsQueryParser {
             return None;
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains_tokens" {
-                let query = TokenQuery::TokensContains(scalar_str);
-                return Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ));
-            }
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar
+            && func.name() == "contains_tokens"
+        {
+            let query = TokenQuery::TokensContains(scalar_str);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
         }
         None
     }
@@ -1334,12 +1334,11 @@ fn maybe_indexed_column<'b>(
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
-    if let Some(nested_path) = extract_nested_column_path(expr) {
-        if let Some((data_type, parser)) = index_info.get_index(&nested_path) {
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                return Some((nested_path, data_type, parser));
-            }
-        }
+    if let Some(nested_path) = extract_nested_column_path(expr)
+        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
+        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+    {
+        return Some((nested_path, data_type, parser));
     }
 
     match expr {

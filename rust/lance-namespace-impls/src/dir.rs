@@ -627,10 +627,10 @@ impl DirectoryNamespace {
         }
 
         // Apply limit
-        if let Some(limit) = limit {
-            if limit >= 0 {
-                names.truncate(limit as usize);
-            }
+        if let Some(limit) = limit
+            && limit >= 0
+        {
+            names.truncate(limit as usize);
         }
     }
 
@@ -671,16 +671,16 @@ impl DirectoryNamespace {
 
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
-        if let Some(id) = id {
-            if !id.is_empty() {
-                return Err(Error::Namespace {
+        if let Some(id) = id
+            && !id.is_empty()
+        {
+            return Err(Error::Namespace {
                     source: format!(
                         "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
                         id
                     ).into(),
                     location: snafu::location!(),
                 });
-            }
         }
         Ok(())
     }
@@ -1025,10 +1025,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            if !self.dir_listing_enabled {
-                return manifest_ns.list_tables(request).await;
-            }
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !self.dir_listing_enabled
+        {
+            return manifest_ns.list_tables(request).await;
         }
 
         // When both manifest and directory listing are enabled, we need to merge and deduplicate

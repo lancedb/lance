@@ -608,10 +608,10 @@ impl<'a> CleanupTask<'a> {
                     )
                     .await;
 
-                    if let Ok(manifest) = manifest {
-                        if policy.should_clean(&manifest) {
-                            referenced_branches.insert(branch_name.clone());
-                        }
+                    if let Ok(manifest) = manifest
+                        && policy.should_clean(&manifest)
+                    {
+                        referenced_branches.insert(branch_name.clone());
                     }
                     Ok::<(), Error>(())
                 }
@@ -720,46 +720,45 @@ impl<'a> CleanupTask<'a> {
             for file in fragment.files.iter() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
-                    if let Some(base_path) = base_path {
-                        if base_path.path == self.dataset.uri {
-                            let full_data_path = self.dataset.data_dir().child(file.path.as_str());
-                            let relative_data_path =
-                                remove_prefix(&full_data_path, &self.dataset.base);
-                            inspection
-                                .verified_files
-                                .data_paths
-                                .remove(&relative_data_path);
-                            inspection
-                                .referenced_files
-                                .data_paths
-                                .insert(relative_data_path);
-                            is_referenced = true;
-                        }
+                    if let Some(base_path) = base_path
+                        && base_path.path == self.dataset.uri
+                    {
+                        let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                        let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                        inspection
+                            .verified_files
+                            .data_paths
+                            .remove(&relative_data_path);
+                        inspection
+                            .referenced_files
+                            .data_paths
+                            .insert(relative_data_path);
+                        is_referenced = true;
                     }
                 }
             }
-            if let Some(del_file) = fragment.deletion_file.as_ref() {
-                if let Some(base_id) = del_file.base_id {
-                    let base_path = manifest.base_paths.get(&base_id);
-                    if let Some(base_path) = base_path {
-                        let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
-                            deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
-                        });
-                        if base_path.path == self.dataset.uri {
-                            if let Some(deletion_path) = deletion_path {
-                                let relative_del_path =
-                                    remove_prefix(&deletion_path, &self.dataset.base);
-                                inspection
-                                    .verified_files
-                                    .delete_paths
-                                    .remove(&relative_del_path);
-                                inspection
-                                    .referenced_files
-                                    .delete_paths
-                                    .insert(relative_del_path);
-                            }
-                            is_referenced = true;
+            if let Some(del_file) = fragment.deletion_file.as_ref()
+                && let Some(base_id) = del_file.base_id
+            {
+                let base_path = manifest.base_paths.get(&base_id);
+                if let Some(base_path) = base_path {
+                    let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
+                        deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
+                    });
+                    if base_path.path == self.dataset.uri {
+                        if let Some(deletion_path) = deletion_path {
+                            let relative_del_path =
+                                remove_prefix(&deletion_path, &self.dataset.base);
+                            inspection
+                                .verified_files
+                                .delete_paths
+                                .remove(&relative_del_path);
+                            inspection
+                                .referenced_files
+                                .delete_paths
+                                .insert(relative_del_path);
                         }
+                        is_referenced = true;
                     }
                 }
             }
@@ -767,13 +766,13 @@ impl<'a> CleanupTask<'a> {
         for index in indexes {
             if let Some(base_id) = index.base_id {
                 let base_path = manifest.base_paths.get(&base_id);
-                if let Some(base_path) = base_path {
-                    if base_path.path == self.dataset.uri {
-                        let uuid_str = index.uuid.to_string();
-                        inspection.verified_files.index_uuids.remove(&uuid_str);
-                        inspection.referenced_files.index_uuids.insert(uuid_str);
-                        is_referenced = true;
-                    }
+                if let Some(base_path) = base_path
+                    && base_path.path == self.dataset.uri
+                {
+                    let uuid_str = index.uuid.to_string();
+                    inspection.verified_files.index_uuids.remove(&uuid_str);
+                    inspection.referenced_files.index_uuids.insert(uuid_str);
+                    is_referenced = true;
                 }
             }
         }
@@ -2535,10 +2534,10 @@ mod tests {
                 while let Some(meta) = s.try_next().await? {
                     match exts {
                         Some(exts) => {
-                            if let Some(e) = meta.location.extension() {
-                                if exts.contains(&e) {
-                                    count += 1;
-                                }
+                            if let Some(e) = meta.location.extension()
+                                && exts.contains(&e)
+                            {
+                                count += 1;
                             }
                         }
                         None => count += 1,

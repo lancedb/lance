@@ -355,15 +355,15 @@ for concurrent distributed create_index"
     }
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message:
-                    "Build Distributed Vector Index: multivector type supports only cosine distance"
-                        .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message:
+                "Build Distributed Vector Index: multivector type supports only cosine distance"
+                    .to_string(),
+            location: location!(),
+        });
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -741,14 +741,14 @@ pub(crate) async fn build_vector_index(
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message: "Build Vector Index: multivector type supports only cosine distance"
-                    .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message: "Build Vector Index: multivector type supports only cosine distance"
+                .to_string(),
+            location: location!(),
+        });
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -1012,14 +1012,14 @@ pub(crate) async fn build_vector_index_incremental(
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message: "Build Vector Index: multivector type supports only cosine distance"
-                    .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message: "Build Vector Index: multivector type supports only cosine distance"
+                .to_string(),
+            location: location!(),
+        });
     }
 
     // Extract IVF model and quantizer from existing index

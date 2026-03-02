@@ -1293,19 +1293,19 @@ impl FileFragment {
                 ));
             }
         }
-        if let Some(physical_rows) = self.metadata.physical_rows {
-            if physical_rows != *expected_length {
-                return Err(Error::corrupt_file(
-                    self.dataset
-                        .data_file_dir(&self.metadata.files[0])?
-                        .child(self.metadata.files[0].path.as_str()),
-                    format!(
-                        "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
-                        expected_length, physical_rows
-                    ),
-                    location!(),
-                ));
-            }
+        if let Some(physical_rows) = self.metadata.physical_rows
+            && physical_rows != *expected_length
+        {
+            return Err(Error::corrupt_file(
+                self.dataset
+                    .data_file_dir(&self.metadata.files[0])?
+                    .child(self.metadata.files[0].path.as_str()),
+                format!(
+                    "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
+                    expected_length, physical_rows
+                ),
+                location!(),
+            ));
         }
 
         if let Some(deletion_vector) = deletion_vector? {
@@ -1315,22 +1315,21 @@ impl FileFragment {
                 .as_ref()
                 .unwrap()
                 .num_deleted_rows
+                && num_deletions != deletion_vector.len()
             {
-                if num_deletions != deletion_vector.len() {
-                    return Err(Error::corrupt_file(
-                        deletion_file_path(
-                            &self.dataset.base,
-                            self.metadata.id,
-                            self.metadata.deletion_file.as_ref().unwrap(),
-                        ),
-                        format!(
-                            "deletion vector length does not match metadata. Metadata: {} Deletion vector: {}",
-                            num_deletions,
-                            deletion_vector.len()
-                        ),
-                        location!(),
-                    ));
-                }
+                return Err(Error::corrupt_file(
+                    deletion_file_path(
+                        &self.dataset.base,
+                        self.metadata.id,
+                        self.metadata.deletion_file.as_ref().unwrap(),
+                    ),
+                    format!(
+                        "deletion vector length does not match metadata. Metadata: {} Deletion vector: {}",
+                        num_deletions,
+                        deletion_vector.len()
+                    ),
+                    location!(),
+                ));
             }
 
             for offset in deletion_vector.iter() {
@@ -2078,14 +2077,13 @@ impl FragmentReader {
         self.with_row_last_updated_at_version = true;
 
         // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none() {
-            if let Some(meta) = &self.fragment.last_updated_at_version_meta {
-                if let Ok(sequence) = meta.load_sequence() {
-                    self.last_updated_at_sequence = Some(Arc::new(sequence));
-                }
-            }
-            // If no metadata or load fails, sequence remains None (will default to version 1)
+        if self.last_updated_at_sequence.is_none()
+            && let Some(meta) = &self.fragment.last_updated_at_version_meta
+            && let Ok(sequence) = meta.load_sequence()
+        {
+            self.last_updated_at_sequence = Some(Arc::new(sequence));
         }
+        // If no metadata or load fails, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -2100,14 +2098,13 @@ impl FragmentReader {
         self.with_row_created_at_version = true;
 
         // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none() {
-            if let Some(meta) = &self.fragment.created_at_version_meta {
-                if let Ok(sequence) = meta.load_sequence() {
-                    self.created_at_sequence = Some(Arc::new(sequence));
-                }
-            }
-            // If no metadata or load fails, sequence remains None (will default to version 1)
+        if self.created_at_sequence.is_none()
+            && let Some(meta) = &self.fragment.created_at_version_meta
+            && let Ok(sequence) = meta.load_sequence()
+        {
+            self.created_at_sequence = Some(Arc::new(sequence));
         }
+        // If no metadata or load fails, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -2425,10 +2422,8 @@ impl FragmentReader {
         batch_size: u32,
         skip_deleted_rows: bool,
     ) -> Result<ReadBatchFutStream> {
-        if skip_deleted_rows {
-            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
-                range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
-            }
+        if skip_deleted_rows && let Some(deletion_vector) = self.deletion_vec.as_ref() {
+            range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
         }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),

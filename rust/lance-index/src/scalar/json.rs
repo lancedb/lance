@@ -434,46 +434,34 @@ impl JsonIndexPlugin {
             let batch = batch_result?;
 
             // Determine type from first non-null value if not yet set
-            if inferred_type.is_none() {
-                if let Some(json_result_column) = batch.column_by_name("json_result") {
-                    if let Some(struct_array) =
-                        json_result_column.as_any().downcast_ref::<StructArray>()
-                    {
-                        if let Some(type_array) = struct_array.column_by_name("type_tag") {
-                            if let Some(uint8_array) =
-                                type_array.as_any().downcast_ref::<UInt8Array>()
-                            {
-                                // Find first non-null value to determine type
-                                for i in 0..uint8_array.len() {
-                                    if !uint8_array.is_null(i) {
-                                        let type_tag = uint8_array.value(i);
-                                        let jsonb_type =
-                                            JsonbType::from_u8(type_tag).ok_or_else(|| {
-                                                Error::InvalidInput {
-                                                    source: format!(
-                                                        "Invalid type tag: {}",
-                                                        type_tag
-                                                    )
-                                                    .into(),
-                                                    location: location!(),
-                                                }
-                                            })?;
+            if inferred_type.is_none()
+                && let Some(json_result_column) = batch.column_by_name("json_result")
+                && let Some(struct_array) =
+                    json_result_column.as_any().downcast_ref::<StructArray>()
+                && let Some(type_array) = struct_array.column_by_name("type_tag")
+                && let Some(uint8_array) = type_array.as_any().downcast_ref::<UInt8Array>()
+            {
+                // Find first non-null value to determine type
+                for i in 0..uint8_array.len() {
+                    if !uint8_array.is_null(i) {
+                        let type_tag = uint8_array.value(i);
+                        let jsonb_type =
+                            JsonbType::from_u8(type_tag).ok_or_else(|| Error::InvalidInput {
+                                source: format!("Invalid type tag: {}", type_tag).into(),
+                                location: location!(),
+                            })?;
 
-                                        // Map JsonbType to Arrow DataType
-                                        inferred_type = Some(match jsonb_type {
-                                            JsonbType::Null => continue, // Skip null values
-                                            JsonbType::Boolean => DataType::Boolean,
-                                            JsonbType::Int64 => DataType::Int64,
-                                            JsonbType::Float64 => DataType::Float64,
-                                            JsonbType::String => DataType::Utf8,
-                                            JsonbType::Array => DataType::LargeBinary,
-                                            JsonbType::Object => DataType::LargeBinary,
-                                        });
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        // Map JsonbType to Arrow DataType
+                        inferred_type = Some(match jsonb_type {
+                            JsonbType::Null => continue, // Skip null values
+                            JsonbType::Boolean => DataType::Boolean,
+                            JsonbType::Int64 => DataType::Int64,
+                            JsonbType::Float64 => DataType::Float64,
+                            JsonbType::String => DataType::Utf8,
+                            JsonbType::Array => DataType::LargeBinary,
+                            JsonbType::Object => DataType::LargeBinary,
+                        });
+                        break;
                     }
                 }
             }

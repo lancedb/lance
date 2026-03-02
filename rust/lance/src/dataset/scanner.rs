@@ -925,17 +925,15 @@ impl TakeOperation {
                     // Check for _rowid = literal
                     if let (Expr::Column(col), Expr::Literal(lit, _)) =
                         (binary.left.as_ref(), binary.right.as_ref())
-                    {
-                        if let Some(ScalarValue::UInt64(Some(val))) =
+                        && let Some(ScalarValue::UInt64(Some(val))) =
                             safe_coerce_scalar(lit, &DataType::UInt64)
-                        {
-                            if col.name == ROW_ID {
-                                return Some((Self::RowIds(vec![val]), None));
-                            } else if col.name == ROW_ADDR {
-                                return Some((Self::RowAddrs(vec![val]), None));
-                            } else if col.name == ROW_OFFSET {
-                                return Some((Self::RowOffsets(vec![val]), None));
-                            }
+                    {
+                        if col.name == ROW_ID {
+                            return Some((Self::RowIds(vec![val]), None));
+                        } else if col.name == ROW_ADDR {
+                            return Some((Self::RowAddrs(vec![val]), None));
+                        } else if col.name == ROW_OFFSET {
+                            return Some((Self::RowOffsets(vec![val]), None));
                         }
                     }
                 }
@@ -957,17 +955,16 @@ impl TakeOperation {
                 }
                 _ => {}
             }
-        } else if let Expr::InList(in_expr) = expr {
-            if let Expr::Column(col) = in_expr.expr.as_ref() {
-                if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
-                    if col.name == ROW_ID {
-                        return Some((Self::RowIds(u64s), None));
-                    } else if col.name == ROW_ADDR {
-                        return Some((Self::RowAddrs(u64s), None));
-                    } else if col.name == ROW_OFFSET {
-                        return Some((Self::RowOffsets(u64s), None));
-                    }
-                }
+        } else if let Expr::InList(in_expr) = expr
+            && let Expr::Column(col) = in_expr.expr.as_ref()
+            && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
+        {
+            if col.name == ROW_ID {
+                return Some((Self::RowIds(u64s), None));
+            } else if col.name == ROW_ADDR {
+                return Some((Self::RowAddrs(u64s), None));
+            } else if col.name == ROW_OFFSET {
+                return Some((Self::RowOffsets(u64s), None));
             }
         }
         None
@@ -1351,12 +1348,12 @@ impl Scanner {
                 "Limit must be non-negative".to_string(),
             ));
         }
-        if let Some(off) = offset {
-            if off < 0 {
-                return Err(Error::invalid_input(
-                    "Offset must be non-negative".to_string(),
-                ));
-            }
+        if let Some(off) = offset
+            && off < 0
+        {
+            return Err(Error::invalid_input(
+                "Offset must be non-negative".to_string(),
+            ));
         }
         self.limit = limit;
         self.offset = offset;
@@ -4386,15 +4383,15 @@ impl Scanner {
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
-        let res = analyze_plan(
+
+        analyze_plan(
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
                 ..Default::default()
             },
         )
-        .await;
-        res
+        .await
     }
 
     #[instrument(level = "info", skip(self))]

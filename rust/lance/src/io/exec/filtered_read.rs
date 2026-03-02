@@ -537,10 +537,10 @@ impl FilteredReadStream {
             deletion_vector,
         } in fragments.iter()
         {
-            if let Some(range_before_filter) = &options.scan_range_before_filter {
-                if range_offset >= range_before_filter.end {
-                    break;
-                }
+            if let Some(range_before_filter) = &options.scan_range_before_filter
+                && range_offset >= range_before_filter.end
+            {
+                break;
             }
 
             let mut to_read: Vec<Range<u64>> =

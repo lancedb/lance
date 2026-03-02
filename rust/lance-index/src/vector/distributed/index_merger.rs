@@ -738,17 +738,16 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut aux_paths: Vec<object_store::path::Path> = Vec::new();
     let mut stream = object_store.list(Some(index_dir.clone()));
     while let Some(item) = stream.next().await {
-        if let Ok(meta) = item {
-            if let Some(fname) = meta.location.filename() {
-                if fname == INDEX_AUXILIARY_FILE_NAME {
-                    // Check parent dir name starts with partial_
-                    let parts: Vec<_> = meta.location.parts().collect();
-                    if parts.len() >= 2 {
-                        let pname = parts[parts.len() - 2].as_ref();
-                        if pname.starts_with("partial_") {
-                            aux_paths.push(meta.location.clone());
-                        }
-                    }
+        if let Ok(meta) = item
+            && let Some(fname) = meta.location.filename()
+            && fname == INDEX_AUXILIARY_FILE_NAME
+        {
+            // Check parent dir name starts with partial_
+            let parts: Vec<_> = meta.location.parts().collect();
+            if parts.len() >= 2 {
+                let pname = parts[parts.len() - 2].as_ref();
+                if pname.starts_with("partial_") {
+                    aux_paths.push(meta.location.clone());
                 }
             }
         }
@@ -1007,13 +1006,13 @@ pub async fn merge_partial_vector_auxiliary_files(
 
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
 
                 if sq_meta.is_none() {
@@ -1082,13 +1081,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1160,13 +1159,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     _ => 0,
                 };
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1225,13 +1224,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     }
                 };
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1292,13 +1291,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1400,13 +1399,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     })?;
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if sq_meta.is_none() {
                     sq_meta = Some(sq_meta_parsed.clone());

@@ -325,24 +325,24 @@ impl FtsIndexExec {
         }
 
         for &(pos, score) in results {
-            if let Some(batch_range) = self.find_batch(pos as usize) {
-                if let Some(stored) = self.batch_store.get(batch_range.batch_id) {
-                    let row_in_batch = (pos as usize - batch_range.start) as u32;
-                    let indices = UInt32Array::from(vec![row_in_batch]);
+            if let Some(batch_range) = self.find_batch(pos as usize)
+                && let Some(stored) = self.batch_store.get(batch_range.batch_id)
+            {
+                let row_in_batch = (pos as usize - batch_range.start) as u32;
+                let indices = UInt32Array::from(vec![row_in_batch]);
 
-                    // Take each column value
-                    for (col_idx, col) in stored.data.columns().iter().enumerate() {
-                        let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
-                        if all_columns.len() <= col_idx {
-                            all_columns.push(Vec::new());
-                        }
-                        all_columns[col_idx].push(taken);
+                // Take each column value
+                for (col_idx, col) in stored.data.columns().iter().enumerate() {
+                    let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
+                    if all_columns.len() <= col_idx {
+                        all_columns.push(Vec::new());
                     }
-
-                    all_rows.push(row_in_batch);
-                    all_scores.push(score);
-                    all_row_positions.push(pos);
+                    all_columns[col_idx].push(taken);
                 }
+
+                all_rows.push(row_in_batch);
+                all_scores.push(score);
+                all_row_positions.push(pos);
             }
         }
 

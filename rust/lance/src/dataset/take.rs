@@ -534,11 +534,10 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                let addresses = row_ids
+                row_ids
                     .iter()
                     .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                    .collect::<Vec<_>>();
-                addresses
+                    .collect::<Vec<_>>()
             } else {
                 row_ids.clone()
             };

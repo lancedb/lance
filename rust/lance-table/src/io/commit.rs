@@ -260,10 +260,10 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
-            return Ok(location);
-        }
+    if object_store.is_local()
+        && let Ok(Some(location)) = current_manifest_local(base)
+    {
+        return Ok(location);
     }
 
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));

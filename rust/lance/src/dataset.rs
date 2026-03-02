@@ -646,52 +646,48 @@ impl Dataset {
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(index_offset) = manifest.index_section {
-            if manifest_size - index_offset <= last_block.len() {
-                let offset_in_block = last_block.len() - (manifest_size - index_offset);
-                let message_len =
-                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
-                        as usize;
-                let message_data =
-                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-                let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let mut indices: Vec<IndexMetadata> = section
-                    .indices
-                    .into_iter()
-                    .map(IndexMetadata::try_from)
-                    .collect::<Result<Vec<_>>>()?;
-                retain_supported_indices(&mut indices);
-                let ds_index_cache = session.index_cache.for_dataset(uri);
-                let metadata_key = crate::session::index_caches::IndexMetadataKey {
-                    version: manifest_location.version,
-                };
-                ds_index_cache
-                    .insert_with_key(&metadata_key, Arc::new(indices))
-                    .await;
-            }
+        if let Some(index_offset) = manifest.index_section
+            && manifest_size - index_offset <= last_block.len()
+        {
+            let offset_in_block = last_block.len() - (manifest_size - index_offset);
+            let message_len =
+                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
+            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            let section = lance_table::format::pb::IndexSection::decode(message_data)?;
+            let mut indices: Vec<IndexMetadata> = section
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?;
+            retain_supported_indices(&mut indices);
+            let ds_index_cache = session.index_cache.for_dataset(uri);
+            let metadata_key = crate::session::index_caches::IndexMetadataKey {
+                version: manifest_location.version,
+            };
+            ds_index_cache
+                .insert_with_key(&metadata_key, Arc::new(indices))
+                .await;
         }
 
         // If transaction is also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(transaction_offset) = manifest.transaction_section {
-            if manifest_size - transaction_offset <= last_block.len() {
-                let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
-                let message_len =
-                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
-                        as usize;
-                let message_data =
-                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-                let transaction: Transaction =
-                    lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+        if let Some(transaction_offset) = manifest.transaction_section
+            && manifest_size - transaction_offset <= last_block.len()
+        {
+            let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
+            let message_len =
+                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
+            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            let transaction: Transaction =
+                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
 
-                let metadata_cache = session.metadata_cache.for_dataset(uri);
-                let metadata_key = TransactionKey {
-                    version: manifest_location.version,
-                };
-                metadata_cache
-                    .insert_with_key(&metadata_key, Arc::new(transaction))
-                    .await;
-            }
+            let metadata_cache = session.metadata_cache.for_dataset(uri);
+            let metadata_key = TransactionKey {
+                version: manifest_location.version,
+            };
+            metadata_cache
+                .insert_with_key(&metadata_key, Arc::new(transaction))
+                .await;
         }
 
         if manifest.should_use_legacy_format() {
@@ -935,10 +931,10 @@ impl Dataset {
                 // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
                 // assumes no dataset exists and converts the mode to CREATE.
                 let mut builder = DatasetBuilder::from_uri(uri.as_str());
-                if let Some(ref store_params) = write_params.store_params {
-                    if let Some(accessor) = &store_params.storage_options_accessor {
-                        builder = builder.with_storage_options_accessor(accessor.clone());
-                    }
+                if let Some(ref store_params) = write_params.store_params
+                    && let Some(accessor) = &store_params.storage_options_accessor
+                {
+                    builder = builder.with_storage_options_accessor(accessor.clone());
                 }
                 let dataset = Arc::new(builder.load().await?);
 

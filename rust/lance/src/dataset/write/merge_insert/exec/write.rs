@@ -583,16 +583,16 @@ impl FullSchemaMergeInsertExec {
                             merge_state_clone.clone(),
                         ) {
                             Ok((update_batch_opt, insert_batch_opt)) => {
-                                if let Some(update_batch) = update_batch_opt {
-                                    if update_tx.send(Ok(update_batch)).is_err() {
-                                        break;
-                                    }
+                                if let Some(update_batch) = update_batch_opt
+                                    && update_tx.send(Ok(update_batch)).is_err()
+                                {
+                                    break;
                                 }
 
-                                if let Some(insert_batch) = insert_batch_opt {
-                                    if insert_tx.send(Ok(insert_batch)).is_err() {
-                                        break;
-                                    }
+                                if let Some(insert_batch) = insert_batch_opt
+                                    && insert_tx.send(Ok(insert_batch)).is_err()
+                                {
+                                    break;
                                 }
                             }
                             Err(e) => {

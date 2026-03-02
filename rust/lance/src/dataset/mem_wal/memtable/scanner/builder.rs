@@ -721,12 +721,11 @@ impl MemTableScanner {
         }
 
         // Check if we can use a BTree index for the filter
-        if self.use_index {
-            if let Some(predicate) = self.extract_btree_predicate() {
-                if self.has_btree_index(predicate.column()) {
-                    return self.plan_btree_query(&predicate).await;
-                }
-            }
+        if self.use_index
+            && let Some(predicate) = self.extract_btree_predicate()
+            && self.has_btree_index(predicate.column())
+        {
+            return self.plan_btree_query(&predicate).await;
         }
 
         // Fall back to full scan

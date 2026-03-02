@@ -1727,27 +1727,27 @@ mod tests {
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
         // Replicate the validation logic from the main write function
-        if matches!(params.mode, WriteMode::Create) {
-            if let Some(target_bases) = &params.target_bases {
-                if target_bases.len() != 1 {
+        if matches!(params.mode, WriteMode::Create)
+            && let Some(target_bases) = &params.target_bases
+        {
+            if target_bases.len() != 1 {
+                return Err(Error::invalid_input(format!(
+                    "target_bases with {} elements is not supported",
+                    target_bases.len()
+                )));
+            }
+            let target_base_id = target_bases[0];
+            if let Some(initial_bases) = &params.initial_bases {
+                if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
                     return Err(Error::invalid_input(format!(
-                        "target_bases with {} elements is not supported",
-                        target_bases.len()
+                        "target_base_id {} must be one of the initial_bases in CREATE mode",
+                        target_base_id
                     )));
                 }
-                let target_base_id = target_bases[0];
-                if let Some(initial_bases) = &params.initial_bases {
-                    if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
-                        return Err(Error::invalid_input(format!(
-                            "target_base_id {} must be one of the initial_bases in CREATE mode",
-                            target_base_id
-                        )));
-                    }
-                } else {
-                    return Err(Error::invalid_input(
-                        "initial_bases must be provided when target_bases is specified in CREATE mode",
-                    ));
-                }
+            } else {
+                return Err(Error::invalid_input(
+                    "initial_bases must be provided when target_bases is specified in CREATE mode",
+                ));
             }
         }
         Ok(())

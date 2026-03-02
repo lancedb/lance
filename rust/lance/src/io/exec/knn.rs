@@ -760,42 +760,41 @@ impl ANNIvfSubIndexExec {
 
             let max_results = prefilter_mask.max_len().map(|x| x as usize);
 
-            if let Some(max_results) = max_results {
-                if found_so_far < max_results && max_results <= query.k {
-                    // In this case there are fewer than k results matching the prefilter so
-                    // just return the prefilter ids and don't bother searching any further
+            if let Some(max_results) = max_results
+                && found_so_far < max_results
+                && max_results <= query.k
+            {
+                // In this case there are fewer than k results matching the prefilter so
+                // just return the prefilter ids and don't bother searching any further
 
-                    // This next if check should be true, because we wouldn't get max_results otherwise
-                    if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
-                        // We only run this on the first delta because the prefilter mask is shared
-                        // by all deltas and we don't want to duplicate the rows.
-                        if state
-                            .took_no_rows_shortcut
-                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            let initial_addrs = state.initial_ids.lock().unwrap();
-                            let found_addrs =
-                                HashSet::<_>::from_iter(initial_addrs.iter().copied());
-                            drop(initial_addrs);
-                            let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
-                            let not_found_addrs = mask_addrs.difference(&found_addrs);
-                            let not_found_addrs =
-                                UInt64Array::from_iter_values(not_found_addrs.copied());
-                            let not_found_distance =
-                                Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
-                            let not_found_batch = RecordBatch::try_new(
-                                KNN_INDEX_SCHEMA.clone(),
-                                vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
-                            )
-                            .unwrap();
-                            return futures::stream::once(async move { Ok(not_found_batch) })
-                                .boxed();
-                        } else {
-                            // We meet all the criteria for an early exit, but we aren't first
-                            // delta so we just return an empty stream and skip the late search
-                            return futures::stream::empty().boxed();
-                        }
+                // This next if check should be true, because we wouldn't get max_results otherwise
+                if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
+                    // We only run this on the first delta because the prefilter mask is shared
+                    // by all deltas and we don't want to duplicate the rows.
+                    if state
+                        .took_no_rows_shortcut
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        let initial_addrs = state.initial_ids.lock().unwrap();
+                        let found_addrs = HashSet::<_>::from_iter(initial_addrs.iter().copied());
+                        drop(initial_addrs);
+                        let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
+                        let not_found_addrs = mask_addrs.difference(&found_addrs);
+                        let not_found_addrs =
+                            UInt64Array::from_iter_values(not_found_addrs.copied());
+                        let not_found_distance =
+                            Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
+                        let not_found_batch = RecordBatch::try_new(
+                            KNN_INDEX_SCHEMA.clone(),
+                            vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
+                        )
+                        .unwrap();
+                        return futures::stream::once(async move { Ok(not_found_batch) }).boxed();
+                    } else {
+                        // We meet all the criteria for an early exit, but we aren't first
+                        // delta so we just return an empty stream and skip the late search
+                        return futures::stream::empty().boxed();
                     }
                 }
             }
@@ -1125,10 +1124,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
 fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
     query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
-    if let Some(maximum) = query.maximum_nprobes {
-        if query.minimum_nprobes > maximum {
-            query.minimum_nprobes = maximum;
-        }
+    if let Some(maximum) = query.maximum_nprobes
+        && query.minimum_nprobes > maximum
+    {
+        query.minimum_nprobes = maximum;
     }
 }
 

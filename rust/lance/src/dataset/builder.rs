@@ -666,12 +666,12 @@ impl DatasetBuilder {
                     .await;
             }
         }
-        if let Some(version_number) = version_number {
-            if version_number != dataset.manifest.version {
-                return Err(Error::VersionNotFound {
-                    message: format!("version {} not found", version_number),
-                });
-            }
+        if let Some(version_number) = version_number
+            && version_number != dataset.manifest.version
+        {
+            return Err(Error::VersionNotFound {
+                message: format!("version {} not found", version_number),
+            });
         }
         Ok(dataset)
     }

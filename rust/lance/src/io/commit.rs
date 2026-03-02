@@ -342,8 +342,8 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     e
                 ),
                 location: location!(),
-            })? {
-                if actual_file_version > data_storage_version {
+            })?
+                && actual_file_version > data_storage_version {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
                         data_storage_version,
@@ -351,20 +351,19 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     );
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
-            }
     } else {
         // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
         // match the data storage version.  This is a sanity assertion to prevent data corruption.
-        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
-            if actual_file_version != data_storage_version {
-                return Err(Error::Internal {
-                    message: format!(
-                        "The operation added files with version {}.  However, the data storage version is {}.",
-                        actual_file_version, data_storage_version
-                    ),
-                    location: location!(),
-                });
-            }
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
+            && actual_file_version != data_storage_version
+        {
+            return Err(Error::Internal {
+                message: format!(
+                    "The operation added files with version {}.  However, the data storage version is {}.",
+                    actual_file_version, data_storage_version
+                ),
+                location: location!(),
+            });
         }
     }
     Ok(())
@@ -418,10 +417,10 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
             .rev()
             .flat_map(|file| file.fields.iter_mut())
         {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
-                if seen_fields.insert(*field_id) {
-                    *field_id = *new_field_id;
-                }
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                && seen_fields.insert(*field_id)
+            {
+                *field_id = *new_field_id;
             }
         }
         seen_fields.clear();

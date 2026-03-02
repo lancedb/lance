@@ -57,10 +57,10 @@ impl DocType {
     pub fn prefix_len(&self, token: &str) -> usize {
         match self {
             Self::Json => {
-                if let Some(pos) = token.find(',') {
-                    if let Some(second_pos) = token[pos + 1..].find(',') {
-                        return pos + second_pos + 2;
-                    }
+                if let Some(pos) = token.find(',')
+                    && let Some(second_pos) = token[pos + 1..].find(',')
+                {
+                    return pos + second_pos + 2;
                 }
                 panic!("json token must be in format of <path>,<type>,<value>")
             }

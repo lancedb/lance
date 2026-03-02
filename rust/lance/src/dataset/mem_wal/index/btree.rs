@@ -220,11 +220,11 @@ impl BTreeMemIndex {
 
         for entry in self.lookup.iter() {
             let key = entry.key();
-            if let Some(last) = result.last_mut() {
-                if last.0 == key.value {
-                    last.1.push(key.row_position);
-                    continue;
-                }
+            if let Some(last) = result.last_mut()
+                && last.0 == key.value
+            {
+                last.1.push(key.row_position);
+                continue;
             }
             result.push((key.value.clone(), vec![key.row_position]));
         }

@@ -291,13 +291,14 @@ impl<'a> CommitBuilder<'a> {
         };
 
         // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset() {
-            if let Some(storage_format) = self.storage_format {
-                let passed_storage_format = DataStorageFormat::new(storage_format);
-                if ds.manifest.data_storage_format != passed_storage_format
-                    && !matches!(transaction.operation, Operation::Overwrite { .. })
-                {
-                    return Err(Error::InvalidInput {
+        if let Some(ds) = dest.dataset()
+            && let Some(storage_format) = self.storage_format
+        {
+            let passed_storage_format = DataStorageFormat::new(storage_format);
+            if ds.manifest.data_storage_format != passed_storage_format
+                && !matches!(transaction.operation, Operation::Overwrite { .. })
+            {
+                return Err(Error::InvalidInput {
                         source: format!(
                             "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
                             ds.manifest.data_storage_format,
@@ -305,7 +306,6 @@ impl<'a> CommitBuilder<'a> {
                         ).into(),
                         location: location!(),
                     });
-                }
             }
         }
 

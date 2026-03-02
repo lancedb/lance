@@ -208,10 +208,10 @@ pub fn apply_row_id_and_deletes(
 ) -> Result<RecordBatch> {
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
-    if let Some(deletion_vector_inner) = deletion_vector {
-        if matches!(deletion_vector_inner.as_ref(), DeletionVector::NoDeletions) {
-            deletion_vector = None;
-        }
+    if let Some(deletion_vector_inner) = deletion_vector
+        && matches!(deletion_vector_inner.as_ref(), DeletionVector::NoDeletions)
+    {
+        deletion_vector = None;
     }
     let has_deletions = deletion_vector.is_some();
     debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);

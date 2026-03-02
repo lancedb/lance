@@ -243,11 +243,11 @@ impl RegionManifestStore {
 
             let mut found_any = false;
             while let Some((version, result)) = futures.next().await {
-                if let Ok(true) = result {
-                    if version > latest_found {
-                        latest_found = version;
-                        found_any = true;
-                    }
+                if let Ok(true) = result
+                    && version > latest_found
+                {
+                    latest_found = version;
+                    found_any = true;
                 }
             }
 
@@ -324,12 +324,11 @@ impl RegionManifestStore {
         for item in list_result {
             match item {
                 Ok(meta) => {
-                    if let Some(filename) = meta.location.filename() {
-                        if filename.ends_with(".binpb") {
-                            if let Some(version) = parse_bit_reversed_filename(filename) {
-                                versions.push(version);
-                            }
-                        }
+                    if let Some(filename) = meta.location.filename()
+                        && filename.ends_with(".binpb")
+                        && let Some(version) = parse_bit_reversed_filename(filename)
+                    {
+                        versions.push(version);
                     }
                 }
                 Err(e) => {

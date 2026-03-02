@@ -401,10 +401,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
-            if let Some(cur_doc) = self.cur_doc {
-                if cur_doc.doc_id() >= doc.doc_id() {
-                    continue;
-                }
+            if let Some(cur_doc) = self.cur_doc
+                && cur_doc.doc_id() >= doc.doc_id()
+            {
+                continue;
             }
             self.cur_doc = Some(doc);
             num_comparisons += 1;
@@ -499,11 +499,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 pivot += 1;
             }
 
-            if let Some(least_id) = self.postings[0].block_first_doc() {
-                if least_id > doc_id {
-                    current_doc = least_id;
-                    continue;
-                }
+            if let Some(least_id) = self.postings[0].block_first_doc()
+                && least_id > doc_id
+            {
+                current_doc = least_id;
+                continue;
             }
             let mut max_pivot = 0;
             while max_pivot + 1 < self.postings.len() {

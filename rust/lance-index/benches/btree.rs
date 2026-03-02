@@ -112,12 +112,11 @@ async fn create_int_unique_index(
 
     let cache = get_cache(use_cache, "int_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
-    let index = BTreeIndexPlugin
+
+    (BTreeIndexPlugin
         .load_index(store, &details, None, &cache)
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a BTree index for int64 data with low cardinality
@@ -133,12 +132,11 @@ async fn create_int_low_card_index(
 
     let cache = get_cache(use_cache, "int_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
-    let index = BTreeIndexPlugin
+
+    (BTreeIndexPlugin
         .load_index(store, &details, None, &cache)
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a BTree index for string data with unique values
@@ -154,12 +152,11 @@ async fn create_string_unique_index(
 
     let cache = get_cache(use_cache, "string_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
-    let index = BTreeIndexPlugin
+
+    (BTreeIndexPlugin
         .load_index(store, &details, None, &cache)
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a BTree index for string data with low cardinality
@@ -175,12 +172,11 @@ async fn create_string_low_card_index(
 
     let cache = get_cache(use_cache, "string_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
-    let index = BTreeIndexPlugin
+
+    (BTreeIndexPlugin
         .load_index(store, &details, None, &cache)
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Setup function for int unique index - creates it only once per cache variant

@@ -1163,10 +1163,10 @@ async fn merge_metadata_files(
             );
         }
 
-        if token_set_format.is_none() {
-            if let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY) {
-                token_set_format = Some(TokenSetFormat::from_str(name)?);
-            }
+        if token_set_format.is_none()
+            && let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY)
+        {
+            token_set_format = Some(TokenSetFormat::from_str(name)?);
         }
     }
 

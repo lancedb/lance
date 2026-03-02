@@ -1948,15 +1948,15 @@ pub async fn finalize_distributed_merge(
 
         while let Some(item) = stream.next().await {
             let meta = item?;
-            if let Some(fname) = meta.location.filename() {
-                if fname == INDEX_FILE_NAME {
-                    let parts: Vec<_> = meta.location.parts().collect();
-                    if parts.len() >= 2 {
-                        let parent = parts[parts.len() - 2].as_ref();
-                        if parent.starts_with("partial_") {
-                            partial_index_path = Some(meta.location.clone());
-                            break;
-                        }
+            if let Some(fname) = meta.location.filename()
+                && fname == INDEX_FILE_NAME
+            {
+                let parts: Vec<_> = meta.location.parts().collect();
+                if parts.len() >= 2 {
+                    let parent = parts[parts.len() - 2].as_ref();
+                    if parent.starts_with("partial_") {
+                        partial_index_path = Some(meta.location.clone());
+                        break;
                     }
                 }
             }
@@ -1975,13 +1975,13 @@ pub async fn finalize_distributed_merge(
             )
             .await?;
             let partial_meta = partial_reader.metadata();
-            if let Some(ivf_idx_str) = partial_meta.file_schema.metadata.get(IVF_METADATA_KEY) {
-                if let Ok(ivf_idx) = ivf_idx_str.parse::<u32>() {
-                    let partial_ivf_bytes = partial_reader.read_global_buffer(ivf_idx).await?;
-                    let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
-                    if partial_pb_ivf.centroids_tensor.is_some() {
-                        pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
-                    }
+            if let Some(ivf_idx_str) = partial_meta.file_schema.metadata.get(IVF_METADATA_KEY)
+                && let Ok(ivf_idx) = ivf_idx_str.parse::<u32>()
+            {
+                let partial_ivf_bytes = partial_reader.read_global_buffer(ivf_idx).await?;
+                let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
+                if partial_pb_ivf.centroids_tensor.is_some() {
+                    pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
                 }
             }
         }

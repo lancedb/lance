@@ -139,24 +139,24 @@ impl Iterator for WikiTextBatchReader {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // If we have a current reader, try to get next batch
-            if let Some(reader) = &mut self.current_reader {
-                if let Some(batch_result) = reader.next() {
-                    return Some(batch_result.and_then(|batch| self.process_batch(&batch)));
-                }
+            if let Some(reader) = &mut self.current_reader
+                && let Some(batch_result) = reader.next()
+            {
+                return Some(batch_result.and_then(|batch| self.process_batch(&batch)));
             }
 
             // If no current reader or current reader is exhausted, try to get next reader
-            if self.current_reader_idx < self.parquet_readers.len() {
-                if let Some(builder) = self.parquet_readers[self.current_reader_idx].take() {
-                    match builder.build() {
-                        Ok(reader) => {
-                            self.current_reader = Some(Box::new(reader));
-                            self.current_reader_idx += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))));
-                        }
+            if self.current_reader_idx < self.parquet_readers.len()
+                && let Some(builder) = self.parquet_readers[self.current_reader_idx].take()
+            {
+                match builder.build() {
+                    Ok(reader) => {
+                        self.current_reader = Some(Box::new(reader));
+                        self.current_reader_idx += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))));
                     }
                 }
             }
