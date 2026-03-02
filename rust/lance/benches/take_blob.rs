@@ -38,27 +38,13 @@ fn bench_take_blob(c: &mut Criterion) {
     for (version, cache_repetition_index, label) in cases {
         let dataset = Arc::new(runtime.block_on(prepare_dataset(version, cache_repetition_index)));
         bench_take_blobs_by_indices(&runtime, c, dataset.clone(), label, 1);
-        bench_take_blobs_by_indices(&runtime, c, dataset, label, 16);
-
-        let descriptor_dataset =
-            Arc::new(runtime.block_on(prepare_dataset(version, cache_repetition_index)));
-        bench_take_blob_descriptors(&runtime, c, descriptor_dataset.clone(), label, 1);
-        bench_take_blob_descriptors(&runtime, c, descriptor_dataset, label, 16);
-
-        let descriptor_addr_dataset =
-            Arc::new(runtime.block_on(prepare_dataset(version, cache_repetition_index)));
-        bench_take_blob_descriptors_with_row_addr(
-            &runtime,
-            c,
-            descriptor_addr_dataset.clone(),
-            label,
-            1,
-        );
-        bench_take_blob_descriptors_with_row_addr(&runtime, c, descriptor_addr_dataset, label, 16);
-
-        let id_dataset = Arc::new(runtime.block_on(prepare_dataset(version, cache_repetition_index)));
-        bench_take_id_column(&runtime, c, id_dataset.clone(), label, 1);
-        bench_take_id_column(&runtime, c, id_dataset, label, 16);
+        bench_take_blobs_by_indices(&runtime, c, dataset.clone(), label, 16);
+        bench_take_blob_descriptors(&runtime, c, dataset.clone(), label, 1);
+        bench_take_blob_descriptors(&runtime, c, dataset.clone(), label, 16);
+        bench_take_blob_descriptors_with_row_addr(&runtime, c, dataset.clone(), label, 1);
+        bench_take_blob_descriptors_with_row_addr(&runtime, c, dataset.clone(), label, 16);
+        bench_take_id_column(&runtime, c, dataset.clone(), label, 1);
+        bench_take_id_column(&runtime, c, dataset, label, 16);
     }
 }
 
@@ -206,7 +192,10 @@ async fn prepare_dataset(version: LanceFileVersion, cache_repetition_index: bool
         "cache_off"
     };
     let uri = std::env::temp_dir()
-        .join(format!("take-blob-{label}-{cache_label}-{}", Uuid::new_v4()))
+        .join(format!(
+            "take-blob-{label}-{cache_label}-{}",
+            Uuid::new_v4()
+        ))
         .to_string_lossy()
         .into_owned();
     write_blob_dataset(&uri, version, cache_repetition_index).await
