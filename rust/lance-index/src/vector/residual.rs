@@ -16,7 +16,6 @@ use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;
 use tracing::instrument;
@@ -83,16 +82,13 @@ where
 
     let vectors_slice = vectors.values();
     let centroids_slice = centroids.values();
-    let residuals = vectors_slice
-        .chunks_exact(dimension)
-        .enumerate()
-        .flat_map(|(idx, vector)| {
-            let part_id = part_ids[idx] as usize;
-            let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
-            iter::zip(vector, c).map(|(v, cent)| *v - *cent)
-        })
-        .exact_size(vectors.len())
-        .collect::<Vec<_>>();
+    let mut residuals = Vec::with_capacity(vectors.len());
+    for (idx, vector) in vectors_slice.chunks_exact(dimension).enumerate() {
+        let part_id = part_ids[idx] as usize;
+        let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
+        residuals.extend(iter::zip(vector, c).map(|(v, cent)| *v - *cent));
+    }
+    debug_assert_eq!(residuals.len(), vectors.len());
     let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
     debug_assert_eq!(residual_arr.len(), vectors.len());
     Ok(FixedSizeListArray::try_new_from_values(

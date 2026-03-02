@@ -986,6 +986,23 @@ fn inner_create_index<'local>(
     (&index_metadata).into_java(env)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeDropIndex(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    name: JString,
+) {
+    ok_or_throw_without_return!(env, inner_drop_index(&mut env, java_dataset, name))
+}
+
+fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> Result<()> {
+    let name = name.extract(env)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_index(&name))?;
+    Ok(())
+}
+
 fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
     match index_type {
         IndexType::BTree => {
