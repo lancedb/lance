@@ -150,7 +150,7 @@ impl DatasetPreFilter {
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
-                        Ok(row_ids_and_deletions.into_iter().fold(
+                        Result::Ok(row_ids_and_deletions.into_iter().fold(
                             RowAddrTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {

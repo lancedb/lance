@@ -720,22 +720,22 @@ impl FtsQueryNode for BooleanQuery {
 #[derive(Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
-    tokens_set: HashSet<String>,
+    tokens_map: HashMap<String, usize>,
     token_type: DocType,
 }
 
 impl Tokens {
     pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
         let mut tokens_vec = vec![];
-        let mut tokens_set = HashSet::new();
-        for token in tokens.into_iter() {
+        let mut tokens_map = HashMap::new();
+        for (idx, token) in tokens.into_iter().enumerate() {
             tokens_vec.push(token.clone());
-            tokens_set.insert(token);
+            tokens_map.insert(token, idx);
         }
 
         Self {
             tokens: tokens_vec,
-            tokens_set,
+            tokens_map,
             token_type,
         }
     }
@@ -753,7 +753,15 @@ impl Tokens {
     }
 
     pub fn contains(&self, token: &str) -> bool {
-        self.tokens_set.contains(token)
+        self.tokens_map.contains_key(token)
+    }
+
+    pub fn token_index(&self, token: &str) -> Option<usize> {
+        self.tokens_map.get(token).copied()
+    }
+
+    pub fn get_token(&self, index: usize) -> &str {
+        &self.tokens[index]
     }
 }
 

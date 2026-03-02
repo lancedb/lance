@@ -564,7 +564,7 @@ impl InnerBuilder {
                     break;
                 }
             }
-            Ok(())
+            Result::Ok(())
         });
 
         let mut write_duration = std::time::Duration::ZERO;

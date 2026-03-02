@@ -10,8 +10,8 @@ use crate::scalar::registry::{
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexReaderStream, IndexStore,
-    IndexWriter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexStore, IndexWriter,
+    ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType, pb};
@@ -25,7 +25,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use futures::{StreamExt, TryFutureExt, TryStreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
@@ -77,6 +77,56 @@ static RTREE_NULLS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
         false,
     )]))
 });
+
+/// A stream that reads the original training data back out of the index
+struct IndexReaderStream {
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    offset: u64,
+    limit: u64,
+}
+
+impl IndexReaderStream {
+    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
+        let limit = reader.num_rows() as u64;
+        Self::new_with_limit(reader, batch_size, limit).await
+    }
+
+    async fn new_with_limit(reader: Arc<dyn IndexReader>, batch_size: u64, limit: u64) -> Self {
+        Self {
+            reader,
+            batch_size,
+            offset: 0,
+            limit,
+        }
+    }
+}
+
+impl Stream for IndexReaderStream {
+    type Item = BoxFuture<'static, Result<RecordBatch>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.offset >= this.limit {
+            return std::task::Poll::Ready(None);
+        }
+        let read_start = this.offset;
+        let read_end = this.limit.min(this.offset + this.batch_size);
+        this.offset = read_end;
+        let reader_copy = this.reader.clone();
+
+        let read_task = async move {
+            reader_copy
+                .read_range(read_start as usize..read_end as usize, None)
+                .await
+        }
+        .boxed();
+        std::task::Poll::Ready(Some(read_task))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RTreeMetadata {

@@ -435,6 +435,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
+        let target_batch_size = context.session_config().batch_size();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -443,7 +444,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let unindexed_input =
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
-        let schema = self.schema();
         let stream = stream::once(async move {
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
@@ -462,15 +462,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 metrics.record_parts_searched(index.partition_count());
             }
 
-            Ok::<_, DataFusionError>(flat_bm25_search_stream(
+            flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
                 &inverted_idx,
-                schema,
-            ))
+                target_batch_size,
+            )
+            .await
         })
-        .try_flatten_unordered(None)
+        .try_flatten()
         .map(move |batch| {
             if let Ok(batch) = &batch {
                 metrics_clone

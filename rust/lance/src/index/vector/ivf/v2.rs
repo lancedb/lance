@@ -482,7 +482,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 pre_filter,
                 &local_metrics,
             )?;
-            Ok((batch, local_metrics))
+            Result::Ok((batch, local_metrics))
         })
         .await?;
 

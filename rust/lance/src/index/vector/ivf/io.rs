@@ -462,8 +462,7 @@ async fn build_hnsw_quantization_partition(
     let mut metric_type = metric_type;
     if metric_type == MetricType::Cosine {
         // Normalize vectors for cosine similarity
-        vectors =
-            Arc::new(spawn_cpu(move || Ok(normalize_fsl(vectors.as_fixed_size_list())?)).await?);
+        vectors = Arc::new(spawn_cpu(move || normalize_fsl(vectors.as_fixed_size_list())).await?);
         metric_type = MetricType::L2;
     }
 
@@ -516,11 +515,7 @@ async fn build_and_write_pq_storage(
     pq: ProductQuantizer,
     mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<()> {
-    let storage = spawn_cpu(move || {
-        let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;
-        Ok(storage)
-    })
-    .await?;
+    let storage = spawn_cpu(move || build_pq_storage(metric_type, row_ids, code_array, pq)).await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
     writer.finish().await?;

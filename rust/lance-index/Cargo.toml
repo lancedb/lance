@@ -161,10 +161,6 @@ name = "bitmap"
 harness = false
 
 [[bench]]
-name = "flat_bm25"
-harness = false
-
-[[bench]]
 name = "geo"
 harness = false
 required-features = ["geo"]
