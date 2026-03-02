@@ -66,7 +66,7 @@ impl MemBM25Scorer {
         self.total_tokens as f32 / self.num_docs as f32
     }
 
-    pub fn num_docs_containing_token(&self, token: &String) -> usize {
+    pub fn num_docs_containing_token(&self, token: &str) -> usize {
         match self.token_docs.get(token) {
             Some(nq) => *nq,
             None => 0,
