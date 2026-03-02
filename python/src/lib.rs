@@ -25,8 +25,8 @@
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{self, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{self, Ordering};
 
 use std::ffi::CString;
 
@@ -47,8 +47,8 @@ use dataset::optimize::{
 use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
-    stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata,
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use lance_index::DatasetIndexExt;
 use log::Level;
@@ -78,15 +78,15 @@ pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
 
-pub use crate::arrow::{bfloat16_array, BFloat16};
+pub use crate::arrow::{BFloat16, bfloat16_array};
 use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
-use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
-pub use crate::tracing::{trace_to_chrome, TraceGuard};
+use crate::tracing::{PyTraceEvent, capture_trace_events, shutdown_tracing};
+pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
-pub use dataset::write_dataset;
 pub use dataset::Dataset;
+pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;

@@ -3,7 +3,7 @@
 
 use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
-use crate::utils::{class_name, export_vec, extract_vec, PyLance};
+use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
@@ -14,8 +14,8 @@ use lance::datatypes::Schema;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
-use pyo3::{intern, prelude::*};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
+use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -132,8 +132,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
             .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .expect("Failed to import LanceOperation namespace");
 
-        let fragment_id = self.0 .0;
-        let new_file = PyLance(&self.0 .1).into_pyobject(py)?;
+        let fragment_id = self.0.0;
+        let new_file = PyLance(&self.0.1).into_pyobject(py)?;
 
         let cls = namespace
             .getattr("DataReplacementGroup")
@@ -432,10 +432,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Delete class");
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
-            Operation::Merge {
-                fragments,
-                schema,
-            } => {
+            Operation::Merge { fragments, schema } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace

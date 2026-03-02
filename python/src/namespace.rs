@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
     CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableVersionRequest,
     DescribeTableVersionResponse, ListTableVersionsRequest, ListTableVersionsResponse,
 };
-use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};

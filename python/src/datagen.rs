@@ -3,9 +3,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use lance_datagen::{BatchCount, ByteCount};
 use pyo3::{
-    pyfunction,
+    Bound, PyResult, Python, pyfunction,
     types::{PyModule, PyModuleMethods},
-    wrap_pyfunction, Bound, PyResult, Python,
+    wrap_pyfunction,
 };
 
 const DEFAULT_BATCH_SIZE_BYTES: u64 = 32 * 1024;
