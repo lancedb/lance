@@ -1,10 +1,42 @@
-***Compare lance vs parquet for TPCH Q1 and Q6 using SF1 dataset***
+# Compare Lance vs Parquet for TPCH Q1 and Q6 (SF1)
 
-**Steps to run the benchmark:**
+## Prerequisites
 
-1. `cd lance/benchmarks/tpch`
-2. `mkdir dataset && cd dataset`
-3. download parquet file lineitem from : "https://github.com/cwida/duckdb-data/releases/download/v1.0/lineitemsf1.snappy.parquet"; then rename it to "lineitem_sf1.parquet"
-4. generate lance file from the parquet file in the same directory
-5. `cd ..`
-6. `python3 benchmark.py q1`
+Install Python dependencies:
+
+```bash
+python3 -m pip install duckdb pyarrow pylance
+```
+
+## Prepare Dataset (generated locally with DuckDB)
+
+Run from this directory (`lance/benchmarks/tpch`):
+
+```bash
+mkdir -p dataset
+python3 - <<'PY'
+import duckdb
+import pyarrow.parquet as pq
+import lance
+
+con = duckdb.connect(database=":memory:")
+con.execute("INSTALL tpch; LOAD tpch")
+con.execute("CALL dbgen(sf=1)")
+
+lineitem = con.query("SELECT * FROM lineitem").to_arrow_table()
+pq.write_table(lineitem, "dataset/lineitem_sf1.parquet")
+lance.write_dataset(lineitem, "dataset/lineitem.lance", mode="overwrite")
+PY
+```
+
+This creates:
+
+- `dataset/lineitem_sf1.parquet`
+- `dataset/lineitem.lance`
+
+## Run Benchmark
+
+```bash
+python3 benchmark.py q1
+python3 benchmark.py q6
+```
