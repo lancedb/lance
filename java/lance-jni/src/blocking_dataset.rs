@@ -132,6 +132,10 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    pub fn new(dataset: Dataset) -> Self {
+        Self { inner: dataset }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,

@@ -760,40 +760,9 @@ impl Schema {
                 location: location!(),
             })
     }
-}
 
-impl PartialEq for Schema {
-    fn eq(&self, other: &Self) -> bool {
-        self.fields == other.fields
-    }
-}
-
-impl fmt::Display for Schema {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for field in self.fields.iter() {
-            writeln!(f, "{field}")?
-        }
-        Ok(())
-    }
-}
-
-/// Convert `arrow2::datatype::Schema` to Lance
-impl TryFrom<&ArrowSchema> for Schema {
-    type Error = Error;
-
-    fn try_from(schema: &ArrowSchema) -> Result<Self> {
-        let mut schema = Self {
-            fields: schema
-                .fields
-                .iter()
-                .map(|f| Field::try_from(f.as_ref()))
-                .collect::<Result<_>>()?,
-            metadata: schema.metadata.clone(),
-        };
-        schema.set_field_id(None);
-        schema.validate()?;
-
-        let pk = schema.unenforced_primary_key();
+    pub fn verify_primary_key(&self) -> Result<()> {
+        let pk = self.unenforced_primary_key();
         for pk_col in pk.into_iter() {
             if !pk_col.is_leaf() {
                 return Err(Error::Schema {
@@ -802,7 +771,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 });
             }
 
-            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
+            if let Some(ancestors) = self.field_ancestry_by_id(pk_col.id) {
                 for ancestor in ancestors {
                     if ancestor.nullable {
                         return Err(Error::Schema {
@@ -836,6 +805,42 @@ impl TryFrom<&ArrowSchema> for Schema {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl PartialEq for Schema {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+    }
+}
+
+impl fmt::Display for Schema {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for field in self.fields.iter() {
+            writeln!(f, "{field}")?
+        }
+        Ok(())
+    }
+}
+
+/// Convert `arrow2::datatype::Schema` to Lance
+impl TryFrom<&ArrowSchema> for Schema {
+    type Error = Error;
+
+    fn try_from(schema: &ArrowSchema) -> Result<Self> {
+        let mut schema = Self {
+            fields: schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
+            metadata: schema.metadata.clone(),
+        };
+        schema.set_field_id(None);
+        schema.validate()?;
+
+        schema.verify_primary_key()?;
 
         Ok(schema)
     }
