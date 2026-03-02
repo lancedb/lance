@@ -7,7 +7,7 @@ use std::{
     task::Waker,
 };
 
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use pin_project::pin_project;
 use tokio::sync::Semaphore;
 use tokio_util::sync::PollSemaphore;

@@ -5,13 +5,13 @@
 //!
 //! run with `cargo run --release --example hnsw`
 #![allow(clippy::print_stdout)]
-use arrow::array::types::Float32Type;
 use arrow::array::AsArray;
+use arrow::array::types::Float32Type;
 use clap::Parser;
 use futures::TryStreamExt;
+use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::index::vector::VectorIndexParams;
-use lance::Dataset;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;

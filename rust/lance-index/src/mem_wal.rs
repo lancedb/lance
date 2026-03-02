@@ -367,7 +367,7 @@ impl MemWalIndex {
         let caught_up_gen = self.index_caught_up_generation(index_name, region_id);
 
         // If not tracked in index_catchup, assumed fully caught up
-        caught_up_gen.is_none_or(|gen| gen >= merged_gen)
+        caught_up_gen.is_none_or(|generation| generation >= merged_gen)
     }
 }
 

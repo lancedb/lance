@@ -8,18 +8,18 @@
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{self, UInt8Type};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
+    FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
     types::{Float32Type, UInt64Type},
-    FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
 };
@@ -32,19 +32,18 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
+use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
-    pb,
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
     vector::{
+        PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
         transform::Transformer,
-        PQ_CODE_COLUMN,
     },
-    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
 pub const PQ_METADATA_KEY: &str = "lance:pq";

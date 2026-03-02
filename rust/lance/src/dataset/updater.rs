@@ -5,17 +5,17 @@ use arrow_array::{RecordBatch, UInt32Array};
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_table::format::Fragment;
 use lance_table::utils::stream::ReadBatchFutStream;
 use snafu::location;
 
+use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{open_writer, GenericWriter};
-use super::Dataset;
-use crate::dataset::utils::SchemaAdapter;
+use super::write::{GenericWriter, open_writer};
 use crate::dataset::FileFragment;
+use crate::dataset::utils::SchemaAdapter;
 
 /// Update or insert a new column.
 ///

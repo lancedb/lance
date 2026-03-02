@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::{as_dictionary_array, as_primitive_array};
 use arrow_array::types::{
-    ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
@@ -18,13 +18,13 @@ use async_trait::async_trait;
 use snafu::location;
 
 use crate::{
-    traits::{Reader, Writer},
     ReadBatchParams,
+    traits::{Reader, Writer},
 };
 use lance_core::{Error, Result};
 
-use super::plain::PlainEncoder;
 use super::AsyncIndex;
+use super::plain::PlainEncoder;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 

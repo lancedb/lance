@@ -27,8 +27,8 @@ use deepsize::DeepSizeOf;
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
 use lance_core::{
-    utils::mask::{RowAddrMask, RowAddrTreeMap},
     Error, Result,
+    utils::mask::{RowAddrMask, RowAddrTreeMap},
 };
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};

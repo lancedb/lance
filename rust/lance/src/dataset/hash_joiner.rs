@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
-use arrow_array::{new_null_array, Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Array, RecordBatch, RecordBatchReader, new_null_array};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
@@ -384,9 +384,11 @@ mod tests {
         let indices = Arc::new(UInt32Array::from_iter(&[Some(15)]));
         let result = joiner.collect(&dataset, indices).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Index column type mismatch: expected Int32, got UInt32"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Index column type mismatch: expected Int32, got UInt32")
+        );
     }
 }

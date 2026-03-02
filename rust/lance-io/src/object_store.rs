@@ -14,18 +14,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
-use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
-#[cfg(feature = "aws")]
-use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
-use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
+use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use snafu::location;
@@ -66,8 +66,8 @@ pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
-    LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor, StorageOptionsProvider,
-    EXPIRES_AT_MILLIS_KEY, REFRESH_OFFSET_MILLIS_KEY,
+    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 
 #[async_trait]
@@ -960,7 +960,10 @@ impl ObjectStore {
                 .unwrap(),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
-                log::warn!("Guessing that object store prefix is {}, since object store scheme is not found in registry.", store_prefix);
+                log::warn!(
+                    "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
+                    store_prefix
+                );
                 store_prefix
             }
         };

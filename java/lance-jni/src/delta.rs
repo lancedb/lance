@@ -39,7 +39,7 @@ fn attach_native_delta<'local>(
     Ok(j_delta)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDeltaBuilder_nativeBuild<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject<'local>,
@@ -60,7 +60,7 @@ pub extern "system" fn Java_org_lance_delta_DatasetDeltaBuilder_nativeBuild<'loc
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeBuildDelta<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject<'local>,
@@ -108,7 +108,7 @@ fn inner_native_build<'local>(
     attach_native_delta(env, blocking_delta, &java_dataset)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_listTransactions<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
@@ -139,7 +139,7 @@ fn inner_list_transactions<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_getInsertedRows<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
@@ -163,7 +163,7 @@ fn inner_get_inserted_rows<'local>(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_getUpdatedRows<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
@@ -187,7 +187,7 @@ fn inner_get_updated_rows<'local>(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_releaseNativeDelta(
     mut env: JNIEnv,
     obj: JObject,

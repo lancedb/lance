@@ -5,12 +5,12 @@ use std::{collections::HashSet, sync::Arc};
 
 use super::fragment::FileFragment;
 use super::{
-    transaction::{Operation, Transaction},
     Dataset,
+    transaction::{Operation, Transaction},
 };
-use crate::{io::exec::Planner, Error, Result};
-use arrow::compute::can_cast_types;
+use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
+use arrow::compute::can_cast_types;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
@@ -196,7 +196,11 @@ fn check_field_conflict(
     match (left.data_type(), right.data_type()) {
         (DataType::Struct(fl), DataType::Struct(fr)) => {
             if !version.support_add_sub_column() {
-                return Err(Error::invalid_input(format!("Column {} is a struct col, add sub column is not supported in Lance file version {}", left.name(), version)));
+                return Err(Error::invalid_input(format!(
+                    "Column {} is a struct col, add sub column is not supported in Lance file version {}",
+                    left.name(),
+                    version
+                )));
             }
 
             if left.is_packed() || right.is_packed() {
@@ -1206,9 +1210,10 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("All-null columns must be nullable."));
+        assert!(
+            err.to_string()
+                .contains("All-null columns must be nullable.")
+        );
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = ArrowSchema::new(vec![
@@ -1262,9 +1267,10 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Cannot add all-null columns to legacy dataset version"));
+        assert!(
+            err.to_string()
+                .contains("Cannot add all-null columns to legacy dataset version")
+        );
 
         Ok(())
     }
@@ -1788,7 +1794,7 @@ mod test {
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 

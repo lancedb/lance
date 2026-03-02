@@ -729,7 +729,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to serialize request: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -745,7 +745,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                                     "Failed to extract response string: {}",
                                     e
                                 ))),
-                                location: snafu::location!(),
+                                location: &snafu::location!(),
                             })?;
                         Ok(response_str)
                     }
@@ -754,7 +754,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                             "Failed to call describe_table_version_json: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     }),
                 }
             })
@@ -762,7 +762,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         .await
         .map_err(|e| lance_core::Error::IO {
             source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })??;
 
         serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
@@ -770,7 +770,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to deserialize response: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })
     }
 
@@ -785,7 +785,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to serialize request: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -801,7 +801,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                                     "Failed to extract response string: {}",
                                     e
                                 ))),
-                                location: snafu::location!(),
+                                location: &snafu::location!(),
                             })?;
                         Ok(response_str)
                     }
@@ -810,7 +810,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                             "Failed to call create_table_version_json: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     }),
                 }
             })
@@ -818,7 +818,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         .await
         .map_err(|e| lance_core::Error::IO {
             source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })??;
 
         serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
@@ -826,7 +826,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to deserialize response: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })
     }
 
@@ -841,7 +841,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to serialize request: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -857,7 +857,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                                     "Failed to extract response string: {}",
                                     e
                                 ))),
-                                location: snafu::location!(),
+                                location: &snafu::location!(),
                             })?;
                         Ok(response_str)
                     }
@@ -866,7 +866,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                             "Failed to call list_table_versions_json: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     }),
                 }
             })
@@ -874,7 +874,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         .await
         .map_err(|e| lance_core::Error::IO {
             source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })??;
 
         serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
@@ -882,7 +882,7 @@ impl LanceNamespaceTrait for PyLanceNamespace {
                 "Failed to deserialize response: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })
     }
 }

@@ -3,18 +3,18 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
 use arrow_buffer::NullBuffer;
 use futures::{
+    FutureExt, Stream, StreamExt,
     future::BoxFuture,
     stream::{BoxStream, FuturesOrdered},
-    FutureExt, Stream, StreamExt,
 };
 use lance_arrow::RecordBatchExt;
 use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
-    ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::instrument;
@@ -394,15 +394,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
-    use arrow_array::{types::Int32Type, RecordBatch, UInt32Array};
+    use arrow_array::{RecordBatch, UInt32Array, types::Int32Type};
     use arrow_schema::ArrowError;
-    use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
+    use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
     use lance_core::{
-        utils::{address::RowAddress, deletion::DeletionVector},
         ROW_ID,
+        utils::{address::RowAddress, deletion::DeletionVector},
     };
     use lance_datagen::{BatchCount, RowCount};
-    use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
+    use lance_io::{ReadBatchParams, stream::arrow_stream_to_lance_stream};
     use roaring::RoaringBitmap;
 
     use crate::utils::stream::ReadBatchTask;

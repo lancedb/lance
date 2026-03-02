@@ -9,44 +9,44 @@ use std::time::Instant;
 
 use arrow::array::Float32Builder;
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
+use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_array::{
+    ArrayRef, BooleanArray, RecordBatch, StringArray,
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, BooleanArray, RecordBatch, StringArray,
 };
-use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PlanProperties;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     common::stats::Precision,
     physical_plan::execution_plan::{Boundedness, EmissionType},
 };
-use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
-use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
-use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::ROW_ID;
-use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
+    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, PARTITIONS_RANKED_METRIC,
     PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
-    flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, Query, flat::compute_distance,
 };
-use lance_index::vector::{VectorIndex, DIST_Q_C_COLUMN};
+use lance_index::vector::{DIST_Q_C_COLUMN, VectorIndex};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
@@ -54,9 +54,9 @@ use snafu::location;
 use tokio::sync::Notify;
 
 use crate::dataset::Dataset;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
-use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -1358,7 +1358,7 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;

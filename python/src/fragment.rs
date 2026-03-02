@@ -450,7 +450,7 @@ pub fn write_fragments(
         Operation::Append { fragments, .. } => Ok(fragments),
         _ => Err(Error::Internal {
             message: "Unexpected operation".into(),
-            location: location!(),
+            location: &location!(),
         }),
     };
     let fragments =

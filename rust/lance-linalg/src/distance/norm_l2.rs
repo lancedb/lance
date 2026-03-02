@@ -3,15 +3,15 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
+use arrow_array::FixedSizeListArray;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::FixedSizeListArray;
 use arrow_schema::DataType;
 use half::{bf16, f16};
-#[cfg(feature = "fp16kernels")]
-use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::SIMD_SUPPORT;
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization

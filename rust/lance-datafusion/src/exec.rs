@@ -19,33 +19,33 @@ use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
     execution::{
+        TaskContext,
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
-        TaskContext,
     },
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
+    Error, Result,
     utils::{
         futures::FinallyStreamExt,
-        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
     },
-    Error, Result,
 };
 use log::{debug, info, warn};
 use tracing::Span;
@@ -54,8 +54,8 @@ use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+        MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 

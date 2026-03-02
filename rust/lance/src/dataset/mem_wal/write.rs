@@ -27,20 +27,20 @@ use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use log::{debug, error, info, warn};
 use object_store::path::Path;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{interval_at, Interval};
+use tokio::time::{Interval, interval_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, IndexStore, IvfPqIndexConfig, MemIndexConfig,
 };
+pub use super::memtable::CacheConfig;
+pub use super::memtable::MemTable;
 pub use super::memtable::batch_store::{BatchStore, StoreFull, StoredBatch};
 pub use super::memtable::flush::MemTableFlusher;
 pub use super::memtable::scanner::MemTableScanner;
-pub use super::memtable::CacheConfig;
-pub use super::memtable::MemTable;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
@@ -2133,8 +2133,8 @@ mod region_writer_tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::scalar::inverted::InvertedIndexParams;
     use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::inverted::InvertedIndexParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::builder::PQBuildParams;
     use lance_index::{DatasetIndexExt, IndexType};

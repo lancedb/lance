@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use object_store_opendal::OpendalStore;
-use opendal::{services::Cos, Operator};
+use opendal::{Operator, services::Cos};
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -74,7 +74,9 @@ impl ObjectStoreProvider for TencentStoreProvider {
         config_map.insert("disable_config_load".to_string(), "false".to_string());
 
         if !config_map.contains_key("endpoint") {
-            return Err(Error::invalid_input("COS endpoint is required. Please provide 'cos_endpoint' in storage options or set COS_ENDPOINT environment variable"));
+            return Err(Error::invalid_input(
+                "COS endpoint is required. Please provide 'cos_endpoint' in storage options or set COS_ENDPOINT environment variable",
+            ));
         }
 
         let operator = Operator::from_iter::<Cos>(config_map)

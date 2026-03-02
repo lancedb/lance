@@ -14,10 +14,10 @@ use crate::scalar::{
     IndexWriter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::vector::VectorIndex;
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType, pb};
+use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::UInt32Array;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -25,8 +25,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryFutureExt, TryStreamExt};
-use geoarrow_array::array::{from_arrow_array, RectArray};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, stream};
+use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
@@ -35,9 +35,9 @@ use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tempfile::TempDir;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
-pub use lance_geo::bbox::{bounding_box, total_bounds, BoundingBox};
+pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -961,7 +961,7 @@ mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
-    use geo_types::{coord, Rect};
+    use geo_types::{Rect, coord};
     use geoarrow_array::builder::{PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, PointType, RectType};
     use lance_core::utils::tempfile::TempObjDir;
@@ -1250,17 +1250,21 @@ mod tests {
         rtree_index.prewarm().await.unwrap();
 
         for page_id in 0..rtree_index.metadata.num_pages {
-            assert!(rtree_index
-                .index_cache
-                .get_with_key(&RTreeCacheKey::Page(page_id))
-                .await
-                .is_some())
+            assert!(
+                rtree_index
+                    .index_cache
+                    .get_with_key(&RTreeCacheKey::Page(page_id))
+                    .await
+                    .is_some()
+            )
         }
 
-        assert!(rtree_index
-            .index_cache
-            .get_with_key(&RTreeCacheKey::Nulls)
-            .await
-            .is_some())
+        assert!(
+            rtree_index
+                .index_cache
+                .get_with_key(&RTreeCacheKey::Nulls)
+                .await
+                .is_some()
+        )
     }
 }

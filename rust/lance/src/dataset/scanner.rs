@@ -12,28 +12,28 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
-use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
+use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_datafusion_err};
 use datafusion::functions_aggregate;
-use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
+use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
-    ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -41,10 +41,10 @@ use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
-use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
-    escape_field_path_for_project, format_field_path, BlobHandling, Field, OnMissing, Projection,
+    BlobHandling, Field, OnMissing, Projection, escape_field_path_for_project, format_field_path,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -53,46 +53,47 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
-    analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
+    LanceExecutionOptions, OneShotExec, StrictBatchSizeExec, analyze_plan, execute_plan,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
+use lance_index::IndexCriteria;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery,
+    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::{Query, DIST_COL};
-use lance_index::IndexCriteria;
+use lance_index::vector::{DIST_COL, Query};
+use lance_index::{DatasetIndexExt, scalar::expression::ScalarIndexExpr};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
-use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use tracing::{info_span, instrument, Span};
+use tracing::{Span, info_span, instrument};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
-    knn::{new_knn_exec, KNN_INDEX_SCHEMA},
-    project, AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec,
-    LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
+    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    knn::{KNN_INDEX_SCHEMA, new_knn_exec},
+    project,
 };
-use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
+use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
 use crate::{Error, Result};
+use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
@@ -433,7 +434,7 @@ impl ExprFilter {
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
                 let state = ctx.state();
@@ -511,7 +512,7 @@ impl AggregateExpr {
         match self {
             #[cfg(feature = "substrait")]
             Self::Substrait(bytes) => {
-                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
                 use lance_datafusion::substrait::parse_substrait_aggregate;
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -1793,7 +1794,9 @@ impl Scanner {
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                    log::warn!(
+                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
+                    );
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
@@ -1802,7 +1805,9 @@ impl Scanner {
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                    log::warn!(
+                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
+                    );
                 }
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
@@ -2009,9 +2014,9 @@ impl Scanner {
     }
 
     fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
+        use datafusion::logical_expr::Expr;
         use datafusion::logical_expr::expr::AggregateFunction;
         use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
-        use datafusion::logical_expr::Expr;
 
         match expr {
             Expr::AggregateFunction(agg_func) => {
@@ -2385,7 +2390,7 @@ impl Scanner {
                 return Err(Error::InvalidInput {
                     source: "Cannot have both nearest and full text search".into(),
                     location: location!(),
-                })
+                });
             }
         };
 
@@ -3639,9 +3644,11 @@ impl Scanner {
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let topk_appended = project(topk_appended, knn_node.schema().as_ref())?;
-            assert!(topk_appended
-                .schema()
-                .equivalent_names_and_types(&knn_node.schema()));
+            assert!(
+                topk_appended
+                    .schema()
+                    .equivalent_names_and_types(&knn_node.schema())
+            );
             // union
             let unioned = UnionExec::try_new(vec![Arc::new(topk_appended), knn_node])?;
             // Enforce only 1 partition.
@@ -4509,8 +4516,8 @@ pub mod test_dataset {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
-        scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams},
         IndexType,
+        scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
     };
 
     use crate::dataset::WriteParams;
@@ -4699,7 +4706,7 @@ mod test {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{
-        array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
+        ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
@@ -4708,7 +4715,7 @@ mod test {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
 
@@ -4718,13 +4725,13 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
+        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
 
     #[test]
@@ -4732,17 +4739,23 @@ mod test {
         // Test that invalid environment variable values don't panic
 
         // Test invalid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None for invalid batch size");
 
         // Test valid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, Some(2048), "Should parse valid batch size");
 
         // Test unset LANCE_DEFAULT_BATCH_SIZE
-        std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        unsafe {
+            std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None when env var is not set");
     }
@@ -4755,43 +4768,61 @@ mod test {
         let test_var = "LANCE_TEST_PARSE_ENV_VAR_USIZE";
 
         // Test valid usize parsing
-        std::env::set_var(test_var, "12345");
+        unsafe {
+            std::env::set_var(test_var, "12345");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, Some(12345));
 
         // Test invalid usize parsing (triggers warning log)
-        std::env::set_var(test_var, "not_a_number");
+        unsafe {
+            std::env::set_var(test_var, "not_a_number");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test unset env var
-        std::env::remove_var(test_var);
+        unsafe {
+            std::env::remove_var(test_var);
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test with u32 type
         let test_var_u32 = "LANCE_TEST_PARSE_ENV_VAR_U32";
-        std::env::set_var(test_var_u32, "42");
+        unsafe {
+            std::env::set_var(test_var_u32, "42");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, Some(42));
 
-        std::env::set_var(test_var_u32, "invalid");
+        unsafe {
+            std::env::set_var(test_var_u32, "invalid");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u32);
+        unsafe {
+            std::env::remove_var(test_var_u32);
+        }
 
         // Test with u64 type
         let test_var_u64 = "LANCE_TEST_PARSE_ENV_VAR_U64";
-        std::env::set_var(test_var_u64, "9999999999");
+        unsafe {
+            std::env::set_var(test_var_u64, "9999999999");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, Some(9999999999));
 
-        std::env::set_var(test_var_u64, "-1");
+        unsafe {
+            std::env::set_var(test_var_u64, "-1");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u64);
+        unsafe {
+            std::env::remove_var(test_var_u64);
+        }
     }
 
     async fn make_binary_vector_dataset() -> Result<(TempStrDir, Dataset)> {
@@ -6176,7 +6207,7 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
-        use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+        use lance_arrow::{FixedSizeListArrayExt, fixed_size_list_type};
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -6188,14 +6219,16 @@ mod test {
 
         let vector_values = Float32Array::from_iter_values((0..600).map(|x| x as f32));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..300)),
-                Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
-            ],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..300)),
+                    Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
+                ],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6262,13 +6295,15 @@ mod test {
             true,
         )]));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(LargeStringArray::from_iter_values(
-                (0..10).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from_iter_values(
+                    (0..10).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6318,13 +6353,15 @@ mod test {
             true,
         )]));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from_iter_values(
-                (0..20).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6483,14 +6520,16 @@ mod test {
                 (0..32 * 512).map(|v| (v / 32) as f32 + 1.0).collect();
             let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
 
-            let batches = vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(0..512)),
-                    Arc::new(vectors.clone()),
-                ],
-            )
-            .unwrap()];
+            let batches = vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(0..512)),
+                        Arc::new(vectors.clone()),
+                    ],
+                )
+                .unwrap(),
+            ];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let mut dataset = Dataset::write(
@@ -6583,14 +6622,16 @@ mod test {
 
             // Add a second fragment and test the case where there are no deletion
             // files but there are missing fragments.
-            let batches = vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(512..1024)),
-                    Arc::new(vectors),
-                ],
-            )
-            .unwrap()];
+            let batches = vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(512..1024)),
+                        Arc::new(vectors),
+                    ],
+                )
+                .unwrap(),
+            ];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let mut dataset = Dataset::write(

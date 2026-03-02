@@ -11,19 +11,20 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream::StreamExt, FutureExt};
-use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::{builder::DatasetBuilder, ReadParams, WriteParams};
+use futures::{FutureExt, stream::StreamExt};
+use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{ReadParams, WriteParams, builder::DatasetBuilder};
 use lance::session::Session;
-use lance::{dataset::scanner::Scanner, Dataset};
-use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
-use lance_core::{box_error, Error, Result};
+use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::{Error, Result, box_error};
+use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::traits::DatasetIndexExt;
-use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -36,7 +37,6 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_namespace::LanceNamespace;
 use object_store::path::Path;
 use snafu::location;
 use std::io::Cursor;
@@ -500,7 +500,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created BTREE index '{}' on object_id for __manifest table",
@@ -526,7 +529,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created Bitmap index '{}' on object_type for __manifest table",
@@ -552,7 +558,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created LabelList index '{}' on base_objects for __manifest table",
@@ -574,7 +583,10 @@ impl ManifestNamespace {
                 }
             }
             Err(e) => {
-                log::warn!("Failed to compact files for __manifest table: {:?}. Continuing with optimization.", e);
+                log::warn!(
+                    "Failed to compact files for __manifest table: {:?}. Continuing with optimization.",
+                    e
+                );
             }
         }
 
@@ -1192,7 +1204,9 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = namespace_id.join(DELIMITER);
             format!(
                 "object_type = 'table' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
@@ -1516,7 +1530,9 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = parent_namespace.join(DELIMITER);
             format!(
                 "object_type = 'namespace' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
@@ -2054,11 +2070,11 @@ mod tests {
     use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
+    use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
         ListTablesRequest, TableExistsRequest,
     };
-    use lance_namespace::LanceNamespace;
     use rstest::rstest;
 
     fn create_test_ipc_data() -> Vec<u8> {

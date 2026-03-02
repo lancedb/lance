@@ -45,28 +45,28 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use super::ManifestWriteConfig;
+use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
+use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
-    rowids::{write_row_ids, RowIdSequence},
+    rowids::{RowIdSequence, write_row_ids},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -1507,7 +1507,10 @@ impl Transaction {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested {
                 if user_requested != file_version {
-                    return Err(Error::invalid_input(format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version)));
+                    return Err(Error::invalid_input(format!(
+                        "User requested data storage version ({}) does not match version in data files ({})",
+                        user_requested, file_version
+                    )));
                 }
             }
             Ok(DataStorageFormat::new(file_version))
@@ -1587,7 +1590,9 @@ impl Transaction {
             } else {
                 // OVERWRITE mode with initial_bases should have been rejected by validation
                 // This branch should never be reached
-                return Err(Error::invalid_input("OVERWRITE mode cannot register new bases. This should have been caught by validation."));
+                return Err(Error::invalid_input(
+                    "OVERWRITE mode cannot register new bases. This should have been caught by validation.",
+                ));
             }
         }
 
@@ -1652,9 +1657,9 @@ impl Transaction {
                 return Err(Error::Internal {
                     message: "Clone operation should not enter build_manifest.".to_string(),
                     location: location!(),
-                })
+                });
             }
-            Operation::Append { ref fragments } => {
+            Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
@@ -1673,8 +1678,8 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
             }
             Operation::Delete {
-                ref updated_fragments,
-                ref deleted_fragment_ids,
+                updated_fragments,
+                deleted_fragment_ids,
                 ..
             } => {
                 // Remove the deleted fragments
@@ -1914,7 +1919,7 @@ impl Transaction {
                     )?;
                 }
             }
-            Operation::Overwrite { ref fragments, .. } => {
+            Operation::Overwrite { fragments, .. } => {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
@@ -1933,9 +1938,9 @@ impl Transaction {
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
-                ref frag_reuse_index,
+                groups,
+                rewritten_indices,
+                frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -1983,7 +1988,7 @@ impl Transaction {
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
-            Operation::Merge { ref fragments, .. } => {
+            Operation::Merge { fragments, .. } => {
                 final_fragments.extend(fragments.clone());
 
                 // Some fields that have indices may have been removed, so we should
@@ -2015,7 +2020,9 @@ impl Transaction {
                 unreachable!()
             }
             Operation::DataReplacement { replacements } => {
-                log::warn!("Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution.");
+                log::warn!(
+                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
+                );
 
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
                     .iter()
@@ -2105,7 +2112,9 @@ impl Transaction {
 
                     // Nothing changed in the current fragment, which is not expected -- error out
                     if &new_frag == frag {
-                        return Err(Error::invalid_input("Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions"));
+                        return Err(Error::invalid_input(
+                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
+                        ));
                     }
                     final_fragments.push(new_frag);
                 }
@@ -2503,7 +2512,9 @@ impl Transaction {
                     }
                     new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
                 } else {
-                    return Err(Error::invalid_input("The compaction plan included a rewrite group that was a split of indexed and non-indexed data"));
+                    return Err(Error::invalid_input(
+                        "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
+                    ));
                 }
             }
         }
@@ -2519,7 +2530,10 @@ impl Transaction {
 
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
-                return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id)));
+                return Err(Error::invalid_input(format!(
+                    "An invalid compaction plan must have been generated because multiple tasks modified the same index: {}",
+                    rewritten_index.old_id
+                )));
             }
 
             // Skip indices that no longer exist (may have been removed by concurrent operation)
@@ -2663,7 +2677,7 @@ impl Transaction {
                                     message: "Failed to deserialize existing row ID sequence"
                                         .into(),
                                     location: location!(),
-                                })
+                                });
                             }
                         };
 
@@ -3545,10 +3559,12 @@ mod tests {
         let empty_fragments = vec![];
         let result = merge_fragments_valid(&manifest, &empty_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 2: Missing original fragments should fail
         let missing_fragments = vec![
@@ -3559,10 +3575,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &missing_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing original fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing original fragments")
+        );
 
         // Test 3: Reduced fragment count should fail
         let reduced_fragments = vec![
@@ -3572,10 +3590,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &reduced_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 4: Valid merge with all original fragments plus new ones should succeed
         let valid_fragments = vec![
@@ -4123,9 +4143,11 @@ mod tests {
 
         // Should keep only non-empty indices
         assert_eq!(indices.len(), 2);
-        assert!(indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4));
+        assert!(
+            indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4)
+        );
     }
 
     #[test]
@@ -4293,9 +4315,11 @@ mod tests {
         // Verify idx_c kept non-empty only
         let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
         assert_eq!(idx_c_indices.len(), 2);
-        assert!(idx_c_indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3));
+        assert!(
+            idx_c_indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3)
+        );
 
         // Verify idx_d kept
         assert!(indices.iter().any(|idx| idx.name == "idx_d"));

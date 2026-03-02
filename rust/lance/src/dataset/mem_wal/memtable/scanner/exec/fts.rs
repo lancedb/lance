@@ -23,7 +23,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
-use super::super::builder::{FtsQuery, FtsQueryType, DEFAULT_WAND_FACTOR};
+use super::super::builder::{DEFAULT_WAND_FACTOR, FtsQuery, FtsQueryType};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 

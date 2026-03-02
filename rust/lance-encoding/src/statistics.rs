@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrowPrimitiveType, UInt64Array};
+use arrow_array::{Array, ArrowPrimitiveType, UInt64Array, cast::AsArray, types::UInt64Type};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
@@ -599,12 +599,12 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use lance_arrow::DataTypeExt;
-    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
 
     use crate::statistics::{GetStat, Stat};
@@ -612,9 +612,9 @@ mod tests {
     use super::DataBlock;
 
     use arrow_array::{
+        Array,
         cast::AsArray,
         types::{Int32Type, UInt64Type},
-        Array,
     };
     use arrow_select::concat::concat;
     #[test]

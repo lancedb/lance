@@ -19,7 +19,7 @@ use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::{Error, Result};
 use lance_io::encodings::{
-    binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
+    Encoder, binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder,
 };
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{WriteExt, Writer};
@@ -47,7 +47,7 @@ pub trait ManifestProvider {
     /// Note: the dictionaries have already been written by this point and the schema should
     /// be populated with the dictionary lengths/offsets
     async fn store_schema(object_writer: &mut dyn Writer, schema: &Schema)
-        -> Result<Option<usize>>;
+    -> Result<Option<usize>>;
 }
 
 /// Implementation of ManifestProvider that does not store the schema
@@ -142,7 +142,10 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name)));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -738,11 +741,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
-        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
-        TimestampSecondArray, UInt8Array,
+        BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray, DurationMicrosecondArray,
+        DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray,
+        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
+        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
+        types::UInt32Type,
     };
     use arrow_buffer::i256;
     use arrow_schema::{

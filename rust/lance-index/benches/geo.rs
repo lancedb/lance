@@ -3,12 +3,12 @@
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
 use geo_types::coord;
-use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::GeoArrowArray;
+use geoarrow_array::builder::RectBuilder;
 use geoarrow_schema::Dimension;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, ROW_ID};
@@ -20,9 +20,9 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -8,15 +8,15 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::datatypes::UInt64Type;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::UInt64Array;
-use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{Array, ArrowPrimitiveType, RecordBatch, UInt32Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 use snafu::location;
 
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_linalg::kernels::normalize_fsl;
 use tracing::instrument;
 
@@ -127,7 +127,7 @@ impl Transformer for KeepFiniteVectors {
                         arr.data_type()
                     ),
                     location: location!(),
-                })
+                });
             }
         };
 

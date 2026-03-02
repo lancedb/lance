@@ -8,9 +8,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
+use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
-use lance_index::IndexType;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
+use crate::Dataset;
 use crate::dataset::mem_wal::manifest::RegionManifestStore;
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
-use crate::Dataset;
 
 #[derive(Debug, Clone)]
 pub struct FlushResult {
@@ -578,8 +578,8 @@ impl MemTableFlusher {
         use lance_index::vector::v3::subindex::IvfSubIndex;
         use lance_index::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN};
         use lance_index::{
-            IndexMetadata as IndexMetaSchema, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
-            INDEX_METADATA_SCHEMA_KEY,
+            INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+            IndexMetadata as IndexMetaSchema,
         };
         use prost::Message;
         use std::sync::Arc;
@@ -771,12 +771,12 @@ fn transpose_pq_batch(
     batch: &arrow_array::RecordBatch,
     pq_code_len: usize,
 ) -> Result<arrow_array::RecordBatch> {
-    use arrow_array::cast::AsArray;
     use arrow_array::FixedSizeListArray;
+    use arrow_array::cast::AsArray;
     use arrow_schema::Field;
     use lance_core::ROW_ID;
-    use lance_index::vector::pq::storage::transpose;
     use lance_index::vector::PQ_CODE_COLUMN;
+    use lance_index::vector::pq::storage::transpose;
     use std::sync::Arc;
 
     let row_ids = batch
@@ -886,10 +886,12 @@ mod tests {
         let result = flusher.flush(&memtable, epoch).await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unflushed fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unflushed fragments")
+        );
     }
 
     #[tokio::test]
@@ -1065,10 +1067,10 @@ mod tests {
         use super::super::super::index::{IndexStore, IvfPqIndexConfig};
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::vector::ivf::storage::IvfModel;
-        use lance_index::vector::kmeans::{train_kmeans, KMeansParams};
-        use lance_index::vector::pq::PQBuildParams;
         use lance_index::DatasetIndexExt;
+        use lance_index::vector::ivf::storage::IvfModel;
+        use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
+        use lance_index::vector::pq::PQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

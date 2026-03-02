@@ -239,15 +239,15 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, MapBuilder, StringBuilder},
         Array, Int32Array, MapArray, StringArray, StructArray,
+        builder::{Int32Builder, MapBuilder, StringBuilder},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::encoder::{default_encoding_strategy, ColumnIndexSequence, EncodingOptions};
+    use crate::encoder::{ColumnIndexSequence, EncodingOptions, default_encoding_strategy};
     use crate::{
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
     use arrow_schema::Field as ArrowField;

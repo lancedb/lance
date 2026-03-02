@@ -4,7 +4,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::{
-    cmp::{min, Reverse},
+    cmp::{Reverse, min},
     collections::BinaryHeap,
 };
 use std::{collections::HashMap, ops::Range};
@@ -31,31 +31,32 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
-use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
+use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -63,7 +64,7 @@ use super::{
     iter::CompressedPostingListIterator,
 };
 use super::{encoding::compress_positions, iter::PostingListIterator};
-use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
@@ -73,7 +74,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -2584,7 +2584,7 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2621,14 +2621,18 @@ mod tests {
                 .as_binary::<i64>(),
         )
         .unwrap();
-        assert!(doc_ids
-            .iter()
-            .zip(expected.doc_ids.iter())
-            .all(|(a, b)| a == b));
-        assert!(freqs
-            .iter()
-            .zip(expected.frequencies.iter())
-            .all(|(a, b)| a == b));
+        assert!(
+            doc_ids
+                .iter()
+                .zip(expected.doc_ids.iter())
+                .all(|(a, b)| a == b)
+        );
+        assert!(
+            freqs
+                .iter()
+                .zip(expected.frequencies.iter())
+                .all(|(a, b)| a == b)
+        );
     }
 
     #[test]

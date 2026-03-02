@@ -37,7 +37,7 @@ use crate::{
                 GeneralBlockDecompressor,
             },
             byte_stream_split::{
-                should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
+                ByteStreamSplitDecompressor, ByteStreamSplitEncoder, should_use_bss,
             },
             constant::ConstantDecompressor,
             fsst::{
@@ -56,8 +56,8 @@ use crate::{
         },
     },
     format::{
-        pb21::{compressive_encoding::Compression, CompressiveEncoding},
         ProtobufUtils21,
+        pb21::{CompressiveEncoding, compressive_encoding::Compression},
     },
     statistics::{GetStat, Stat},
     version::LanceFileVersion,
@@ -66,7 +66,7 @@ use crate::{
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
-use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
+use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
@@ -595,7 +595,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         field.children.clone(),
                     )))
                 } else {
-                    Err(Error::invalid_input("Packed struct per-value compression should not be used for fixed-width-only structs"))
+                    Err(Error::invalid_input(
+                        "Packed struct per-value compression should not be used for fixed-width-only structs",
+                    ))
                 }
             }
             DataBlock::VariableWidth(variable_width) => {
@@ -635,7 +637,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         Ok(variable_compression)
                     }
                 } else {
-                    panic!("Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width.bits_per_offset);
+                    panic!(
+                        "Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.",
+                        variable_width.bits_per_offset
+                    );
                 }
             }
             _ => unreachable!(
@@ -884,15 +889,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 assert!(offsets.bits_per_value < u8::MAX as u64);
                 Ok(Box::new(VariableDecoder::default()))
             }
-            Compression::Fsst(ref fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
+            Compression::Fsst(fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::General(ref general) => {
-                Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                    general.compression.as_ref().expect_ok()?.scheme(),
-                )?))
-            }
+            Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                general.compression.as_ref().expect_ok()?.scheme(),
+            )?)),
             Compression::VariablePackedStruct(description) => {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
@@ -972,7 +975,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         return Err(Error::InvalidInput {
                             location: location!(),
                             source: "OutOfLineBitpacking values must use Flat encoding".into(),
-                        })
+                        });
                     }
                 };
                 Ok(Box::new(OutOfLineBitpacking::new(

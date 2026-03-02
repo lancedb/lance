@@ -72,9 +72,11 @@ mod tests {
 
     #[test]
     fn test_error_lance_result_to_error_std_result() {
-        assert!(lance_result_to_std_result::<()>(lance_core::Result::Err(
-            lance_core::Error::invalid_input("bad input")
-        ))
-        .is_err());
+        assert!(
+            lance_result_to_std_result::<()>(lance_core::Result::Err(
+                lance_core::Error::invalid_input("bad input")
+            ))
+            .is_err()
+        );
     }
 }

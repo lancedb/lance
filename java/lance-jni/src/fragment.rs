@@ -44,7 +44,7 @@ pub(crate) struct FragmentUpdateResult {
 //////////////////
 // Read Methods //
 //////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_countRowsNative(
     mut env: JNIEnv,
     _jfragment: JObject,
@@ -76,7 +76,7 @@ fn inner_count_rows_native(
 ///////////////////
 // Write Methods //
 ///////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -155,7 +155,7 @@ fn inner_create_with_ffi_array<'local>(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -260,7 +260,7 @@ fn create_fragment<'a>(
     export_vec(env, &fragments)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeDeleteRows<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -314,7 +314,7 @@ fn inner_delete_rows<'local>(
     Ok(obj)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeMergeColumns<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -378,7 +378,7 @@ fn inner_merge_column<'local>(
     result.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeUpdateColumns<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,

@@ -17,11 +17,11 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 
 use crate::pb;
-use crate::vector::ivf::storage::{IvfModel, IVF_METADATA_KEY};
+use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
 use crate::vector::pq::storage::PQ_METADATA_KEY;
 use crate::vector::sq::storage::SQ_METADATA_KEY;
 use crate::vector::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
-use crate::{IndexMetadata as IndexMetaSchema, INDEX_METADATA_SCHEMA_KEY};
+use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata as IndexMetaSchema};
 
 /// Supported vector index types for unified IVF metadata writing.
 ///

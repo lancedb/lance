@@ -20,12 +20,12 @@ use std::{
 };
 
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
-use lance_index::scalar::btree::{train_btree_index, BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE};
+use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex};

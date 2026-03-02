@@ -11,23 +11,23 @@ use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use itertools::Itertools;
+use lance_core::Result;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowAddrMask;
-use lance_core::Result;
 
 use crate::metrics::MetricsCollector;
 
 use super::{
+    CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
     query::FtsSearchParams,
     scorer::Scorer,
-    CompressedPostingList, DocSet, PostingList, RawDocInfo,
 };
-use super::{builder::BLOCK_SIZE, DocInfo};
+use super::{DocInfo, builder::BLOCK_SIZE};
 use super::{
     query::Operator,
-    scorer::{idf, K1},
+    scorer::{K1, idf},
 };
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
@@ -437,12 +437,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
@@ -563,12 +563,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -899,7 +899,7 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, CompressedPostingList, PlainPostingList,
+            CompressedPostingList, PlainPostingList, encoding::compress_posting_list,
         },
     };
 

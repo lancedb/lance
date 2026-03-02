@@ -326,11 +326,7 @@ impl RowAddrSelection {
                 .union(),
         );
 
-        if is_full {
-            Self::Full
-        } else {
-            res
-        }
+        if is_full { Self::Full } else { res }
     }
 }
 

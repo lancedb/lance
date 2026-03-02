@@ -33,8 +33,8 @@ use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::compute_partitions_arrow_array;
-use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::DistanceType;
 

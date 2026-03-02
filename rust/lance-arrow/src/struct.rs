@@ -3,7 +3,7 @@
 
 //! Extension to arrow struct arrays
 
-use arrow_array::{cast::AsArray, make_array, Array, StructArray};
+use arrow_array::{Array, StructArray, cast::AsArray, make_array};
 use arrow_buffer::NullBuffer;
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::ArrowError;
@@ -124,7 +124,7 @@ impl StructArrayExt for StructArray {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{cast::AsArray, make_array, Array, Int32Array, StructArray};
+    use arrow_array::{Array, Int32Array, StructArray, cast::AsArray, make_array};
     use arrow_schema::{DataType, Field, Fields};
     use std::sync::Arc;
 

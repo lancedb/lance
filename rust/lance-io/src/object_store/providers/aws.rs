@@ -11,26 +11,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
-use opendal::{services::S3, Operator};
+use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
+    ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
+    StaticCredentialProvider,
     aws::{
         AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider,
     },
-    ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
-    StaticCredentialProvider,
 };
 use snafu::location;
 use tokio::sync::RwLock;
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    StorageOptionsProvider, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
-    DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    StorageOptionsProvider,
 };
 use lance_core::error::{Error, Result};
 
@@ -368,11 +368,7 @@ impl CredentialProvider for AwsCredentialAdapter {
                         .unwrap_or(false)
                 })
                 .unwrap_or(true); // no cred is the same as expired;
-            if expired {
-                None
-            } else {
-                cache_value.clone()
-            }
+            if expired { None } else { cache_value.clone() }
         };
 
         if let Some(creds) = cached_creds {

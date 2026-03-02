@@ -11,7 +11,7 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::{Shuffle, SIMD};
+use super::{SIMD, Shuffle};
 
 /// 16 of 8-bit `u8` values.
 #[allow(non_camel_case_types)]

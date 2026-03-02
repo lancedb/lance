@@ -5,7 +5,7 @@ use libc::{c_void, size_t};
 mod sys {
     use super::*;
 
-    extern "C" {
+    unsafe extern "C" {
         #[link_name = "__libc_malloc"]
         fn libc_malloc(size: size_t) -> *mut c_void;
         #[link_name = "__libc_calloc"]
@@ -48,7 +48,7 @@ mod sys {
         _private: [u8; 0],
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn malloc_default_zone() -> *mut malloc_zone_t;
         fn malloc_zone_malloc(zone: *mut malloc_zone_t, size: size_t) -> *mut c_void;
         fn malloc_zone_calloc(
@@ -215,14 +215,14 @@ fn is_valid_posix_memalign_alignment(alignment: usize) -> bool {
     is_power_of_two(alignment) && alignment >= std::mem::size_of::<*mut c_void>()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
     to_virtual(sys::malloc(size.saturating_add(HEADER_SIZE)), size, 0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn calloc(size: size_t, element_size: size_t) -> *mut c_void {
     let Some(total_size) = size.checked_mul(element_size) else {
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn calloc(size: size_t, element_size: size_t) -> *mut c_vo
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_malloc(size: size_t) -> *mut c_void {
     let ptr = sys::malloc(size);
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn memtest_malloc(size: size_t) -> *mut c_void {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_calloc(count: size_t, element_size: size_t) -> *mut c_void {
     let Some(_total_size) = count.checked_mul(element_size) else {
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn memtest_calloc(count: size_t, element_size: size_t) -> 
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -277,7 +277,7 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn memtest_free(ptr: *mut c_void) {
     sys::free(ptr);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
     let (old_size, actual_ptr) = if ptr.is_null() || !is_ours(ptr) {
@@ -310,7 +310,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void 
     to_virtual(new_ptr, size, 0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
     if ptr.is_null() {
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn memtest_realloc(ptr: *mut c_void, size: size_t) -> *mut
     new_ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_voi
     to_virtual(actual_ptr, size, alignment)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut c_void,
@@ -364,7 +364,7 @@ pub unsafe extern "C" fn posix_memalign(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
@@ -373,7 +373,7 @@ pub unsafe extern "C" fn aligned_alloc(alignment: size_t, size: size_t) -> *mut 
     to_virtual(actual_ptr, size, alignment)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn valloc(size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
@@ -383,7 +383,7 @@ pub unsafe extern "C" fn valloc(size: size_t) -> *mut c_void {
     to_virtual(actual_ptr, size, page_size)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_posix_memalign(
     memptr: *mut *mut c_void,
@@ -406,7 +406,7 @@ pub unsafe extern "C" fn memtest_posix_memalign(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void {
     if !is_valid_posix_memalign_alignment(alignment as usize) {
@@ -423,7 +423,7 @@ pub unsafe extern "C" fn memtest_aligned_alloc(alignment: size_t, size: size_t) 
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_valloc(size: size_t) -> *mut c_void {
     let page_size = libc::sysconf(libc::_SC_PAGESIZE) as size_t;
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn memtest_valloc(size: size_t) -> *mut c_void {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn reallocarray(
     old_ptr: *mut c_void,
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn reallocarray(
     realloc(old_ptr, size)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> size_t {
     if ptr.is_null() {
@@ -464,7 +464,7 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> size_t {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "macos")]
 pub unsafe extern "C" fn memtest_malloc_usable_size(ptr: *mut c_void) -> size_t {
     if ptr.is_null() {
@@ -484,7 +484,7 @@ struct Interpose {
 unsafe impl Sync for Interpose {}
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn malloc(size: size_t) -> *mut c_void;
     fn calloc(count: size_t, element_size: size_t) -> *mut c_void;
     fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
@@ -496,7 +496,7 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 #[used]
-#[link_section = "__DATA,__interpose"]
+#[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_TABLE: [Interpose; 7] = [
     Interpose {
         replacement: memtest_malloc as *const () as *const c_void,

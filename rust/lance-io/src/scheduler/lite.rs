@@ -23,8 +23,8 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Instant,
@@ -308,7 +308,9 @@ impl SimpleBackpressureThrottle {
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
             tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
-            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            log::debug!(
+                "Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind"
+            );
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
         }

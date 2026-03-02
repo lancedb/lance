@@ -30,16 +30,16 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
-use object_store::path::Path;
 use object_store::PutMode;
 use object_store::PutOptions;
+use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

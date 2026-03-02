@@ -12,7 +12,7 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;

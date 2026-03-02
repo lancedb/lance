@@ -4,9 +4,9 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
-use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
+use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
+use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
+use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;

@@ -5,21 +5,21 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
+use lance_index::VECTOR_INDEX_VERSION;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::NoopIndexBuildProgress;
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
-use lance_index::VECTOR_INDEX_VERSION;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
 
-use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
-use crate::dataset::index::LanceIndexStoreExt;
+use super::vector::ivf::optimize_vector_indices;
 use crate::dataset::Dataset;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
@@ -265,12 +265,12 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{array, Dimension, RowCount};
+    use lance_datagen::{Dimension, RowCount, array};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
+        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -325,11 +325,13 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            !dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
@@ -352,11 +354,13 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 
-        assert!(dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // There should be two indices directories existed.
         let object_store = dataset.object_store();

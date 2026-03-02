@@ -14,9 +14,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use crate::format::{pb, ExternalFile, Fragment};
+use crate::format::{ExternalFile, Fragment, pb};
 use crate::rowids::segment::U64Segment;
-use crate::rowids::{read_row_ids, RowIdSequence};
+use crate::rowids::{RowIdSequence, read_row_ids};
 
 /// A run of identical versions over a contiguous span of row positions.
 ///

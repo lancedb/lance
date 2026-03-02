@@ -76,7 +76,7 @@ fn build_pq_params_from_java(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainIvfCentroids<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -132,7 +132,7 @@ fn inner_train_ivf_centroids<'local>(
     Ok(jarray)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainPqCodebook<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,

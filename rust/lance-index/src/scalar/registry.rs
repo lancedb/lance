@@ -6,13 +6,13 @@ use std::sync::Arc;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_core::{cache::LanceCache, Result};
+use lance_core::{Result, cache::LanceCache};
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
-    scalar::{expression::ScalarQueryParser, CreatedIndex, IndexStore, ScalarIndex},
+    scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser},
 };
 
 pub const VALUE_COLUMN_NAME: &str = "value";
@@ -97,7 +97,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// This training request specifies the criteria that the data must satisfy to train the index.
     /// For example, does the index require the input data to be sorted?
     fn new_training_request(&self, params: &str, field: &Field)
-        -> Result<Box<dyn TrainingRequest>>;
+    -> Result<Box<dyn TrainingRequest>>;
 
     /// Train a new index
     ///

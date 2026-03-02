@@ -3,15 +3,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
+        DisplayAs, ExecutionPlan, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, ExecutionPlan, PlanProperties,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
@@ -19,12 +19,12 @@ use futures::StreamExt;
 use lance_core::ROW_ADDR;
 use roaring::RoaringTreemap;
 
+use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
-use crate::dataset::write::merge_insert::{MergeInsertParams, MergeStats, MERGE_ACTION_COLUMN};
-use crate::Dataset;
+use crate::dataset::write::merge_insert::{MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats};
 
-use super::{apply_deletions, MergeInsertMetrics};
+use super::{MergeInsertMetrics, apply_deletions};
 
 /// Specialized physical execution node for delete-only merge insert operations.
 ///

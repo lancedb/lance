@@ -30,7 +30,7 @@ use crate::{
 
 use crate::error::Result;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -95,7 +95,7 @@ fn inner_plan_compaction<'local>(
     plan.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -171,7 +171,7 @@ fn inner_commit_compaction<'local>(
     committed_metrics.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,                            // CompactionTask itself

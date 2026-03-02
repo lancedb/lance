@@ -9,30 +9,30 @@ use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, StructArray, UInt32Array,
     builder::PrimitiveBuilder,
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray, UInt32Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::{self, concat_batches};
 use async_recursion::async_recursion;
 use deepsize::DeepSizeOf;
-use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
+use futures::{Future, FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::*;
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
-use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::encodings::AsyncIndex;
+use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_fixed_stride_array, read_metadata_offset, read_struct, read_struct_from_buf,
 };
-use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use std::borrow::Cow;
 
 use object_store::path::Path;
@@ -746,7 +746,7 @@ where
             return Err(Error::Internal {
                 message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
                 location: location!(),
-            })
+            });
         }
         ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..positions.value(*end).as_usize())
@@ -782,11 +782,11 @@ mod tests {
     use super::*;
 
     use arrow_array::{
+        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
+        UInt8Array,
         builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
         types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
-        UInt8Array,
     };
     use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};

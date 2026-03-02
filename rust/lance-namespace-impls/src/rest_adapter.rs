@@ -10,12 +10,12 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router, ServiceExt,
     body::Bytes,
     extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router, ServiceExt,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -24,8 +24,8 @@ use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
-use lance_namespace::models::*;
 use lance_namespace::LanceNamespace;
+use lance_namespace::models::*;
 
 /// Configuration for the REST server
 #[derive(Debug, Clone)]
@@ -2557,11 +2557,13 @@ mod tests {
             // Verify table exists
             let mut exists_req = TableExistsRequest::new();
             exists_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
-            assert!(fixture
-                .namespace
-                .table_exists(exists_req.clone())
-                .await
-                .is_ok());
+            assert!(
+                fixture
+                    .namespace
+                    .table_exists(exists_req.clone())
+                    .await
+                    .is_ok()
+            );
 
             // Deregister the table
             let deregister_req = DeregisterTableRequest {

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -26,7 +26,7 @@ use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
 use crate::vector::bq::builder::RabitQuantizer;
-use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
 pub trait Quantization:
     Send

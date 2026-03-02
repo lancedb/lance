@@ -4,11 +4,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
-    DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
-use lance_core::error::Result;
 use lance_core::Error;
+use lance_core::error::Result;
 use object_store::{local::LocalFileSystem, path::Path};
 use url::Url;
 

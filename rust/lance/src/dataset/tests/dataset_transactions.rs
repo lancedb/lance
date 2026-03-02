@@ -7,7 +7,7 @@ use std::vec;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig, TRANSACTIONS_DIR};
+use crate::dataset::{ManifestWriteConfig, TRANSACTIONS_DIR, write_manifest_file};
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
@@ -16,10 +16,10 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
-use arrow_array::{types::Int32Type, Int32Array, RecordBatchIterator, StringArray};
+use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
-use lance_datagen::{array, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array};
 use lance_index::DatasetIndexExt;
 
 use crate::datafusion::LanceTableProvider;

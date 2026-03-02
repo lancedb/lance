@@ -17,10 +17,10 @@ use lance_table::format::Fragment;
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
+use crate::Dataset;
+use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
-use crate::dataset::WriteParams;
-use crate::Dataset;
 
 mod throttle_store;
 

@@ -4,7 +4,7 @@
 //! Index merging mechanisms for distributed vector index building
 
 use crate::vector::shared::partition_merger::{
-    write_unified_ivf_and_index_metadata, SupportedIvfIndexType,
+    SupportedIvfIndexType, write_unified_ivf_and_index_metadata,
 };
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
@@ -13,20 +13,20 @@ use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ID_FIELD, Result};
 use snafu::location;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::flat::index::FlatMetadata;
-use crate::vector::ivf::storage::{IvfModel as IvfStorageModel, IVF_METADATA_KEY};
-use crate::vector::pq::storage::{transpose, ProductQuantizationMetadata, PQ_METADATA_KEY};
+use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
+use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
 use crate::vector::quantizer::QuantizerMetadata;
-use crate::vector::sq::storage::{ScalarQuantizationMetadata, SQ_METADATA_KEY};
+use crate::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
-use crate::IndexMetadata as IndexMetaSchema;
 use crate::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -1127,7 +1127,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                                 location: location!(),
                             });
                         } else {
-                            log::warn!("PQ codebook differs within tolerance; proceeding with first shard codebook");
+                            log::warn!(
+                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
+                            );
                         }
                     }
                 }
@@ -1335,7 +1337,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                                 location: location!(),
                             });
                         } else {
-                            log::warn!("PQ codebook differs within tolerance; proceeding with first shard codebook");
+                            log::warn!(
+                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
+                            );
                         }
                     }
                 }
@@ -1536,13 +1540,13 @@ pub async fn merge_partial_vector_auxiliary_files(
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
     use futures::StreamExt;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID_FIELD;
+    use lance_core::utils::address::RowAddress;
     use lance_file::writer::FileWriterOptions as V2WriterOptions;
     use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};

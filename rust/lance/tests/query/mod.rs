@@ -3,15 +3,15 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, RecordBatch, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array, cast::AsArray};
 use arrow_select::concat::concat_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
+use lance::dataset::scanner::ColumnOrdering;
 use lance_datafusion::udf::register_functions;
-use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 
 /// Creates a fresh SessionContext with Lance UDFs registered
 fn create_datafusion_context() -> SessionContext {

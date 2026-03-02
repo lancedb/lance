@@ -19,19 +19,19 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::location;
 
+use crate::Dataset;
+use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
-use crate::dataset::ReadParams;
-use crate::Dataset;
 use crate::{Error, Result};
 use tracing::info;
 
-use super::commit::CommitBuilder;
-use super::resolve_commit_handler;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
+use super::commit::CommitBuilder;
+use super::resolve_commit_handler;
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -522,15 +522,12 @@ mod test {
 
     #[tokio::test]
     async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "blob",
-            DataType::Binary,
-            false,
-        )
-        .with_metadata(HashMap::from([(
-            BLOB_META_KEY.to_string(),
-            "true".to_string(),
-        )]))]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::Binary, false).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]))],

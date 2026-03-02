@@ -7,17 +7,17 @@ use std::sync::Arc;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow_array::{
-    cast::{as_largestring_array, as_primitive_array, as_string_array, AsArray},
-    types::{
-        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, GenericStringArray,
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
+    cast::{AsArray, as_largestring_array, as_primitive_array, as_string_array},
+    types::{
+        Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    },
 };
 use arrow_schema::{ArrowError, DataType};
 use num_traits::AsPrimitive;
-use num_traits::{bounds::Bounded, Float, Num};
+use num_traits::{Float, Num, bounds::Bounded};
 
 use crate::{Error, Result};
 
@@ -323,7 +323,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::{
-        Float32Array, Int16Array, Int8Array, LargeStringArray, StringArray, UInt32Array, UInt8Array,
+        Float32Array, Int8Array, Int16Array, LargeStringArray, StringArray, UInt8Array, UInt32Array,
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::Field;

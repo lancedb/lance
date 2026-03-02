@@ -16,8 +16,8 @@ pub use fragment::*;
 pub use index::IndexMetadata;
 
 pub use manifest::{
-    is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, DETACHED_VERSION_MASK,
+    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
+    WriterVersion, is_detached_version,
 };
 pub use transaction::Transaction;
 

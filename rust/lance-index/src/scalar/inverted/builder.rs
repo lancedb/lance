@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{
+    InvertedIndexParams,
     index::*,
     merger::{Merger, PartitionSource, SizeBasedMerger},
-    InvertedIndexParams,
 };
+use crate::scalar::IndexStore;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
-use crate::{progress::noop_progress, progress::IndexBuildProgress};
+use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -22,11 +22,11 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
-use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
+use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use smallvec::SmallVec;
@@ -1315,9 +1315,9 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
-    use lance_core::ROW_ID;
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::sync::Mutex;

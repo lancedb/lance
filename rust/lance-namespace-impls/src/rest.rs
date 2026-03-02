@@ -41,9 +41,9 @@ use lance_namespace::models::{
     UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-use lance_core::{box_error, Error, Result};
+use lance_core::{Error, Result, box_error};
 
 use lance_namespace::LanceNamespace;
 

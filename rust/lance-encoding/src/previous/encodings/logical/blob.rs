@@ -4,30 +4,30 @@
 use std::{collections::VecDeque, sync::Arc, vec};
 
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, Array, ArrayRef, LargeBinaryArray, PrimitiveArray,
-    StructArray, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, PrimitiveArray, StructArray, UInt64Array, cast::AsArray,
+    types::UInt64Type,
 };
 use arrow_buffer::{
     BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
 use arrow_schema::DataType;
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use snafu::location;
 
-use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
+use lance_core::{Error, Result, datatypes::BLOB_DESC_FIELDS};
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
-    format::pb::{column_encoding, Blob, ColumnEncoding},
+    format::pb::{Blob, ColumnEncoding, column_encoding},
     previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     repdef::RepDefBuilder,
-    EncodingsIo,
 };
 
 /// A field scheduler for large binary data
@@ -400,7 +400,7 @@ pub mod tests {
 
     use crate::{
         format::pb::column_encoding,
-        testing::{check_round_trip_encoding_of_data, check_specific_random, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
         version::LanceFileVersion,
     };
 

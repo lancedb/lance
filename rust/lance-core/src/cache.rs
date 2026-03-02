@@ -6,8 +6,8 @@
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use futures::{Future, FutureExt};

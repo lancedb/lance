@@ -33,12 +33,12 @@ pub mod pb21 {
 }
 
 use pb::{
-    array_encoding::ArrayEncoding as ArrayEncodingEnum,
-    buffer::BufferType,
-    nullable::{AllNull, NoNull, Nullability, SomeNull},
     ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary, FixedSizeBinary,
     FixedSizeList, Flat, Fsst, InlineBitpacking, Nullable, OutOfLineBitpacking, PackedStruct,
     PackedStructFixedWidthMiniBlock, Rle, Variable,
+    array_encoding::ArrayEncoding as ArrayEncodingEnum,
+    buffer::BufferType,
+    nullable::{AllNull, NoNull, Nullability, SomeNull},
 };
 
 use crate::{encodings::physical::block::CompressionConfig, repdef::DefinitionInterpretation};

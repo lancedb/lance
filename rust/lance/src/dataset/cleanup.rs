@@ -35,18 +35,18 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
-use crate::{utils::temporal::utc_now, Dataset};
+use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
+    Error, Result,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
     },
-    Error, Result,
 };
 use lance_table::{
     format::{IndexMetadata, Manifest},
@@ -64,7 +64,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
-use tracing::{debug, info, instrument, Span};
+use tracing::{Span, debug, info, instrument};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -1037,9 +1037,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::blob::{blob_field, BlobArrayBuilder};
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1057,7 +1057,7 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
-    use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, some_batch};
     use mock_instant::thread_local::MockClock;
     use snafu::location;
 
@@ -2076,10 +2076,12 @@ mod tests {
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 2);
 
-        assert!(fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-            .await
-            .is_err());
+        assert!(
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+                .await
+                .is_err()
+        );
 
         // This test currently relies on us sending in manifest files after
         // data files.  Also, the delete process is run in parallel.  However,
@@ -2623,7 +2625,7 @@ mod tests {
 
         // Compact files for a given branch and optimize indices to stabilize index files.
         async fn compact(&mut self) -> Result<()> {
-            use crate::dataset::optimize::{compact_files, CompactionOptions};
+            use crate::dataset::optimize::{CompactionOptions, compact_files};
             compact_files(&mut self.dataset, CompactionOptions::default(), None).await?;
             self.refresh().await
         }

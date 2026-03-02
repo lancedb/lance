@@ -7,11 +7,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use futures::{
-    future::{BoxFuture, Shared},
     FutureExt,
+    future::{BoxFuture, Shared},
 };
-use lance_core::{error::CloneableError, Error, Result};
-use object_store::{path::Path, GetOptions, GetResult, ObjectStore, Result as OSResult};
+use lance_core::{Error, Result, error::CloneableError};
+use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
@@ -126,7 +126,13 @@ async fn do_get_with_outer_retry(
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 if retries == 0 {
-                    log::warn!("Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}", desc(), get_request.path(), download_retry_count, err);
+                    log::warn!(
+                        "Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}",
+                        desc(),
+                        get_request.path(),
+                        download_retry_count,
+                        err
+                    );
                     return Err(err);
                 }
                 log::debug!(

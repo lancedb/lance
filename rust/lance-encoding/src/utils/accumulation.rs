@@ -67,8 +67,7 @@ impl AccumulationQueue {
         } else {
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
-                self.column_index,
-                self.current_bytes
+                self.column_index, self.current_bytes
             );
             if self.keep_original_array {
                 self.buffered_arrays.push(array);
@@ -89,8 +88,7 @@ impl AccumulationQueue {
         } else {
             trace!(
                 "Final flush of column {} which has {} bytes",
-                self.column_index,
-                self.current_bytes
+                self.column_index, self.current_bytes
             );
             self.current_bytes = 0;
             let row_number = self.row_number;

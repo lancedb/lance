@@ -8,28 +8,28 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
+use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
 use aws_sdk_dynamodb::operation::RequestId;
+use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
 };
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
-use aws_sdk_dynamodb::Client;
 use object_store::path::Path;
-use snafu::location;
 use snafu::OptionExt;
+use snafu::location;
 use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
-use lance_core::error::box_error;
 use lance_core::error::NotFoundSnafu;
+use lance_core::error::box_error;
 use lance_core::{Error, Result};
 
-use super::external_manifest::detect_naming_scheme_from_path;
 use super::ManifestLocation;
+use super::external_manifest::detect_naming_scheme_from_path;
 
 #[derive(Debug)]
 struct WrappedSdkError<E>(SdkError<E>);
@@ -206,9 +206,12 @@ impl DynamoDBExternalManifestStore {
 
         // Both keys must be present
         if !(has_hash_key && has_range_key) {
-            return Err(
-                Error::io(format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!()))
-            );
+            return Err(Error::io(format!(
+                "dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively",
+                table_name,
+                base_uri!(),
+                version!()
+            )));
         }
 
         SANITY_CHECK_CACHE
@@ -390,8 +393,10 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                             e_tag,
                         };
                         Ok(Some(location))
-                    },
-                    _ => Err(Error::invalid_input(format!("dynamodb error: found entries for {base_uri} but the returned data is not number type")))
+                    }
+                    _ => Err(Error::invalid_input(format!(
+                        "dynamodb error: found entries for {base_uri} but the returned data is not number type"
+                    ))),
                 }
             }
             _ => Ok(None),

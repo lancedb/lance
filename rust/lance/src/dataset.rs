@@ -7,7 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
-use chrono::{prelude::*, Duration};
+use chrono::{Duration, prelude::*};
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -18,6 +18,7 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
+use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
@@ -25,7 +26,6 @@ use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
@@ -38,12 +38,12 @@ use lance_io::object_store::{
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
 };
 use lance_table::io::commit::{
-    external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
-    write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler, CommitLock,
-    ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
+    CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
+    VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
+    write_manifest_file_to_path,
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -106,18 +106,18 @@ use crate::io::commit::{
     detect_overlapping_fragments,
 };
 use crate::session::Session;
-use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
+use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
-use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
 };
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
-use lance_table::io::deletion::{relative_deletion_file_path, DELETIONS_DIR};
+use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -131,8 +131,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder,
-    WriteDestination, WriteMode, WriteParams,
+    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder, WriteDestination,
+    WriteMode, WriteParams, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";

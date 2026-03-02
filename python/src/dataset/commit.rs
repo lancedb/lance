@@ -37,7 +37,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {
                 message: format!("Error importing from pylance {}", import_error),
-                location: location!(),
+                location: &location!(),
             })
         }
     };
@@ -47,7 +47,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     } else {
         CommitError::OtherError(Error::Internal {
             message: format!("Error from commit handler: {}", py_err),
-            location: location!(),
+            location: &location!(),
         })
     }
 }

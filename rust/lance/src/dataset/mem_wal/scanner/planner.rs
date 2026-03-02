@@ -11,13 +11,13 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{limit::GlobalLimitExec, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::Expr;
 use lance_core::Result;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DeduplicateExec, MemtableGenTagExec, MEMTABLE_GEN_COLUMN, ROW_ADDRESS_COLUMN};
+use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
 
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
@@ -450,9 +450,9 @@ mod integration_tests {
     use futures::TryStreamExt;
     use uuid::Uuid;
 
+    use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
     use crate::dataset::mem_wal::scanner::data_source::RegionSnapshot;
-    use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
@@ -977,8 +977,8 @@ mod integration_tests {
         String,
     ) {
         use crate::index::CreateIndexBuilder;
-        use lance_index::scalar::ScalarIndexParams;
         use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
 
         let schema = create_pk_schema();
         let temp_dir = tempfile::tempdir().unwrap();

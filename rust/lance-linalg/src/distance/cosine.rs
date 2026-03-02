@@ -10,22 +10,22 @@
 use std::sync::Arc;
 
 use arrow_array::{
+    Array, FixedSizeListArray, Float32Array,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
-    Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::SIMD_SUPPORT;
 
-use super::{dot::dot, Normalize};
-use super::{norm_l2::norm_l2, Dot};
+use super::{Dot, norm_l2::norm_l2};
+use super::{Normalize, dot::dot};
 use crate::simd::{
-    f32::{f32x16, f32x8},
     FloatSimd, SIMD,
+    f32::{f32x8, f32x16},
 };
 use crate::{Error, Result};
 

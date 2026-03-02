@@ -342,7 +342,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             .expect("Failed to import LanceOperation namespace");
 
         match self.0 {
-            Operation::Append { ref fragments } => {
+            Operation::Append { fragments } => {
                 let fragments = export_vec(py, fragments.as_slice())?;
                 let cls = namespace
                     .getattr("Append")
@@ -350,9 +350,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((fragments,))
             }
             Operation::Overwrite {
-                ref fragments,
-                ref schema,
-                ref initial_bases,
+                fragments,
+                schema,
+                initial_bases,
                 ..
             } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
@@ -433,8 +433,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
             Operation::Merge {
-                ref fragments,
-                ref schema,
+                fragments,
+                schema,
             } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
@@ -450,8 +450,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((version,))
             }
             Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
+                groups,
+                rewritten_indices,
                 ..
             } => {
                 let groups_py = export_vec(py, groups.as_slice())?;
@@ -462,8 +462,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((groups_py, rewritten_indices_py))
             }
             Operation::CreateIndex {
-                ref new_indices,
-                ref removed_indices,
+                new_indices,
+                removed_indices,
             } => {
                 let new_indices_py = export_vec(py, new_indices.as_slice())?;
                 let removed_indices_py = export_vec(py, removed_indices.as_slice())?;
@@ -473,7 +473,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { ref schema } => {
+            Operation::Project { schema } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
@@ -489,10 +489,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 }
             }
             Operation::UpdateConfig {
-                ref config_updates,
-                ref table_metadata_updates,
-                ref schema_metadata_updates,
-                ref field_metadata_updates,
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
             } => {
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
                     let config = export_update_map(py, config_updates)?;
@@ -517,7 +517,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            Operation::UpdateBases { ref new_bases } => {
+            Operation::UpdateBases { new_bases } => {
                 if let Ok(cls) = namespace.getattr("UpdateBases") {
                     use crate::dataset::DatasetBasePath;
                     let new_bases_py: Vec<DatasetBasePath> = new_bases

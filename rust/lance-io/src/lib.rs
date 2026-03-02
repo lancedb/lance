@@ -377,8 +377,10 @@ mod test {
         check_error(ReadBatchParams::RangeTo(RangeTo { end: 10 }), 5, 6);
 
         assert!(ReadBatchParams::RangeFull.to_offsets().is_err());
-        assert!(ReadBatchParams::RangeFrom(RangeFrom { start: 10 })
-            .to_offsets()
-            .is_err());
+        assert!(
+            ReadBatchParams::RangeFrom(RangeFrom { start: 10 })
+                .to_offsets()
+                .is_err()
+        );
     }
 }

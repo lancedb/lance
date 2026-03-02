@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use mockall::mock;
 use object_store::{
-    path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as OSObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, path::Path,
 };
 use std::future::Future;
 

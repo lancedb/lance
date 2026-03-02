@@ -473,7 +473,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     mut env: JNIEnv,
     _obj: JObject,
@@ -482,7 +482,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     ok_or_throw_without_return!(env, env.get_integers(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     mut env: JNIEnv,
     _obj: JObject,
@@ -491,7 +491,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     ok_or_throw_without_return!(env, env.get_longs(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     mut env: JNIEnv,
     _obj: JObject,
@@ -500,7 +500,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     ok_or_throw_without_return!(env, env.get_ints_opt(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     mut env: JNIEnv,
     _obj: JObject,
@@ -509,7 +509,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIndexParams(
     mut env: JNIEnv,
     _obj: JObject,

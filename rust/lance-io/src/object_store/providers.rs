@@ -4,18 +4,18 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use object_store::path::Path;
 use url::Url;
 
-use crate::object_store::uri_to_url;
 use crate::object_store::WrappingObjectStore;
+use crate::object_store::uri_to_url;
 
-use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
+use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]

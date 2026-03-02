@@ -62,7 +62,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: snafu::location!(),
+                    location: &snafu::location!(),
                 })?;
 
             // Call fetchStorageOptions() method on Java object
@@ -80,7 +80,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                         "Failed to call fetchStorageOptions: {}",
                         e
                     ))),
-                    location: snafu::location!(),
+                    location: &snafu::location!(),
                 })?;
 
             let result_obj = result.l().map_err(|e| lance_core::Error::IO {
@@ -88,7 +88,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                     "fetchStorageOptions result is not an object: {}",
                     e
                 ))),
-                location: snafu::location!(),
+                location: &snafu::location!(),
             })?;
 
             // Check if result is null
@@ -103,7 +103,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                         "fetchStorageOptions result is not a Map: {}",
                         e
                     ))),
-                    location: snafu::location!(),
+                    location: &snafu::location!(),
                 })?;
 
             let mut storage_options = HashMap::new();
@@ -115,7 +115,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                             "Failed to iterate storage options: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     })?;
 
             while let Some((key, value)) =
@@ -124,7 +124,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                         "Failed to get next storage option entry: {}",
                         e
                     ))),
-                    location: snafu::location!(),
+                    location: &snafu::location!(),
                 })?
             {
                 let key_str: String = env
@@ -134,7 +134,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                             "storage option key is not a string: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     })?
                     .into();
 
@@ -145,7 +145,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                             "storage option value is not a string: {}",
                             e
                         ))),
-                        location: snafu::location!(),
+                        location: &snafu::location!(),
                     })?
                     .into();
 
@@ -160,7 +160,7 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: snafu::location!(),
+            location: &snafu::location!(),
         })?
     }
 

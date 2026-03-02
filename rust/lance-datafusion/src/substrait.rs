@@ -8,18 +8,19 @@ use crate::aggregate::Aggregate;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    from_substrait_agg_func, from_substrait_rex, from_substrait_sorts, DefaultSubstraitConsumer,
+    DefaultSubstraitConsumer, from_substrait_agg_func, from_substrait_rex, from_substrait_sorts,
 };
 use datafusion_substrait::substrait::proto::{
+    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
     expression::{
+        RexType,
         field_reference::{ReferenceType, RootType},
-        reference_segment, RexType,
+        reference_segment,
     },
     expression_reference::ExprType,
     function_argument::ArgType,
-    r#type::{Kind, Struct},
     rel::RelType,
-    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
+    r#type::{Kind, Struct},
 };
 use lance_core::{Error, Result};
 use prost::Message;
@@ -168,7 +169,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             "Window functions or subqueries not allowed in filter expression",
         )),
         // Pass through operators, nested children may have field references
-        RexType::ScalarFunction(ref mut func) => {
+        RexType::ScalarFunction(func) => {
             #[allow(deprecated)]
             for arg in &mut func.args {
                 remap_expr_references(arg, mapping)?;
@@ -181,7 +182,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::IfThen(ref mut ifthen) => {
+        RexType::IfThen(ifthen) => {
             for clause in ifthen.ifs.iter_mut() {
                 remap_expr_references(clause.r#if.as_mut().unwrap(), mapping)?;
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
@@ -189,21 +190,21 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             remap_expr_references(ifthen.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SwitchExpression(ref mut switch) => {
+        RexType::SwitchExpression(switch) => {
             for clause in switch.ifs.iter_mut() {
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
             }
             remap_expr_references(switch.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SingularOrList(ref mut orlist) => {
+        RexType::SingularOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 remap_expr_references(opt, mapping)?;
             }
             remap_expr_references(orlist.value.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::MultiOrList(ref mut orlist) => {
+        RexType::MultiOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 for field in opt.fields.iter_mut() {
                     remap_expr_references(field, mapping)?;
@@ -214,11 +215,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::Cast(ref mut cast) => {
+        RexType::Cast(cast) => {
             remap_expr_references(cast.input.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::Selection(ref mut sel) => {
+        RexType::Selection(sel) => {
             // Finally, the selection, which might actually have field references
             let root_type = sel.root_type.as_mut().unwrap();
             // These types of references do not reference input fields so no remap needed
@@ -244,7 +245,9 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                                 if let Some(new_index) = mapping.get(&(field.field as usize)) {
                                     field.field = *new_index as i32;
                                 } else {
-                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion"));
+                                    return Err(Error::invalid_input(
+                                        "pushdown filter referenced a field that is not yet supported by Substrait conversion",
+                                    ));
                                 }
                                 Ok(())
                             }
@@ -546,21 +549,21 @@ mod tests {
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
+        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
+        Version,
         expression::{
+            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
             field_reference::{ReferenceType, RootReference, RootType},
             literal::LiteralType,
             reference_segment::{self, StructField},
-            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
         },
         expression_reference::ExprType,
         extensions::{
-            simple_extension_declaration::{ExtensionFunction, MappingType},
             SimpleExtensionDeclaration, SimpleExtensionUri, SimpleExtensionUrn,
+            simple_extension_declaration::{ExtensionFunction, MappingType},
         },
         function_argument::ArgType,
-        r#type::{Boolean, Kind, Nullability, Struct, I32},
-        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
-        Version,
+        r#type::{Boolean, I32, Kind, Nullability, Struct},
     };
     use prost::Message;
 
@@ -859,10 +862,10 @@ mod tests {
     // ==================== Aggregate parsing tests ====================
 
     use datafusion_substrait::substrait::proto::{
+        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
         aggregate_function::AggregationInvocation,
         aggregate_rel::{Grouping, Measure},
         rel::RelType,
-        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
     };
 
     /// Helper to create a field reference expression for a column index

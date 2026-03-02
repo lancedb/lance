@@ -279,7 +279,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeReadTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -608,7 +608,7 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
@@ -1338,7 +1338,7 @@ fn export_update_map<'a>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     mut env: JNIEnv<'local>,

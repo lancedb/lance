@@ -13,8 +13,8 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
-    expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
+    expr::{InList, ScalarFunction},
 };
 use tokio::try_join;
 
@@ -25,8 +25,8 @@ use super::{
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
 use lance_core::{
-    utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
@@ -1832,7 +1832,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
-    use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+    use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 

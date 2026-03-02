@@ -297,11 +297,13 @@ mod tests {
             .iter()
             .find(|f| f.name == "meta")
             .unwrap();
-        assert!(meta_json_field
-            .metadata
-            .as_ref()
-            .unwrap()
-            .contains_key(ARROW_EXT_NAME_KEY));
+        assert!(
+            meta_json_field
+                .metadata
+                .as_ref()
+                .unwrap()
+                .contains_key(ARROW_EXT_NAME_KEY)
+        );
 
         let roundtrip = convert_json_arrow_schema(&json_schema).unwrap();
         let meta_field = roundtrip.field_with_name("meta").unwrap();
@@ -389,10 +391,12 @@ mod tests {
         let unsupported_type = JsonArrowDataType::new("unsupported".to_string());
         let result = convert_json_arrow_type(&unsupported_type);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported Arrow type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported Arrow type")
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use lance_core::datatypes::Schema;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,    // Dataset object

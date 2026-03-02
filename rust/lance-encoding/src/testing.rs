@@ -7,36 +7,36 @@ use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
     format::pb21::{
-        compressive_encoding::Compression, BufferCompression, CompressiveEncoding, PageLayout,
+        BufferCompression, CompressiveEncoding, PageLayout, compressive_encoding::Compression,
     },
 };
 
-use arrow_array::{make_array, Array, StructArray, UInt64Array};
+use arrow_array::{Array, StructArray, UInt64Array, make_array};
 use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
-use futures::{future::BoxFuture, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{utils::bit::pad_bytes, Result};
-use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
+use lance_core::{Result, utils::bit::pad_bytes};
+use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::{
-        create_decode_stream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins,
-        FilterExpression, PageInfo,
+        ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins, FilterExpression,
+        PageInfo, create_decode_stream,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
+        ColumnIndexSequence, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
+        MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers, default_encoding_strategy,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
-    EncodingsIo,
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -245,14 +245,14 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
-                            i,
-                            offset,
-                            expected,
-                            actual,
-                            expected.slice(i, 1),
-                            actual.slice(i, 1)
-                        );
+                                "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                                i,
+                                offset,
+                                expected,
+                                actual,
+                                expected.slice(i, 1),
+                                actual.slice(i, 1)
+                            );
                         }
                     }
                 } else {

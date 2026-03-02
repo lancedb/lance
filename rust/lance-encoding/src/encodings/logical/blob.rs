@@ -4,16 +4,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
+    Array, ArrayRef, StructArray, UInt64Array,
     builder::{PrimitiveBuilder, StringBuilder},
     cast::AsArray,
-    types::{UInt32Type, UInt64Type, UInt8Type},
-    Array, ArrayRef, StructArray, UInt64Array,
+    types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    datatypes::Field, datatypes::BLOB_V2_DESC_FIELDS, error::LanceOptionExt, Error, Result,
+    Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
 };
 use snafu::location;
 
@@ -437,13 +437,13 @@ mod tests {
         compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{
-            check_round_trip_encoding_of_data, check_round_trip_encoding_of_data_with_expected,
-            TestCases,
+            TestCases, check_round_trip_encoding_of_data,
+            check_round_trip_encoding_of_data_with_expected,
         },
         version::LanceFileVersion,
     };
     use arrow_array::{
-        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField};
 

@@ -16,10 +16,10 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
 use snafu::location;
-use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
+use storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata, ScalarQuantizationStorage};
 
-use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
 use super::SQ_CODE_COLUMN;
+use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
 
 pub mod builder;
 pub mod storage;
@@ -174,7 +174,7 @@ impl Quantization for ScalarQuantizer {
                 return Err(Error::Index {
                     message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
                     location: location!(),
-                })
+                });
             }
         }
 
@@ -204,7 +204,7 @@ impl Quantization for ScalarQuantizer {
                 return Err(Error::invalid_input(format!(
                     "unsupported data type {} for scalar quantizer",
                     value_type
-                )))
+                )));
             }
         }
         Ok(())

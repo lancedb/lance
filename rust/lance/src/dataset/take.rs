@@ -26,7 +26,7 @@ use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use snafu::location;
 
 use super::ProjectionRequest;
-use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
+use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 
 /// Convert a list of row offsets to a list of row addresses
 ///
@@ -594,7 +594,7 @@ mod test {
     use rstest::rstest;
     use std::collections::HashMap;
 
-    use crate::dataset::{scanner::test_dataset::TestVectorDataset, WriteParams};
+    use crate::dataset::{WriteParams, scanner::test_dataset::TestVectorDataset};
 
     use super::*;
 
@@ -775,12 +775,9 @@ mod test {
         let mut metadata = HashMap::new();
         metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "blob",
-            DataType::LargeBinary,
-            true,
-        )
-        .with_metadata(metadata)]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata),
+        ]));
 
         let batch = RecordBatch::try_new(
             schema.clone(),

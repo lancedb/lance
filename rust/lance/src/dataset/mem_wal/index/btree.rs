@@ -575,8 +575,8 @@ mod tests {
         assert_eq!(snapshot.len(), 3);
 
         // Snapshot should be in sorted order
-        assert_eq!(snapshot[0].0 .0, ScalarValue::Int32(Some(0)));
-        assert_eq!(snapshot[1].0 .0, ScalarValue::Int32(Some(1)));
-        assert_eq!(snapshot[2].0 .0, ScalarValue::Int32(Some(2)));
+        assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
+        assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
+        assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
     }
 }

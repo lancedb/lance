@@ -137,7 +137,7 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_JniLoader_initLanceLogger() {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")

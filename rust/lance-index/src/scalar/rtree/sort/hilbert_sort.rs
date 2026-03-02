@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::scalar::rtree::sort::Sorter;
 use crate::Result;
+use crate::scalar::rtree::sort::Sorter;
 use arrow_array::{ArrayRef, UInt32Array};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Field as ArrowField, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{DataFusionError, Result as DataFusionResult};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
@@ -19,8 +19,8 @@ use datafusion_physical_expr::expressions::Column as DFColumn;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use geoarrow_array::array::from_arrow_array;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
-use lance_datafusion::exec::{execute_plan, LanceExecutionOptions, OneShotExec};
-use lance_geo::bbox::{bounding_box, BoundingBox};
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_geo::bbox::{BoundingBox, bounding_box};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -264,12 +264,12 @@ mod tests {
     use arrow_array::{RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
     use geo_traits::{CoordTrait, PointTrait};
     use geo_types::Point;
+    use geoarrow_array::GeoArrowArray;
     use geoarrow_array::array::PointArray;
     use geoarrow_array::builder::PointBuilder;
-    use geoarrow_array::GeoArrowArray;
     use geoarrow_schema::{Dimension, PointType};
     use lance_core::ROW_ID;
     use lance_geo::bbox::total_bounds;

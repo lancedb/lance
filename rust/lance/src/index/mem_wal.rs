@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MemWalIndex, MemWalIndexDetails, MergedGeneration, MEM_WAL_INDEX_NAME};
-use lance_table::format::{pb, IndexMetadata};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration};
+use lance_table::format::{IndexMetadata, pb};
 use snafu::location;
 use uuid::Uuid;
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{StreamExt, TryStreamExt};
 use lance_file::version::LanceFileVersion;
 use log::info;
@@ -22,8 +22,8 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{
-    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexType,
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;

@@ -18,14 +18,14 @@ use std::{
 };
 
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
-use lance_index::scalar::{bitmap::BitmapIndexPlugin, SargableQuery, ScalarIndex};
+use lance_index::scalar::{SargableQuery, ScalarIndex, bitmap::BitmapIndexPlugin};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]

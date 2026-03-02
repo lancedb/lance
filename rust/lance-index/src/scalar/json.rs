@@ -13,35 +13,35 @@ use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{projection::ProjectionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
-use datafusion_common::{config::ConfigOptions, ScalarValue};
+use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    expressions::{Column, Literal},
     PhysicalExpr, ScalarFunctionExpr,
+    expressions::{Column, Literal},
 };
 use deepsize::DeepSizeOf;
 use futures::StreamExt;
-use lance_datafusion::exec::{get_session_context, LanceExecutionOptions, OneShotExec};
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt};
 
 use crate::{
+    Index, IndexType,
     frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
+        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME},
-        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
     },
-    Index, IndexType,
 };
 
 const JSON_INDEX_VERSION: u32 = 0;

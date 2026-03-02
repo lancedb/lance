@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
-use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
+use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use snafu::location;
 
@@ -19,12 +19,12 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
-    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+    BlobVersion, Encoding, Field, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,
-    OnMissing, Projectable, Projection, Schema,
+    BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
+    escape_field_path_for_project, format_field_path, parse_field_path,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -224,7 +224,7 @@ impl TryFrom<&DataType> for LogicalType {
                 return Err(Error::Schema {
                     message: format!("Unsupported data type: {:?}", dt),
                     location: location!(),
-                })
+                });
             }
         };
 

@@ -15,9 +15,9 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::writer::FileWriterOptions;
+use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
-use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
 use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
@@ -26,17 +26,17 @@ use object_store::path::Path;
 use snafu::location;
 use tracing::instrument;
 
-use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result, traits::DatasetTakeRows};
 use lance_index::vector::{
-    hnsw::{builder::HnswBuildParams, HnswMetadata},
+    hnsw::{HnswMetadata, builder::HnswBuildParams},
     ivf::shuffler::shuffle_dataset,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::{DistanceType, MetricType};
 
+use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::index::vector::ivf::io::write_pq_partitions;
-use crate::Dataset;
 
 use super::io::write_hnsw_quantization_index_partitions;
 

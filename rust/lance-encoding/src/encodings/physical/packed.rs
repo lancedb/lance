@@ -13,7 +13,7 @@ use std::{convert::TryInto, sync::Arc};
 
 use arrow_array::types::UInt64Type;
 
-use lance_core::{datatypes::Field, Error, Result};
+use lance_core::{Error, Result, datatypes::Field};
 use snafu::location;
 
 use crate::{
@@ -31,8 +31,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb21::{compressive_encoding::Compression, CompressiveEncoding, PackedStruct},
         ProtobufUtils21,
+        pb21::{CompressiveEncoding, PackedStruct, compressive_encoding::Compression},
     },
     statistics::{GetStat, Stat},
 };
@@ -112,9 +112,18 @@ pub struct PackedStructFixedWidthMiniBlockDecompressor {
 
 impl PackedStructFixedWidthMiniBlockDecompressor {
     pub fn new(description: &PackedStruct) -> Self {
-        let array_encoding: Box<dyn MiniBlockDecompressor> = match description.values.as_ref().unwrap().compression.as_ref().unwrap() {
+        let array_encoding: Box<dyn MiniBlockDecompressor> = match description
+            .values
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        {
             Compression::Flat(flat) => Box::new(ValueDecompressor::from_flat(flat)),
-            _ => panic!("Currently only `ArrayEncoding::Flat` is supported in packed struct encoding in Lance 2.1."),
+            _ => panic!(
+                "Currently only `ArrayEncoding::Flat` is supported in packed struct encoding in Lance 2.1."
+            ),
         };
         Self {
             bits_per_values: description.bits_per_value.clone(),
@@ -194,7 +203,9 @@ impl VariablePackedFieldData {
             Self::Fixed { block } => {
                 let bits_per_value = block.bits_per_value;
                 if bits_per_value % 8 != 0 {
-                    return Err(Error::invalid_input("Packed struct variable encoding requires byte-aligned fixed-width children"));
+                    return Err(Error::invalid_input(
+                        "Packed struct variable encoding requires byte-aligned fixed-width children",
+                    ));
                 }
                 let bytes_per_value = (bits_per_value / 8) as usize;
                 let start = row_idx
@@ -477,7 +488,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             _ => {
                 return Err(Error::invalid_input(
                     "Packed struct row offsets must be 32 or 64 bits",
-                ))
+                ));
             }
         };
 
@@ -540,7 +551,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     _ => {
                         return Err(Error::invalid_input(
                             "Packed struct variable child must use 32 or 64-bit length prefixes",
-                        ))
+                        ));
                     }
                 },
             }
@@ -669,7 +680,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     _ => {
                         return Err(Error::invalid_input(
                             "Packed struct accumulator kind mismatch",
-                        ))
+                        ));
                     }
                 }
             }
@@ -734,7 +745,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                 _ => {
                     return Err(Error::invalid_input(
                         "Packed struct accumulator mismatch during finalize",
-                    ))
+                    ));
                 }
             }
         }
@@ -755,7 +766,7 @@ mod tests {
         compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
         constants::PACKED_STRUCT_META_KEY,
         statistics::ComputeStat,
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
     use arrow_array::{

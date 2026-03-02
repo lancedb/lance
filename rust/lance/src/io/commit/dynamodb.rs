@@ -25,12 +25,12 @@ mod test {
 
     use aws_credential_types::Credentials;
     use aws_sdk_dynamodb::{
+        Client,
         config::Region,
         types::{
             AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput,
             ScalarAttributeType,
         },
-        Client,
     };
     use futures::future::join_all;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
@@ -38,14 +38,14 @@ mod test {
     use object_store::path::Path;
 
     use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
+        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
     };
     use lance_core::utils::tempfile::TempStrDir;
     use lance_table::io::commit::{
+        CommitHandler, ManifestNamingScheme,
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-        CommitHandler, ManifestNamingScheme,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
@@ -129,28 +129,36 @@ mod test {
         // DNE should return None for latest
         assert_eq!(store.get_latest_version("test").await.unwrap(), None);
         // DNE should return Err for get specific version
-        assert!(store
-            .get("test", 1)
-            .await
-            .unwrap_err()
-            .to_string()
-            .starts_with("Not found: dynamodb not found: base_uri: test; version: 1"));
+        assert!(
+            store
+                .get("test", 1)
+                .await
+                .unwrap_err()
+                .to_string()
+                .starts_with("Not found: dynamodb not found: base_uri: test; version: 1")
+        );
         // try to use the API for finalizing should return err when the version is DNE
-        assert!(store
-            .put_if_exists("test", 1, "test", 4, None)
-            .await
-            .is_err());
+        assert!(
+            store
+                .put_if_exists("test", 1, "test", 4, None)
+                .await
+                .is_err()
+        );
 
         // Put a new version should work
-        assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized", 4, None)
-            .await
-            .is_ok());
+        assert!(
+            store
+                .put_if_not_exists("test", 1, "test.unfinalized", 4, None)
+                .await
+                .is_ok()
+        );
         // put again should get err
-        assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized_1", 4, None)
-            .await
-            .is_err());
+        assert!(
+            store
+                .put_if_not_exists("test", 1, "test.unfinalized_1", 4, None)
+                .await
+                .is_err()
+        );
 
         // Can get that new version back and is the latest
         assert_eq!(
@@ -160,10 +168,12 @@ mod test {
         assert_eq!(store.get("test", 1).await.unwrap(), "test.unfinalized");
 
         // Put a new version should work again
-        assert!(store
-            .put_if_not_exists("test", 2, "test.unfinalized_2", 4, None)
-            .await
-            .is_ok());
+        assert!(
+            store
+                .put_if_not_exists("test", 2, "test.unfinalized_2", 4, None)
+                .await
+                .is_ok()
+        );
         // latest should see update
         assert_eq!(
             store.get_latest_version("test").await.unwrap(),
@@ -171,10 +181,12 @@ mod test {
         );
 
         // try to finalize should work on existing version
-        assert!(store
-            .put_if_exists("test", 2, "test", 4, None)
-            .await
-            .is_ok());
+        assert!(
+            store
+                .put_if_exists("test", 2, "test", 4, None)
+                .await
+                .is_ok()
+        );
 
         // latest should see update
         assert_eq!(

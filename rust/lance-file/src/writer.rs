@@ -3,22 +3,22 @@
 
 use core::panic;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arrow_array::RecordBatch;
 
 use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::stream::FuturesOrdered;
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
-    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
+    BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
+    FieldEncodingStrategy, OutOfLineBuffers, default_encoding_strategy,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
@@ -34,10 +34,10 @@ use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use crate::datatypes::FieldsWithMeta;
+use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
-use crate::format::MAGIC;
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -256,7 +256,9 @@ impl FileWriter {
                     )
                     .is_ok()
             {
-                warn!("You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data.");
+                warn!(
+                    "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
+                );
             }
         }
         Self {
@@ -392,7 +394,10 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name)));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -963,17 +968,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::reader::{describe_encoding, FileReader, FileReaderOptions};
+    use crate::reader::{FileReader, FileReaderOptions, describe_encoding};
     use crate::testing::FsFixture;
-    use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
+    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
     use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{RecordBatchReader, StringArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
@@ -1114,7 +1119,9 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
         // 2MiB
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        }
 
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
@@ -1160,7 +1167,9 @@ mod tests {
             }
         }
 
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        }
     }
 
     #[tokio::test]
@@ -1468,12 +1477,9 @@ mod tests {
             "off".to_string(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "status",
-            DataType::Int32,
-            false,
-        )
-        .with_metadata(metadata)]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("status", DataType::Int32, false).with_metadata(metadata),
+        ]));
 
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 

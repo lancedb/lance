@@ -11,18 +11,18 @@ use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
-use ndarray::{s, Axis, ShapeBuilder};
+use ndarray::{Axis, ShapeBuilder, s};
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
 use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
-    RabitQuantizationMetadata, RabitQuantizationStorage, RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
 };
 use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::bq::{
-    rotation::{apply_fast_rotation, random_fast_rotation_signs},
     RQBuildParams, RQRotationType,
+    rotation::{apply_fast_rotation, random_fast_rotation_signs},
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
@@ -344,7 +344,7 @@ impl Quantization for RabitQuantizer {
                 return Err(Error::invalid_input(format!(
                     "Unsupported data type: {:?}",
                     dt
-                )))
+                )));
             }
         };
         Ok(q)

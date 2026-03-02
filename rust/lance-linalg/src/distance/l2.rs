@@ -10,17 +10,17 @@ use std::sync::Arc;
 
 use crate::{Error, Result};
 use arrow_array::{
+    Array, FixedSizeListArray, Float32Array,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
-    Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Num};
 
 /// Calculate the L2 distance between two vectors.

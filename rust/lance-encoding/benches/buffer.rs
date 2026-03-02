@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use lance_encoding::buffer::LanceBuffer;
 
 const NUM_VALUES: &[usize] = &[1024 * 1024, 32 * 1024, 8 * 1024];
