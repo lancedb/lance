@@ -223,6 +223,7 @@ incremental = false
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unsafe_op_in_unsafe_fn = "allow"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
