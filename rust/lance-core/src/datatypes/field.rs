@@ -1057,7 +1057,7 @@ impl TryFrom<&ArrowField> for Field {
         let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
             Some(val) => val
                 .parse::<i32>()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .map_err(|e| Error::invalid_input(e.to_string()))?
                 .max(-1),
             None => -1,
         };
