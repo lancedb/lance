@@ -267,7 +267,7 @@ const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION
 fn default_cache_repetition_index() -> bool {
     static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
     *DEFAULT_CACHE_REPETITION_INDEX
-        .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, false))
+        .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
 }
 
 /// Top-level encoding message for a page.  Wraps both the
@@ -1875,7 +1875,9 @@ pub struct DecoderConfig {
     /// Whether to cache repetition indices for better performance.
     ///
     /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
-    /// when present. The env var is read once per process.
+    /// when present and is enabled by default. Set the env var to a non-truthy
+    /// value (for example `0` or `false`) to disable it. The env var is read
+    /// once per process.
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
