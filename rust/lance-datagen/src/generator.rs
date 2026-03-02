@@ -2987,12 +2987,11 @@ pub fn rand_field(field: &Field) -> Box<dyn ArrayGenerator> {
         array::rand_type(field.data_type())
     };
 
-    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY) {
-        if let Ok(cardinality) = cardinality_str.parse::<usize>() {
-            if cardinality > 0 {
-                generator = array::low_cardinality(generator, cardinality);
-            }
-        }
+    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY)
+        && let Ok(cardinality) = cardinality_str.parse::<usize>()
+        && cardinality > 0
+    {
+        generator = array::low_cardinality(generator, cardinality);
     }
 
     generator
