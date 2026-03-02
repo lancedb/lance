@@ -215,20 +215,20 @@ fn drop_dataset_from_cache(dataset_dir: &str) -> std::io::Result<()> {
     let entries = fs::read_dir(format!("{}/data", dataset_dir)).unwrap();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if let Ok(file) = fs::File::open(&path) {
-                let fd = file.as_raw_fd();
-                // POSIX_FADV_DONTNEED = 4
-                let result = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
-                if result != 0 {
-                    panic!(
-                        "Warning: Failed to drop {:?} from cache: {}",
-                        path,
-                        std::io::Error::from_raw_os_error(result)
-                    );
-                }
-                num_dropped += 1;
+        if path.is_file()
+            && let Ok(file) = fs::File::open(&path)
+        {
+            let fd = file.as_raw_fd();
+            // POSIX_FADV_DONTNEED = 4
+            let result = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if result != 0 {
+                panic!(
+                    "Warning: Failed to drop {:?} from cache: {}",
+                    path,
+                    std::io::Error::from_raw_os_error(result)
+                );
             }
+            num_dropped += 1;
         }
     }
     if num_dropped == 0 {
