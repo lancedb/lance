@@ -12,7 +12,7 @@ on:
 
 jobs:
   claude-review:
-    if: github.event.pull_request.author_association == 'CONTRIBUTOR'
+    if: github.event.pull_request.author_association != 'FIRST_TIME_CONTRIBUTOR'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
