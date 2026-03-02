@@ -19,7 +19,6 @@ import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Rewrite Result of a single compaction task. It will be passed across different workers and be
@@ -31,25 +30,21 @@ public class RewriteResult implements Serializable {
   private final List<FragmentMetadata> originalFragments;
   private final long readVersion;
 
-  // null if index remap is deferred after compaction
-  @Nullable private final Map<Long, Long> rowIdMap;
-
-  // null if index remap is part of compaction
-  @Nullable private final byte[] changedRowAddrs;
+  // Serialized RoaringTreemap of row addresses read from the original fragments.
+  // null for stable row IDs.
+  @Nullable private final byte[] rowAddrs;
 
   public RewriteResult(
       CompactionMetrics metrics,
       List<FragmentMetadata> newFragments,
       List<FragmentMetadata> originalFragments,
       long readVersion,
-      Map<Long, Long> rowIdMap,
-      byte[] changedRowAddrs) {
+      byte[] rowAddrs) {
     this.metrics = metrics;
     this.newFragments = newFragments;
     this.originalFragments = originalFragments;
     this.readVersion = readVersion;
-    this.rowIdMap = rowIdMap;
-    this.changedRowAddrs = changedRowAddrs;
+    this.rowAddrs = rowAddrs;
   }
 
   public long getReadVersion() {
@@ -61,8 +56,8 @@ public class RewriteResult implements Serializable {
   }
 
   @Nullable
-  public byte[] getChangedRowAddrs() {
-    return changedRowAddrs;
+  public byte[] getRowAddrs() {
+    return rowAddrs;
   }
 
   public List<FragmentMetadata> getNewFragments() {
@@ -71,10 +66,5 @@ public class RewriteResult implements Serializable {
 
   public List<FragmentMetadata> getOriginalFragments() {
     return originalFragments;
-  }
-
-  @Nullable
-  public Map<Long, Long> getRowIdMap() {
-    return rowIdMap;
   }
 }
