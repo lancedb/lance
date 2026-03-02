@@ -439,14 +439,13 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     }
 
     // Evict least recently used entry if cache is full
-    if cache.len() >= get_max_cache_size() {
-        if let Some(lru_key) = cache
+    if cache.len() >= get_max_cache_size()
+        && let Some(lru_key) = cache
             .iter()
             .min_by_key(|(_, v)| v.last_access)
             .map(|(k, _)| k.clone())
-        {
-            cache.remove(&lru_key);
-        }
+    {
+        cache.remove(&lru_key);
     }
 
     let context = new_session_context(options);

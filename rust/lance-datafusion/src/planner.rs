@@ -431,12 +431,11 @@ impl Planner {
     }
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
-        if let SQLExpr::Function(function) = &function {
-            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
-                if &name.value == "is_valid" {
-                    return self.legacy_parse_function(function);
-                }
-            }
+        if let SQLExpr::Function(function) = &function
+            && let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first()
+            && &name.value == "is_valid"
+        {
+            return self.legacy_parse_function(function);
         }
         let sql_to_rel = SqlToRel::new_with_options(
             &self.context_provider,

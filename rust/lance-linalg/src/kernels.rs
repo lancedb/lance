@@ -42,11 +42,11 @@ pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
     let mut max_idx: Option<u32> = None;
     let mut max_value = T::min_value();
     for (idx, value) in iter.enumerate() {
-        if let Some(value) = value {
-            if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
-                max_value = value;
-                max_idx = Some(idx as u32);
-            }
+        if let Some(value) = value
+            && let Some(Ordering::Greater) = value.partial_cmp(&max_value)
+        {
+            max_value = value;
+            max_idx = Some(idx as u32);
         }
     }
     max_idx
@@ -116,11 +116,11 @@ pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
     let mut min_idx: Option<u32> = None;
     let mut min_value = T::max_value();
     for (idx, value) in iter.enumerate() {
-        if let Some(value) = value {
-            if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
-                min_value = value;
-                min_idx = Some(idx as u32);
-            }
+        if let Some(value) = value
+            && let Some(Ordering::Less) = value.partial_cmp(&min_value)
+        {
+            min_value = value;
+            min_idx = Some(idx as u32);
         }
     }
     min_idx.map(|idx| (idx, min_value))
