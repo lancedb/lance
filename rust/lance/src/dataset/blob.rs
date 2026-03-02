@@ -10,7 +10,7 @@ use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
 use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use object_store::path::Path;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
@@ -437,77 +437,116 @@ pub struct BlobFile {
     uri: Option<String>,
 }
 
-impl BlobFile {
-    /// Create a new BlobFile
-    ///
-    /// See [`crate::dataset::Dataset::take_blobs`]
-    pub fn new_inline(
-        dataset: Arc<Dataset>,
-        field_id: u32,
-        row_addr: u64,
-        position: u64,
-        size: u64,
-    ) -> Self {
-        let frag_id = RowAddress::from(row_addr).fragment_id();
-        let frag = dataset.get_fragment(frag_id as usize).unwrap();
-        let data_file = frag.data_file_for_field(field_id).unwrap();
-        let data_file = dataset.data_dir().child(data_file.path.as_str());
-        Self {
-            object_store: dataset.object_store.clone(),
-            path: data_file,
-            position,
-            size,
-            kind: BlobKind::Inline,
-            uri: None,
-            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
-        }
-    }
+#[derive(Clone)]
+struct BlobReadLocation {
+    object_store: Arc<ObjectStore>,
+    data_file_dir: Path,
+    data_file_key: String,
+    data_file_path: Path,
+}
 
-    pub fn new_dedicated(dataset: Arc<Dataset>, path: Path, size: u64) -> Self {
-        Self {
-            object_store: dataset.object_store.clone(),
-            path,
-            position: 0,
-            size,
-            kind: BlobKind::Dedicated,
-            uri: None,
-            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
-        }
-    }
-    pub fn new_packed(dataset: Arc<Dataset>, path: Path, position: u64, size: u64) -> Self {
-        Self {
-            object_store: dataset.object_store.clone(),
-            path,
-            position,
-            size,
-            kind: BlobKind::Packed,
-            uri: None,
-            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
-        }
-    }
-    pub async fn new_external(
-        uri: String,
+impl BlobFile {
+    fn with_location(
+        object_store: Arc<ObjectStore>,
+        path: Path,
         position: u64,
         size: u64,
-        registry: Arc<ObjectStoreRegistry>,
-        params: Arc<ObjectStoreParams>,
-    ) -> Result<Self> {
-        let (object_store, path) =
-            ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
-        let size = if size > 0 {
-            size
-        } else {
-            object_store.size(&path).await?
-        };
-        Ok(Self {
+        kind: BlobKind,
+        uri: Option<String>,
+    ) -> Self {
+        Self {
             object_store,
             path,
             position,
             size,
-            kind: BlobKind::External,
-            uri: Some(uri),
+            kind,
+            uri,
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
-        })
+        }
+    }
+
+    /// Create an inline blob reader backed by a data file.
+    ///
+    /// This constructor assumes the caller has already resolved multi-base routing
+    /// (base-aware object store and file path). It does not inspect dataset metadata.
+    ///
+    /// # Parameters
+    ///
+    /// * `object_store` - The store that owns `path`; reads are issued against this store.
+    /// * `path` - Full path to the data file containing inline blob bytes.
+    /// * `position` - Byte offset of the blob payload inside the data file.
+    /// * `size` - Blob payload length in bytes.
+    pub fn new_inline(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        position: u64,
+        size: u64,
+    ) -> Self {
+        Self::with_location(object_store, path, position, size, BlobKind::Inline, None)
+    }
+
+    /// Create a dedicated blob reader backed by a sidecar `.blob` file.
+    ///
+    /// Dedicated blobs occupy an entire sidecar file, so the logical read starts
+    /// at offset `0` and spans `size` bytes.
+    ///
+    /// # Parameters
+    ///
+    /// * `object_store` - The store that owns `path`; reads are issued against this store.
+    /// * `path` - Full path to the dedicated sidecar blob file.
+    /// * `size` - Total byte length to expose from the sidecar file.
+    pub fn new_dedicated(object_store: Arc<ObjectStore>, path: Path, size: u64) -> Self {
+        Self::with_location(object_store, path, 0, size, BlobKind::Dedicated, None)
+    }
+
+    /// Create a packed blob reader for a slice inside a shared sidecar `.blob` file.
+    ///
+    /// Packed blobs share one sidecar file; this constructor exposes only the
+    /// `[position, position + size)` range that belongs to a single row.
+    ///
+    /// # Parameters
+    ///
+    /// * `object_store` - The store that owns `path`; reads are issued against this store.
+    /// * `path` - Full path to the packed sidecar blob file.
+    /// * `position` - Start offset of this blob within the packed sidecar.
+    /// * `size` - Blob payload length in bytes.
+    pub fn new_packed(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        position: u64,
+        size: u64,
+    ) -> Self {
+        Self::with_location(object_store, path, position, size, BlobKind::Packed, None)
+    }
+
+    /// Create an external blob reader backed by a caller-resolved object location.
+    ///
+    /// External blobs are identified by a URI in metadata, but actual reads happen
+    /// against a concrete store/path pair resolved by the caller. This keeps URI
+    /// resolution (which may be async) outside of the constructor.
+    ///
+    /// # Parameters
+    ///
+    /// * `object_store` - The resolved store used to open and read `path`.
+    /// * `path` - The resolved object path that contains external blob bytes.
+    /// * `uri` - The original URI recorded in blob metadata for round-tripping.
+    /// * `position` - Start offset of the blob payload in the external object.
+    /// * `size` - Number of bytes exposed from `position`.
+    pub fn new_external(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        uri: String,
+        position: u64,
+        size: u64,
+    ) -> Self {
+        Self::with_location(
+            object_store,
+            path,
+            position,
+            size,
+            BlobKind::External,
+            Some(uri),
+        )
     }
 
     /// Close the blob file, releasing any associated resources
@@ -761,7 +800,11 @@ fn collect_blob_files_v1(
             Some((*row_addr, position, size))
         })
         .map(|(row_addr, position, size)| {
-            BlobFile::new_inline(dataset.clone(), blob_field_id, row_addr, position, size)
+            let frag_id = RowAddress::from(row_addr).fragment_id();
+            let frag = dataset.get_fragment(frag_id as usize).unwrap();
+            let data_file = frag.data_file_for_field(blob_field_id).unwrap();
+            let data_file_path = dataset.data_dir().child(data_file.path.as_str());
+            BlobFile::new_inline(dataset.object_store.clone(), data_file_path, position, size)
         })
         .collect())
 }
@@ -779,6 +822,8 @@ async fn collect_blob_files_v2(
     let blob_uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
+    let mut fragment_cache = HashMap::<u32, BlobReadLocation>::new();
+    let mut store_cache = HashMap::<u32, Arc<ObjectStore>>::new();
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
         let kind = BlobKind::try_from(kinds.value(idx))?;
 
@@ -791,10 +836,17 @@ async fn collect_blob_files_v2(
             BlobKind::Inline => {
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
-                files.push(BlobFile::new_inline(
-                    dataset.clone(),
+                let location = resolve_blob_read_location(
+                    dataset,
                     blob_field_id,
                     *row_addr,
+                    &mut fragment_cache,
+                    &mut store_cache,
+                )
+                .await?;
+                files.push(BlobFile::new_inline(
+                    location.object_store,
+                    location.data_file_path,
                     position,
                     size,
                 ));
@@ -802,46 +854,36 @@ async fn collect_blob_files_v2(
             BlobKind::Dedicated => {
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
-                let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
-
-                let data_file_key = data_file_key_from_path(data_file.path.as_str());
-                let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
-                files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
+                let location = resolve_blob_read_location(
+                    dataset,
+                    blob_field_id,
+                    *row_addr,
+                    &mut fragment_cache,
+                    &mut store_cache,
+                )
+                .await?;
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                files.push(BlobFile::new_dedicated(location.object_store, path, size));
             }
             BlobKind::Packed => {
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
                 let position = positions.value(idx);
-                let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file_key = data_file_key_from_path(data_file.path.as_str());
-                let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
-                files.push(BlobFile::new_packed(dataset.clone(), path, position, size));
+                let location = resolve_blob_read_location(
+                    dataset,
+                    blob_field_id,
+                    *row_addr,
+                    &mut fragment_cache,
+                    &mut store_cache,
+                )
+                .await?;
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                files.push(BlobFile::new_packed(
+                    location.object_store,
+                    path,
+                    position,
+                    size,
+                ));
             }
             BlobKind::External => {
                 let uri = blob_uris.value(idx).to_string();
@@ -853,12 +895,86 @@ async fn collect_blob_files_v2(
                     .as_ref()
                     .map(|p| Arc::new((**p).clone()))
                     .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-                files.push(BlobFile::new_external(uri, position, size, registry, params).await?);
+                let (object_store, path) =
+                    ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
+                let size = if size > 0 {
+                    size
+                } else {
+                    object_store.size(&path).await?
+                };
+                files.push(BlobFile::new_external(
+                    object_store,
+                    path,
+                    uri,
+                    position,
+                    size,
+                ));
             }
         }
     }
 
     Ok(files)
+}
+
+/// Resolve the physical read location for a blob row in a base-aware way.
+///
+/// Given a `row_addr`, this helper locates the owning fragment and the blob field's
+/// data file, then returns the concrete object store and paths needed to read blob
+/// bytes correctly under multi-base datasets.
+///
+/// It uses two caller-provided caches:
+/// - `fragment_cache` memoizes per-fragment path metadata (`data_file_dir`,
+///   `data_file_path`, and `data_file_key`) plus the resolved store.
+/// - `store_cache` memoizes `base_id -> ObjectStore` so multiple fragments that
+///   share the same base do not repeat async store resolution.
+async fn resolve_blob_read_location(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    row_addr: u64,
+    fragment_cache: &mut HashMap<u32, BlobReadLocation>,
+    store_cache: &mut HashMap<u32, Arc<ObjectStore>>,
+) -> Result<BlobReadLocation> {
+    let frag_id = RowAddress::from(row_addr).fragment_id();
+    if let Some(location) = fragment_cache.get(&frag_id) {
+        return Ok(location.clone());
+    }
+
+    let frag = dataset
+        .get_fragment(frag_id as usize)
+        .ok_or_else(|| Error::Internal {
+            message: "Fragment not found".to_string(),
+            location: location!(),
+        })?;
+    let data_file = frag
+        .data_file_for_field(blob_field_id)
+        .ok_or_else(|| Error::Internal {
+            message: "Data file not found for blob field".to_string(),
+            location: location!(),
+        })?;
+    let data_file_dir = dataset.data_file_dir(data_file)?;
+    let data_file_path = data_file_dir.child(data_file.path.as_str());
+    let data_file_key = data_file_key_from_path(data_file.path.as_str()).to_string();
+
+    let object_store = if let Some(base_id) = data_file.base_id {
+        if let Some(store) = store_cache.get(&base_id) {
+            store.clone()
+        } else {
+            let store = dataset.object_store_for_base(base_id).await?;
+            store_cache.insert(base_id, store.clone());
+            store
+        }
+    } else {
+        dataset.object_store.clone()
+    };
+
+    let location = BlobReadLocation {
+        object_store,
+        data_file_dir,
+        data_file_key,
+        data_file_path,
+    };
+    fragment_cache.insert(frag_id, location.clone());
+    Ok(location)
 }
 
 fn data_file_key_from_path(path: &str) -> &str {
@@ -876,10 +992,15 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+    use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
+    use lance_table::format::BasePath;
 
-    use lance_core::{utils::tempfile::TempStrDir, Error, Result};
+    use lance_core::{
+        utils::tempfile::{TempDir, TempStrDir},
+        Error, Result,
+    };
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
 
@@ -895,6 +1016,12 @@ mod tests {
         _test_dir: TempStrDir,
         dataset: Arc<Dataset>,
         data: Vec<RecordBatch>,
+    }
+
+    struct MultiBaseBlobFixture {
+        _test_dir: TempDir,
+        dataset: Arc<Dataset>,
+        expected: Vec<u8>,
     }
 
     impl BlobTestFixture {
@@ -920,6 +1047,74 @@ mod tests {
                 dataset,
                 data,
             }
+        }
+    }
+
+    async fn create_multi_base_blob_v2_fixture(
+        payload: Vec<u8>,
+        dedicated_threshold: Option<usize>,
+        is_dataset_root: bool,
+    ) -> MultiBaseBlobFixture {
+        let test_dir = TempDir::default();
+        let primary_uri = test_dir.path_str();
+        let base_dir = test_dir.std_path().join("blob_base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let base_uri = format!("file://{}", base_dir.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(payload.clone()).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+
+        let mut blob_column = blob_field("blob", true);
+        if let Some(threshold) = dedicated_threshold {
+            let mut metadata = blob_column.metadata().clone();
+            metadata.insert(
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                threshold.to_string(),
+            );
+            blob_column = blob_column.with_metadata(metadata);
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            blob_column,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from(vec![0])), blob_array],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &primary_uri,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    initial_bases: Some(vec![BasePath {
+                        id: 1,
+                        name: Some("blob_base".to_string()),
+                        path: base_uri,
+                        is_dataset_root,
+                    }]),
+                    target_bases: Some(vec![1]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert!(dataset
+            .fragments()
+            .iter()
+            .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1))));
+
+        MultiBaseBlobFixture {
+            _test_dir: test_dir,
+            dataset,
+            expected: payload,
         }
     }
 
@@ -1189,6 +1384,82 @@ mod tests {
         let second = blobs[1].read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_non_default_base_inline() {
+        let fixture = create_multi_base_blob_v2_fixture(b"inline".to_vec(), None, true).await;
+
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Inline);
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            fixture.expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_non_default_base_packed() {
+        let fixture =
+            create_multi_base_blob_v2_fixture(vec![0x5A; super::INLINE_MAX + 4096], None, true)
+                .await;
+
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            fixture.expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_non_default_base_dedicated() {
+        let fixture = create_multi_base_blob_v2_fixture(vec![0xA5; 4096], Some(1), true).await;
+
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Dedicated);
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            fixture.expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_data_only_base() {
+        let fixture =
+            create_multi_base_blob_v2_fixture(vec![0x6B; super::INLINE_MAX + 2048], None, false)
+                .await;
+
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            fixture.expected.as_slice()
+        );
     }
 
     #[tokio::test]
