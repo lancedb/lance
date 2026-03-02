@@ -150,12 +150,11 @@ impl Schema {
         let mut differences =
             explain_fields_difference(&self.fields, &expected.fields, options, None);
 
-        if options.compare_metadata {
-            if let Some(difference) =
+        if options.compare_metadata
+            && let Some(difference) =
                 explain_metadata_difference(&self.metadata, &expected.metadata)
-            {
-                differences.push(difference);
-            }
+        {
+            differences.push(difference);
         }
 
         if differences.is_empty() {
@@ -485,10 +484,10 @@ impl Schema {
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_nested() {
-                    if let Some(f) = field.exclude(other_field) {
-                        fields.push(f)
-                    }
+                if field.data_type().is_nested()
+                    && let Some(f) = field.exclude(other_field)
+                {
+                    fields.push(f)
                 }
             } else {
                 fields.push(field.clone());
@@ -1511,16 +1510,16 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
                         // End of quoted field
                         in_quotes = false;
                         // After closing quote, we should either see a dot or end of string
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch != '.' {
-                                return Err(Error::Schema {
-                                    message: format!(
-                                        "Invalid field path '{}': expected '.' or end of string after closing quote",
-                                        path
-                                    ),
-                                    location: location!(),
-                                });
-                            }
+                        if let Some(&next_ch) = chars.peek()
+                            && next_ch != '.'
+                        {
+                            return Err(Error::Schema {
+                                message: format!(
+                                    "Invalid field path '{}': expected '.' or end of string after closing quote",
+                                    path
+                                ),
+                                location: location!(),
+                            });
                         }
                     }
                 } else if current.is_empty() {
