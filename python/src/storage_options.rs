@@ -92,7 +92,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
                                 "Failed to call fetch_storage_options: {}",
                                 e
                             ))),
-                            location: &snafu::location!(),
+                            location: snafu::location!(),
                         })?;
 
                     // If result is None, return None
@@ -106,7 +106,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
                             source:
                                 "fetch_storage_options() must return None or a dict of string key-value pairs"
                                     .into(),
-                            location: &snafu::location!(),
+                            location: snafu::location!(),
                         }
                     })?;
 
@@ -116,7 +116,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
                         let key_str: String =
                             key.extract().map_err(|e| lance_core::Error::InvalidInput {
                                 source: format!("storage option keys must be strings: {}", e).into(),
-                                location: &snafu::location!(),
+                                location: snafu::location!(),
                             })?;
                         let value_str: String =
                             value
@@ -124,7 +124,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
                                 .map_err(|e| lance_core::Error::InvalidInput {
                                     source: format!("storage option values must be strings: {}", e)
                                         .into(),
-                                    location: &snafu::location!(),
+                                    location: snafu::location!(),
                                 })?;
                         storage_options.insert(key_str, value_str);
                     }
@@ -138,7 +138,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
                     "Failed to call Python fetch_storage_options: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?
     }
 

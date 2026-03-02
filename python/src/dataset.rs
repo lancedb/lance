@@ -1252,7 +1252,7 @@ impl Dataset {
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
                     Err(err) => Some(Err(lance::Error::InvalidInput {
                         source: Box::new(err),
-                        location: &location!(),
+                        location: location!(),
                     })),
                 }
             })
@@ -1999,11 +1999,9 @@ impl Dataset {
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
         let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
-            let index_metadata = rt()
-                .block_on(None, builder.execute_uncommitted())?
-                .infer_error()?;
             // Note: We don't update self.ds here as the index is not committed
-            index_metadata
+            rt().block_on(None, builder.execute_uncommitted())?
+                .infer_error()?
         } else {
             // For regular indexing, use the standard execute path
             let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
@@ -3145,10 +3143,10 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         // Handle target_bases parameter (list of strings - base names or paths)
-        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")? {
-            if !target_bases_list.is_empty() {
-                p = p.with_target_base_names_or_paths(target_bases_list);
-            }
+        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")?
+            && !target_bases_list.is_empty()
+        {
+            p = p.with_target_base_names_or_paths(target_bases_list);
         }
 
         // Handle properties
@@ -3663,42 +3661,42 @@ fn vector_query_params_from_dict(
     let mut minimum_nprobes = DEFAULT_NPROBES;
     let mut maximum_nprobes: Option<usize> = None;
 
-    if let Some(nprobes) = dict.get_item("nprobes")? {
-        if !nprobes.is_none() {
-            let extracted: usize = nprobes.extract()?;
-            minimum_nprobes = extracted;
-            maximum_nprobes = Some(extracted);
-        }
+    if let Some(nprobes) = dict.get_item("nprobes")?
+        && !nprobes.is_none()
+    {
+        let extracted: usize = nprobes.extract()?;
+        minimum_nprobes = extracted;
+        maximum_nprobes = Some(extracted);
     }
 
-    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")? {
-        if !min_nprobes.is_none() {
-            minimum_nprobes = min_nprobes.extract()?;
-        }
+    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")?
+        && !min_nprobes.is_none()
+    {
+        minimum_nprobes = min_nprobes.extract()?;
     }
 
-    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")? {
-        if !max_nprobes.is_none() {
-            maximum_nprobes = Some(max_nprobes.extract()?);
-        }
+    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")?
+        && !max_nprobes.is_none()
+    {
+        maximum_nprobes = Some(max_nprobes.extract()?);
     }
 
-    if let Some(maximum_nprobes_val) = maximum_nprobes {
-        if minimum_nprobes > maximum_nprobes_val {
-            return Err(PyValueError::new_err(
-                "minimum_nprobes must be <= maximum_nprobes",
-            ));
-        }
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && minimum_nprobes > maximum_nprobes_val
+    {
+        return Err(PyValueError::new_err(
+            "minimum_nprobes must be <= maximum_nprobes",
+        ));
     }
 
     if minimum_nprobes < 1 {
         return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
     }
 
-    if let Some(maximum_nprobes_val) = maximum_nprobes {
-        if maximum_nprobes_val < 1 {
-            return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
-        }
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && maximum_nprobes_val < 1
+    {
+        return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
     }
 
     let metric_type: Option<MetricType> = if let Some(metric) = dict.get_item("metric")? {

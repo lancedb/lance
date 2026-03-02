@@ -300,17 +300,17 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let field_metadata_updates_py = ob.getattr("field_metadata_updates")?;
                 let mut field_metadata_updates = HashMap::new();
 
-                if !field_metadata_updates_py.is_none() {
-                    if let Ok(items) = field_metadata_updates_py.call_method0("items") {
-                        for item in items.try_iter()? {
-                            let item = item?;
-                            // Extract as a tuple and then get individual elements
-                            let tuple = item.downcast::<pyo3::types::PyTuple>()?;
-                            let field_id = tuple.get_item(0)?.extract::<i32>()?;
-                            let update_map = tuple.get_item(1)?;
-                            if let Some(map) = extract_update_map(&update_map)? {
-                                field_metadata_updates.insert(field_id, map);
-                            }
+                if !field_metadata_updates_py.is_none()
+                    && let Ok(items) = field_metadata_updates_py.call_method0("items")
+                {
+                    for item in items.try_iter()? {
+                        let item = item?;
+                        // Extract as a tuple and then get individual elements
+                        let tuple = item.downcast::<pyo3::types::PyTuple>()?;
+                        let field_id = tuple.get_item(0)?.extract::<i32>()?;
+                        let update_map = tuple.get_item(1)?;
+                        if let Some(map) = extract_update_map(&update_map)? {
+                            field_metadata_updates.insert(field_id, map);
                         }
                     }
                 }
