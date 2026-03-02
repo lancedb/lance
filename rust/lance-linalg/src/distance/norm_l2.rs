@@ -26,7 +26,7 @@ mod kernel {
 
     // These are the `norm_l2_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
-    extern "C" {
+    unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
