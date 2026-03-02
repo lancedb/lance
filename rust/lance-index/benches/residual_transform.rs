@@ -19,10 +19,8 @@ const PARTITION_COL: &str = "__part_id";
 const VECTOR_COL: &str = "vector";
 
 fn bench_residual_transform(c: &mut Criterion) {
-    let centroids = generate_random_array_with_seed::<Float32Type>(
-        NUM_CENTROIDS * DIMENSION,
-        [7; 32],
-    );
+    let centroids =
+        generate_random_array_with_seed::<Float32Type>(NUM_CENTROIDS * DIMENSION, [7; 32]);
     let centroids = FixedSizeListArray::try_new_from_values(centroids, DIMENSION as i32).unwrap();
 
     let vectors = generate_random_array_with_seed::<Float32Type>(NUM_VECTORS * DIMENSION, [42; 32]);
