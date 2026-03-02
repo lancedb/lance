@@ -92,21 +92,21 @@ impl Error {
         }
 
         // For namespace errors, throw the specific LanceNamespaceException
-        if self.java_class == JavaExceptionClass::LanceNamespaceException {
-            if let Some(code) = self.namespace_error_code {
-                // Call LanceNamespaceException.fromCode static method
-                if self.throw_namespace_exception(env, code).is_err() {
-                    // lance-namespace is bundled as a dependency, so the exception classes
-                    // should always be available. Panic if they're not.
-                    panic!(
-                        "Failed to throw LanceNamespaceException (code={}). \
+        if self.java_class == JavaExceptionClass::LanceNamespaceException
+            && let Some(code) = self.namespace_error_code
+        {
+            // Call LanceNamespaceException.fromCode static method
+            if self.throw_namespace_exception(env, code).is_err() {
+                // lance-namespace is bundled as a dependency, so the exception classes
+                // should always be available. Panic if they're not.
+                panic!(
+                    "Failed to throw LanceNamespaceException (code={}). \
                         org.lance.namespace.errors.LanceNamespaceException and ErrorCode classes \
                         must be available in the classpath.",
-                        code
-                    );
-                }
-                return;
+                    code
+                );
             }
+            return;
         }
 
         if let Err(e) = env.throw_new(self.java_class.as_str(), &self.message) {

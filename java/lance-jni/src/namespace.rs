@@ -207,7 +207,7 @@ impl JavaLanceNamespace {
                 "Failed to create request JSON string: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?;
 
         // Create ObjectMapper
@@ -218,7 +218,7 @@ impl JavaLanceNamespace {
                     "Failed to find ObjectMapper class: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
         let object_mapper = env
@@ -228,7 +228,7 @@ impl JavaLanceNamespace {
                     "Failed to create ObjectMapper: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
         // Get request class
@@ -239,7 +239,7 @@ impl JavaLanceNamespace {
                         "Failed to find request class {}: {}",
                         request_class, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
         // Call objectMapper.readValue(json, class)
@@ -257,7 +257,7 @@ impl JavaLanceNamespace {
                 "Failed to deserialize request via ObjectMapper: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
         .l()
         .map_err(|e| lance_core::Error::IO {
@@ -265,7 +265,7 @@ impl JavaLanceNamespace {
                 "ObjectMapper.readValue did not return an object: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })
     }
 
@@ -279,7 +279,7 @@ impl JavaLanceNamespace {
                     "Failed to find ObjectMapper class: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
         let object_mapper = env
@@ -289,7 +289,7 @@ impl JavaLanceNamespace {
                     "Failed to create ObjectMapper: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
         // Call objectMapper.writeValueAsString(obj)
@@ -305,7 +305,7 @@ impl JavaLanceNamespace {
                     "Failed to serialize response via ObjectMapper: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?
             .l()
             .map_err(|e| lance_core::Error::IO {
@@ -313,7 +313,7 @@ impl JavaLanceNamespace {
                     "ObjectMapper.writeValueAsString did not return a string: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
         let response_str: String = env
@@ -323,7 +323,7 @@ impl JavaLanceNamespace {
                     "Failed to convert response JSON to string: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?
             .into();
 
@@ -356,7 +356,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -366,7 +366,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -386,7 +386,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .l()
                 .map_err(|e| lance_core::Error::IO {
@@ -394,7 +394,7 @@ impl JavaLanceNamespace {
                         "{} did not return an object: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             if response_obj.is_null() {
@@ -403,7 +403,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -415,7 +415,7 @@ impl JavaLanceNamespace {
                     "Failed to deserialize response: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })
         })
         .await
@@ -424,7 +424,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -450,7 +450,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -460,7 +460,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -479,7 +479,7 @@ impl JavaLanceNamespace {
                     "Failed to call {}: {}",
                     method_name, e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
             Ok(())
@@ -490,7 +490,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -516,7 +516,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -526,7 +526,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -546,7 +546,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             let response_obj = result.l().map_err(|e| lance_core::Error::IO {
@@ -554,7 +554,7 @@ impl JavaLanceNamespace {
                     "{} did not return an object: {}",
                     method_name, e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
             if response_obj.is_null() {
@@ -563,7 +563,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -574,7 +574,7 @@ impl JavaLanceNamespace {
                         "Failed to convert response to string: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .into();
 
@@ -586,7 +586,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -612,7 +612,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -622,7 +622,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -642,7 +642,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             let long_obj = result.l().map_err(|e| lance_core::Error::IO {
@@ -650,7 +650,7 @@ impl JavaLanceNamespace {
                     "{} did not return an object: {}",
                     method_name, e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
             if long_obj.is_null() {
@@ -659,7 +659,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -671,7 +671,7 @@ impl JavaLanceNamespace {
                         "Failed to call longValue: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .j()
                 .map_err(|e| lance_core::Error::IO {
@@ -679,7 +679,7 @@ impl JavaLanceNamespace {
                         "longValue did not return a long: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             Ok(long_value)
@@ -690,7 +690,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -720,7 +720,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -730,7 +730,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -743,7 +743,7 @@ impl JavaLanceNamespace {
                         "Failed to create byte array: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Call the interface method with request object and byte array
@@ -760,7 +760,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .l()
                 .map_err(|e| lance_core::Error::IO {
@@ -768,7 +768,7 @@ impl JavaLanceNamespace {
                         "{} did not return an object: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             if response_obj.is_null() {
@@ -777,7 +777,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -789,7 +789,7 @@ impl JavaLanceNamespace {
                     "Failed to deserialize response: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })
         })
         .await
@@ -798,7 +798,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -824,7 +824,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -834,7 +834,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -854,7 +854,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             let response_obj = result.l().map_err(|e| lance_core::Error::IO {
@@ -862,7 +862,7 @@ impl JavaLanceNamespace {
                     "{} did not return an object: {}",
                     method_name, e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })?;
 
             if response_obj.is_null() {
@@ -871,7 +871,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -883,7 +883,7 @@ impl JavaLanceNamespace {
                         "Failed to convert byte array: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             Ok(Bytes::from(bytes))
@@ -894,7 +894,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 
@@ -925,7 +925,7 @@ impl JavaLanceNamespace {
                         "Failed to attach to JVM: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Serialize request to JSON
@@ -935,7 +935,7 @@ impl JavaLanceNamespace {
                         "Failed to serialize request: {}",
                         e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
@@ -949,7 +949,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         getter_method, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .l()
                 .map_err(|e| lance_core::Error::IO {
@@ -957,7 +957,7 @@ impl JavaLanceNamespace {
                         "{} did not return an object: {}",
                         getter_method, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             // Call the interface method with request object and extra string
@@ -980,7 +980,7 @@ impl JavaLanceNamespace {
                         "Failed to call {}: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?
                 .l()
                 .map_err(|e| lance_core::Error::IO {
@@ -988,7 +988,7 @@ impl JavaLanceNamespace {
                         "{} did not return an object: {}",
                         method_name, e
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 })?;
 
             if response_obj.is_null() {
@@ -997,7 +997,7 @@ impl JavaLanceNamespace {
                         "{} returned null",
                         method_name
                     ))),
-                    location: &snafu::location!(),
+                    location: snafu::location!(),
                 });
             }
 
@@ -1009,7 +1009,7 @@ impl JavaLanceNamespace {
                     "Failed to deserialize response: {}",
                     e
                 ))),
-                location: &snafu::location!(),
+                location: snafu::location!(),
             })
         })
         .await
@@ -1018,7 +1018,7 @@ impl JavaLanceNamespace {
                 "Failed to spawn blocking task: {}",
                 e
             ))),
-            location: &snafu::location!(),
+            location: snafu::location!(),
         })?
     }
 }
@@ -1674,11 +1674,11 @@ fn create_directory_namespace_internal(
         })?;
 
     // Add context provider if provided
-    if let Some(provider_obj) = context_provider {
-        if !provider_obj.is_null() {
-            let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
-            builder = builder.context_provider(Arc::new(java_provider));
-        }
+    if let Some(provider_obj) = context_provider
+        && !provider_obj.is_null()
+    {
+        let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
+        builder = builder.context_provider(Arc::new(java_provider));
     }
 
     let namespace = RT
@@ -2267,11 +2267,11 @@ fn create_rest_namespace_internal(
     })?;
 
     // Add context provider if provided
-    if let Some(provider_obj) = context_provider {
-        if !provider_obj.is_null() {
-            let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
-            builder = builder.context_provider(Arc::new(java_provider));
-        }
+    if let Some(provider_obj) = context_provider
+        && !provider_obj.is_null()
+    {
+        let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
+        builder = builder.context_provider(Arc::new(java_provider));
     }
 
     let namespace = builder.build();

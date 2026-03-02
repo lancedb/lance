@@ -206,6 +206,7 @@ pub trait IndexReader: Send + Sync {
 }
 
 /// A stream that reads the original training data back out of the index
+#[allow(dead_code)]
 struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
     batch_size: u64,
@@ -213,6 +214,7 @@ struct IndexReaderStream {
     limit: u64,
 }
 
+#[allow(dead_code)]
 impl IndexReaderStream {
     async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
         let limit = reader.num_rows() as u64;
