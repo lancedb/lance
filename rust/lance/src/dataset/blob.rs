@@ -1736,7 +1736,8 @@ mod tests {
             BlobKind::External as u8
         );
         assert_eq!(desc.column(3).as_primitive::<UInt32Type>().value(0), 0);
-        assert_eq!(desc.column(4).as_string::<i32>().value(0), external_uri);
+        let expected_uri = super::normalize_external_absolute_uri(&external_uri).unwrap();
+        assert_eq!(desc.column(4).as_string::<i32>().value(0), expected_uri);
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
