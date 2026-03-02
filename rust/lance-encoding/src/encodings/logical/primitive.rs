@@ -2458,21 +2458,21 @@ impl StructuralPageScheduler for FullZipScheduler {
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        if self.enable_cache {
-            if let Some(rep_index) = self.rep_index {
-                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
-                let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
-                let io_clone = io.clone();
-                return async move {
-                    let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
-                    let state = Arc::new(FullZipCacheableState {
-                        rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
-                    });
-                    self.cached_state = Some(state.clone());
-                    Ok(state as Arc<dyn CachedPageData>)
-                }
-                .boxed();
+        if self.enable_cache
+            && let Some(rep_index) = self.rep_index
+        {
+            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+            let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+            let io_clone = io.clone();
+            return async move {
+                let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                let state = Arc::new(FullZipCacheableState {
+                    rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
+                });
+                self.cached_state = Some(state.clone());
+                Ok(state as Arc<dyn CachedPageData>)
             }
+            .boxed();
         }
         std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
@@ -5051,36 +5051,35 @@ impl PrimitiveStructuralEncoder {
                 };
             }
 
-            if let DataType::Struct(fields) = &field.data_type() {
-                if fields.is_empty() {
-                    if has_repdef_info {
-                        return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
-                    }
-                    // This is maybe a little confusing but the reader should never look at this anyways and it
-                    // seems like overkill to invent a new layout just for "empty structs".
-                    return Self::encode_simple_all_null(column_idx, num_values, row_number);
+            if let DataType::Struct(fields) = &field.data_type()
+                && fields.is_empty()
+            {
+                if has_repdef_info {
+                    return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
                 }
+                // This is maybe a little confusing but the reader should never look at this anyways and it
+                // seems like overkill to invent a new layout just for "empty structs".
+                return Self::encode_simple_all_null(column_idx, num_values, row_number);
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            if version.resolve() >= LanceFileVersion::V2_2 {
-                if let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-                {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using constant layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    return constant::encode_constant_page(
-                        column_idx,
-                        scalar,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    );
-                }
+            if version.resolve() >= LanceFileVersion::V2_2
+                && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+            {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using constant layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                return constant::encode_constant_page(
+                    column_idx,
+                    scalar,
+                    repdef,
+                    row_number,
+                    num_rows,
+                );
             }
 
             let requires_full_zip_packed_struct =
@@ -6504,23 +6503,25 @@ mod tests {
                 let col = &cols[0];
 
                 // Navigate to the dictionary encoding in the page layout
-                if let Some(PageEncoding::Structural(page_layout)) = &col.final_pages.first().map(|p| &p.description) {
-                    // Check that dictionary is wrapped with general compression
-                    if let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) = &page_layout.layout {
-                        if let Some(dictionary_encoding) = &mini_block.dictionary {
-                            match dictionary_encoding.compression.as_ref() {
-                                Some(Compression::General(general)) => {
-                                    // Verify it's using LZ4 or Zstd
-                                    let compression = general.compression.as_ref().unwrap();
-                                    assert!(
-                                        compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmLz4
-                                        || compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmZstd,
-                                        "Expected LZ4 or Zstd compression for large dictionary"
-                                    );
-                                }
-                                _ => panic!("Expected General compression for large dictionary"),
-                            }
+                if let Some(PageEncoding::Structural(page_layout)) =
+                    &col.final_pages.first().map(|p| &p.description)
+                    && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                        &page_layout.layout
+                    && let Some(dictionary_encoding) = &mini_block.dictionary
+                {
+                    match dictionary_encoding.compression.as_ref() {
+                        Some(Compression::General(general)) => {
+                            // Verify it's using LZ4 or Zstd
+                            let compression = general.compression.as_ref().unwrap();
+                            assert!(
+                                compression.scheme()
+                                    == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                    || compression.scheme()
+                                        == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                "Expected LZ4 or Zstd compression for large dictionary"
+                            );
                         }
+                        _ => panic!("Expected General compression for large dictionary"),
                     }
                 }
             }));

@@ -203,10 +203,10 @@ fn try_rle_for_mini_block(
     if rle_bytes < raw_bytes {
         #[cfg(feature = "bitpacking")]
         {
-            if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data) {
-                if (bitpack_bytes as u128) < rle_bytes {
-                    return None;
-                }
+            if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data)
+                && (bitpack_bytes as u128) < rle_bytes
+            {
+                return None;
             }
         }
         return Some(Box::new(RleEncoder::new()));
@@ -349,13 +349,14 @@ fn try_general_compression(
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressionConfig)>> {
     // User-requested compression (unused today but perhaps still used
     // in the future someday)
-    if let Some(compression_scheme) = &field_params.compression {
-        if compression_scheme != "none" && version >= LanceFileVersion::V2_2 {
-            let scheme: CompressionScheme = compression_scheme.parse()?;
-            let config = CompressionConfig::new(scheme, field_params.compression_level);
-            let compressor = Box::new(CompressedBufferEncoder::try_new(config)?);
-            return Ok(Some((compressor, config)));
-        }
+    if let Some(compression_scheme) = &field_params.compression
+        && compression_scheme != "none"
+        && version >= LanceFileVersion::V2_2
+    {
+        let scheme: CompressionScheme = compression_scheme.parse()?;
+        let config = CompressionConfig::new(scheme, field_params.compression_level);
+        let compressor = Box::new(CompressedBufferEncoder::try_new(config)?);
+        return Ok(Some((compressor, config)));
     }
 
     // Automatic compression for large blocks

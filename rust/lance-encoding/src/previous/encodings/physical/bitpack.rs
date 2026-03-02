@@ -1049,10 +1049,11 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
 
                 // If we've reached the last byte, there may be some extra bits from the
                 // next value outside the range. We don't want to be taking those.
-                if let Some(buffer_bit_end_offset) = self.buffer_bit_end_offsets[i] {
-                    if src_idx == src.len() - 1 && src_offset >= buffer_bit_end_offset as u64 {
-                        break;
-                    }
+                if let Some(buffer_bit_end_offset) = self.buffer_bit_end_offsets[i]
+                    && src_idx == src.len() - 1
+                    && src_offset >= buffer_bit_end_offset as u64
+                {
+                    break;
                 }
             }
         }
@@ -1179,14 +1180,12 @@ pub mod test {
     #[test]
     fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
-            let arr = gen_batch()
+            gen_batch()
                 .anon_col(generator)
                 .into_batch_rows(RowCount::from(10000))
                 .unwrap()
                 .column(0)
-                .clone();
-
-            arr
+                .clone()
         }
 
         macro_rules! do_test {

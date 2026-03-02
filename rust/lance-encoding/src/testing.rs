@@ -485,15 +485,15 @@ impl TestCases {
     fn get_versions(&self) -> Vec<LanceFileVersion> {
         LanceFileVersion::iter_non_legacy()
             .filter(|v| {
-                if let Some(min_file_version) = &self.min_file_version {
-                    if v < min_file_version {
-                        return false;
-                    }
+                if let Some(min_file_version) = &self.min_file_version
+                    && v < min_file_version
+                {
+                    return false;
                 }
-                if let Some(max_file_version) = &self.max_file_version {
-                    if v > max_file_version {
-                        return false;
-                    }
+                if let Some(max_file_version) = &self.max_file_version
+                    && v > max_file_version
+                {
+                    return false;
                 }
                 true
             })
@@ -690,14 +690,13 @@ fn verify_page_encoding(
             // All-null structural pages may legitimately contain no encodings to verify.
             // This can happen even when compression is configured because there is no value data
             // (and rep/def compression is not currently described in the page layout).
-            if actual_chain.is_empty() && page.data.is_empty() {
-                if let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+            if actual_chain.is_empty()
+                && page.data.is_empty()
+                && let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
                     layout.layout.as_ref()
-                {
-                    if cl.inline_value.is_none() {
-                        return Ok(());
-                    }
-                }
+                && cl.inline_value.is_none()
+            {
+                return Ok(());
             }
         }
         PageEncoding::Legacy(_) => {
@@ -888,11 +887,11 @@ async fn check_round_trip_encoding_inner(
             log_page(&encoded_page);
 
             // For V2.1, verify encoding in the page if expected
-            if file_version >= LanceFileVersion::V2_1 {
-                if let Some(ref expected) = test_cases.expected_encoding {
-                    verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                        .unwrap();
-                }
+            if file_version >= LanceFileVersion::V2_1
+                && let Some(ref expected) = test_cases.expected_encoding
+            {
+                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                    .unwrap();
             }
 
             writer.write_page(encoded_page);
@@ -910,11 +909,11 @@ async fn check_round_trip_encoding_inner(
         log_page(&encoded_page);
 
         // For V2.1, verify encoding in the page if expected
-        if file_version >= LanceFileVersion::V2_1 {
-            if let Some(ref expected) = test_cases.expected_encoding {
-                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                    .unwrap();
-            }
+        if file_version >= LanceFileVersion::V2_1
+            && let Some(ref expected) = test_cases.expected_encoding
+        {
+            verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                .unwrap();
         }
 
         writer.write_page(encoded_page);
