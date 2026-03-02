@@ -533,22 +533,24 @@ impl Dataset {
 
         // Handle read_params dict
         if let Some(read_params_dict) = read_params {
-            let cache_repetition_index = read_params_dict
+            let mut decoder_config = DecoderConfig::default();
+
+            if let Some(cache_repetition_index) = read_params_dict
                 .get_item("cache_repetition_index")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.cache_repetition_index = cache_repetition_index;
+            }
 
-            let validate_on_decode = read_params_dict
+            if let Some(validate_on_decode) = read_params_dict
                 .get_item("validate_on_decode")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.validate_on_decode = validate_on_decode;
+            }
 
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode,
-            };
             let file_reader_options = FileReaderOptions {
                 decoder_config,
                 ..Default::default()

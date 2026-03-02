@@ -227,6 +227,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -261,6 +262,7 @@ use crate::{BufferScheduler, EncodingsIo};
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
+const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
 
 /// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
@@ -1862,12 +1864,24 @@ impl RequestedRows {
 }
 
 /// Configuration for decoder behavior
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DecoderConfig {
-    /// Whether to cache repetition indices for better performance
+    /// Whether to cache repetition indices for better performance.
+    ///
+    /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
+    /// when present.
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            cache_repetition_index: parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, false),
+            validate_on_decode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
