@@ -595,11 +595,6 @@ pub fn execute_plan(
         );
     }
 
-    println!(
-        "Executing plan: {}",
-        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
-    );
-
     let session_ctx = get_session_context(&options);
 
     // NOTE: we are only executing the first partition here. Therefore, if

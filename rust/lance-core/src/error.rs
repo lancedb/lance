@@ -475,7 +475,6 @@ pub type DataFusionResult<T> = std::result::Result<T, datafusion_common::DataFus
 impl From<ArrowError> for Error {
     #[track_caller]
     fn from(e: ArrowError) -> Self {
-        println!("{:#?}", std::backtrace::Backtrace::force_capture());
         match e {
             ArrowError::ExternalError(source) => {
                 // Try to downcast to lance_core::Error first to recover the original
