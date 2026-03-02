@@ -231,11 +231,11 @@ impl ObjectStoreRegistry {
                         .active_stores
                         .write()
                         .expect("ObjectStoreRegistry lock poisoned");
-                    if let Some(store) = cache_lock.get(&cache_key) {
-                        if store.upgrade().is_none() {
-                            // Remove the weak reference if it is no longer valid
-                            cache_lock.remove(&cache_key);
-                        }
+                    if let Some(store) = cache_lock.get(&cache_key)
+                        && store.upgrade().is_none()
+                    {
+                        // Remove the weak reference if it is no longer valid
+                        cache_lock.remove(&cache_key);
                     }
                 }
             }

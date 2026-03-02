@@ -346,10 +346,10 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
-    if let Some(s) = expanded_path.as_path().to_str() {
-        if s.is_empty() {
-            expanded_path = std::env::current_dir()?;
-        }
+    if let Some(s) = expanded_path.as_path().to_str()
+        && s.is_empty()
+    {
+        expanded_path = std::env::current_dir()?;
     }
 
     Ok(expanded_path)

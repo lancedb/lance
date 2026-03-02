@@ -354,10 +354,10 @@ impl DeepSizeOf for SmallReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
-        if let Ok(guard) = self.inner.state.try_lock() {
-            if let SmallReaderState::Finished(Ok(data)) = &*guard {
-                size += data.len();
-            }
+        if let Ok(guard) = self.inner.state.try_lock()
+            && let SmallReaderState::Finished(Ok(data)) = &*guard
+        {
+            size += data.len();
         }
 
         size

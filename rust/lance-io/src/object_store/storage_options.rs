@@ -309,10 +309,10 @@ impl StorageOptionsAccessor {
         // Check if we have valid cached options with read lock
         {
             let cached = self.cache.read().await;
-            if !self.needs_refresh(&cached) {
-                if let Some(cached_opts) = &*cached {
-                    return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-                }
+            if !self.needs_refresh(&cached)
+                && let Some(cached_opts) = &*cached
+            {
+                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
             }
         }
 
@@ -335,10 +335,10 @@ impl StorageOptionsAccessor {
 
         // Double-check if options are still stale after acquiring write lock
         // (another thread might have refreshed them)
-        if !self.needs_refresh(&cache) {
-            if let Some(cached_opts) = &*cache {
-                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-            }
+        if !self.needs_refresh(&cache)
+            && let Some(cached_opts) = &*cache
+        {
+            return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
         }
 
         log::debug!(

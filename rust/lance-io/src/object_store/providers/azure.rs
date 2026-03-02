@@ -165,10 +165,10 @@ impl StorageOptions {
     fn from_env() -> Self {
         let mut opts = HashMap::<String, String>::new();
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    opts.insert(config_key.as_ref().to_string(), value.to_string());
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase())
+            {
+                opts.insert(config_key.as_ref().to_string(), value.to_string());
             }
         }
         Self(opts)

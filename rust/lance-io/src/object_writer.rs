@@ -313,12 +313,12 @@ impl Drop for ObjectWriter {
             // Take ownership of the state.
             let state =
                 std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-            if let UploadState::InProgress { mut upload, .. } = state {
-                if let Ok(handle) = Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = upload.abort().await;
-                    });
-                }
+            if let UploadState::InProgress { mut upload, .. } = state
+                && let Ok(handle) = Handle::try_current()
+            {
+                handle.spawn(async move {
+                    let _ = upload.abort().await;
+                });
             }
         }
     }

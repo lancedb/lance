@@ -37,10 +37,10 @@ impl ObjectStoreProvider for FileStoreProvider {
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        if let Ok(file_path) = url.to_file_path() {
-            if let Ok(path) = Path::from_absolute_path(&file_path) {
-                return Ok(path);
-            }
+        if let Ok(file_path) = url.to_file_path()
+            && let Ok(path) = Path::from_absolute_path(&file_path)
+        {
+            return Ok(path);
         }
 
         Path::parse(url.path()).map_err(|e| {

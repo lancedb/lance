@@ -262,18 +262,18 @@ pub async fn build_aws_credential(
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
     // If accessor has a provider, use DynamicStorageOptionsCredentialProvider
-    if let Some(accessor) = storage_options_accessor {
-        if accessor.has_provider() {
-            // Explicit aws_credentials takes precedence
-            if let Some(creds) = credentials {
-                return Ok((creds, region));
-            }
-            // Use accessor for dynamic credential refresh
-            return Ok((
-                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-                region,
-            ));
+    if let Some(accessor) = storage_options_accessor
+        && accessor.has_provider()
+    {
+        // Explicit aws_credentials takes precedence
+        if let Some(creds) = credentials {
+            return Ok((creds, region));
         }
+        // Use accessor for dynamic credential refresh
+        return Ok((
+            Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
+            region,
+        ));
     }
 
     // Fall back to existing logic for static credentials
@@ -403,13 +403,12 @@ impl StorageOptions {
     /// Add values from the environment to storage options
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
+                && !self.0.contains_key(config_key.as_ref())
+            {
+                self.0
+                    .insert(config_key.as_ref().to_string(), value.to_string());
             }
         }
     }
