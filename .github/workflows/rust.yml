@@ -178,6 +178,10 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup default stable
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
