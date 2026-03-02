@@ -30,20 +30,20 @@ const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedExternalBase {
+pub(super) struct ResolvedExternalBase {
     pub base_id: u32,
     pub relative_path: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExternalBaseCandidate {
+pub(super) struct ExternalBaseCandidate {
     pub base_id: u32,
     pub store_prefix: String,
     pub base_path: Path,
 }
 
 #[derive(Debug)]
-pub(crate) struct ExternalBaseResolver {
+pub(super) struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
     store_registry: Arc<ObjectStoreRegistry>,
     store_params: ObjectStoreParams,
@@ -51,7 +51,7 @@ pub(crate) struct ExternalBaseResolver {
 }
 
 impl ExternalBaseResolver {
-    pub(crate) fn new(
+    pub(super) fn new(
         candidates: Vec<ExternalBaseCandidate>,
         store_registry: Arc<ObjectStoreRegistry>,
         store_params: ObjectStoreParams,
@@ -215,7 +215,7 @@ pub struct BlobPreprocessor {
 }
 
 impl BlobPreprocessor {
-    pub(crate) fn new(
+    pub(super) fn new(
         object_store: ObjectStore,
         data_dir: Path,
         data_file_key: String,

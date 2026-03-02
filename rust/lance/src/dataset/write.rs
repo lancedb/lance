@@ -911,12 +911,20 @@ pub async fn open_writer(
         schema,
         base_dir,
         storage_version,
-        true,
-        None,
-        None,
-        false,
+        WriterOptions {
+            add_data_dir: true,
+            ..Default::default()
+        },
     )
     .await
+}
+
+#[derive(Default)]
+struct WriterOptions {
+    add_data_dir: bool,
+    base_id: Option<u32>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
 }
 
 async fn open_writer_with_options(
@@ -924,11 +932,15 @@ async fn open_writer_with_options(
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
-    add_data_dir: bool,
-    base_id: Option<u32>,
-    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
-    allow_external_blob_outside_bases: bool,
+    options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
+    let WriterOptions {
+        add_data_dir,
+        base_id,
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    } = options;
+
     let data_file_key = generate_random_filename();
     let filename = format!("{}.lance", data_file_key);
 
@@ -1057,10 +1069,12 @@ impl WriterGenerator {
                 &self.schema,
                 &base_info.base_dir,
                 self.storage_version,
-                base_info.is_dataset_root,
-                Some(base_info.base_id),
-                self.external_base_resolver.clone(),
-                self.allow_external_blob_outside_bases,
+                WriterOptions {
+                    add_data_dir: base_info.is_dataset_root,
+                    base_id: Some(base_info.base_id),
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         } else {
@@ -1069,10 +1083,12 @@ impl WriterGenerator {
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
-                true,
-                None,
-                self.external_base_resolver.clone(),
-                self.allow_external_blob_outside_bases,
+                WriterOptions {
+                    add_data_dir: true,
+                    base_id: None,
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         };
@@ -1752,10 +1768,10 @@ mod tests {
             &schema,
             &base_dir,
             LanceFileVersion::Stable,
-            false, // Don't add /data
-            None,
-            None,
-            false,
+            WriterOptions {
+                add_data_dir: false, // Don't add /data
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
