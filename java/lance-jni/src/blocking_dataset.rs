@@ -990,7 +990,7 @@ fn inner_create_index<'local>(
     (&index_metadata).into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDropIndex(
     mut env: JNIEnv,
     java_dataset: JObject,
