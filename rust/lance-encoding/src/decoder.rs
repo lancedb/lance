@@ -213,7 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
-use std::sync::{LazyLock, Once};
+use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -263,6 +263,12 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
 const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
+
+fn default_cache_repetition_index() -> bool {
+    static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
+    *DEFAULT_CACHE_REPETITION_INDEX
+        .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, false))
+}
 
 /// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
@@ -1869,7 +1875,7 @@ pub struct DecoderConfig {
     /// Whether to cache repetition indices for better performance.
     ///
     /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
-    /// when present.
+    /// when present. The env var is read once per process.
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
@@ -1878,7 +1884,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
-            cache_repetition_index: parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, false),
+            cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
         }
     }
