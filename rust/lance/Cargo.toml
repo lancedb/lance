@@ -167,6 +167,10 @@ name = "take"
 harness = false
 
 [[bench]]
+name = "take_blob"
+harness = false
+
+[[bench]]
 name = "random_access"
 harness = false
 
