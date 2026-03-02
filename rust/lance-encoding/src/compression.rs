@@ -334,9 +334,8 @@ fn maybe_wrap_general_for_mini_block(
     match params.compression.as_deref() {
         None | Some("none") | Some("fsst") => Ok(inner),
         Some(raw) => {
-            let scheme = CompressionScheme::from_str(raw).map_err(|_| {
-                Error::invalid_input(format!("Unknown compression scheme: {raw}"), location!())
-            })?;
+            let scheme = CompressionScheme::from_str(raw)
+                .map_err(|_| Error::invalid_input(format!("Unknown compression scheme: {raw}")))?;
             let cfg = CompressionConfig::new(scheme, params.compression_level);
             Ok(Box::new(GeneralMiniBlockCompressor::new(inner, cfg)))
         }
@@ -470,13 +469,10 @@ impl DefaultCompressionStrategy {
         let params = self.get_merged_field_params(field);
         let compression = params.compression.as_deref();
         if data.bits_per_offset != 32 && data.bits_per_offset != 64 {
-            return Err(Error::invalid_input(
-                format!(
-                    "Variable width compression not supported for {} bit offsets",
-                    data.bits_per_offset
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Variable width compression not supported for {} bit offsets",
+                data.bits_per_offset
+            )));
         }
 
         // Get statistics
@@ -545,7 +541,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if struct_data_block.has_variable_width_child() {
                     return Err(Error::invalid_input(
                         "Packed struct mini-block encoding supports only fixed-width children",
-                        location!(),
                     ));
                 }
                 Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()))
@@ -585,7 +580,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if field.children.len() != struct_block.children.len() {
                     return Err(Error::invalid_input(
                         "Struct field metadata does not match data block children",
-                        location!(),
                     ));
                 }
                 let has_variable_child = struct_block.has_variable_width_child();
@@ -601,10 +595,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         field.children.clone(),
                     )))
                 } else {
-                    Err(Error::invalid_input(
-                        "Packed struct per-value compression should not be used for fixed-width-only structs",
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("Packed struct per-value compression should not be used for fixed-width-only structs"))
                 }
             }
             DataBlock::VariableWidth(variable_width) => {
@@ -834,14 +825,14 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
                     general.values.as_ref().ok_or_else(|| {
-                        Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
+                        Error::invalid_input("GeneralMiniBlock missing inner encoding")
                     })?,
                     decompression_strategy,
                 )?;
 
                 // Parse compression config
                 let compression = general.compression.as_ref().ok_or_else(|| {
-                    Error::invalid_input("GeneralMiniBlock missing compression config", location!())
+                    Error::invalid_input("GeneralMiniBlock missing compression config")
                 })?;
 
                 let scheme = compression.scheme().try_into()?;
@@ -906,16 +897,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
                     let value_encoding = field.value.as_ref().ok_or_else(|| {
-                        Error::invalid_input(
-                            "VariablePackedStruct field is missing value encoding",
-                            location!(),
-                        )
+                        Error::invalid_input("VariablePackedStruct field is missing value encoding")
                     })?;
                     let decoder = match field.layout.as_ref().ok_or_else(|| {
-                        Error::invalid_input(
-                            "VariablePackedStruct field is missing layout details",
-                            location!(),
-                        )
+                        Error::invalid_input("VariablePackedStruct field is missing layout details")
                     })? {
                         crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerValue(
                             bits_per_value,
@@ -1000,19 +985,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .values
                     .as_ref()
                     .ok_or_else(|| {
-                        Error::invalid_input(
-                            "General compression missing inner encoding",
-                            location!(),
-                        )
+                        Error::invalid_input("General compression missing inner encoding")
                     })?
                     .as_ref();
                 let inner_decompressor = self.create_block_decompressor(inner_desc)?;
 
                 let compression = general.compression.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        "General compression missing compression config",
-                        location!(),
-                    )
+                    Error::invalid_input("General compression missing compression config")
                 })?;
                 let scheme = compression.scheme().try_into()?;
                 let config = CompressionConfig::new(scheme, compression.level);
@@ -1031,44 +1010,40 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 }
 /// Validates RLE compression format and extracts bits_per_value
 fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
-    let values = rle.values.as_ref().ok_or_else(|| {
-        Error::invalid_input("RLE compression missing values encoding", location!())
-    })?;
-    let run_lengths = rle.run_lengths.as_ref().ok_or_else(|| {
-        Error::invalid_input("RLE compression missing run lengths encoding", location!())
-    })?;
+    let values = rle
+        .values
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("RLE compression missing values encoding"))?;
+    let run_lengths = rle
+        .run_lengths
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths encoding"))?;
 
-    let values = values.compression.as_ref().ok_or_else(|| {
-        Error::invalid_input("RLE compression missing values compression", location!())
-    })?;
+    let values = values
+        .compression
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("RLE compression missing values compression"))?;
     let Compression::Flat(values) = values else {
         return Err(Error::invalid_input(
             "RLE compression only supports flat values",
-            location!(),
         ));
     };
 
-    let run_lengths = run_lengths.compression.as_ref().ok_or_else(|| {
-        Error::invalid_input(
-            "RLE compression missing run lengths compression",
-            location!(),
-        )
-    })?;
+    let run_lengths = run_lengths
+        .compression
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths compression"))?;
     let Compression::Flat(run_lengths) = run_lengths else {
         return Err(Error::invalid_input(
             "RLE compression only supports flat run lengths",
-            location!(),
         ));
     };
 
     if run_lengths.bits_per_value != 8 {
-        return Err(Error::invalid_input(
-            format!(
-                "RLE compression only supports 8-bit run lengths, got {}",
-                run_lengths.bits_per_value
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "RLE compression only supports 8-bit run lengths, got {}",
+            run_lengths.bits_per_value
+        )));
     }
 
     Ok(values.bits_per_value)

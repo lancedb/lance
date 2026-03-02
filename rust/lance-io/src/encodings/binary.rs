@@ -27,7 +27,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::BufferExt;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use super::ReadBatchParams;
@@ -99,10 +98,10 @@ impl Encoder for BinaryEncoder<'_> {
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
-                return Err(lance_core::Error::invalid_input(
-                    format!("Unsupported data type for binary encoding: {}", data_type),
-                    location!(),
-                ));
+                return Err(lance_core::Error::invalid_input(format!(
+                    "Unsupported data type for binary encoding: {}",
+                    data_type
+                )));
             }
         }
     }

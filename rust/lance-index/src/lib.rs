@@ -209,10 +209,10 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
             "FragmentReuse" => Ok(Self::FragmentReuse),
             "MemWal" => Ok(Self::MemWal),
-            _ => Err(Error::invalid_input(
-                format!("invalid index type: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "invalid index type: {}",
+                value
+            ))),
         }
     }
 }

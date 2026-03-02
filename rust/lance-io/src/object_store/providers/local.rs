@@ -10,7 +10,6 @@ use crate::object_store::{
 use lance_core::error::Result;
 use lance_core::Error;
 use object_store::{local::LocalFileSystem, path::Path};
-use snafu::location;
 use url::Url;
 
 #[derive(Default, Debug)]
@@ -45,10 +44,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         }
 
         Path::parse(url.path()).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to parse path '{}': {}", url.path(), e),
-                location!(),
-            )
+            Error::invalid_input(format!("Failed to parse path '{}': {}", url.path(), e))
         })
     }
 

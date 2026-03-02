@@ -505,7 +505,6 @@ impl Index for InvertedIndex {
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
         Err(Error::invalid_input(
             "inverted index cannot be cast to vector index",
-            location!(),
         ))
     }
 
@@ -1487,10 +1486,7 @@ impl PostingListReader {
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location!(),
-                        ),
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                         e => e
                     }
                 })?;
@@ -2418,17 +2414,16 @@ pub fn flat_full_text_search(
     if is_phrase_query(query) {
         return Err(Error::invalid_input(
             "phrase query is not supported for flat full text search, try using FTS index",
-            location!(),
         ));
     }
 
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
-        data_type => Err(Error::invalid_input(
-            format!("unsupported data type {} for inverted index", data_type),
-            location!(),
-        )),
+        data_type => Err(Error::invalid_input(format!(
+            "unsupported data type {} for inverted index",
+            data_type
+        ))),
     }
 }
 

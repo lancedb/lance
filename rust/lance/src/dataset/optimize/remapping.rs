@@ -253,9 +253,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                             // and we always reindex either the entire group or nothing.
                             // We use invalid input to be consistent with
                             // dataset::transaction::recalculate_fragment_bitmap
-                            return Err(Error::invalid_input(
-                                format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags),
-                                location!()));
+                            return Err(Error::invalid_input(format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags)));
                         }
                         index_frag_bitmap
                             .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));

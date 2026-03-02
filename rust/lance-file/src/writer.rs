@@ -392,7 +392,7 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name)));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -621,7 +621,7 @@ impl FileWriter {
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
+        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created"))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
         // Use descriptor layout for blob v2 in the footer to avoid exposing logical child fields.
         //

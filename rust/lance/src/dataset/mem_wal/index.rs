@@ -152,13 +152,10 @@ impl MemIndexConfig {
         } else if type_url.ends_with("VectorIndexDetails") {
             Ok("vector")
         } else {
-            Err(Error::invalid_input(
-                format!(
-                    "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
-                    type_url
-                ),
-                location!(),
-            ))
+            Err(Error::invalid_input(format!(
+                "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
+                type_url
+            )))
         }
     }
 
@@ -168,20 +165,14 @@ impl MemIndexConfig {
         schema: &LanceSchema,
     ) -> Result<(i32, String)> {
         let field_id = index_meta.fields.first().ok_or_else(|| {
-            Error::invalid_input(
-                format!("Index '{}' has no fields", index_meta.name),
-                location!(),
-            )
+            Error::invalid_input(format!("Index '{}' has no fields", index_meta.name))
         })?;
 
         let column = schema
             .field_by_id(*field_id)
             .map(|f| f.name.clone())
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!("Field with id {} not found in schema", field_id),
-                    location!(),
-                )
+                Error::invalid_input(format!("Field with id {} not found in schema", field_id))
             })?;
 
         Ok((*field_id, column))

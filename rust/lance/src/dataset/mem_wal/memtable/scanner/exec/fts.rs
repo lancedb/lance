@@ -22,7 +22,6 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
-use snafu::location;
 
 use super::super::builder::{FtsQuery, FtsQueryType, DEFAULT_WAND_FACTOR};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
@@ -95,10 +94,10 @@ impl FtsIndexExec {
         // Verify the index exists for this column
         let column = &query.column;
         if indexes.get_fts_by_column(column).is_none() {
-            return Err(Error::invalid_input(
-                format!("No FTS index found for column '{}'", column),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "No FTS index found for column '{}'",
+                column
+            )));
         }
 
         // Build output schema: base fields + _score + optional _rowid

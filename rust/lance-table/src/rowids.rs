@@ -33,8 +33,6 @@ use lance_core::{
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
-use snafu::location;
-
 use crate::utils::LanceIteratorExtension;
 use lance_core::utils::mask::RowSetOps;
 use segment::U64Segment;
@@ -590,23 +588,17 @@ pub fn rechunk_sequences(
         .peekable();
 
     let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
-        Error::invalid_input(
-            format!(
-                "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
-                chunk_index, expected_chunk_size, remaining
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
+            chunk_index, expected_chunk_size, remaining
+        ))
     };
 
     let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
-        Error::invalid_input(
-            format!(
-                "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
-                processed_chunks, total_chunk_sizes
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
+            processed_chunks, total_chunk_sizes
+        ))
     };
 
     let mut segment_offset = 0_u64;
@@ -682,14 +674,11 @@ pub fn select_row_ids<'a>(
     offsets: &'a ReadBatchParams,
 ) -> Result<Vec<u64>> {
     let out_of_bounds_err = |offset: u32| {
-        Error::invalid_input(
-            format!(
-                "Index out of bounds: {} for sequence of length {}",
-                offset,
-                sequence.len()
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Index out of bounds: {} for sequence of length {}",
+            offset,
+            sequence.len()
+        ))
     };
 
     match offsets {

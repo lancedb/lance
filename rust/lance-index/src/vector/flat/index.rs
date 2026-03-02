@@ -15,7 +15,6 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::{
     metrics::MetricsCollector,
@@ -289,10 +288,7 @@ impl TryFrom<Quantizer> for FlatQuantizer {
     fn try_from(value: Quantizer) -> Result<Self> {
         match value {
             Quantizer::Flat(quantizer) => Ok(quantizer),
-            _ => Err(Error::invalid_input(
-                "quantizer is not FlatQuantizer",
-                location!(),
-            )),
+            _ => Err(Error::invalid_input("quantizer is not FlatQuantizer")),
         }
     }
 }
@@ -378,10 +374,7 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
     fn try_from(value: Quantizer) -> Result<Self> {
         match value {
             Quantizer::FlatBin(quantizer) => Ok(quantizer),
-            _ => Err(Error::invalid_input(
-                "quantizer is not FlatBinQuantizer",
-                location!(),
-            )),
+            _ => Err(Error::invalid_input("quantizer is not FlatBinQuantizer")),
         }
     }
 }

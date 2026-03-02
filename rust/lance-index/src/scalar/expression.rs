@@ -1669,13 +1669,10 @@ fn visit_node(
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     if depth >= MAX_DEPTH {
-        return Err(Error::invalid_input(
-            format!(
-                "the filter expression is too long, lance limit the max number of conditions to {}",
-                MAX_DEPTH
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "the filter expression is too long, lance limit the max number of conditions to {}",
+            MAX_DEPTH
+        )));
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),

@@ -10,7 +10,6 @@ use std::{
 };
 
 use object_store::path::Path;
-use snafu::location;
 use url::Url;
 
 use crate::object_store::uri_to_url;
@@ -46,9 +45,8 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        Path::parse(url.path()).map_err(|_| {
-            Error::invalid_input(format!("Invalid path in URL: {}", url.path()), location!())
-        })
+        Path::parse(url.path())
+            .map_err(|_| Error::invalid_input(format!("Invalid path in URL: {}", url.path())))
     }
 
     /// Calculate the unique prefix that should be used for this object store.
@@ -192,7 +190,7 @@ impl ObjectStoreRegistry {
             let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
             message.push_str(&format!("\nValid schemes: {}", valid_schemes));
         }
-        Error::invalid_input(message, location!())
+        Error::invalid_input(message)
     }
 
     /// Get an object store for a given base path and parameters.

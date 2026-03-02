@@ -367,78 +367,53 @@ impl ZoneMapIndex {
         rows_per_zone: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
-        let min_col = data.column_by_name("min").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'min' column", location!())
-        })?;
-        let max_col = data.column_by_name("max").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'max' column", location!())
-        })?;
+        let min_col = data
+            .column_by_name("min")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
+        let max_col = data
+            .column_by_name("max")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
         let null_count_col = data
             .column_by_name("null_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'null_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'null_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32")
             })?;
         let nan_count_col = data
             .column_by_name("nan_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'nan_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'nan_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32")
             })?;
         let zone_length = data
             .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_length' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
             })?;
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'fragment_id' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
             })?;
 
         let zone_start_col = data
             .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_start' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_start' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
         let data_type = min_col.data_type().clone();

@@ -15,7 +15,6 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Result, ROW_ADDR};
 use lance_datafusion::chunker::chunk_concat_stream;
-use snafu::location;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.
@@ -74,7 +73,6 @@ where
         if zone_capacity == 0 {
             return Err(Error::invalid_input(
                 "zone capacity must be greater than zero",
-                location!(),
             ));
         }
         Ok(Self {
@@ -96,10 +94,7 @@ where
         stream: SendableRecordBatchStream,
     ) -> Result<Vec<P::ZoneStatistics>> {
         let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
-            Error::invalid_input(
-                "zone capacity does not fit into usize on this platform",
-                location!(),
-            )
+            Error::invalid_input("zone capacity does not fit into usize on this platform")
         })?;
 
         let mut batches = chunk_concat_stream(stream, zone_size);
@@ -221,10 +216,7 @@ where
         let inferred_end =
             zone_end_offset.unwrap_or_else(|| start + (*current_zone_len as u64).saturating_sub(1));
         if inferred_end < start {
-            return Err(Error::invalid_input(
-                "zone row offsets are out of order",
-                location!(),
-            ));
+            return Err(Error::invalid_input("zone row offsets are out of order"));
         }
         let bound = ZoneBound {
             fragment_id,

@@ -5,7 +5,6 @@ use std::ops::{Range, RangeInclusive};
 
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 use deepsize::DeepSizeOf;
-use snafu::location;
 
 /// Different ways to represent a sequence of distinct u64s.
 ///
@@ -375,14 +374,11 @@ impl U64Segment {
         // Check that the new value is higher than the current maximum
         if let Some(range) = self.range() {
             if val <= *range.end() {
-                return Err(lance_core::Error::invalid_input(
-                    format!(
-                        "New value {} must be higher than current maximum {}",
-                        val,
-                        range.end()
-                    ),
-                    location!(),
-                ));
+                return Err(lance_core::Error::invalid_input(format!(
+                    "New value {} must be higher than current maximum {}",
+                    val,
+                    range.end()
+                )));
             }
         }
 

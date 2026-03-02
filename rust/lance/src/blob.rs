@@ -76,10 +76,7 @@ impl BlobArrayBuilder {
         self.ensure_capacity()?;
         let uri = uri.into();
         if uri.is_empty() {
-            return Err(Error::invalid_input(
-                "URI cannot be empty",
-                snafu::location!(),
-            ));
+            return Err(Error::invalid_input("URI cannot be empty"));
         }
         self.validity.append_non_null();
         self.data_builder.append_null();
@@ -111,13 +108,10 @@ impl BlobArrayBuilder {
     /// Finish building and return an Arrow struct array.
     pub fn finish(mut self) -> Result<ArrayRef> {
         if self.len != self.expected_len {
-            return Err(Error::invalid_input(
-                format!(
-                    "Expected {} rows but received {}",
-                    self.expected_len, self.len
-                ),
-                snafu::location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Expected {} rows but received {}",
+                self.expected_len, self.len
+            )));
         }
 
         let data = Arc::new(self.data_builder.finish());
@@ -139,10 +133,7 @@ impl BlobArrayBuilder {
 
     fn ensure_capacity(&self) -> Result<()> {
         if self.len >= self.expected_len {
-            Err(Error::invalid_input(
-                "BlobArrayBuilder capacity exceeded",
-                snafu::location!(),
-            ))
+            Err(Error::invalid_input("BlobArrayBuilder capacity exceeded"))
         } else {
             Ok(())
         }

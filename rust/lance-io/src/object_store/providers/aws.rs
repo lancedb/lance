@@ -99,7 +99,7 @@ impl AwsStoreProvider {
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
-            .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name", location!()))?
+            .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -116,12 +116,7 @@ impl AwsStoreProvider {
         }
 
         let operator = Operator::from_iter::<S3>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create S3 operator: {:?}", e),
-                    location!(),
-                )
-            })?
+            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?
             .finish();
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
@@ -209,10 +204,7 @@ async fn resolve_s3_region(
         // If no endpoint is set, we can assume this is AWS S3 and the region
         // can be resolved from the bucket.
         let bucket = url.host_str().ok_or_else(|| {
-            Error::invalid_input(
-                format!("Could not parse bucket from url: {}", url),
-                location!(),
-            )
+            Error::invalid_input(format!("Could not parse bucket from url: {}", url))
         })?;
 
         let mut client_options = ClientOptions::default();

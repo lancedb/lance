@@ -241,13 +241,10 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::invalid_input(
-                format!(
-                    "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
-                    start, end, self.length
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                start, end, self.length
+            )));
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {

@@ -48,7 +48,6 @@ use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
-use snafu::location;
 
 use chrono::Utc;
 use lance_core::{Error, Result};
@@ -317,10 +316,9 @@ impl Planner {
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
             _ => {
-                return Err(Error::invalid_input(
-                    format!("Operator {op} is not supported"),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Operator {op} is not supported"
+                )));
             }
         })
     }
@@ -347,10 +345,7 @@ impl Planner {
                         Err(_) => lit(-n
                             .parse::<f64>()
                             .map_err(|_e| {
-                                Error::invalid_input(
-                                    format!("negative operator can be only applied to integer and float operands, got: {n}"),
-                                    location!(),
-                                )
+                                Error::invalid_input(format!("negative operator can be only applied to integer and float operands, got: {n}"))
                             })?),
                     },
                     _ => {
@@ -360,10 +355,10 @@ impl Planner {
             }
 
             _ => {
-                return Err(Error::invalid_input(
-                    format!("Unary operator '{:?}' is not supported", op),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Unary operator '{:?}' is not supported",
+                    op
+                )));
             }
         })
     }
@@ -380,10 +375,7 @@ impl Planner {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
-                Error::invalid_input(
-                    format!("'{value}' is not supported number value."),
-                    location!(),
-                )
+                Error::invalid_input(format!("'{value}' is not supported number value."))
             })
         }
     }
@@ -405,10 +397,10 @@ impl Planner {
     fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported function args: {:?}", func_args),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported function args: {:?}",
+                func_args
+            ))),
         }
     }
 
@@ -422,19 +414,19 @@ impl Planner {
         match &func.args {
             FunctionArguments::List(args) => {
                 if func.name.0.len() != 1 {
-                    return Err(Error::invalid_input(
-                        format!("Function name must have 1 part, got: {:?}", func.name.0),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Function name must have 1 part, got: {:?}",
+                        func.name.0
+                    )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
                     self.parse_function_args(&args.args[0])?,
                 )))
             }
-            _ => Err(Error::invalid_input(
-                format!("Unsupported function args: {:?}", &func.args),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported function args: {:?}",
+                &func.args
+            ))),
         }
     }
 
@@ -463,7 +455,7 @@ impl Planner {
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         sql_to_rel
             .sql_to_expr(function, &schema, &mut planner_context)
-            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}"), location!()))
+            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}")))
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -505,7 +497,6 @@ impl Planner {
                     _ => {
                         return Err(Error::invalid_input(
                             "Timezone not supported in timestamp".to_string(),
-                            location!(),
                         ));
                     }
                 };
@@ -517,10 +508,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "Unsupported datetime resolution: {:?}",
+                            resolution
+                        )));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -533,10 +524,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "Unsupported datetime resolution: {:?}",
+                            resolution
+                        )));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -545,21 +536,15 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => Err(Error::invalid_input(
-                    format!(
-                        "Must provide precision and scale for decimal: {:?}",
-                        number_info
-                    ),
-                    location!(),
-                )),
+                _ => Err(Error::invalid_input(format!(
+                    "Must provide precision and scale for decimal: {:?}",
+                    number_info
+                ))),
             },
-            _ => Err(Error::invalid_input(
-                format!(
-                    "Unsupported data type: {:?}. Supported types: {:?}",
-                    data_type, SUPPORTED_TYPES
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported data type: {:?}. Supported types: {:?}",
+                data_type, SUPPORTED_TYPES
+            ))),
         }
     }
 
@@ -573,10 +558,7 @@ impl Planner {
                 }
             }
         }
-        Err(Error::invalid_input(
-            "Field access could not be planned",
-            location!(),
-        ))
+        Err(Error::invalid_input("Field access could not be planned"))
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
@@ -605,13 +587,10 @@ impl Planner {
                 let mut values = vec![];
 
                 let array_literal_error = |pos: usize, value: &_| {
-                    Err(Error::invalid_input(
-                        format!(
-                            "Expected a literal value in array, instead got {} at position {}",
-                            value, pos
-                        ),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input(format!(
+                        "Expected a literal value in array, instead got {} at position {}",
+                        value, pos
+                    )))
                 };
 
                 for (pos, expr) in elem.iter().enumerate() {
@@ -652,10 +631,7 @@ impl Planner {
 
                     for value in &mut values {
                         if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(
-                                format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
-                                location!()
-                            ))?;
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type())))?;
                         }
                     }
                     Field::new("item", data_type, true)
@@ -718,10 +694,7 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(
-                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
-                        location!()
-                    )),
+                    Some(value) => return Err(Error::invalid_input(format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value))),
                     None => None,
                 },
                 true,
@@ -738,10 +711,7 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(
-                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
-                        location!()
-                    )),
+                    Some(value) => return Err(Error::invalid_input(format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value))),
                     None => None,
                 },
                 false,
@@ -764,10 +734,7 @@ impl Planner {
                     data_type: self.parse_type(data_type)?,
                 })),
             },
-            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
-                "JSON access is not supported",
-                location!(),
-            )),
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input("JSON access is not supported")),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
                 let mut expr = self.parse_sql_expr(root)?;
 
@@ -790,18 +757,12 @@ impl Planner {
                             GetFieldAccess::ListIndex { key }
                         }
                         AccessExpr::Subscript(Subscript::Slice { .. }) => {
-                            return Err(Error::invalid_input(
-                                "Slice subscript is not supported",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Slice subscript is not supported"));
                         }
                         _ => {
                             // Handle other cases like JSON access
                             // Note: JSON access is not supported in lance
-                            return Err(Error::invalid_input(
-                                "Only dot notation or index access is supported for field access",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Only dot notation or index access is supported for field access"));
                         }
                     };
 
@@ -830,10 +791,7 @@ impl Planner {
                 ));
                 Ok(between)
             }
-            _ => Err(Error::invalid_input(
-                format!("Expression '{expr}' is not supported SQL in lance"),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!("Expression '{expr}' is not supported SQL in lance"))),
         }
     }
 
@@ -847,10 +805,7 @@ impl Planner {
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
-            Error::invalid_input(
-                format!("Error resolving filter expression {filter}: {e}"),
-                location!(),
-            )
+            Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))

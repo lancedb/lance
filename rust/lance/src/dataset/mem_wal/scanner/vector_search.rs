@@ -181,10 +181,10 @@ impl LsmVectorSearchPlanner {
         };
 
         let distance_idx = filtered.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
-            lance_core::Error::invalid_input(
-                format!("Column '{}' not found in schema", DISTANCE_COLUMN),
-                snafu::location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Column '{}' not found in schema",
+                DISTANCE_COLUMN
+            ))
         })?;
 
         let sort_expr = vec![PhysicalSortExpr {

@@ -164,19 +164,15 @@ impl Updater {
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::invalid_input(
                 "Fragment Updater: no input data is available before update".to_string(),
-                location!(),
             ));
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Fragment Updater: new batch has different size with the source batch: {} != {}",
-                    last.num_rows(),
-                    batch.num_rows()
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Fragment Updater: new batch has different size with the source batch: {} != {}",
+                last.num_rows(),
+                batch.num_rows()
+            )));
         };
 
         // Add back in deleted rows

@@ -123,14 +123,11 @@ impl LsmPointLookupPlanner {
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if pk_values.len() != self.pk_columns.len() {
-            return Err(lance_core::Error::invalid_input(
-                format!(
-                    "Expected {} primary key values, got {}",
-                    self.pk_columns.len(),
-                    pk_values.len()
-                ),
-                snafu::location!(),
-            ));
+            return Err(lance_core::Error::invalid_input(format!(
+                "Expected {} primary key values, got {}",
+                self.pk_columns.len(),
+                pk_values.len()
+            )));
         }
 
         let pk_hash = compute_pk_hash_from_scalars(pk_values);
@@ -196,9 +193,7 @@ impl LsmPointLookupPlanner {
             });
         }
 
-        expr.ok_or_else(|| {
-            lance_core::Error::invalid_input("No primary key columns specified", snafu::location!())
-        })
+        expr.ok_or_else(|| lance_core::Error::invalid_input("No primary key columns specified"))
     }
 
     /// Build scan plan for a single data source.

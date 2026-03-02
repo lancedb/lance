@@ -78,10 +78,7 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
-            _ => Err(Error::io(
-                format!("Invalid object type: {}", s),
-                location!(),
-            )),
+            _ => Err(Error::io(format!("Invalid object type: {}", s))),
         }
     }
 }
@@ -655,16 +652,11 @@ impl ManifestNamespace {
     fn get_string_column<'a>(batch: &'a RecordBatch, column_name: &str) -> Result<&'a StringArray> {
         let column = batch
             .column_by_name(column_name)
-            .ok_or_else(|| Error::io(format!("Column '{}' not found", column_name), location!()))?;
+            .ok_or_else(|| Error::io(format!("Column '{}' not found", column_name)))?;
         column
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                Error::io(
-                    format!("Column '{}' is not a string array", column_name),
-                    location!(),
-                )
-            })
+            .ok_or_else(|| Error::io(format!("Column '{}' is not a string array", column_name)))
     }
 
     /// Check if the manifest contains an object with the given ID
@@ -724,13 +716,10 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
-                        "Expected exactly 1 table with id '{}', found {}",
-                        object_id, total_rows
-                    ),
-                    location!(),
-                ));
+                return Err(Error::io(format!(
+                    "Expected exactly 1 table with id '{}', found {}",
+                    object_id, total_rows
+                )));
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -844,12 +833,7 @@ impl ManifestNamespace {
                 Arc::new(base_objects_array),
             ],
         )
-        .map_err(|e| {
-            Error::io(
-                format!("Failed to create manifest entry: {}", e),
-                location!(),
-            )
-        })?;
+        .map_err(|e| Error::io(format!("Failed to create manifest entry: {}", e)))?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
@@ -947,10 +931,7 @@ impl ManifestNamespace {
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", name),
-                location!(),
-            ));
+            return Err(Error::io(format!("Table '{}' already exists", name)));
         }
 
         self.insert_into_manifest(object_id, ObjectType::Table, Some(location))
@@ -998,13 +979,10 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
-                        "Expected exactly 1 namespace with id '{}', found {}",
-                        object_id, total_rows
-                    ),
-                    location!(),
-                ));
+                return Err(Error::io(format!(
+                    "Expected exactly 1 namespace with id '{}', found {}",
+                    object_id, total_rows
+                )));
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -1016,13 +994,10 @@ impl ManifestNamespace {
                 match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
                     Ok(map) => Some(map),
                     Err(e) => {
-                        return Err(Error::io(
-                            format!(
-                                "Failed to deserialize metadata for namespace '{}': {}",
-                                object_id, e
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::io(format!(
+                            "Failed to deserialize metadata for namespace '{}': {}",
+                            object_id, e
+                        )));
                     }
                 }
             } else {
@@ -1393,10 +1368,7 @@ impl LanceNamespace for ManifestNamespace {
 
         // Check if table already exists in manifest
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", table_name),
-                location!(),
-            ));
+            return Err(Error::io(format!("Table '{}' already exists", table_name)));
         }
 
         // Create the physical table location with hash-based naming
@@ -1422,18 +1394,15 @@ impl LanceNamespace for ManifestNamespace {
         // Write the data using Lance Dataset
         let cursor = Cursor::new(data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| Error::io(format!("Failed to read IPC stream: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to read IPC stream: {}", e)))?;
 
         let batches: Vec<RecordBatch> =
             stream_reader
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::io(format!("Failed to collect batches: {}", e), location!()))?;
+                .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
-            return Err(Error::io(
-                "No data provided for table creation",
-                location!(),
-            ));
+            return Err(Error::io("No data provided for table creation"));
         }
 
         let schema = batches[0].schema();

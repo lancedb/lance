@@ -215,13 +215,10 @@ async fn do_take_rows(
         let range = range_start..(range_end + 1);
 
         let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
-            Error::invalid_input(
-                format!(
-                    "rowaddr start: {} belongs to non-existent fragment: {}",
-                    start, fragment_id
-                ),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "rowaddr start: {} belongs to non-existent fragment: {}",
+                start, fragment_id
+            ))
         })?;
 
         let read_config = FragReadConfig::default()
@@ -260,13 +257,10 @@ async fn do_take_rows(
                 .dataset
                 .get_fragment(fragment_id as usize)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "rowaddr {} belongs to non-existent fragment: {}",
-                            row_addrs[range.start], fragment_id
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "rowaddr {} belongs to non-existent fragment: {}",
+                        row_addrs[range.start], fragment_id
+                    ))
                 })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 

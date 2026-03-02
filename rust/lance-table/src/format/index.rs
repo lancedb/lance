@@ -8,7 +8,6 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
 use super::pb;
@@ -97,10 +96,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::invalid_input(
-                    "uuid field does not exist in Index metadata".to_string(),
-                    location!(),
-                )
+                Error::invalid_input("uuid field does not exist in Index metadata".to_string())
             })??,
             name: proto.name,
             fields: proto.fields,

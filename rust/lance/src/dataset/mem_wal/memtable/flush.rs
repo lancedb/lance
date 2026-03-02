@@ -15,7 +15,6 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
 use object_store::path::Path;
-use snafu::location;
 use uuid::Uuid;
 
 use super::super::index::MemIndexConfig;
@@ -82,16 +81,12 @@ impl MemTableFlusher {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
-            return Err(Error::invalid_input(
-                "Cannot flush empty MemTable",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
         if !memtable.all_flushed_to_wal() {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
-                location!(),
             ));
         }
 
@@ -180,7 +175,7 @@ impl MemTableFlusher {
             .inner
             .put(path, Bytes::from(data).into())
             .await
-            .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e)))?;
         Ok(())
     }
 
@@ -194,16 +189,12 @@ impl MemTableFlusher {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
-            return Err(Error::invalid_input(
-                "Cannot flush empty MemTable",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
         if !memtable.all_flushed_to_wal() {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
-                location!(),
             ));
         }
 
@@ -470,12 +461,8 @@ impl MemTableFlusher {
 
             // Create index metadata for commit
             let details = pbold::InvertedIndexDetails::try_from(&fts_cfg.params)?;
-            let index_details = prost_types::Any::from_msg(&details).map_err(|e| {
-                Error::io(
-                    format!("Failed to serialize index details: {}", e),
-                    location!(),
-                )
-            })?;
+            let index_details = prost_types::Any::from_msg(&details)
+                .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
 
             let schema = dataset.schema();
             let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
@@ -646,7 +633,7 @@ impl MemTableFlusher {
         let centroids = ivf_model
             .centroids
             .clone()
-            .ok_or_else(|| Error::io("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::io("IVF model has no centroids"))?;
         let mut index_ivf = lance_index::vector::ivf::storage::IvfModel::new(centroids, None);
         let mut partition_index_metadata = Vec::with_capacity(ivf_model.num_partitions());
 
@@ -794,11 +781,11 @@ fn transpose_pq_batch(
 
     let row_ids = batch
         .column_by_name(ROW_ID)
-        .ok_or_else(|| Error::io("Missing _rowid column in partition batch", location!()))?;
+        .ok_or_else(|| Error::io("Missing _rowid column in partition batch"))?;
 
     let pq_codes = batch
         .column_by_name(PQ_CODE_COLUMN)
-        .ok_or_else(|| Error::io("Missing __pq_code column in partition batch", location!()))?;
+        .ok_or_else(|| Error::io("Missing __pq_code column in partition batch"))?;
 
     let pq_codes_fsl = pq_codes.as_fixed_size_list();
     let codes_flat = pq_codes_fsl
@@ -811,21 +798,11 @@ fn transpose_pq_batch(
     let inner_field = Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false));
     let transposed_fsl = Arc::new(
         FixedSizeListArray::try_new(inner_field, pq_code_len as i32, Arc::new(transposed), None)
-            .map_err(|e| {
-                Error::io(
-                    format!("Failed to create transposed PQ array: {}", e),
-                    location!(),
-                )
-            })?,
+            .map_err(|e| Error::io(format!("Failed to create transposed PQ array: {}", e)))?,
     );
 
     arrow_array::RecordBatch::try_new(batch.schema(), vec![row_ids.clone(), transposed_fsl])
-        .map_err(|e| {
-            Error::io(
-                format!("Failed to create transposed batch: {}", e),
-                location!(),
-            )
-        })
+        .map_err(|e| Error::io(format!("Failed to create transposed batch: {}", e)))
 }
 
 /// Message to trigger flush of a frozen memtable to Lance storage.

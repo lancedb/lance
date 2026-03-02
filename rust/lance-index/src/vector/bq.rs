@@ -98,13 +98,10 @@ impl FromStr for RQRotationType {
         match value.to_lowercase().as_str() {
             "fast" | "fht_kac" | "fht-kac" => Ok(Self::Fast),
             "matrix" | "dense" => Ok(Self::Matrix),
-            _ => Err(Error::invalid_input(
-                format!(
-                    "Unknown RQ rotation type: {}. Expected one of: fast, matrix",
-                    value
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unknown RQ rotation type: {}. Expected one of: fast, matrix",
+                value
+            ))),
         }
     }
 }

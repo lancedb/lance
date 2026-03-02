@@ -186,10 +186,7 @@ impl LsmScanPlanner {
         // Sort by PK columns (ASC) to group duplicates together
         for col in &self.pk_columns {
             let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(
-                    format!("Column '{}' not found in schema", col),
-                    snafu::location!(),
-                )
+                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
             })?;
             sort_exprs.push(PhysicalSortExpr {
                 expr: Arc::new(Column::new(col, idx)),
@@ -202,10 +199,10 @@ impl LsmScanPlanner {
 
         // Sort by _rowaddr DESC (higher address = newer within generation)
         let (addr_idx, _) = schema.column_with_name(ROW_ADDRESS_COLUMN).ok_or_else(|| {
-            lance_core::Error::invalid_input(
-                format!("Column '{}' not found in schema", ROW_ADDRESS_COLUMN),
-                snafu::location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Column '{}' not found in schema",
+                ROW_ADDRESS_COLUMN
+            ))
         })?;
         sort_exprs.push(PhysicalSortExpr {
             expr: Arc::new(Column::new(ROW_ADDRESS_COLUMN, addr_idx)),
@@ -239,10 +236,7 @@ impl LsmScanPlanner {
         // Sort by PK columns (ASC) only - NOT _rowaddr!
         for col in &self.pk_columns {
             let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(
-                    format!("Column '{}' not found in schema", col),
-                    snafu::location!(),
-                )
+                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
             })?;
             sort_exprs.push(PhysicalSortExpr {
                 expr: Arc::new(Column::new(col, idx)),

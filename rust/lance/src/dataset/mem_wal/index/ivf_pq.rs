@@ -37,7 +37,6 @@ use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::DistanceType;
-use snafu::location;
 
 use crate::dataset::mem_wal::memtable::batch_store::StoredBatch;
 
@@ -553,14 +552,11 @@ impl IvfPqMemIndex {
 
         let column = batch.column(col_idx);
         let fsl = column.as_fixed_size_list_opt().ok_or_else(|| {
-            Error::invalid_input(
-                format!(
-                    "Column '{}' is not a FixedSizeList, got {:?}",
-                    self.column_name,
-                    column.data_type()
-                ),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "Column '{}' is not a FixedSizeList, got {:?}",
+                self.column_name,
+                column.data_type()
+            ))
         })?;
 
         // Find partition assignments for all vectors using batch computation
@@ -568,7 +564,7 @@ impl IvfPqMemIndex {
             .ivf_model
             .centroids
             .as_ref()
-            .ok_or_else(|| Error::invalid_input("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
         let (partition_ids, _distances) =
             compute_partitions_arrow_array(centroids, fsl, self.distance_type)?;
 
@@ -672,7 +668,7 @@ impl IvfPqMemIndex {
             .ivf_model
             .centroids
             .as_ref()
-            .ok_or_else(|| Error::invalid_input("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
         let (partition_ids, _distances) =
             compute_partitions_arrow_array(centroids, mega_fsl, self.distance_type)?;
 
@@ -757,10 +753,10 @@ impl IvfPqMemIndex {
         max_row_position: RowPosition,
     ) -> Result<Vec<(f32, RowPosition)>> {
         if query.len() != 1 {
-            return Err(Error::invalid_input(
-                format!("Query must have exactly 1 vector, got {}", query.len()),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Query must have exactly 1 vector, got {}",
+                query.len()
+            )));
         }
 
         // Find nearest partitions to probe
@@ -961,21 +957,11 @@ impl IvfPqMemIndex {
                     Arc::new(pq_codes_array),
                     None,
                 )
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create PQ code array: {}", e),
-                        location!(),
-                    )
-                })?,
+                .map_err(|e| Error::io(format!("Failed to create PQ code array: {}", e)))?,
             );
 
             let batch = RecordBatch::try_new(schema.clone(), vec![row_id_array, pq_codes_fsl])
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create partition batch: {}", e),
-                        location!(),
-                    )
-                })?;
+                .map_err(|e| Error::io(format!("Failed to create partition batch: {}", e)))?;
 
             result.push((part_id, batch));
         }
@@ -1049,21 +1035,11 @@ impl IvfPqMemIndex {
                     Arc::new(pq_codes_array),
                     None,
                 )
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create PQ code array: {}", e),
-                        location!(),
-                    )
-                })?,
+                .map_err(|e| Error::io(format!("Failed to create PQ code array: {}", e)))?,
             );
 
             let batch = RecordBatch::try_new(schema.clone(), vec![row_id_array, pq_codes_fsl])
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create partition batch: {}", e),
-                        location!(),
-                    )
-                })?;
+                .map_err(|e| Error::io(format!("Failed to create partition batch: {}", e)))?;
 
             result.push((part_id, batch));
         }

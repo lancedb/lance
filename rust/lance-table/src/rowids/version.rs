@@ -343,23 +343,17 @@ pub fn rechunk_version_sequences(
         .peekable();
 
     let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
-        Error::invalid_input(
-            format!(
-                "Got too few version runs for chunk {}. Expected chunk size: {}, remaining needed: {}",
-                chunk_index, expected_chunk_size, remaining
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too few version runs for chunk {}. Expected chunk size: {}, remaining needed: {}",
+            chunk_index, expected_chunk_size, remaining
+        ))
     };
 
     let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
-        Error::invalid_input(
-            format!(
-                "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
-                processed_chunks, total_chunk_sizes
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
+            processed_chunks, total_chunk_sizes
+        ))
     };
 
     let mut segment_offset = 0_u64;

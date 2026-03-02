@@ -6,7 +6,6 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
 use opendal::{services::Gcs, Operator};
-use snafu::location;
 
 use object_store::{
     gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
@@ -31,7 +30,7 @@ impl GcsStoreProvider {
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
-            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name", location!()))?
+            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -48,12 +47,7 @@ impl GcsStoreProvider {
         }
 
         let operator = Operator::from_iter::<Gcs>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create GCS operator: {:?}", e),
-                    location!(),
-                )
-            })?
+            .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?
             .finish();
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)

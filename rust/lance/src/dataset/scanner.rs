@@ -427,10 +427,7 @@ impl ExprFilter {
                 }
 
                 let optimized = planner.optimize_expr(filter).map_err(|e| {
-                    Error::invalid_input(
-                        format!("Error optimizing sql filter: {sql} ({e})"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
                 })?;
                 Ok(optimized)
             }
@@ -446,10 +443,9 @@ impl ExprFilter {
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
                 planner.optimize_expr(expr.clone()).map_err(|e| {
-                    Error::invalid_input(
-                        format!("Error optimizing substrait filter: {expr:?} ({e})"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "Error optimizing substrait filter: {expr:?} ({e})"
+                    ))
                 })
             }
             #[cfg(not(feature = "substrait"))]
@@ -1066,7 +1062,6 @@ impl Scanner {
         if self.is_fragment_scan() {
             Err(Error::not_supported(
                 "This operation is not supported for fragment scan".to_string(),
-                location!(),
             ))
         } else {
             Ok(())
@@ -1211,10 +1206,7 @@ impl Scanner {
         if !fields.is_empty() {
             for field in fields.iter() {
                 if self.dataset.schema().field(field).is_none() {
-                    return Err(Error::invalid_input(
-                        format!("Column {} not found", field),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!("Column {} not found", field)));
                 }
             }
         }
@@ -1356,14 +1348,12 @@ impl Scanner {
         if limit.unwrap_or_default() < 0 {
             return Err(Error::invalid_input(
                 "Limit must be non-negative".to_string(),
-                location!(),
             ));
         }
         if let Some(off) = offset {
             if off < 0 {
                 return Err(Error::invalid_input(
                     "Offset must be non-negative".to_string(),
-                    location!(),
                 ));
             }
         }
@@ -1383,15 +1373,11 @@ impl Scanner {
         }
 
         if k == 0 {
-            return Err(Error::invalid_input(
-                "k must be positive".to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("k must be positive".to_string()));
         }
         if q.is_empty() {
             return Err(Error::invalid_input(
                 "Query vector must have non-zero length".to_string(),
-                location!(),
             ));
         }
         // make sure the field exists
@@ -1401,58 +1387,46 @@ impl Scanner {
         let q = match q.data_type() {
             DataType::List(_) | DataType::FixedSizeList(_, _) => {
                 if !matches!(vector_type, DataType::List(_)) {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Query is multivector but column {}({})is not multivector",
-                            column, vector_type,
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Query is multivector but column {}({})is not multivector",
+                        column, vector_type,
+                    )));
                 }
 
                 if let Some(list_array) = q.as_list_opt::<i32>() {
                     for i in 0..list_array.len() {
                         let vec = list_array.value(i);
                         if vec.len() != dim {
-                            return Err(Error::invalid_input(
-                                format!(
-                                    "query dim({}) doesn't match the column {} vector dim({})",
-                                    vec.len(),
-                                    column,
-                                    dim,
-                                ),
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input(format!(
+                                "query dim({}) doesn't match the column {} vector dim({})",
+                                vec.len(),
+                                column,
+                                dim,
+                            )));
                         }
                     }
                     list_array.values().clone()
                 } else {
                     let fsl = q.as_fixed_size_list();
                     if fsl.value_length() as usize != dim {
-                        return Err(Error::invalid_input(
-                            format!(
-                                "query dim({}) doesn't match the column {} vector dim({})",
-                                fsl.value_length(),
-                                column,
-                                dim,
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "query dim({}) doesn't match the column {} vector dim({})",
+                            fsl.value_length(),
+                            column,
+                            dim,
+                        )));
                     }
                     fsl.values().clone()
                 }
             }
             _ => {
                 if q.len() != dim {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "query dim({}) doesn't match the column {} vector dim({})",
-                            q.len(),
-                            column,
-                            dim,
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "query dim({}) doesn't match the column {} vector dim({})",
+                        q.len(),
+                        column,
+                        dim,
+                    )));
                 }
                 q.slice(0, q.len())
             }
@@ -1465,15 +1439,12 @@ impl Scanner {
                 FloatType::try_from(dt)?,
             )?,
             _ => {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} has element type {} and the query vector is {}",
-                        column,
-                        element_type,
-                        q.data_type(),
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} has element type {} and the query vector is {}",
+                    column,
+                    element_type,
+                    q.data_type(),
+                )));
             }
         };
 
@@ -1638,10 +1609,10 @@ impl Scanner {
                 self.dataset
                     .schema()
                     .field(&column.column_name)
-                    .ok_or(Error::invalid_input(
-                        format!("Column {} not found", &column.column_name),
-                        location!(),
-                    ))?;
+                    .ok_or(Error::invalid_input(format!(
+                        "Column {} not found",
+                        &column.column_name
+                    )))?;
             }
         }
         self.ordering = ordering;
@@ -1706,10 +1677,7 @@ impl Scanner {
         let field_path = lance_schema
             .resolve_case_insensitive(column_name)
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!("Field '{}' not found in schema", column_name),
-                    location!(),
-                )
+                Error::invalid_input(format!("Field '{}' not found in schema", column_name))
             })?;
 
         if field_path.len() == 1 {
@@ -1938,7 +1906,6 @@ impl Scanner {
                     .downcast_ref::<Int64Array>()
                     .ok_or(Error::invalid_input(
                         "Count plan did not return an Int64Array".to_string(),
-                        location!(),
                     ))?;
                 Ok(array.value(0) as u64)
             } else {
@@ -1957,7 +1924,6 @@ impl Scanner {
             if self.aggregate.is_none() {
                 return Err(Error::invalid_input(
                     "create_aggregate_plan called but no aggregate was set",
-                    location!(),
                 ));
             }
             // create_plan() now applies aggregate automatically when set
@@ -2098,13 +2064,10 @@ impl Scanner {
                 let coerced_inner = Self::coerce_aggregate_expr_impl(&alias.expr, schema)?;
                 Ok(coerced_inner.alias(&alias.name))
             }
-            other => Err(Error::invalid_input(
-                format!(
-                    "Expected aggregate function expression, got {:?}",
-                    other.variant_name()
-                ),
-                location!(),
-            )),
+            other => Err(Error::invalid_input(format!(
+                "Expected aggregate function expression, got {:?}",
+                other.variant_name()
+            ))),
         }
     }
 
@@ -2893,10 +2856,7 @@ impl Scanner {
             });
         }
         let Some(query) = self.nearest.as_ref() else {
-            return Err(Error::invalid_input(
-                "No nearest query".to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("No nearest query".to_string()));
         };
 
         if self.prefilter {
@@ -2962,7 +2922,6 @@ impl Scanner {
                 self.fragments_covered_by_fts_leaf(
                     match_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?,
                     accum,
                 )
@@ -2980,7 +2939,6 @@ impl Scanner {
                         .fragments_covered_by_fts_leaf(
                             mq.column.as_ref().ok_or(Error::invalid_input(
                                 "the column must be specified in the query".to_string(),
-                                location!(),
                             ))?,
                             accum,
                         )
@@ -2995,7 +2953,6 @@ impl Scanner {
                 self.fragments_covered_by_fts_leaf(
                     phrase_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?,
                     accum,
                 )
@@ -3261,7 +3218,6 @@ impl Scanner {
                 if query.should.is_empty() && must.is_none() {
                     return Err(Error::invalid_input(
                         "boolean query must have at least one should/must query".to_string(),
-                        location!(),
                     ));
                 }
 
@@ -3286,17 +3242,16 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query.column.clone().ok_or(Error::invalid_input(
             "the column must be specified in the query".to_string(),
-            location!(),
         ))?;
 
         let index_meta = self
             .dataset
             .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?
-            .ok_or(Error::invalid_input(
-                format!("No Inverted index found for column {}", column),
-                location!(),
-            ))?;
+            .ok_or(Error::invalid_input(format!(
+                "No Inverted index found for column {}",
+                column
+            )))?;
 
         let details_any =
             crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
@@ -3304,11 +3259,8 @@ impl Scanner {
             .as_ref()
             .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
-            return Err(Error::invalid_input(
-                "position is not found but required for phrase queries, try recreating the index with position"
-                    .to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
+                .to_string()));
         }
 
         Ok(Arc::new(PhraseQueryExec::new(
@@ -3331,7 +3283,6 @@ impl Scanner {
             .as_ref()
             .ok_or(Error::invalid_input(
                 "the column must be specified in the query".to_string(),
-                location!(),
             ))?
             .clone();
 
@@ -3430,7 +3381,6 @@ impl Scanner {
             .as_ref()
             .ok_or(Error::invalid_input(
                 "the column must be specified in the query".to_string(),
-                location!(),
             ))?
             .clone();
 
@@ -3550,7 +3500,6 @@ impl Scanner {
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
                     "Refine factor cannot be zero".to_string(),
-                    location!(),
                 ));
             }
             let ann_node = match vector_type {
@@ -4031,7 +3980,6 @@ impl Scanner {
                     .as_ref()
                     .ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?
                     .clone();
                 let input = if schema.column_with_name(&column).is_none() {

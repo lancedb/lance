@@ -397,7 +397,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
     if segments.len() < 2 {
         return Err(Error::invalid_input(
             "Huggingface URL must contain at least owner and repo",
-            location!(),
         ));
     }
 
@@ -406,7 +405,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
         if segments.len() < 3 {
             return Err(Error::invalid_input(
                 "Huggingface URL missing owner/repo after repo type",
-                location!(),
             ));
         }
         (segments[1].as_str(), segments[2].as_str())
@@ -496,9 +494,9 @@ impl ObjectStore {
     /// The extracted path component
     pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
         let url = uri_to_url(uri)?;
-        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
-            Error::invalid_input(format!("Unknown scheme: {}", url.scheme()), location!())
-        })?;
+        let provider = registry
+            .get_provider(url.scheme())
+            .ok_or_else(|| Error::invalid_input(format!("Unknown scheme: {}", url.scheme())))?;
         provider.extract_path(&url)
     }
 
@@ -679,9 +677,7 @@ impl ObjectStore {
                 let named_temp =
                     tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
                         .await
-                        .map_err(|e| {
-                            Error::io(format!("spawn_blocking failed: {}", e), location!())
-                        })??;
+                        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(LocalWriter::new(
@@ -911,16 +907,10 @@ impl StorageOptions {
                 let name = header_name
                     .parse::<http::header::HeaderName>()
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("invalid header name '{header_name}': {e}"),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("invalid header name '{header_name}': {e}"))
                     })?;
                 let val = HeaderValue::from_str(value).map_err(|e| {
-                    Error::invalid_input(
-                        format!("invalid header value for '{header_name}': {e}"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("invalid header value for '{header_name}': {e}"))
                 })?;
                 headers.insert(name, val);
             }

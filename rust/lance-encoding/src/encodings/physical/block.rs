@@ -76,10 +76,10 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
         match scheme {
             CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
             CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -91,10 +91,10 @@ impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
         match scheme {
             pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
             pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -120,10 +120,10 @@ impl FromStr for CompressionScheme {
             "fsst" => Ok(Self::Fsst),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
-            _ => Err(Error::invalid_input(
-                format!("Unknown compression scheme: {}", s),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unknown compression scheme: {}",
+                s
+            ))),
         }
     }
 }

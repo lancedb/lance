@@ -27,7 +27,6 @@ use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use log::{debug, error, info, warn};
 use object_store::path::Path;
-use snafu::location;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Interval};
@@ -505,7 +504,7 @@ impl DurabilityResult {
     pub fn into_result(self) -> Result<()> {
         match self {
             Self::Durable => Ok(()),
-            Self::Failed(msg) => Err(Error::io(msg, location!())),
+            Self::Failed(msg) => Err(Error::io(msg)),
         }
     }
 }
@@ -1109,19 +1108,13 @@ impl RegionWriter {
     /// `AlreadyExists`, indicating this writer has been fenced.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
         if batches.is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot write empty batch list",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot write empty batch list"));
         }
 
         // Validate no empty batches
         for (i, batch) in batches.iter().enumerate() {
             if batch.num_rows() == 0 {
-                return Err(Error::invalid_input(
-                    format!("Batch {} is empty", i),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
             }
         }
 
@@ -1511,7 +1504,7 @@ impl MemTableFlushHandler {
             completion_reader
                 .await_value()
                 .await
-                .map_err(|e| Error::io(format!("WAL flush failed: {}", e), snafu::location!()))?;
+                .map_err(|e| Error::io(format!("WAL flush failed: {}", e)))?;
         }
 
         // Step 2: Flush the memtable to Lance storage

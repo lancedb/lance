@@ -3,7 +3,6 @@
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -305,13 +304,10 @@ impl InvertedIndexParams {
                 Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
                 None => {
                     tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "removing stop words for language {:?} is not supported yet",
-                                self.language
-                            ),
-                            location!(),
-                        )
+                        Error::invalid_input(format!(
+                            "removing stop words for language {:?} is not supported yet",
+                            self.language
+                        ))
                     })?
                 }
             };
@@ -326,13 +322,10 @@ impl InvertedIndexParams {
             Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
             Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            _ => Err(Error::invalid_input(
-                format!(
-                    "unknown lance tokenizer {}",
-                    self.lance_tokenizer.as_ref().unwrap()
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "unknown lance tokenizer {}",
+                self.lance_tokenizer.as_ref().unwrap()
+            ))),
         }
     }
 
@@ -356,16 +349,16 @@ impl InvertedIndexParams {
                     self.max_ngram_length as usize,
                     self.prefix_only,
                 )
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+                .map_err(|e| Error::invalid_input(e.to_string()))?,
             )
             .dynamic()),
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
                 let Some(home) = language_model_home() else {
-                    return Err(Error::invalid_input(
-                        format!("unknown base tokenizer {}", self.base_tokenizer),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "unknown base tokenizer {}",
+                        self.base_tokenizer
+                    )));
                 };
                 lindera::LinderaBuilder::load(&home.join(s))?.build()
             }
@@ -373,17 +366,17 @@ impl InvertedIndexParams {
             s if s.starts_with("jieba/") || s == "jieba" => {
                 let s = if s == "jieba" { "jieba/default" } else { s };
                 let Some(home) = language_model_home() else {
-                    return Err(Error::invalid_input(
-                        format!("unknown base tokenizer {}", self.base_tokenizer),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "unknown base tokenizer {}",
+                        self.base_tokenizer
+                    )));
                 };
                 jieba::JiebaBuilder::load(&home.join(s))?.build()
             }
-            _ => Err(Error::invalid_input(
-                format!("unknown base tokenizer {}", self.base_tokenizer),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "unknown base tokenizer {}",
+                self.base_tokenizer
+            ))),
         }
     }
 }

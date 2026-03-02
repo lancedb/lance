@@ -178,7 +178,6 @@ pub async fn rewrite_files_binary_copy(
     if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.is_empty()) {
         return Err(Error::invalid_input(
             "binary copy requires at least one data file",
-            location!(),
         ));
     }
 

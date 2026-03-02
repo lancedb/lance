@@ -1254,7 +1254,6 @@ impl Dataset {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
                 _ => Err(Error::invalid_input(
                     "read_version must be specified for this operation",
-                    location!(),
                 )),
             },
             Ok,
@@ -1710,13 +1709,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for data_file {}",
-                            base_id, data_file.path
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for data_file {}",
+                        base_id, data_file.path
+                    ))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
@@ -1732,10 +1728,7 @@ impl Dataset {
     /// Get the ObjectStore for a specific path based on base_id
     pub(crate) async fn object_store_for_base(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
-            Error::invalid_input(
-                format!("Dataset base path with ID {} not found", base_id),
-                location!(),
-            )
+            Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
 
         let (store, _) = ObjectStore::from_uri_and_params(
@@ -1753,13 +1746,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for deletion_file {:?}",
-                            base_id, deletion_file
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for deletion_file {:?}",
+                        base_id, deletion_file
+                    ))
                 })?;
 
                 if !base_path.is_dataset_root {
@@ -1783,13 +1773,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for index {}",
-                            base_id, index.uuid
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for index {}",
+                        base_id, index.uuid
+                    ))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
@@ -2676,20 +2663,17 @@ impl Dataset {
     ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
-            return Err(Error::invalid_input(
-                format!("Column {} does not exist in the left side dataset", left_on),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side dataset",
+                left_on
+            )));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side dataset",
-                    right_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side dataset",
+                right_on
+            )));
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
@@ -2698,13 +2682,10 @@ impl Dataset {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} exists in both sides of the dataset",
-                        field.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} exists in both sides of the dataset",
+                    field.name()
+                )));
             }
         }
 

@@ -469,11 +469,10 @@ impl IvfShuffler {
         // we need to have row ID and partition ID column
         schema
             .column_with_name(ROW_ID)
-            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
-        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
-            "partition ID column not found".to_owned(),
-            location!(),
-        ))?;
+            .ok_or(Error::io("row ID column not found".to_owned()))?;
+        schema
+            .column_with_name(PART_ID_COLUMN)
+            .ok_or(Error::io("partition ID column not found".to_owned()))?;
 
         info!("Writing unsorted data to disk at {}", path);
         info!("with schema: {:?}", schema);

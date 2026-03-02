@@ -13,7 +13,6 @@ use lance_core::ROW_CREATED_AT_VERSION;
 use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
-use snafu::location;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -128,7 +127,6 @@ impl DatasetDeltaBuilder {
         {
             return Err(Error::invalid_input(
                 "Cannot combine compared_against_version with explicit begin/end versions or dates",
-                location!(),
             ));
         }
 
@@ -155,26 +153,20 @@ impl DatasetDeltaBuilder {
             (None, Some(_), None, None, None) | (None, None, Some(_), None, None) => {
                 return Err(Error::invalid_input(
                     "Must specify both with_begin_version and with_end_version",
-                    location!(),
                 ));
             }
             (None, None, None, Some(begin_ts), None) => (0, 0, Some(begin_ts), None),
             (None, None, None, None, Some(_)) => {
                 return Err(Error::invalid_input(
                     "Must specify with_begin_date when with_end_date is provided",
-                    location!(),
                 ));
             }
             (None, None, None, None, None) => {
-                return Err(Error::invalid_input(
-                    "Must specify either compared_against_version or both with_begin_version and with_end_version",
-                    location!(),
-                ));
+                return Err(Error::invalid_input("Must specify either compared_against_version or both with_begin_version and with_end_version"));
             }
             _ => {
                 return Err(Error::invalid_input(
                     "Invalid combination of parameters for DatasetDeltaBuilder",
-                    location!(),
                 ));
             }
         };

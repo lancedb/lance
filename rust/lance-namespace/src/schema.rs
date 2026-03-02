@@ -9,7 +9,6 @@
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_namespace_reqwest_client::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
-use snafu::location;
 
 /// Convert Arrow Schema to JsonArrowSchema
 pub fn arrow_schema_to_json(arrow_schema: &ArrowSchema) -> Result<JsonArrowSchema> {
@@ -183,14 +182,10 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
 
         DataType::Map(entries_field, keys_sorted) => {
             if *keys_sorted {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Map types with keys_sorted=true are not yet supported for JSON conversion: {:?}",
-                        data_type
-                    )
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::namespace(format!(
+                    "Map types with keys_sorted=true are not yet supported for JSON conversion: {:?}",
+                    data_type
+                )));
             }
             let inner_type = arrow_type_to_json(entries_field.data_type())?;
             let inner_field = JsonArrowField {
@@ -211,30 +206,18 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         }
 
         // Unsupported types
-        DataType::RunEndEncoded(_, _) => Err(Error::Namespace {
-            source: format!(
-                "RunEndEncoded type is not yet supported for JSON conversion: {:?}",
-                data_type
-            )
-            .into(),
-            location: location!(),
-        }),
-        DataType::ListView(_) | DataType::LargeListView(_) => Err(Error::Namespace {
-            source: format!(
-                "ListView types are not yet supported for JSON conversion: {:?}",
-                data_type
-            )
-            .into(),
-            location: location!(),
-        }),
-        DataType::Utf8View | DataType::BinaryView => Err(Error::Namespace {
-            source: format!(
-                "View types are not yet supported for JSON conversion: {:?}",
-                data_type
-            )
-            .into(),
-            location: location!(),
-        }),
+        DataType::RunEndEncoded(_, _) => Err(Error::namespace(format!(
+            "RunEndEncoded type is not yet supported for JSON conversion: {:?}",
+            data_type
+        ))),
+        DataType::ListView(_) | DataType::LargeListView(_) => Err(Error::namespace(format!(
+            "ListView types are not yet supported for JSON conversion: {:?}",
+            data_type
+        ))),
+        DataType::Utf8View | DataType::BinaryView => Err(Error::namespace(format!(
+            "View types are not yet supported for JSON conversion: {:?}",
+            data_type
+        ))),
     }
 }
 
@@ -282,10 +265,10 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
         "float64" => Ok(DataType::Float64),
         "utf8" => Ok(DataType::Utf8),
         "binary" => Ok(DataType::Binary),
-        _ => Err(Error::Namespace {
-            source: format!("Unsupported Arrow type: {}", type_name).into(),
-            location: location!(),
-        }),
+        _ => Err(Error::namespace(format!(
+            "Unsupported Arrow type: {}",
+            type_name
+        ))),
     }
 }
 

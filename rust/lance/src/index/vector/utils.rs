@@ -154,10 +154,15 @@ pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize>
 }
 
 fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) -> Result<usize> {
-    match (data_type,in_list) {
-        (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
-        (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
-        _ => Err(Error::invalid_input(format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type), location!()))
+    match (data_type, in_list) {
+        (arrow::datatypes::DataType::FixedSizeList(_, dim), _) => Ok(*dim as usize),
+        (arrow::datatypes::DataType::List(inner), false) => {
+            infer_vector_dim_impl(inner.data_type(), true)
+        }
+        _ => Err(Error::invalid_input(format!(
+            "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+            data_type
+        ))),
     }
 }
 
@@ -208,13 +213,10 @@ pub fn validate_distance_type_for(
     if supported {
         Ok(())
     } else {
-        Err(Error::invalid_input(
-            format!(
-                "Distance type {} does not support {} vectors",
-                distance_type, element_type
-            ),
-            location!(),
-        ))
+        Err(Error::invalid_input(format!(
+            "Distance type {} does not support {} vectors",
+            distance_type, element_type
+        )))
     }
 }
 
@@ -252,13 +254,10 @@ fn infer_vector_element_type_impl(
         (arrow::datatypes::DataType::List(inner), false) => {
             infer_vector_element_type_impl(inner.data_type(), true)
         }
-        _ => Err(Error::invalid_input(
-            format!(
+        _ => Err(Error::invalid_input(format!(
             "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
             data_type
-        ),
-            location!(),
-        )),
+        ))),
     }
 }
 

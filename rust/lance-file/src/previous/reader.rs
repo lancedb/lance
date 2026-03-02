@@ -469,7 +469,7 @@ pub async fn read_batch(
         let arrs = arrs.await?;
         Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     } else {
-        Err(Error::invalid_input("no fields requested", location!()))
+        Err(Error::invalid_input("no fields requested"))
     }
 }
 
@@ -516,13 +516,10 @@ fn get_page_info<'a>(
     batch_id: i32,
 ) -> Result<&'a PageInfo> {
     page_table.get(field.id, batch_id).ok_or_else(|| {
-        Error::invalid_input(
-            format!(
-                "No page info found for field: {}, field_id={} batch={}",
-                field.name, field.id, batch_id
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "No page info found for field: {}, field_id={} batch={}",
+            field.name, field.id, batch_id
+        ))
     })
 }
 
@@ -560,13 +557,10 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length as u64 {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "NullArray Reader: request([{}]) out of range: [0..{}]",
-                            idx_max, page_info.length
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "NullArray Reader: request([{}]) out of range: [0..{}]",
+                        idx_max, page_info.length
+                    )));
                 }
                 indices.len()
             }
@@ -580,16 +574,13 @@ fn read_null_array(
                 _ => unreachable!(),
             };
             if idx_end > page_info.length {
-                return Err(Error::invalid_input(
-                    format!(
-                        "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
-                        // and wrap it in here.
-                        idx_start,
-                        idx_end,
-                        page_info.length
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
+                    // and wrap it in here.
+                    idx_start,
+                    idx_end,
+                    page_info.length
+                )));
             }
             idx_end - idx_start
         }
