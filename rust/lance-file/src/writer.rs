@@ -245,21 +245,20 @@ impl FileWriter {
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: Box<dyn Writer>, options: FileWriterOptions) -> Self {
-        if let Some(format_version) = options.format_version {
-            if format_version.is_unstable()
-                && WARNED_ON_UNSTABLE_API
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
-                warn!(
-                    "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
-                );
-            }
+        if let Some(format_version) = options.format_version
+            && format_version.is_unstable()
+            && WARNED_ON_UNSTABLE_API
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
+            );
         }
         Self {
             writer: object_writer,

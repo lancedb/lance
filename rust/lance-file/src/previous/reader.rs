@@ -367,12 +367,12 @@ impl FileReader {
         self.metadata.stats_metadata.as_ref().map(|meta| {
             let mut stats_field_ids = vec![];
             for stats_field in &meta.schema.fields {
-                if let Ok(stats_field_id) = stats_field.name.parse::<i32>() {
-                    if field_ids.contains(&stats_field_id) {
-                        stats_field_ids.push(stats_field.id);
-                        for child in &stats_field.children {
-                            stats_field_ids.push(child.id);
-                        }
+                if let Ok(stats_field_id) = stats_field.name.parse::<i32>()
+                    && field_ids.contains(&stats_field_id)
+                {
+                    stats_field_ids.push(stats_field.id);
+                    for child in &stats_field.children {
+                        stats_field_ids.push(child.id);
                     }
                 }
             }
