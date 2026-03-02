@@ -4,16 +4,16 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::namespace::{
-    create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+    BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
 };
 use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
+use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
     get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
-use crate::{traits::IntoJava, RT};
+use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
@@ -27,10 +27,10 @@ use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
-use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
+use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
@@ -45,16 +45,16 @@ use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::btree::BTreeParameters;
 use lance_index::DatasetIndexExt;
 use lance_index::IndexCriteria as RustIndexCriteria;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
 use lance_namespace::LanceNamespace;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;

@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use jni::JNIEnv;
 use jni::objects::JObject;
 use jni::sys::jlong;
-use jni::JNIEnv;
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 use lance_io::object_store::ObjectStoreRegistry;

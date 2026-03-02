@@ -3,17 +3,17 @@
 
 use std::sync::Arc;
 
+use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::RT;
 
 use arrow::array::{FixedSizeListArray, Float32Array};
+use jni::JNIEnv;
 use jni::objects::{JClass, JFloatArray, JObject, JString};
 use jni::sys::jfloatArray;
-use jni::JNIEnv;
-use lance::index::vector::utils::get_vector_dim;
 use lance::index::NoopIndexBuildProgress;
+use lance::index::vector::utils::get_vector_dim;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
 use lance_linalg::distance::MetricType;

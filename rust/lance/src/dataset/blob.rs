@@ -9,7 +9,7 @@ use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_schema::DataType as ArrowDataType;
-use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use object_store::path::Path;
 use snafu::location;
@@ -979,17 +979,17 @@ mod tests {
     use arrow_array::{RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
-    use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+    use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, DataTypeExt};
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
 
     use lance_core::{
-        utils::tempfile::{TempDir, TempStrDir},
         Error, Result,
+        utils::tempfile::{TempDir, TempStrDir},
     };
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::version::LanceFileVersion;
 
     use super::data_file_key_from_path;
@@ -1094,10 +1094,12 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(dataset
-            .fragments()
-            .iter()
-            .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1))));
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1)))
+        );
 
         MultiBaseBlobFixture {
             _test_dir: test_dir,

@@ -6,9 +6,9 @@ use crate::error::Result;
 use crate::traits::{FromJString, IntoJava};
 use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
-use jni::JNIEnv;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,

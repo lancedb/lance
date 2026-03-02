@@ -4,7 +4,7 @@
 use std::str::Utf8Error;
 
 use arrow_schema::ArrowError;
-use jni::{errors::Error as JniError, JNIEnv};
+use jni::{JNIEnv, errors::Error as JniError};
 use lance::Error as LanceError;
 use lance_namespace::error::NamespaceError;
 use serde_json::Error as JsonError;

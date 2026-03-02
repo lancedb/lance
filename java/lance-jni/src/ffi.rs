@@ -3,12 +3,12 @@
 
 use core::slice;
 
+use crate::Error;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
-use crate::Error;
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
 use lance_index::scalar::inverted::query::{Occur, Operator};
 
 /// Extend JNIEnv with helper functions.

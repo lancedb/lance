@@ -5,20 +5,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{
     array::{RecordBatch, StructArray},
-    ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type},
 };
 use arrow_schema::DataType;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::jlong,
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_file::{

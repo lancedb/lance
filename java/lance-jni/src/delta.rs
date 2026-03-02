@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::ffi::JNIEnvExt;
 use crate::transaction::convert_to_java_transaction;
-use crate::RT;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::jlong;
-use jni::JNIEnv;
 use lance::dataset::delta::DatasetDelta as RustDatasetDelta;
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance::dataset::transaction::Transaction;

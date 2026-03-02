@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
+use jni::objects::{JMap, JObject, JString};
 use lance_io::object_store::StorageOptionsProvider;
 
 use crate::error::Result;

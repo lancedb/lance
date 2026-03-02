@@ -6,20 +6,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use jni::JNIEnv;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
-use jni::JNIEnv;
-use lance_namespace::models::*;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace::models::*;
 use lance_namespace_impls::{
     ConnectBuilder, DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo, RestAdapter,
     RestAdapterConfig, RestNamespaceBuilder,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::RT;
 use crate::error::{Error, Result};
 use crate::utils::to_rust_map;
-use crate::RT;
 
 /// Java-implemented dynamic context provider.
 ///

@@ -10,22 +10,22 @@ use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE};
-use jni::{sys::jlong, JNIEnv};
+use jni::sys::{JNI_TRUE, jboolean, jint};
+use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
     PhraseQuery as FtsPhraseQuery,
 };
-use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
-    RT,
 };
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";

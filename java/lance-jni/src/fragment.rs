@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
-use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
 use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::{jint, jlong},
-    JNIEnv,
 };
 use lance::datatypes::Schema;
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
@@ -21,12 +21,12 @@ use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance};
+use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
-    RT,
 };
 
 #[derive(Debug, Clone)]
@@ -307,7 +307,7 @@ fn inner_delete_rows<'local>(
             return Err(Error::runtime_error(format!(
                 "Cannot delete rows in fragment {}: {:?}",
                 fragment_id, e
-            )))
+            )));
         }
     };
 
@@ -360,7 +360,7 @@ fn inner_merge_column<'local>(
         None => {
             return Err(Error::input_error(format!(
                 "Fragment not found: {fragment_id}"
-            )))
+            )));
         }
     };
 
@@ -420,7 +420,7 @@ fn inner_update_column<'local>(
         None => {
             return Err(Error::input_error(format!(
                 "Fragment not found: {fragment_id}"
-            )))
+            )));
         }
     };
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -444,7 +444,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResult";

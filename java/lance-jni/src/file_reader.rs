@@ -7,17 +7,17 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::{jint, jlong},
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
@@ -27,9 +27,9 @@ use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
+    ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
-    ReadBatchParams,
 };
 use object_store::path::Path;
 
