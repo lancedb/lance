@@ -41,7 +41,7 @@ fn main() -> Result<(), String> {
         // Build version with NEON
         // A13 bionic is the earliest supported iOS SOC
         build_f16_with_flags("neon", &["-mtune=apple-a13"]).unwrap();
-    } else if target_arch == "aarch64" && target_os == "linux" {
+    } else if target_arch == "aarch64" && (target_os == "linux" || target_os == "android") {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
     } else if target_arch == "x86_64" {
