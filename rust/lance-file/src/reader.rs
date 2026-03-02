@@ -420,7 +420,7 @@ impl FileReader {
     }
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
-        let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len()), location!()))?;
+        let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len())))?;
         self.scheduler
             .submit_single(
                 buffer_desc.position..buffer_desc.position + buffer_desc.size,
@@ -445,13 +445,10 @@ impl FileReader {
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
-            return Err(Error::invalid_input(
-                format!(
-                    "does not have sufficient data, len: {}, bytes: {:?}",
-                    len, footer_bytes
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "does not have sufficient data, len: {}, bytes: {:?}",
+                len, footer_bytes
+            )));
         }
         let mut cursor = Cursor::new(footer_bytes.slice(len - FOOTER_LEN..));
 
@@ -474,13 +471,10 @@ impl FileReader {
 
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
-            return Err(Error::invalid_input(
-                format!(
-                    "file does not appear to be a Lance file (invalid magic: {:?})",
-                    MAGIC
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "file does not appear to be a Lance file (invalid magic: {:?})",
+                MAGIC
+            )));
         }
         Ok(Footer {
             column_meta_start,
@@ -752,22 +746,18 @@ impl FileReader {
             return Err(Error::invalid_input(
                 "Attempt to read zero columns from the file, at least one column must be specified"
                     .to_string(),
-                location!(),
             ));
         }
         let mut column_indices_seen = BTreeSet::new();
         for column_index in &projection.column_indices {
             if !column_indices_seen.insert(*column_index) {
-                return Err(Error::invalid_input(
-                    format!(
-                        "The projection specified the column index {} more than once",
-                        column_index
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "The projection specified the column index {} more than once",
+                    column_index
+                )));
             }
             if *column_index >= metadata.column_infos.len() as u32 {
-                return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len()), location!()));
+                return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len())));
             }
         }
         Ok(())
@@ -1068,13 +1058,10 @@ impl FileReader {
         Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
-                Err(Error::invalid_input(
-                    format!(
-                        "cannot read {:?} from file with {} rows",
-                        params, self.num_rows
-                    ),
-                    location!(),
-                ))
+                Err(Error::invalid_input(format!(
+                    "cannot read {:?} from file with {} rows",
+                    params, self.num_rows
+                )))
             } else {
                 Ok(())
             }
@@ -1084,10 +1071,7 @@ impl FileReader {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input(
-                                "Null value in indices array",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Null value in indices array"));
                         }
                         Some(idx) => {
                             verify_bound(&params, idx as u64, true)?;
@@ -1311,13 +1295,10 @@ impl FileReader {
         Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
-                Err(Error::invalid_input(
-                    format!(
-                        "cannot read {:?} from file with {} rows",
-                        params, self.num_rows
-                    ),
-                    location!(),
-                ))
+                Err(Error::invalid_input(format!(
+                    "cannot read {:?} from file with {} rows",
+                    params, self.num_rows
+                )))
             } else {
                 Ok(())
             }
@@ -1327,10 +1308,7 @@ impl FileReader {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input(
-                                "Null value in indices array",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Null value in indices array"));
                         }
                         Some(idx) => {
                             verify_bound(&params, idx as u64, true)?;

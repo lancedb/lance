@@ -99,14 +99,11 @@ pub async fn read_manifest(
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::invalid_input(
-            format!(
-                "Invalid format: manifest length does not match. Expected {}, got {}",
-                recorded_length,
-                buf.len()
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Invalid format: manifest length does not match. Expected {}, got {}",
+            recorded_length,
+            buf.len()
+        )));
     }
 
     let proto = pb::Manifest::decode(buf)?;
@@ -180,20 +177,14 @@ pub async fn write_manifest(
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() && is_legacy_storage {
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                    Error::io(
-                        format!("Lance field {} misses dictionary info", field.name),
-                        location!(),
-                    )
+                    Error::io(format!("Lance field {} misses dictionary info", field.name))
                 })?;
 
                 let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                    Error::io(
-                        format!(
+                    Error::io(format!(
                         "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
-                    ),
-                        location!(),
-                    )
+                    ))
                 })?;
 
                 let data_type = value_arr.data_type();
@@ -207,13 +198,10 @@ pub async fn write_manifest(
                         encoder.encode(&[value_arr]).await?
                     }
                     _ => {
-                        return Err(Error::schema(
-                            format!(
-                                "Does not support {} as dictionary value type",
-                                value_arr.data_type()
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::schema(format!(
+                            "Does not support {} as dictionary value type",
+                            value_arr.data_type()
+                        )));
                     }
                 };
                 dict_info.offset = pos;

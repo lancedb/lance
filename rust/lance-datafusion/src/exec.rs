@@ -48,7 +48,6 @@ use lance_core::{
     Error, Result,
 };
 use log::{debug, info, warn};
-use snafu::location;
 use tracing::Span;
 
 use crate::udf::register_functions;
@@ -635,12 +634,7 @@ pub async fn analyze_plan(
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, get_task_context(&session_ctx, &options))
-        .map_err(|err| {
-            Error::io(
-                format!("Failed to execute analyze plan: {}", err),
-                location!(),
-            )
-        })?;
+        .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
     while (stream.next().await).is_some() {}

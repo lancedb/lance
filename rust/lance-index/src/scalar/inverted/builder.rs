@@ -1318,7 +1318,6 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
-    use snafu::location;
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
@@ -1399,28 +1398,24 @@ mod tests {
         async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn IndexReader>> {
             Err(Error::not_supported(
                 "CountingStore does not support reading",
-                location!(),
             ))
         }
 
         async fn copy_index_file(&self, _name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support copying",
-                location!(),
             ))
         }
 
         async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support renaming",
-                location!(),
             ))
         }
 
         async fn delete_index_file(&self, _name: &str) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support deleting",
-                location!(),
             ))
         }
     }

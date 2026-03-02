@@ -1504,7 +1504,6 @@ impl ScalarIndex for BTreeIndex {
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
             SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
                 "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
             )),
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };

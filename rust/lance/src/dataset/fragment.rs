@@ -724,14 +724,11 @@ impl FileFragment {
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
         if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
-            return Err(Error::invalid_input(
-                format!(
-                    "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
-                    dataset.manifest.data_storage_format.lance_file_version()?,
-                    file_version
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
+                dataset.manifest.data_storage_format.lance_file_version()?,
+                file_version
+            )));
         }
 
         if file_version == LanceFileVersion::Legacy {
@@ -1541,23 +1538,17 @@ impl FileFragment {
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the left side fragment",
-                    left_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side fragment",
+                left_on
+            )));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side fragment",
-                    right_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side fragment",
+                right_on
+            )));
         };
 
         for field in right_schema.fields() {
@@ -1567,13 +1558,10 @@ impl FileFragment {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} exists in left side fragment and right side dataset",
-                        field.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} exists in left side fragment and right side dataset",
+                    field.name()
+                )));
             }
         }
         // Hash join
@@ -1614,44 +1602,32 @@ impl FileFragment {
         right_on: &str,
     ) -> Result<(Fragment, Vec<u32>)> {
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the left side fragment",
-                    left_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side fragment",
+                left_on
+            )));
         };
         let right_stream = Box::new(right_stream);
         let right_schema = right_stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side fragment",
-                    right_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side fragment",
+                right_on
+            )));
         };
         let write_schema = right_schema.as_ref().without_column(right_on);
         for field in write_schema.fields() {
             if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} is a reversed metadata column and cannot be updated",
-                        field.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} is a reversed metadata column and cannot be updated",
+                    field.name()
+                )));
             }
             if self.schema().field(field.name()).is_none() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} in right side fragment does not exist in left side fragment",
-                        field.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} in right side fragment does not exist in left side fragment",
+                    field.name()
+                )));
             }
         }
 
@@ -2003,7 +1979,6 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(Error::invalid_input(
             "Cannot merge empty batches".to_string(),
-            location!(),
         ));
     }
 
@@ -2031,16 +2006,12 @@ impl FragmentReader {
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
-                        return Err(Error::invalid_input(
-                                "Cannot create FragmentReader from data files with different number of batches"
-                                    .to_string(),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input("Cannot create FragmentReader from data files with different number of batches"
+                            .to_string()));
                     }
                 } else {
                     return Err(Error::invalid_input(
                         "Cannot mix legacy and non-legacy readers".to_string(),
-                        location!(),
                     ));
                 }
             }
@@ -2332,13 +2303,10 @@ impl FragmentReader {
         // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
         // sure it is valid to read / take 0..100
         if !params.valid_given_len(total_num_rows as usize) {
-            return Err(Error::invalid_input(
-                format!(
-                    "Invalid read params {} for fragment with {} addressable rows",
-                    params, total_num_rows
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Invalid read params {} for fragment with {} addressable rows",
+                params, total_num_rows
+            )));
         }
         // If just the row id or address there is no need to actually read any data
         // and we don't need to involve the readers at all.

@@ -4,17 +4,16 @@
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
-use snafu::location;
 use std::sync::Arc;
 use url::Url;
 
 fn path_to_parent(path: &Path) -> Result<(Path, String)> {
     let mut parts = path.parts().collect::<Vec<_>>();
     if parts.is_empty() {
-        return Err(Error::invalid_input(
-            format!("Path {} is not a valid path to a file", path),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Path {} is not a valid path to a file",
+            path
+        )));
     }
     let filename = parts.pop().unwrap().as_ref().to_owned();
     Ok((Path::from_iter(parts), filename))

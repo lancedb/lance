@@ -166,7 +166,6 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         // Complex operators not supported in filters
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",
-            location!(),
         )),
         // Pass through operators, nested children may have field references
         RexType::ScalarFunction(ref mut func) => {
@@ -235,19 +234,17 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                         reference_segment::ReferenceType::ListElement(_)
                         | reference_segment::ReferenceType::MapKey(_) => Err(Error::invalid_input(
                             "map/list nested references not supported in pushdown filters",
-                            location!(),
                         )),
                         reference_segment::ReferenceType::StructField(field) => {
                             if field.child.is_some() {
                                 Err(Error::invalid_input(
                                     "nested references in pushdown filters not yet supported",
-                                    location!(),
                                 ))
                             } else {
                                 if let Some(new_index) = mapping.get(&(field.field as usize)) {
                                     field.field = *new_index as i32;
                                 } else {
-                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion", location!()));
+                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion"));
                                 }
                                 Ok(())
                             }
@@ -256,7 +253,6 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                 }
                 ReferenceType::MaskedReference(_) => Err(Error::invalid_input(
                     "masked references not yet supported in filter expressions",
-                    location!(),
                 )),
             }
         }
@@ -345,14 +341,12 @@ pub async fn parse_substrait(
     if expr_container.exprs.is_empty() {
         return Err(Error::invalid_input(
             "Substrait expression did not contain any expressions",
-            location!(),
         ));
     }
 
     if expr_container.exprs.len() > 1 {
         return Err(Error::invalid_input(
             "Substrait expression contained multiple expressions",
-            location!(),
         ));
     }
 
@@ -394,10 +388,7 @@ pub async fn parse_substrait_aggregate(
 
 fn extract_aggregate_from_plan(plan: &Plan) -> Result<(Box<AggregateRel>, Vec<String>)> {
     if plan.relations.is_empty() {
-        return Err(Error::invalid_input(
-            "Substrait Plan has no relations",
-            location!(),
-        ));
+        return Err(Error::invalid_input("Substrait Plan has no relations"));
     }
 
     let plan_rel = &plan.relations[0];
@@ -411,21 +402,15 @@ fn extract_aggregate_from_plan(plan: &Plan) -> Result<(Box<AggregateRel>, Vec<St
         None => (None, vec![]),
     };
 
-    let rel = rel.ok_or_else(|| Error::invalid_input("Plan relation has no input", location!()))?;
+    let rel = rel.ok_or_else(|| Error::invalid_input("Plan relation has no input"))?;
 
     match &rel.rel_type {
         Some(RelType::Aggregate(agg)) => Ok((agg.clone(), output_names)),
-        Some(other) => Err(Error::invalid_input(
-            format!(
-                "Expected Substrait AggregateRel, got {:?}",
-                std::mem::discriminant(other)
-            ),
-            location!(),
-        )),
-        None => Err(Error::invalid_input(
-            "Substrait Rel has no rel_type",
-            location!(),
-        )),
+        Some(other) => Err(Error::invalid_input(format!(
+            "Expected Substrait AggregateRel, got {:?}",
+            std::mem::discriminant(other)
+        ))),
+        None => Err(Error::invalid_input("Substrait Rel has no rel_type")),
     }
 }
 
@@ -467,23 +452,17 @@ async fn parse_groupings(
             for expr_ref in &grouping.expression_references {
                 let idx = *expr_ref as usize;
                 if idx >= agg_rel.grouping_expressions.len() {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Grouping expression reference {} out of bounds (max: {})",
-                            idx,
-                            agg_rel.grouping_expressions.len()
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Grouping expression reference {} out of bounds (max: {})",
+                        idx,
+                        agg_rel.grouping_expressions.len()
+                    )));
                 }
                 let expr = &agg_rel.grouping_expressions[idx];
                 let df_expr = from_substrait_rex(consumer, expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse grouping expression: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse grouping expression: {}", e))
                     })?;
                 group_exprs.push(df_expr);
             }
@@ -496,10 +475,7 @@ async fn parse_groupings(
                 let df_expr = from_substrait_rex(consumer, expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse grouping expression: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse grouping expression: {}", e))
                     })?;
                 group_exprs.push(df_expr);
             }
@@ -523,10 +499,7 @@ async fn parse_measures(
                 let df_filter = from_substrait_rex(consumer, filter_expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse measure filter: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse measure filter: {}", e))
                     })?;
                 Some(Box::new(df_filter))
             } else {
@@ -537,10 +510,7 @@ async fn parse_measures(
             let order_by = from_substrait_sorts(consumer, &agg_func.sorts, schema)
                 .await
                 .map_err(|e| {
-                    Error::invalid_input(
-                        format!("Failed to parse aggregate sorts: {}", e),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("Failed to parse aggregate sorts: {}", e))
                 })?;
 
             // Check for DISTINCT invocation
@@ -554,10 +524,7 @@ async fn parse_measures(
                 from_substrait_agg_func(consumer, agg_func, schema, filter, order_by, distinct)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse aggregate function: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse aggregate function: {}", e))
                     })?;
 
             aggregates.push(df_expr.as_ref().clone());

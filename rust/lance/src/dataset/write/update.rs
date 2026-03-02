@@ -84,14 +84,13 @@ impl UpdateBuilder {
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
-        self.condition = Some(planner.optimize_expr(expr).map_err(box_error).context(
-            InvalidInputSnafu {
-                location: location!(),
-            },
-        )?);
+            .context(InvalidInputSnafu {})?;
+        self.condition = Some(
+            planner
+                .optimize_expr(expr)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?,
+        );
         Ok(self)
     }
 
@@ -101,14 +100,11 @@ impl UpdateBuilder {
             .schema()
             .field(column.as_ref())
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Column '{}' does not exist in dataset schema: {:?}",
-                        column.as_ref(),
-                        self.dataset.schema()
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Column '{}' does not exist in dataset schema: {:?}",
+                    column.as_ref(),
+                    self.dataset.schema()
+                ))
             })?;
 
         // TODO: support nested column references. This is mostly blocked on the
@@ -129,9 +125,7 @@ impl UpdateBuilder {
         let mut expr = planner
             .parse_expr(value)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
 
         // Cast expression to the column's data type if necessary.
         let dest_type = field.data_type();
@@ -139,9 +133,7 @@ impl UpdateBuilder {
         let src_type = expr
             .get_type(&df_schema)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
@@ -163,9 +155,7 @@ impl UpdateBuilder {
                 _ => expr
                     .cast_to(&dest_type, &df_schema)
                     .map_err(box_error)
-                    .context(InvalidInputSnafu {
-                        location: location!(),
-                    })?,
+                    .context(InvalidInputSnafu {})?,
             };
         }
 
@@ -175,9 +165,7 @@ impl UpdateBuilder {
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
 
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
@@ -213,7 +201,7 @@ impl UpdateBuilder {
         }
 
         if updates.is_empty() {
-            return Err(Error::invalid_input("No updates provided", location!()));
+            return Err(Error::invalid_input("No updates provided"));
         }
 
         let updates = Arc::new(updates);

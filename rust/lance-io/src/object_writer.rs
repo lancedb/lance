@@ -22,7 +22,6 @@ use tracing::Instrument;
 
 use crate::traits::Writer;
 use crate::utils::tracking_store::IOTracker;
-use snafu::location;
 use tokio::runtime::Handle;
 
 /// Start at 5MB.
@@ -487,10 +486,10 @@ impl Writer for ObjectWriter {
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
         AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(
-                format!("failed to shutdown object writer for {}: {}", self.path, e),
-                location!(),
-            )
+            Error::io(format!(
+                "failed to shutdown object writer for {}: {}",
+                self.path, e
+            ))
         })?;
         if let UploadState::Done(result) = &self.state {
             Ok(result.clone())
@@ -562,38 +561,32 @@ impl Writer for LocalWriter {
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
         AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(
-                format!("failed to shutdown local writer for {}: {}", self.path, e),
-                location!(),
-            )
+            Error::io(format!(
+                "failed to shutdown local writer for {}: {}",
+                self.path, e
+            ))
         })?;
 
         let final_path = crate::local::to_local_path(&self.path);
         let temp_path = self.temp_path.take().ok_or_else(|| {
-            Error::io(
-                format!("local writer for {} already shut down", self.path),
-                location!(),
-            )
+            Error::io(format!("local writer for {} already shut down", self.path))
         })?;
         let path_clone = self.path.clone();
         let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
             temp_path.persist(&final_path).map_err(|e| {
-                Error::io(
-                    format!("failed to persist temp file to {}: {}", final_path, e.error),
-                    location!(),
-                )
+                Error::io(format!(
+                    "failed to persist temp file to {}: {}",
+                    final_path, e.error
+                ))
             })?;
 
             let metadata = std::fs::metadata(&final_path).map_err(|e| {
-                Error::io(
-                    format!("failed to read metadata for {}: {}", path_clone, e),
-                    location!(),
-                )
+                Error::io(format!("failed to read metadata for {}: {}", path_clone, e))
             })?;
             Ok(get_etag(&metadata))
         })
         .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e), location!()))??;
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
 
         self.io_tracker
             .record_write("put", self.path.clone(), self.cursor as u64);

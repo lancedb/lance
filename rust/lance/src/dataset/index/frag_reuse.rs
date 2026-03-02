@@ -11,7 +11,6 @@ use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
-use snafu::location;
 
 /// Cleanup a fragment reuse index based on the current condition of the indices.
 /// If all the indices currently available are already caught up to as a specific reuse version,
@@ -126,10 +125,8 @@ fn is_index_remap_caught_up(
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    group.old_frags),
-                            location!()));
+                        return Err(Error::invalid_input(format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                group.old_frags)));
                     }
                     return Ok(false);
                 }

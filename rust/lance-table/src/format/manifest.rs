@@ -366,13 +366,10 @@ impl Manifest {
             field.metadata = new_metadata;
             Ok(())
         } else {
-            Err(Error::invalid_input(
-                format!(
-                    "Field with id {} does not exist for replace_field_metadata",
-                    field_id
-                ),
-                location!(),
-            ))
+            Err(Error::invalid_input(format!(
+                "Field with id {} does not exist for replace_field_metadata",
+                field_id
+            )))
         }
     }
 
@@ -441,13 +438,10 @@ impl Manifest {
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::invalid_input(
-                format!(
-                    "fragments_since: given version {} is newer than manifest version {}",
-                    since.version, self.version
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "fragments_since: given version {} is newer than manifest version {}",
+                since.version, self.version
+            )));
         }
         let start = since.max_fragment_id();
         Ok(self

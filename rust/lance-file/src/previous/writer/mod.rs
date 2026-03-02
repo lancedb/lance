@@ -142,7 +142,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name)));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -201,10 +201,10 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 .iter()
                 .map(|batch| {
                     batch.column_by_name(&field.name).ok_or_else(|| {
-                        Error::invalid_input(
-                            format!("FileWriter::write: Field '{}' not found", field.name),
-                            location!(),
-                        )
+                        Error::invalid_input(format!(
+                            "FileWriter::write: Field '{}' not found",
+                            field.name
+                        ))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -629,20 +629,14 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             if let Some(field) = schema.mut_field_by_id(field_id) {
                 if field.data_type().is_dictionary() {
                     let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                        Error::io(
-                            format!("Lance field {} misses dictionary info", field.name),
-                            // and wrap it in here.
-                            location!(),
-                        )
+                        // and wrap it in here.
+                        Error::io(format!("Lance field {} misses dictionary info", field.name))
                     })?;
 
                     let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name),
-                            location!(),
-                        )
+                        Error::invalid_input(format!(
+                                                "Lance field {} is dictionary type, but misses the dictionary value array",
+                                                field.name))
                     })?;
 
                     let data_type = value_arr.data_type();
@@ -656,13 +650,10 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            return Err(Error::schema(
-                                format!(
-                                    "Does not support {} as dictionary value type",
-                                    value_arr.data_type()
-                                ),
-                                location!(),
-                            ));
+                            return Err(Error::schema(format!(
+                                "Does not support {} as dictionary value type",
+                                value_arr.data_type()
+                            )));
                         }
                     };
                     dict_info.offset = pos;

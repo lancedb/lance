@@ -15,7 +15,6 @@ use ndarray::{s, Axis, ShapeBuilder};
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
 use rayon::prelude::*;
-use snafu::location;
 
 use crate::vector::bq::storage::{
     RabitQuantizationMetadata, RabitQuantizationStorage, RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
@@ -200,14 +199,11 @@ impl RabitQuantizer {
     {
         let dim = self.dim();
         if residual_vectors.value_length() as usize != dim {
-            return Err(Error::invalid_input(
-                format!(
-                    "Vector dimension mismatch: {} != {}",
-                    residual_vectors.value_length(),
-                    dim
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Vector dimension mismatch: {} != {}",
+                residual_vectors.value_length(),
+                dim
+            )));
         }
 
         let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
@@ -223,7 +219,7 @@ impl RabitQuantizer {
                 // convert the vector to a dxN matrix
                 let vec_mat =
                     ndarray::ArrayView2::from_shape((residual_vectors.len(), dim), values)
-                        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                        .map_err(|e| Error::invalid_input(e.to_string()))?;
                 let vec_mat = vec_mat.t();
                 let rotated_vectors = self.rotate_vectors::<T>(vec_mat);
                 let norm_dists = rotated_vectors.mapv(f32::abs).sum_axis(Axis(0)) / sqrt_dim;
@@ -273,7 +269,7 @@ impl RabitQuantizer {
         match self.rotation_type() {
             RQRotationType::Matrix => {
                 let vectors = ndarray::ArrayView2::from_shape((n, dim), values)
-                    .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+                    .map_err(|e| Error::invalid_input(e.to_string()))?;
                 let vectors = vectors.t();
                 let rotated_vectors = self.rotate_vectors::<T>(vectors);
 
@@ -325,7 +321,6 @@ impl Quantization for RabitQuantizer {
         if !dim.is_multiple_of(u8::BITS as usize) {
             return Err(Error::invalid_input(
                 "vector dimension must be divisible by 8 for IVF_RQ",
-                location!(),
             ));
         }
 
@@ -346,10 +341,10 @@ impl Quantization for RabitQuantizer {
                 params.rotation_type,
             ),
             dt => {
-                return Err(Error::invalid_input(
-                    format!("Unsupported data type: {:?}", dt),
-                    location!(),
-                ))
+                return Err(Error::invalid_input(format!(
+                    "Unsupported data type: {:?}",
+                    dt
+                )))
             }
         };
         Ok(q)
@@ -385,10 +380,10 @@ impl Quantization for RabitQuantizer {
             DataType::Float16 => self.transform::<Float16Type>(vectors),
             DataType::Float32 => self.transform::<Float32Type>(vectors),
             DataType::Float64 => self.transform::<Float64Type>(vectors),
-            value_type => Err(Error::invalid_input(
-                format!("Unsupported data type: {:?}", value_type),
-                location!(),
-            )),
+            value_type => Err(Error::invalid_input(format!(
+                "Unsupported data type: {:?}",
+                value_type
+            ))),
         }
     }
 
@@ -442,7 +437,6 @@ impl TryFrom<Quantizer> for RabitQuantizer {
             Quantizer::Rabit(quantizer) => Ok(quantizer),
             _ => Err(Error::invalid_input(
                 "Cannot convert non-RabitQuantizer to RabitQuantizer",
-                location!(),
             )),
         }
     }

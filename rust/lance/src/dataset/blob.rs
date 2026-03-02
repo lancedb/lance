@@ -192,14 +192,11 @@ impl BlobPreprocessor {
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let expected_columns = self.blob_v2_cols.len();
         if batch.num_columns() != expected_columns {
-            return Err(Error::invalid_input(
-                format!(
-                    "Unexpected number of columns: expected {}, got {}",
-                    expected_columns,
-                    batch.num_columns()
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Unexpected number of columns: expected {}, got {}",
+                expected_columns,
+                batch.num_columns()
+            )));
         }
 
         let batch_schema = batch.schema();
@@ -220,21 +217,15 @@ impl BlobPreprocessor {
             let struct_arr = array
                 .as_any()
                 .downcast_ref::<arrow_array::StructArray>()
-                .ok_or_else(|| {
-                    Error::invalid_input("Blob column was not a struct array", location!())
-                })?;
+                .ok_or_else(|| Error::invalid_input("Blob column was not a struct array"))?;
 
             let data_col = struct_arr
                 .column_by_name("data")
-                .ok_or_else(|| {
-                    Error::invalid_input("Blob struct missing `data` field", location!())
-                })?
+                .ok_or_else(|| Error::invalid_input("Blob struct missing `data` field"))?
                 .as_binary::<i64>();
             let uri_col = struct_arr
                 .column_by_name("uri")
-                .ok_or_else(|| {
-                    Error::invalid_input("Blob struct missing `uri` field", location!())
-                })?
+                .ok_or_else(|| Error::invalid_input("Blob struct missing `uri` field"))?
                 .as_string::<i32>();
             let position_col = struct_arr
                 .column_by_name("position")
@@ -385,7 +376,7 @@ impl BlobPreprocessor {
         ));
 
         RecordBatch::try_new(new_schema, new_columns)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))
+            .map_err(|e| Error::invalid_input(e.to_string()))
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
@@ -583,7 +574,6 @@ impl BlobFile {
             }
             ReaderState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
-                location!(),
             )),
             _ => unreachable!(),
         }
@@ -632,7 +622,6 @@ impl BlobFile {
             }
             ReaderState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
-                location!(),
             )),
             ReaderState::Uninitialized(cursor) => {
                 *cursor = new_cursor;
@@ -648,7 +637,6 @@ impl BlobFile {
             ReaderState::Open((cursor, _)) => Ok(cursor),
             ReaderState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
-                location!(),
             )),
             ReaderState::Uninitialized(cursor) => Ok(cursor),
         }

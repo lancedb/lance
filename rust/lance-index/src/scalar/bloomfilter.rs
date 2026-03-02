@@ -135,81 +135,49 @@ impl BloomFilterIndex {
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'fragment_id' column",
-                    location!(),
-                )
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'fragment_id' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'fragment_id' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'fragment_id' column is not UInt64")
             })?;
 
         let zone_start_col = data
             .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::invalid_input("BloomFilterIndex: missing 'zone_start' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'zone_start' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'zone_start' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'zone_start' column is not UInt64")
             })?;
 
         let zone_length_col = data
             .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'zone_length' column",
-                    location!(),
-                )
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'zone_length' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'zone_length' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'zone_length' column is not UInt64")
             })?;
 
         let bloom_filter_data_col = data
             .column_by_name("bloom_filter_data")
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'bloom_filter_data' column",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: missing 'bloom_filter_data' column")
             })?
             .as_any()
             .downcast_ref::<arrow_array::BinaryArray>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'bloom_filter_data' column is not Binary",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'bloom_filter_data' column is not Binary")
             })?;
 
         let has_null_col = data
             .column_by_name("has_null")
-            .ok_or_else(|| {
-                Error::invalid_input("BloomFilterIndex: missing 'has_null' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'has_null' column"))?
             .as_any()
             .downcast_ref::<arrow_array::BooleanArray>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'has_null' column is not Boolean",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'has_null' column is not Boolean")
             })?;
 
         let num_blocks = data.num_rows();
@@ -224,10 +192,7 @@ impl BloomFilterIndex {
 
             // Convert bytes back to Sbbf
             let bloom_filter = Sbbf::new(&bloom_filter_bytes).map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to deserialize bloom filter: {:?}", e),
-                    location!(),
-                )
+                Error::invalid_input(format!("Failed to deserialize bloom filter: {:?}", e))
             })?;
 
             blocks.push(BloomFilterStatistics {
@@ -788,10 +753,7 @@ impl ZoneProcessor for BloomFilterProcessor {
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
         let sbbf = self.sbbf.as_mut().ok_or_else(|| {
-            Error::invalid_input(
-                "BloomFilterProcessor did not initialize bloom filter",
-                location!(),
-            )
+            Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
 
         let has_null = match array.data_type() {
@@ -1005,10 +967,7 @@ impl ZoneProcessor for BloomFilterProcessor {
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
-            Error::invalid_input(
-                "BloomFilterProcessor did not initialize bloom filter",
-                location!(),
-            )
+            Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
         Ok(BloomFilterStatistics {
             bound,

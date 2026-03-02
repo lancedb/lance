@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use object_store_opendal::OpendalStore;
 use opendal::{services::Oss, Operator};
-use snafu::location;
 use url::Url;
 
 use crate::object_store::{
@@ -26,7 +25,7 @@ impl ObjectStoreProvider for OssStoreProvider {
 
         let bucket = base_path
             .host_str()
-            .ok_or_else(|| Error::invalid_input("OSS URL must contain bucket name", location!()))?
+            .ok_or_else(|| Error::invalid_input("OSS URL must contain bucket name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -75,19 +74,11 @@ impl ObjectStoreProvider for OssStoreProvider {
         }
 
         if !config_map.contains_key("endpoint") {
-            return Err(Error::invalid_input(
-                "OSS endpoint is required. Please provide 'oss_endpoint' in storage options or set OSS_ENDPOINT environment variable",
-                location!(),
-            ));
+            return Err(Error::invalid_input("OSS endpoint is required. Please provide 'oss_endpoint' in storage options or set OSS_ENDPOINT environment variable"));
         }
 
         let operator = Operator::from_iter::<Oss>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create OSS operator: {:?}", e),
-                    location!(),
-                )
-            })?
+            .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?
             .finish();
 
         let opendal_store = Arc::new(OpendalStore::new(operator));

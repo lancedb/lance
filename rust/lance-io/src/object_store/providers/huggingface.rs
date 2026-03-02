@@ -8,7 +8,6 @@ use object_store::path::Path;
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
 use opendal::{services::Huggingface, Operator};
-use snafu::location;
 use url::Url;
 
 use crate::object_store::parse_hf_repo_id;
@@ -33,7 +32,7 @@ struct ParsedHfUrl {
 fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
     let mut repo_type = url
         .host_str()
-        .ok_or_else(|| Error::invalid_input("Huggingface URL must contain repo type", location!()))?
+        .ok_or_else(|| Error::invalid_input("Huggingface URL must contain repo type"))?
         .to_string();
     // OpenDAL expects `dataset` instead of `datasets`; keep the workaround here and adapt tests.
     if repo_type == "datasets" {
@@ -43,10 +42,10 @@ fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
     let mut segments = url.path().trim_start_matches('/').split('/');
     let owner = segments
         .next()
-        .ok_or_else(|| Error::invalid_input("Huggingface URL must contain owner", location!()))?;
-    let repo_name = segments.next().ok_or_else(|| {
-        Error::invalid_input("Huggingface URL must contain repository name", location!())
-    })?;
+        .ok_or_else(|| Error::invalid_input("Huggingface URL must contain owner"))?;
+    let repo_name = segments
+        .next()
+        .ok_or_else(|| Error::invalid_input("Huggingface URL must contain repository name"))?;
 
     let relative_path = segments.collect::<Vec<_>>().join("/");
 
@@ -95,10 +94,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 
         let operator = Operator::from_iter::<Huggingface>(config_map)
             .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create Huggingface operator: {:?}", e),
-                    location!(),
-                )
+                Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
             })?
             .finish();
 
@@ -122,10 +118,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
     fn extract_path(&self, url: &Url) -> Result<Path> {
         let parsed = parse_hf_url(url)?;
         Path::parse(&parsed.relative_path).map_err(|_| {
-            Error::invalid_input(
-                format!("Invalid path in Huggingface URL: {}", url.path()),
-                location!(),
-            )
+            Error::invalid_input(format!("Invalid path in Huggingface URL: {}", url.path()))
         })
     }
 

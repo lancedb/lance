@@ -194,21 +194,17 @@ impl VariablePackedFieldData {
             Self::Fixed { block } => {
                 let bits_per_value = block.bits_per_value;
                 if bits_per_value % 8 != 0 {
-                    return Err(Error::invalid_input(
-                        "Packed struct variable encoding requires byte-aligned fixed-width children",
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input("Packed struct variable encoding requires byte-aligned fixed-width children"));
                 }
                 let bytes_per_value = (bits_per_value / 8) as usize;
-                let start = row_idx.checked_mul(bytes_per_value).ok_or_else(|| {
-                    Error::invalid_input("Packed struct row size overflow", location!())
-                })?;
+                let start = row_idx
+                    .checked_mul(bytes_per_value)
+                    .ok_or_else(|| Error::invalid_input("Packed struct row size overflow"))?;
                 let end = start + bytes_per_value;
                 let data = block.data.as_ref();
                 if end > data.len() {
                     return Err(Error::invalid_input(
                         "Packed struct fixed child out of bounds",
-                        location!(),
                     ));
                 }
                 output.extend_from_slice(&data[start..end]);
@@ -221,14 +217,12 @@ impl VariablePackedFieldData {
                 if bits_per_length % 8 != 0 {
                     return Err(Error::invalid_input(
                         "Packed struct variable children must have byte-aligned length prefixes",
-                        location!(),
                     ));
                 }
                 let prefix_bytes = (*bits_per_length / 8) as usize;
                 if !(prefix_bytes == 4 || prefix_bytes == 8) {
                     return Err(Error::invalid_input(
                         "Packed struct variable children must use 32 or 64-bit length prefixes",
-                        location!(),
                     ));
                 }
                 match block.bits_per_offset {
@@ -239,14 +233,12 @@ impl VariablePackedFieldData {
                         if end > block.data.len() {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child offsets out of bounds",
-                                location!(),
                             ));
                         }
                         let len = (end - start) as u32;
                         if prefix_bytes != std::mem::size_of::<u32>() {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child length prefix mismatch",
-                                location!(),
                             ));
                         }
                         output.extend_from_slice(&len.to_le_bytes());
@@ -260,14 +252,12 @@ impl VariablePackedFieldData {
                         if end > block.data.len() {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child offsets out of bounds",
-                                location!(),
                             ));
                         }
                         let len = (end - start) as u64;
                         if prefix_bytes != std::mem::size_of::<u64>() {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child length prefix mismatch",
-                                location!(),
                             ));
                         }
                         output.extend_from_slice(&len.to_le_bytes());
@@ -276,7 +266,6 @@ impl VariablePackedFieldData {
                     }
                     _ => Err(Error::invalid_input(
                         "Packed struct variable child must use 32 or 64-bit offsets",
-                        location!(),
                     )),
                 }
             }
@@ -301,20 +290,17 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
         let DataBlock::Struct(struct_block) = data else {
             return Err(Error::invalid_input(
                 "Packed struct encoder requires Struct data block",
-                location!(),
             ));
         };
 
         if struct_block.children.is_empty() {
             return Err(Error::invalid_input(
                 "Packed struct encoder requires at least one child field",
-                location!(),
             ));
         }
         if struct_block.children.len() != self.fields.len() {
             return Err(Error::invalid_input(
                 "Struct field metadata does not match number of children",
-                location!(),
             ));
         }
 
@@ -323,7 +309,6 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             if child.num_values() != num_values {
                 return Err(Error::invalid_input(
                     "Packed struct children must have matching value counts",
-                    location!(),
                 ));
             }
         }
@@ -373,9 +358,9 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             let end = row_data.len();
             let row_len = end - start;
             max_row_len = max_row_len.max(row_len);
-            total_bytes = total_bytes.checked_add(row_len).ok_or_else(|| {
-                Error::invalid_input("Packed struct row data size overflow", location!())
-            })?;
+            total_bytes = total_bytes
+                .checked_add(row_len)
+                .ok_or_else(|| Error::invalid_input("Packed struct row data size overflow"))?;
             row_offsets.push(end as u64);
         }
         debug_assert_eq!(total_bytes, row_data.len());
@@ -492,7 +477,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             _ => {
                 return Err(Error::invalid_input(
                     "Packed struct row offsets must be 32 or 64 bits",
-                    location!(),
                 ))
             }
         };
@@ -500,7 +484,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
         if offsets_u64.len() != num_values as usize + 1 {
             return Err(Error::invalid_input(
                 "Packed struct row offsets length mismatch",
-                location!(),
             ));
         }
 
@@ -511,20 +494,13 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     if bits_per_value % 8 != 0 {
                         return Err(Error::invalid_input(
                             "Packed struct fixed child must be byte-aligned",
-                            location!(),
                         ));
                     }
                     let bytes_per_value = bits_per_value.checked_div(8).ok_or_else(|| {
-                        Error::invalid_input(
-                            "Invalid bits per value for packed struct field",
-                            location!(),
-                        )
+                        Error::invalid_input("Invalid bits per value for packed struct field")
                     })?;
                     let estimate = bytes_per_value.checked_mul(num_values).ok_or_else(|| {
-                        Error::invalid_input(
-                            "Packed struct fixed child allocation overflow",
-                            location!(),
-                        )
+                        Error::invalid_input("Packed struct fixed child allocation overflow")
                     })?;
                     let empty_value = DataBlock::FixedWidth(FixedWidthDataBlock {
                         data: LanceBuffer::from(vec![0_u8; bytes_per_value as usize]),
@@ -564,7 +540,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     _ => {
                         return Err(Error::invalid_input(
                             "Packed struct variable child must use 32 or 64-bit length prefixes",
-                            location!(),
                         ))
                     }
                 },
@@ -577,7 +552,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             if row_end > data.data.len() || row_start > row_end {
                 return Err(Error::invalid_input(
                     "Packed struct row bounds exceed buffer",
-                    location!(),
                 ));
             }
             if row_start == row_end {
@@ -603,7 +577,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                         if end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct fixed child exceeds row bounds",
-                                location!(),
                             ));
                         }
                         let value_block = DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -624,14 +597,12 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                         if *bits_per_length != 32 {
                             return Err(Error::invalid_input(
                                 "Packed struct length prefix size mismatch",
-                                location!(),
                             ));
                         }
                         let end = cursor + std::mem::size_of::<u32>();
                         if end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child length prefix out of bounds",
-                                location!(),
                             ));
                         }
                         let len = u32::from_le_bytes(
@@ -644,7 +615,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                         if value_end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child exceeds row bounds",
-                                location!(),
                             ));
                         }
                         let value_block = DataBlock::VariableWidth(VariableWidthBlock {
@@ -666,14 +636,12 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                         if *bits_per_length != 64 {
                             return Err(Error::invalid_input(
                                 "Packed struct length prefix size mismatch",
-                                location!(),
                             ));
                         }
                         let end = cursor + std::mem::size_of::<u64>();
                         if end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child length prefix out of bounds",
-                                location!(),
                             ));
                         }
                         let len = u64::from_le_bytes(
@@ -686,7 +654,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                         if value_end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct variable child exceeds row bounds",
-                                location!(),
                             ));
                         }
                         let value_block = DataBlock::VariableWidth(VariableWidthBlock {
@@ -702,7 +669,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     _ => {
                         return Err(Error::invalid_input(
                             "Packed struct accumulator kind mismatch",
-                            location!(),
                         ))
                     }
                 }
@@ -710,7 +676,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             if cursor != row_end {
                 return Err(Error::invalid_input(
                     "Packed struct row parsing did not consume full row",
-                    location!(),
                 ));
             }
         }
@@ -769,7 +734,6 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                 _ => {
                     return Err(Error::invalid_input(
                         "Packed struct accumulator mismatch during finalize",
-                        location!(),
                     ))
                 }
             }

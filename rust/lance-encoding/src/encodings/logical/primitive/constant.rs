@@ -136,46 +136,37 @@ impl ConstantPageScheduler {
                 (None, 1) => (ScalarSource::ValueBuffer(0), None, None),
                 (None, 3) => (ScalarSource::ValueBuffer(0), Some(1), Some(2)),
                 (Some(_inline), 1) => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Invalid constant layout: inline_value present with {} buffers",
-                            1
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: inline_value present with {} buffers",
+                        1
+                    )));
                 }
                 (Some(_inline), 3) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: inline_value present with 3 buffers",
-                        location!(),
                     ));
                 }
                 (None, 0) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: missing scalar source",
-                        location!(),
                     ))
                 }
                 (None, 2) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: ambiguous (2 buffers and no inline_value)",
-                        location!(),
                     ))
                 }
                 (Some(_), n) => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Invalid constant layout: inline_value present with {} buffers",
-                            n
-                        ),
-                        location!(),
-                    ))
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: inline_value present with {} buffers",
+                        n
+                    )))
                 }
                 (None, n) => {
-                    return Err(Error::invalid_input(
-                        format!("Invalid constant layout: unexpected buffer count {}", n),
-                        location!(),
-                    ))
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: unexpected buffer count {}",
+                        n
+                    )))
                 }
             };
 
@@ -233,7 +224,6 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
             let ScalarSource::Inline(inline) = &self.scalar_source else {
                 return std::future::ready(Err(Error::invalid_input(
                     "Invalid constant layout: missing scalar source",
-                    location!(),
                 )))
                 .boxed();
             };

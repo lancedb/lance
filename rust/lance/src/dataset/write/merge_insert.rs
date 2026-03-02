@@ -198,7 +198,7 @@ pub fn create_duplicate_row_error(
                     "Ambiguous merge inserts are prohibited: multiple source rows match the same target row on ({}). \
                     Please ensure each target row is matched by at most one source row.",
                     format_key_values_on_columns(batch, row_idx, on_columns)
-                ), location!())
+                ))
             )
         )
 }
@@ -231,15 +231,11 @@ impl WhenNotMatchedBySource {
         let expr = planner
             .parse_filter(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         Ok(Self::DeleteIf(expr))
     }
 }
@@ -406,10 +402,7 @@ impl MergeInsertBuilder {
             let pk_fields = schema.unenforced_primary_key();
 
             if pk_fields.is_empty() {
-                return Err(Error::invalid_input(
-                    "A merge insert operation requires join keys: specify `on` columns explicitly or configure a primary key in the dataset schema",
-                    location!(),
-                ));
+                return Err(Error::invalid_input("A merge insert operation requires join keys: specify `on` columns explicitly or configure a primary key in the dataset schema"));
             }
 
             pk_fields
@@ -426,13 +419,10 @@ impl MergeInsertBuilder {
                         .field_case_insensitive(col)
                         .map(|f| f.name.clone())
                         .ok_or_else(|| {
-                            Error::invalid_input(
-                                format!(
-                                    "Merge insert key column '{}' does not exist in schema",
-                                    col
-                                ),
-                                location!(),
-                            )
+                            Error::invalid_input(format!(
+                                "Merge insert key column '{}' does not exist in schema",
+                                col
+                            ))
                         })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -558,7 +548,6 @@ impl MergeInsertBuilder {
         {
             return Err(Error::invalid_input(
                 "The merge insert job is not configured to change the data in any way",
-                location!(),
             ));
         }
         Ok(MergeInsertJob {
@@ -1398,10 +1387,10 @@ impl MergeInsertJob {
         };
 
         if partition_count != 1 {
-            return Err(Error::invalid_input(
-                format!("Expected exactly 1 partition, got {}", partition_count),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Expected exactly 1 partition, got {}",
+                partition_count
+            )));
         }
 
         // Execute partition 0 (the only partition)
@@ -1412,13 +1401,10 @@ impl MergeInsertJob {
         if let Some(batch) = stream.next().await {
             let batch = batch?;
             if batch.num_rows() > 0 {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Expected no output from write operation, got {} rows",
-                        batch.num_rows()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Expected no output from write operation, got {} rows",
+                    batch.num_rows()
+                )));
             }
         }
 
@@ -1948,7 +1934,7 @@ impl Merger {
             let physical_expr = planner.create_physical_expr(&expr)?;
             let data_type = physical_expr.data_type(&schema)?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}", expr, data_type)));
             }
             Some(physical_expr)
         } else {
@@ -1962,7 +1948,7 @@ impl Merger {
             let match_expr = planner.create_physical_expr(&expr)?;
             let data_type = match_expr.data_type(combined_schema.as_ref())?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}", expr, data_type)));
             }
             Some(match_expr)
         } else {

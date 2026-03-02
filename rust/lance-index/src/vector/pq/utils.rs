@@ -5,7 +5,6 @@ use arrow_array::{
     cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray, PrimitiveArray,
 };
 use lance_core::{assume, Error, Result};
-use snafu::location;
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
@@ -20,13 +19,10 @@ where
 {
     let dim = fsl.value_length() as usize;
     if !dim.is_multiple_of(m) {
-        return Err(Error::invalid_input(
-            format!(
-                "num_sub_vectors must divide vector dimension {}, but got {}",
-                dim, m
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "num_sub_vectors must divide vector dimension {}, but got {}",
+            dim, m
+        )));
     };
 
     let sub_vector_length = dim / m;

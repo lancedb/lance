@@ -9,7 +9,6 @@ use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
@@ -212,14 +211,12 @@ impl ArrayEncoder for PackedStructEncoder {
                     let flattened = fixed_size_list.try_into_flat().ok_or_else(|| {
                         Error::invalid_input(
                             "Packed struct encoder cannot pack nullable fixed-width data blocks",
-                            location!(),
                         )
                     })?;
                     Ok(flattened)
                 }
                 _ => Err(Error::invalid_input(
                     "Packed struct encoder currently only implemented for fixed-width data blocks",
-                    location!(),
                 )),
             })
             .collect::<Result<Vec<_>>>()?;

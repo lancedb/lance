@@ -116,7 +116,6 @@ use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
 use lance_core::{utils::bit::log_2_ceil, Error, Result};
-use snafu::location;
 
 use crate::buffer::LanceBuffer;
 
@@ -1307,7 +1306,7 @@ impl RepDefUnraveler {
 
         let to_offset = |val: usize| {
             T::from_usize(val)
-            .ok_or_else(|| Error::invalid_input("A single batch had more than i32::MAX values and so a large container type is required", location!()))
+            .ok_or_else(|| Error::invalid_input("A single batch had more than i32::MAX values and so a large container type is required"))
         };
         self.current_rep_cmp += 1;
         if let Some(def_levels) = &mut self.def_levels {

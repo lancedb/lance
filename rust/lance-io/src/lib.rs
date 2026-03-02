@@ -239,15 +239,9 @@ impl ReadBatchParams {
                 }
                 Ok(UInt32Array::from(offsets))
             }
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(UInt32Array::from(Vec::from_iter(0..r.end as u32))),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 
@@ -260,15 +254,9 @@ impl ReadBatchParams {
             Self::Ranges(ranges) => Ok(Box::new(
                 ranges.iter().map(|r| r.start as u32..r.end as u32),
             )),
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(Box::new(std::iter::once(0..r.end as u32))),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 
@@ -282,15 +270,9 @@ impl ReadBatchParams {
                 .collect()),
             Self::Range(r) => Ok(vec![r.start as u64..r.end as u64]),
             Self::Ranges(ranges) => Ok(ranges.to_vec()),
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(vec![0..r.end as u64]),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 

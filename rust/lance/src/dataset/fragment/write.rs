@@ -14,7 +14,6 @@ use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
-use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
@@ -168,7 +167,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         fragment.physical_rows = Some(writer.finish().await? as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
-            return Err(Error::invalid_input("Input data was empty.", location!()));
+            return Err(Error::invalid_input("Input data was empty."));
         }
 
         let field_ids = writer
@@ -262,7 +261,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
 
         if writer.is_empty() {
-            return Err(Error::invalid_input("Input data was empty.", location!()));
+            return Err(Error::invalid_input("Input data was empty."));
         }
 
         fragment.physical_rows = Some(writer.finish().await?);
@@ -312,10 +311,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
         if actual.fields().is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot write with an empty schema.",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot write with an empty schema."));
         }
         let actual_lance = Schema::try_from(actual)?;
         actual_lance.check_compatible(expected, &Default::default())?;

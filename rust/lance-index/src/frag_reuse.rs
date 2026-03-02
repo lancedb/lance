@@ -328,10 +328,8 @@ impl FragReuseIndex {
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    group.old_frags),
-                            location!()));
+                        return Err(Error::invalid_input(format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                group.old_frags)));
                     }
 
                     for new_frag in group.new_frags.iter() {

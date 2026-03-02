@@ -438,7 +438,6 @@ impl<'a> ColumnInfoIter<'a> {
         self.next().ok_or_else(|| {
             Error::invalid_input(
                 "there were more fields in the schema than provided column indices / infos",
-                location!(),
             )
         })
     }
@@ -525,13 +524,10 @@ impl CoreFieldDecoderStrategy {
             .column_encoding
             .as_ref()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "the column at index {} was missing a ColumnEncoding",
-                        column_info.index
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "the column at index {} was missing a ColumnEncoding",
+                    column_info.index
+                ))
             })?;
         if matches!(
             column_encoding,
@@ -539,7 +535,7 @@ impl CoreFieldDecoderStrategy {
         ) {
             Ok(())
         } else {
-            Err(Error::invalid_input(format!("the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it", column_info.index, field_name, column_encoding), location!()))
+            Err(Error::invalid_input(format!("the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it", column_info.index, field_name, column_encoding)))
         }
     }
 

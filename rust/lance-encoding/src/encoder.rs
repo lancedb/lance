@@ -306,7 +306,6 @@ pub fn default_encoding_strategy_with_params(
     match version.resolve() {
         LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
             "Compression parameters are only supported in Lance file version 2.1 and later",
-            location!(),
         )),
         _ => {
             let compression_strategy =
