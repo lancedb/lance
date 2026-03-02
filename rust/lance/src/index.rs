@@ -17,7 +17,7 @@ use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
@@ -191,12 +191,7 @@ impl CacheKey for MemWalCacheKey<'_> {
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
     static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
-    *LANCE_AUTO_MIGRATION.get_or_init(|| {
-        std::env::var("LANCE_AUTO_MIGRATION")
-            .ok()
-            .map(|s| str_is_truthy(&s))
-            .unwrap_or(true)
-    })
+    *LANCE_AUTO_MIGRATION.get_or_init(|| parse_env_as_bool("LANCE_AUTO_MIGRATION", true))
 }
 
 /// Derive a friendly (but not necessarily unique) type name from a type URL.

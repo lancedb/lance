@@ -49,6 +49,10 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
 
+/// Use this config key in Arrow field metadata to specify the field id of the lance field.
+/// The value should be non-negative i32 value. Any negative value will be seen as -1.
+pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
         .metadata()
@@ -1050,6 +1054,14 @@ impl TryFrom<&ArrowField> for Field {
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let mut metadata = field.metadata().clone();
+        let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
+            Some(val) => val
+                .parse::<i32>()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .max(-1),
+            None => -1,
+        };
+
         let children = match field.data_type() {
             DataType::Struct(children) => children
                 .iter()
@@ -1126,7 +1138,7 @@ impl TryFrom<&ArrowField> for Field {
         };
 
         Ok(Self {
-            id: -1,
+            id,
             parent_id: -1,
             name: field.name().clone(),
             logical_type,
@@ -1188,6 +1200,25 @@ mod tests {
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
+
+    #[test]
+    fn arrow_field_to_field_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(LANCE_FIELD_ID_KEY.to_string(), "42".to_string());
+        metadata.insert("custom".to_string(), "value".to_string());
+
+        let arrow_field =
+            ArrowField::new("a", DataType::Int32, false).with_metadata(metadata.clone());
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        assert_eq!(field.id, 42);
+        assert!(!field.metadata.contains_key(LANCE_FIELD_ID_KEY));
+        assert_eq!(
+            field.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
