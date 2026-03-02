@@ -82,7 +82,9 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
-use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+use crate::io::exec::fts::{
+    BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
@@ -349,7 +351,7 @@ impl FilterPlan {
         if self.refine_query_filter {
             match &self.query_filter {
                 Some(QueryFilter::Fts(fts_query)) => {
-                    plan = scanner.flat_fts(plan, fts_query).await?;
+                    plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
                     plan = scanner.flat_knn(plan, vector_query)?;
@@ -2806,10 +2808,11 @@ impl Scanner {
         if self.prefilter {
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.vector_filter() {
                 Some(vector_query) => {
+                    // Perform vector search first then rerank according to BM25 scores
                     let vector_plan = self
                         .vector_search(&filter_plan.expr_filter_plan, vector_query)
                         .await?;
-                    self.flat_fts(vector_plan, query).await?
+                    self.fts_rerank(vector_plan, query).await?
                 }
                 None => self.fts(&filter_plan.expr_filter_plan, query).await?,
             };
@@ -3390,7 +3393,6 @@ impl Scanner {
             query.clone(),
             params.clone(),
             scan_node,
-            FTS_SCHEMA.clone(),
         ));
         Ok(flat_match_plan)
     }
@@ -3939,7 +3941,63 @@ impl Scanner {
         )?))
     }
 
-    async fn flat_fts(
+    /// Here we use a full text search as a post-filter.  Any rows that
+    /// do not contain at least one query token are removed.
+    ///
+    /// Only valid (currently) for match queries.
+    async fn flat_fts_filter(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let fts_query = if q.columns().is_empty() {
+            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
+            fill_fts_query_column(&q.query, &indexed_columns, false)?
+        } else {
+            q.query.clone()
+        };
+
+        match &fts_query {
+            FtsQuery::Match(match_query) => {
+                let schema = Arc::new((input.schema()).try_with_column(SCORE_FIELD.clone())?);
+
+                let column = match_query
+                    .column
+                    .as_ref()
+                    .ok_or(Error::invalid_input(
+                        "the column must be specified in the query".to_string(),
+                        location!(),
+                    ))?
+                    .clone();
+                let input = if schema.column_with_name(&column).is_none() {
+                    let projection = self
+                        .dataset
+                        .empty_projection()
+                        .union_column(&column, OnMissing::Error)?;
+                    self.take(input, projection)?
+                } else {
+                    input
+                };
+
+                Ok(Arc::new(FlatMatchFilterExec::new(
+                    input,
+                    self.dataset.clone(),
+                    match_query.clone(),
+                    q.params(),
+                )))
+            }
+            _ => Err(Error::not_supported(
+                "Only Match queries are supported currently when using FTS as a post-filter",
+                location!(),
+            )),
+        }
+    }
+
+    /// Here we consume all input (as unindexed) and rerank according to BM25 scores
+    ///
+    /// If there is an index on the column then we still use the index to determine the
+    /// tokenizer and inform the BM25 scoring (e.g. avg doc length, token frequency, etc.)
+    async fn fts_rerank(
         &self,
         input: Arc<dyn ExecutionPlan>,
         q: &FullTextSearchQuery,
@@ -3977,7 +4035,6 @@ impl Scanner {
                     match_query.clone(),
                     q.params(),
                     input,
-                    schema,
                 )))
             }
             _ => {

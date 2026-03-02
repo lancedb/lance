@@ -298,17 +298,8 @@ async fn test_fts_filter_vector_search() {
         )))
         .unwrap()
         .try_into_stream()
-        .await
-        .unwrap();
-    check_results(
-        stream,
-        schema
-            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
-            .unwrap()
-            .into(),
-        &[299, 300],
-    )
-    .await;
+        .await;
+    assert!(stream.is_err());
 
     // Case 6: search with prefilter=false, query_filter=phrase("text")
     let mut scanner = dataset.scan();
@@ -325,17 +316,8 @@ async fn test_fts_filter_vector_search() {
         )))
         .unwrap()
         .try_into_stream()
-        .await
-        .unwrap();
-    check_results(
-        stream,
-        schema
-            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
-            .unwrap()
-            .into(),
-        &[300],
-    )
-    .await;
+        .await;
+    assert!(stream.is_err());
 }
 
 #[tokio::test]

@@ -4461,8 +4461,8 @@ def test_vector_filter_fts_search(tmp_path):
         nearest=vector_query,
         filter=PhraseQuery("text", "text"),
     )
-    result = scanner.to_table()
-    assert [299, 300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()
 
     # Case 6: search with prefilter=false, search_filter=phrase("text")
     scanner = ds.scanner(
@@ -4473,5 +4473,5 @@ def test_vector_filter_fts_search(tmp_path):
             "search_filter": PhraseQuery("text", "text"),
         },
     )
-    result = scanner.to_table()
-    assert [300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()

@@ -783,42 +783,14 @@ impl<'a> IntoIterator for &'a Tokens {
     }
 }
 
-pub fn collect_query_tokens(
-    text: &str,
-    tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&HashSet<String>>,
-) -> Tokens {
+pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive
-            && !inclusive.contains(&token.text)
-        {
-            continue;
-        }
         tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
-}
-
-pub fn collect_doc_tokens(
-    text: &str,
-    tokenizer: &mut Box<dyn LanceTokenizer>,
-    query_tokens: &Tokens,
-    doc_token_count: &mut HashMap<String, usize>,
-) -> (u64, u64) {
-    let mut num_tokens = 0;
-    let mut num_matching_tokens = 0;
-    let mut stream = tokenizer.token_stream_for_doc(text);
-    while let Some(token) = stream.next() {
-        num_tokens += 1;
-        if query_tokens.contains(&token.text) {
-            num_matching_tokens += 1;
-            *doc_token_count.entry(token.text.clone()).or_insert(0) += 1;
-        }
-    }
-    (num_tokens, num_matching_tokens)
 }
 
 pub fn has_query_token(

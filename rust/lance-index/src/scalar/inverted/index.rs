@@ -551,7 +551,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_query_tokens(text, &mut tokenizer, None);
+        let tokens = collect_query_tokens(text, &mut tokenizer);
 
         let (doc_ids, _) = self
             .bm25_search(
@@ -2421,7 +2421,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer, None);
+    let query_tokens = collect_query_tokens(query, &mut tokenizer);
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -2439,46 +2439,6 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 
     Ok(results)
 }
-
-// #[allow(clippy::too_many_arguments)]
-// pub fn flat_bm25_search(
-//     batch: RecordBatch,
-//     doc_col: &str,
-//     query_tokens: &Tokens,
-//     tokenizer: &mut Box<dyn LanceTokenizer>,
-//     scorer: &mut MemBM25Scorer,
-//     schema: SchemaRef,
-// ) -> std::result::Result<RecordBatch, DataFusionError> {
-//     let doc_iter = iter_str_array(&batch[doc_col]);
-//     let mut scores = Vec::with_capacity(batch.num_rows());
-//     for doc in doc_iter {
-//         let Some(doc) = doc else {
-//             scores.push(0.0);
-//             continue;
-//         };
-
-//         let mut doc_token_count = HashMap::with_capacity(query_tokens.len());
-//         let (num_tokens, num_matching_tokens) =
-//             collect_doc_tokens(doc, tokenizer, &query_tokens, &mut doc_token_count);
-//         scorer.update(&doc_token_count, num_tokens);
-
-//         let doc_norm = K1 * (1.0 - B + B * num_matching_tokens as f32 / scorer.avg_doc_length());
-//         let mut score = 0.0;
-//         for token in query_tokens {
-//             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
-
-//             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
-//             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
-//         }
-//         scores.push(score);
-//     }
-
-//     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
-//     let batch = batch
-//         .try_with_column(SCORE_FIELD.clone(), score_col)?
-//         .project_by_schema(&schema)?;
-//     Ok(batch)
-// }
 
 const FLAT_ROW_ID_COL_IDX: usize = 0;
 const FLAT_ALL_TOKENS_COL_IDX: usize = 1;
@@ -2598,7 +2558,7 @@ fn initialize_scorer(
     if let Some(index) = index {
         let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
         for (token_index, token) in query_tokens.into_iter().enumerate() {
-            let token_nq = index_bm25_scorer.num_docs_containing_token(token).max(1);
+            let token_nq = index_bm25_scorer.num_docs_containing_token(token);
             all_token_counts[token_index] = token_nq as u64;
         }
         total_tokens += index_bm25_scorer.total_tokens();
@@ -2673,6 +2633,9 @@ fn flat_bm25_score(
         let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
         let row_id = row_ids_iter.next().expect_ok()?;
         if num_tokens_in_doc == 0 {
+            for _ in query_tokens {
+                query_token_counts_iter.next().expect_ok()?;
+            }
             continue;
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
@@ -2681,10 +2644,10 @@ fn flat_bm25_score(
             let freq = query_token_counts_iter.next().expect_ok()? as f32;
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
-            if score > 0.0 {
-                row_ids_builder.append_value(row_id);
-                scores_builder.append_value(score);
-            }
+        }
+        if score > 0.0 {
+            row_ids_builder.append_value(row_id);
+            scores_builder.append_value(score);
         }
     }
 
@@ -2713,7 +2676,7 @@ pub async fn flat_bm25_search_stream(
             .build(),
         )),
     };
-    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer, None));
+    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
     let input_schema = input.schema();
     let doc_col_idx = input_schema.index_of(&doc_col)?;
