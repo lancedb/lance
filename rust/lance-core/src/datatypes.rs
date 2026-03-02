@@ -440,9 +440,9 @@ pub enum BlobKind {
     Dedicated = 2,
     /// Not stored by Lance data files.
     ///
-    /// For external blobs, `blob_uri` can be either:
-    /// - a path relative to a base location selected by `blob_id` (0 means dataset root),
-    /// - or an absolute URI when external writes outside registered bases are enabled.
+    /// For external blobs:
+    /// - `blob_id == 0` means `blob_uri` is an absolute external URI.
+    /// - `blob_id > 0` means `blob_uri` is a path relative to `manifest.base_paths[blob_id]`.
     ///
     /// External blobs can have a position and a size. If the position is not set,
     /// it defaults to 0, which points to the beginning of the blob.

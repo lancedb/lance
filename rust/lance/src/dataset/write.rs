@@ -248,8 +248,8 @@ pub struct WriteParams {
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
 
-    /// Allow writing external blob URIs that cannot be mapped to the dataset root
-    /// or any registered base path. When disabled, such rows are rejected.
+    /// Allow writing external blob URIs that cannot be mapped to any registered
+    /// non-dataset-root base path. When disabled, such rows are rejected.
     pub allow_external_blob_outside_bases: bool,
 }
 
@@ -413,7 +413,7 @@ pub async fn do_write_fragments(
         && schema.fields.iter().any(|field| field.is_blob_v2())
     {
         Some(Arc::new(
-            build_external_base_resolver(dataset, object_store.clone(), base_dir, &params).await?,
+            build_external_base_resolver(dataset, &params).await?,
         ))
     } else {
         None
@@ -584,6 +584,9 @@ fn append_external_base_candidate(
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) {
+    if base_path.is_dataset_root {
+        return;
+    }
     if seen_base_ids.insert(base_path.id) {
         candidates.push(ExternalBaseCandidate {
             base_id: base_path.id,
@@ -622,8 +625,6 @@ async fn append_external_initial_bases(
 
 async fn build_external_base_resolver(
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
     params: &WriteParams,
 ) -> Result<ExternalBaseResolver> {
     let store_registry = dataset
@@ -632,12 +633,7 @@ async fn build_external_base_resolver(
     let store_params = params.store_params.clone().unwrap_or_default();
 
     let mut seen_base_ids = HashSet::new();
-    let mut candidates = vec![ExternalBaseCandidate {
-        base_id: 0,
-        store_prefix: object_store.store_prefix.clone(),
-        base_path: base_dir.clone(),
-    }];
-    seen_base_ids.insert(0);
+    let mut candidates = vec![];
 
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {

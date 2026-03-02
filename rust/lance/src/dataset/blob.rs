@@ -47,7 +47,6 @@ pub(super) struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
     store_registry: Arc<ObjectStoreRegistry>,
     store_params: ObjectStoreParams,
-    uri_cache: Mutex<HashMap<String, Option<ResolvedExternalBase>>>,
 }
 
 impl ExternalBaseResolver {
@@ -60,7 +59,6 @@ impl ExternalBaseResolver {
             candidates,
             store_registry,
             store_params,
-            uri_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -68,10 +66,6 @@ impl ExternalBaseResolver {
         &self,
         uri: &str,
     ) -> Result<Option<ResolvedExternalBase>> {
-        if let Some(cached) = self.uri_cache.lock().await.get(uri).cloned() {
-            return Ok(cached);
-        }
-
         let uri_store_prefix = self
             .store_registry
             .calculate_object_store_prefix(uri, self.store_params.storage_options())?;
@@ -105,12 +99,7 @@ impl ExternalBaseResolver {
             }
         }
 
-        let resolved = best_match.map(|(_, matched)| matched);
-        self.uri_cache
-            .lock()
-            .await
-            .insert(uri.to_string(), resolved.clone());
-        Ok(resolved)
+        Ok(best_match.map(|(_, matched)| matched))
     }
 }
 
@@ -299,7 +288,7 @@ impl BlobPreprocessor {
 
         Err(Error::invalid_input(
             format!(
-                "External blob URI '{}' is outside dataset bases. Set allow_external_blob_outside_bases=true to permit writing outside registered bases.",
+                "External blob URI '{}' is outside registered external bases (dataset root is not allowed). Set allow_external_blob_outside_bases=true to store it as absolute external URI.",
                 uri
             ),
             location!(),
@@ -1010,7 +999,7 @@ async fn collect_blob_files_v2(
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
                 let base_id = blob_ids.value(idx);
-                let (object_store, path) = if is_absolute_external_uri(base_id, &uri_or_path) {
+                let (object_store, path) = if base_id == 0 {
                     let registry = dataset.session.store_registry();
                     let params = dataset
                         .store_params
@@ -1019,34 +1008,25 @@ async fn collect_blob_files_v2(
                         .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
                     ObjectStore::from_uri_and_params(registry, &uri_or_path, &params).await?
                 } else {
-                    let (object_store, base_root) = if base_id == 0 {
-                        (dataset.object_store.clone(), dataset.base.clone())
+                    let object_store = if let Some(store) = store_cache.get(&base_id) {
+                        store.clone()
                     } else {
-                        let object_store = if let Some(store) = store_cache.get(&base_id) {
-                            store.clone()
-                        } else {
-                            let store = dataset.object_store_for_base(base_id).await?;
-                            store_cache.insert(base_id, store.clone());
-                            store
-                        };
-                        let base_root = if let Some(path) = external_base_path_cache.get(&base_id) {
-                            path.clone()
-                        } else {
-                            let base =
-                                dataset.manifest.base_paths.get(&base_id).ok_or_else(|| {
-                                    Error::invalid_input(
-                                        format!(
-                                            "External blob references unknown base_id {}",
-                                            base_id
-                                        ),
-                                        location!(),
-                                    )
-                                })?;
-                            let path = base.extract_path(dataset.session.store_registry())?;
-                            external_base_path_cache.insert(base_id, path.clone());
-                            path
-                        };
-                        (object_store, base_root)
+                        let store = dataset.object_store_for_base(base_id).await?;
+                        store_cache.insert(base_id, store.clone());
+                        store
+                    };
+                    let base_root = if let Some(path) = external_base_path_cache.get(&base_id) {
+                        path.clone()
+                    } else {
+                        let base = dataset.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::invalid_input(
+                                format!("External blob references unknown base_id {}", base_id),
+                                location!(),
+                            )
+                        })?;
+                        let path = base.extract_path(dataset.session.store_registry())?;
+                        external_base_path_cache.insert(base_id, path.clone());
+                        path
                     };
                     let path = join_base_and_relative_path(&base_root, &uri_or_path)?;
                     (object_store, path)
@@ -1074,17 +1054,13 @@ fn normalize_external_absolute_uri(uri: &str) -> Result<String> {
     let url = Url::parse(uri).map_err(|_| {
         Error::invalid_input(
             format!(
-                "External URI '{}' is outside dataset bases and is not a valid absolute URI",
+                "External URI '{}' is outside registered external bases and is not a valid absolute URI",
                 uri
             ),
             location!(),
         )
     })?;
     Ok(url.to_string())
-}
-
-fn is_absolute_external_uri(base_id: u32, uri: &str) -> bool {
-    base_id == 0 && Url::parse(uri).is_ok()
 }
 
 fn join_base_and_relative_path(base: &Path, relative_path: &str) -> Result<Path> {
@@ -1649,19 +1625,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_absolute_external_uri_requires_root_base() {
-        assert!(super::is_absolute_external_uri(
-            0,
-            "file:///tmp/external.bin"
-        ));
-        assert!(!super::is_absolute_external_uri(
-            1,
-            "file:///tmp/external.bin"
-        ));
-        assert!(!super::is_absolute_external_uri(0, "objects/mapped.bin"));
-    }
-
     #[tokio::test]
     async fn test_blob_v2_external_outside_base_denied_by_default() {
         let dataset_dir = TempDir::default();
@@ -1688,7 +1651,45 @@ mod tests {
         .await;
 
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("outside dataset bases"), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("outside registered external bases"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_under_dataset_root_denied_by_default() {
+        let test_dir = TempDir::default();
+        let dataset_path = test_dir.std_path().join("dataset");
+        std::fs::create_dir_all(dataset_path.join("media")).unwrap();
+        let external_path = dataset_path.join("media").join("external.bin");
+        std::fs::write(&external_path, b"root-local").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let result = Dataset::write(
+            reader,
+            dataset_path.to_str().unwrap(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside registered external bases"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

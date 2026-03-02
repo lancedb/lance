@@ -92,7 +92,7 @@ ds = lance.write_dataset(
 
 Note:
 
-- By default, external blob URIs must map to the dataset root or a registered base path.
+- By default, external blob URIs must map to a registered non-dataset-root base path.
 - If you need to reference external objects outside those bases, set
   `allow_external_blob_outside_bases=True` when writing.
 
