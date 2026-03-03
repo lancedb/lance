@@ -493,7 +493,7 @@ pub struct ExecutionSummaryCounts {
     pub all_counts: HashMap<String, usize>,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+pub fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
