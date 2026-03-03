@@ -1061,9 +1061,9 @@ async fn rewrite_files(
     log::info!("Compaction task {}: file written", task_id);
 
     let row_addrs = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-        })?;
+        let captured_ids = row_ids_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
         let row_addrs = captured_ids.row_addrs(None).into_owned();
         let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
         row_addrs.serialize_into(&mut serialized)?;
