@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -32,11 +32,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-<<<<<<< HEAD
-use futures::{FutureExt, StreamExt, TryStreamExt, stream};
-=======
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
->>>>>>> 902b77e45 (Rework according to PR suggestions)
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};

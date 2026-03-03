@@ -3966,7 +3966,6 @@ impl Scanner {
                     .as_ref()
                     .ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?
                     .clone();
                 let input = if schema.column_with_name(&column).is_none() {
@@ -3988,7 +3987,6 @@ impl Scanner {
             }
             _ => Err(Error::not_supported(
                 "Only Match queries are supported currently when using FTS as a post-filter",
-                location!(),
             )),
         }
     }

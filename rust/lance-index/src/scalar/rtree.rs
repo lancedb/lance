@@ -25,6 +25,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;

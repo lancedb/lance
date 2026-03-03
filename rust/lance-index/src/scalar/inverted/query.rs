@@ -6,7 +6,6 @@ use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
