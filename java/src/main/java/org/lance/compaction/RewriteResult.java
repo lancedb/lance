@@ -19,7 +19,6 @@ import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Rewrite Result of a single compaction task. It will be passed across different workers and be
@@ -35,13 +34,6 @@ public class RewriteResult implements Serializable {
   // null for stable row IDs.
   @Nullable private final byte[] rowAddrs;
 
-  // Legacy field kept for backwards compatibility with older serialized results.
-  @Nullable private final Map<Long, Long> rowIdMap;
-
-  // Legacy field kept for backwards compatibility with older serialized results.
-  @Nullable private final byte[] changedRowAddrs;
-
-  /** Current constructor used by JNI. */
   public RewriteResult(
       CompactionMetrics metrics,
       List<FragmentMetadata> newFragments,
@@ -53,25 +45,6 @@ public class RewriteResult implements Serializable {
     this.originalFragments = originalFragments;
     this.readVersion = readVersion;
     this.rowAddrs = rowAddrs;
-    this.rowIdMap = null;
-    this.changedRowAddrs = null;
-  }
-
-  /** Legacy constructor for backwards compatibility with older serialized results. */
-  public RewriteResult(
-      CompactionMetrics metrics,
-      List<FragmentMetadata> newFragments,
-      List<FragmentMetadata> originalFragments,
-      long readVersion,
-      Map<Long, Long> rowIdMap,
-      byte[] changedRowAddrs) {
-    this.metrics = metrics;
-    this.newFragments = newFragments;
-    this.originalFragments = originalFragments;
-    this.readVersion = readVersion;
-    this.rowAddrs = null;
-    this.rowIdMap = rowIdMap;
-    this.changedRowAddrs = changedRowAddrs;
   }
 
   public long getReadVersion() {
@@ -93,15 +66,5 @@ public class RewriteResult implements Serializable {
 
   public List<FragmentMetadata> getOriginalFragments() {
     return originalFragments;
-  }
-
-  @Nullable
-  public Map<Long, Long> getRowIdMap() {
-    return rowIdMap;
-  }
-
-  @Nullable
-  public byte[] getChangedRowAddrs() {
-    return changedRowAddrs;
   }
 }
