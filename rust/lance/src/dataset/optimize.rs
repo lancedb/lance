@@ -867,8 +867,16 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    /// Serialized RoaringTreemap of row addresses read from the original fragments.
-    /// Some for address-style row IDs, None for stable row IDs.
+    /// Serialized `RoaringTreemap` of the original row addresses read from the
+    /// source fragments during compaction.
+    ///
+    /// `Some` for datasets using address-style row IDs. During commit, these
+    /// addresses are transposed to the new fragment layout to build an old-to-new
+    /// mapping for index remapping. Also triggers fragment ID reservation since
+    /// address-style fragments don't have pre-allocated IDs.
+    ///
+    /// `None` for datasets using stable row IDs, which handle remapping via
+    /// row ID sequences instead.
     pub row_addrs: Option<Vec<u8>>,
 }
 
