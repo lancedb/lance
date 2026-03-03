@@ -15,7 +15,7 @@ use azure_identity::DefaultAzureCredential;
 use azure_storage::prelude::*;
 use azure_storage::shared_access_signature::service_sas::{BlobSharedAccessSignature, SasKey};
 use azure_storage_blobs::prelude::*;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
 use lance_namespace::models::Identity;
@@ -23,8 +23,8 @@ use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
 
 use super::{
-    redact_credential, CredentialVendor, VendedCredentials, VendedPermission,
-    DEFAULT_CREDENTIAL_DURATION_MILLIS,
+    CredentialVendor, DEFAULT_CREDENTIAL_DURATION_MILLIS, VendedCredentials, VendedPermission,
+    redact_credential,
 };
 
 /// Configuration for Azure credential vending.
@@ -236,12 +236,11 @@ impl AzureCredentialVendor {
     async fn generate_sas_token(&self, account: &str, container: &str) -> Result<(String, u64)> {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to create Azure credentials: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -265,12 +264,11 @@ impl AzureCredentialVendor {
         let user_delegation_key = blob_service_client
             .get_user_deligation_key(now, key_end_time)
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to get user delegation key for account '{}': {}",
                     account, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let permissions = Self::build_sas_permissions(self.config.permission);
@@ -284,23 +282,21 @@ impl AzureCredentialVendor {
                 &user_delegation_key.user_deligation_key,
             )
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to generate SAS token for container '{}': {}",
                     container, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let expires_at_millis =
             (end_time.unix_timestamp() * 1000 + end_time.millisecond() as i64) as u64;
 
-        let token = sas_token.token().map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let token = sas_token.token().map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to get SAS token: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         Ok((token, expires_at_millis))
@@ -315,12 +311,11 @@ impl AzureCredentialVendor {
     ) -> Result<(String, u64)> {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to create Azure credentials: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -340,12 +335,11 @@ impl AzureCredentialVendor {
         let user_delegation_key = blob_service_client
             .get_user_deligation_key(now, key_end_time)
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to get user delegation key for account '{}': {}",
                     account, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let permissions = Self::build_sas_permissions(permission);
@@ -357,23 +351,21 @@ impl AzureCredentialVendor {
                 &user_delegation_key.user_deligation_key,
             )
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to generate SAS token for container '{}': {}",
                     container, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let expires_at_millis =
             (end_time.unix_timestamp() * 1000 + end_time.millisecond() as i64) as u64;
 
-        let token = sas_token.token().map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let token = sas_token.token().map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to get SAS token: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         Ok((token, expires_at_millis))
@@ -398,12 +390,11 @@ impl AzureCredentialVendor {
     ) -> Result<(String, u64)> {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to create Azure credentials: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -423,12 +414,11 @@ impl AzureCredentialVendor {
         let user_delegation_key = blob_service_client
             .get_user_deligation_key(now, key_end_time)
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to get user delegation key for account '{}': {}",
                     account, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         // Normalize path: remove leading/trailing slashes
@@ -457,12 +447,11 @@ impl AzureCredentialVendor {
         )
         .signed_directory_depth(depth as u8);
 
-        let token = sas.token().map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let token = sas.token().map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to generate directory SAS token: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         let expires_at_millis =
@@ -482,24 +471,17 @@ impl AzureCredentialVendor {
     /// 1. An Azure AD App Registration with Federated Credentials configured
     /// 2. The OIDC token's issuer and subject to match the Federated Credential configuration
     async fn exchange_oidc_for_azure_token(&self, oidc_token: &str) -> Result<String> {
-        let tenant_id = self
-            .config
-            .tenant_id
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "azure_tenant_id must be configured for OIDC token exchange".into(),
-                location: snafu::location!(),
-            })?;
+        let tenant_id = self.config.tenant_id.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "azure_tenant_id must be configured for OIDC token exchange".into(),
+            )
+        })?;
 
-        let client_id =
-            self.config
-                .federated_client_id
-                .as_ref()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "azure_federated_client_id must be configured for OIDC token exchange"
-                        .into(),
-                    location: snafu::location!(),
-                })?;
+        let client_id = self.config.federated_client_id.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "azure_federated_client_id must be configured for OIDC token exchange".into(),
+            )
+        })?;
 
         let token_url = format!(
             "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
@@ -523,43 +505,37 @@ impl AzureCredentialVendor {
             .form(&params)
             .send()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to exchange OIDC token for Azure AD token: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Azure AD token exchange failed with status {}: {}",
-                    status, body
-                ))),
-                location: snafu::location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
+                "Azure AD token exchange failed with status {}: {}",
+                status, body
+            )))));
         }
 
-        let token_response: serde_json::Value = response.json().await.map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let token_response: serde_json::Value = response.json().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to parse Azure AD token response: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         token_response
             .get("access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| Error::IO {
-                source: Box::new(std::io::Error::other(
+            .ok_or_else(|| {
+                Error::io_source(Box::new(std::io::Error::other(
                     "Azure AD token response missing access_token",
-                )),
-                location: snafu::location!(),
+                )))
             })
     }
 
@@ -594,12 +570,11 @@ impl AzureCredentialVendor {
         let user_delegation_key = blob_service_client
             .get_user_deligation_key(now, key_end_time)
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to get user delegation key with federated token: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let permissions = Self::build_sas_permissions(permission);
@@ -618,20 +593,18 @@ impl AzureCredentialVendor {
                     &user_delegation_key.user_deligation_key,
                 )
                 .await
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to generate SAS token with federated token: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
-            sas_token.token().map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            sas_token.token().map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to get SAS token: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?
         } else {
             // Directory-scoped SAS
@@ -648,12 +621,11 @@ impl AzureCredentialVendor {
             )
             .signed_directory_depth(depth as u8);
 
-            sas.token().map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            sas.token().map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to generate directory SAS token with federated token: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?
         };
 
@@ -702,7 +674,12 @@ impl AzureCredentialVendor {
 
         info!(
             "Azure credentials vended (web identity): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-            account, container, path, self.config.permission, expires_at_millis, redact_credential(&sas_token)
+            account,
+            container,
+            path,
+            self.config.permission,
+            expires_at_millis,
+            redact_credential(&sas_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -716,14 +693,11 @@ impl AzureCredentialVendor {
         path: &str,
         api_key: &str,
     ) -> Result<VendedCredentials> {
-        let salt = self
-            .config
-            .api_key_salt
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "api_key_salt must be configured to use API key authentication".into(),
-                location: snafu::location!(),
-            })?;
+        let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "api_key_salt must be configured to use API key authentication".into(),
+            )
+        })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
 
@@ -738,10 +712,7 @@ impl AzureCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::InvalidInput {
-                    source: "Invalid API key".into(),
-                    location: snafu::location!(),
-                }
+                Error::invalid_input_source("Invalid API key".into())
             })?;
 
         debug!(
@@ -771,7 +742,12 @@ impl AzureCredentialVendor {
 
         info!(
             "Azure credentials vended (api_key): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-            account, container, path, permission, expires_at_millis, redact_credential(&sas_token)
+            account,
+            container,
+            path,
+            permission,
+            expires_at_millis,
+            redact_credential(&sas_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -829,9 +805,10 @@ impl CredentialVendor for AzureCredentialVendor {
 
         let url = uri_to_url(table_location)?;
 
-        let container = url.host_str().ok_or_else(|| Error::InvalidInput {
-            source: format!("Azure URI '{}' missing container", table_location).into(),
-            location: snafu::location!(),
+        let container = url.host_str().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Azure URI '{}' missing container", table_location).into(),
+            )
         })?;
 
         // Extract path for directory-scoped SAS
@@ -841,10 +818,7 @@ impl CredentialVendor for AzureCredentialVendor {
             self.config
                 .account_name
                 .as_ref()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "Azure credential vending requires 'credential_vendor.azure_account_name' to be set in configuration".into(),
-                    location: snafu::location!(),
-                })?;
+                .ok_or_else(|| Error::invalid_input_source("Azure credential vending requires 'credential_vendor.azure_account_name' to be set in configuration".into()))?;
 
         // Dispatch based on identity
         match identity {
@@ -858,10 +832,9 @@ impl CredentialVendor for AzureCredentialVendor {
                 self.vend_with_api_key(account, container, path, api_key)
                     .await
             }
-            Some(_) => Err(Error::InvalidInput {
-                source: "Identity provided but neither auth_token nor api_key is set".into(),
-                location: snafu::location!(),
-            }),
+            Some(_) => Err(Error::invalid_input_source(
+                "Identity provided but neither auth_token nor api_key is set".into(),
+            )),
             None => {
                 // Static credential vending using DefaultAzureCredential
                 // Use directory-scoped SAS when path is provided, container-level otherwise
@@ -887,7 +860,12 @@ impl CredentialVendor for AzureCredentialVendor {
 
                 info!(
                     "Azure credentials vended (static): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-                    account, container, path, self.config.permission, expires_at_millis, redact_credential(&sas_token)
+                    account,
+                    container,
+                    path,
+                    self.config.permission,
+                    expires_at_millis,
+                    redact_credential(&sas_token)
                 );
 
                 Ok(VendedCredentials::new(storage_options, expires_at_millis))

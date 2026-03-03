@@ -10,46 +10,45 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
+    Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::{NullableRowAddrSet, RowAddrTreeMap},
         tokio::get_num_compute_intensive_cpus,
     },
-    Error, Result, ROW_ID,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 use tracing::instrument;
 
-use super::{
-    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
-};
 use super::{AnyQuery, IndexStore, ScalarIndex};
+use super::{
+    BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
+};
 use crate::pbold;
+use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
             DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
             TrainingRequest, VALUE_COLUMN_NAME,
         },
-        CreatedIndex, UpdateCriteria,
     },
 };
-use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
+use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -217,10 +216,7 @@ impl BitmapIndex {
                 .column(0)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::Internal {
-                    message: "Invalid bitmap column type".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
             let bitmap_bytes = binary_bitmaps.value(0);
             let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -278,10 +274,7 @@ impl BitmapIndex {
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Invalid bitmap column type".to_string(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -324,10 +317,9 @@ impl Index for BitmapIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "BitmapIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "BitmapIndex is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -387,9 +379,11 @@ impl Index for BitmapIndex {
         let stats = BitmapStatistics {
             num_bitmaps: self.index_map.len() + if !self.null_map.is_empty() { 1 } else { 0 },
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize bitmap index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize bitmap index statistics: {}",
+                e
+            ))
         })
     }
 
@@ -539,10 +533,9 @@ impl ScalarIndex for BitmapIndex {
                 ((*self.null_map).clone(), None)
             }
             SargableQuery::FullTextSearch(_) => {
-                return Err(Error::NotSupported {
-                    source: "full text search is not supported for bitmap indexes".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "full text search is not supported for bitmap indexes".into(),
+                ));
             }
         };
 
@@ -712,12 +705,8 @@ impl BitmapIndexPlugin {
         }
 
         // Finish file with metadata that allows lightweight statistics reads
-        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps }).map_err(|e| {
-            Error::Internal {
-                message: format!("failed to serialize bitmap statistics: {e}"),
-                location: location!(),
-            }
-        })?;
+        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps })
+            .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
         let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
 
@@ -772,10 +761,9 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A bitmap index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A bitmap index can only be created on a non-nested field.".into(),
+            ));
         }
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
@@ -807,10 +795,9 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "Bitmap index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Bitmap index does not support fragment training".into(),
+            ));
         }
 
         Self::train_bitmap_index(data, index_store).await?;
@@ -839,9 +826,8 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     ) -> Result<Option<serde_json::Value>> {
         let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         if let Some(value) = reader.schema().metadata.get(INDEX_STATS_METADATA_KEY) {
-            let stats = serde_json::from_str(value).map_err(|e| Error::Internal {
-                message: format!("failed to parse bitmap statistics metadata: {e}"),
-                location: location!(),
+            let stats = serde_json::from_str(value).map_err(|e| {
+                Error::internal(format!("failed to parse bitmap statistics metadata: {e}"))
             })?;
             Ok(Some(stats))
         } else {
@@ -855,7 +841,7 @@ pub mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{record_batch, RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
@@ -1003,9 +989,9 @@ pub mod tests {
     async fn test_big_bitmap_index() {
         // WARNING: This test allocates a huge state to force overflow over int32 on BinaryArray
         // You must run it only on a machine with enough resources (or skip it normally).
-        use super::{BitmapIndex, BITMAP_LOOKUP_NAME};
-        use crate::scalar::lance_format::LanceIndexStore;
+        use super::{BITMAP_LOOKUP_NAME, BitmapIndex};
         use crate::scalar::IndexStore;
+        use crate::scalar::lance_format::LanceIndexStore;
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
@@ -1194,27 +1180,35 @@ pub mod tests {
             value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string()))),
         };
 
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_red)
-            .await
-            .is_none());
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_blue)
-            .await
-            .is_none());
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_red)
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_blue)
+                .await
+                .is_none()
+        );
 
         // Call prewarm
         index.prewarm().await.unwrap();
 
         // Verify all bitmaps are now cached
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_red)
-            .await
-            .is_some());
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_blue)
-            .await
-            .is_some());
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_red)
+                .await
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_blue)
+                .await
+                .is_some()
+        );
 
         // Verify cached bitmaps have correct content
         let cached_red = cache

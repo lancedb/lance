@@ -4,34 +4,33 @@
 //! Lance Schema Field
 
 use std::{
-    cmp::{max, Ordering},
+    cmp::{Ordering, max},
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
 };
 
 use arrow_array::{
+    ArrayRef,
     cast::AsArray,
     types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     },
-    ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
-    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
-use snafu::location;
 
 use super::{
-    schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
+    schema::{compare_fields, explain_fields_difference},
 };
 use crate::{
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
     Error, Result,
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -635,13 +634,10 @@ impl Field {
     ///
     pub fn project_by_field(&self, other: &Self, on_type_mismatch: OnTypeMismatch) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Schema {
-                message: format!(
-                    "Attempt to project field by different names: {} and {}",
-                    self.name, other.name,
-                ),
-                location: location!(),
-            });
+            return Err(Error::schema(format!(
+                "Attempt to project field by different names: {} and {}",
+                self.name, other.name,
+            )));
         };
 
         match (self.data_type(), other.data_type()) {
@@ -651,13 +647,10 @@ impl Field {
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
             {
                 if dt != other_dt {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Attempt to project field by different types: {} and {}",
-                            dt, other_dt,
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Attempt to project field by different types: {} and {}",
+                        dt, other_dt,
+                    )));
                 }
                 Ok(self.clone())
             }
@@ -671,13 +664,10 @@ impl Field {
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Attempt to project non-existed field: {} on {}",
-                                other_field.name, self,
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(format!(
+                            "Attempt to project non-existed field: {} on {}",
+                            other_field.name, self,
+                        )));
                     };
                     fields.push(child.project_by_field(other_field, on_type_mismatch)?);
                 }
@@ -710,13 +700,10 @@ impl Field {
                 Ok(self.clone())
             }
             _ => match on_type_mismatch {
-                OnTypeMismatch::Error => Err(Error::Schema {
-                    message: format!(
-                        "Attempt to project incompatible fields: {} and {}",
-                        self, other
-                    ),
-                    location: location!(),
-                }),
+                OnTypeMismatch::Error => Err(Error::schema(format!(
+                    "Attempt to project incompatible fields: {} and {}",
+                    self, other
+                ))),
                 OnTypeMismatch::TakeSelf => Ok(self.clone()),
             },
         }
@@ -768,23 +755,17 @@ impl Field {
 
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect different fields: {} and {}",
-                    self.name, other.name,
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect different fields: {} and {}",
+                self.name, other.name,
+            )));
         }
 
         if self.is_blob() != other.is_blob() {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect blob and non-blob field: {}",
-                    self.name
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect blob and non-blob field: {}",
+                self.name
+            )));
         }
 
         let self_type = self.data_type();
@@ -831,13 +812,10 @@ impl Field {
         }
 
         if (!ignore_types && self_type != other_type) || self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect different fields: ({}, {}) and ({}, {})",
-                    self.name, self_type, other.name, other_type
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect different fields: ({}, {}) and ({}, {})",
+                self.name, self_type, other.name, other_type
+            )));
         }
 
         Ok(if self.id >= 0 {
@@ -922,13 +900,10 @@ impl Field {
             }
             _ => {
                 if self.data_type() != other.data_type() {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Attempt to merge incompatible fields: {} and {}",
-                            self, other
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Attempt to merge incompatible fields: {} and {}",
+                        self, other
+                    )));
                 }
             }
         }
@@ -1057,7 +1032,7 @@ impl TryFrom<&ArrowField> for Field {
         let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
             Some(val) => val
                 .parse::<i32>()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .map_err(|e| Error::invalid_input(e.to_string()))?
                 .max(-1),
             None => -1,
         };
@@ -1077,34 +1052,27 @@ impl TryFrom<&ArrowField> for Field {
                 //  because converting a rust arrow map field to the python arrow field will
                 //  lose the keys_sorted property.
                 if *keys_sorted {
-                    return Err(Error::Schema {
-                        message: "Unsupported map field with keys_sorted=true".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Unsupported map field with keys_sorted=true".to_string(),
+                    ));
                 }
                 // Validate Map entries follow Arrow specification
                 let DataType::Struct(struct_fields) = entries.data_type() else {
-                    return Err(Error::Schema {
-                        message: "Map entries field must be a Struct<key, value>".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Map entries field must be a Struct<key, value>".to_string(),
+                    ));
                 };
                 if struct_fields.len() < 2 {
-                    return Err(Error::Schema {
-                        message: "Map entries struct must contain both key and value fields"
-                            .to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Map entries struct must contain both key and value fields".to_string(),
+                    ));
                 }
                 let key_field = &struct_fields[0];
                 if key_field.is_nullable() {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Map key field '{}' must be non-nullable according to Arrow Map specification",
-                            key_field.name()
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                        key_field.name()
+                    )));
                 }
                 vec![Self::try_from(entries.as_ref())?]
             }

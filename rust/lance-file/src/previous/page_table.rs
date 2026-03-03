@@ -5,9 +5,8 @@ use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use lance_io::encodings::plain::PlainDecoder;
 use lance_io::encodings::Decoder;
-use snafu::location;
+use lance_io::encodings::plain::PlainDecoder;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
@@ -59,13 +58,10 @@ impl PageTable {
         num_batches: i32,
     ) -> Result<Self> {
         if max_field_id < min_field_id {
-            return Err(Error::Internal {
-                message: format!(
-                    "max_field_id {} is less than min_field_id {}",
-                    max_field_id, min_field_id
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "max_field_id {} is less than min_field_id {}",
+                max_field_id, min_field_id
+            )));
         }
 
         let field_ids = min_field_id..=max_field_id;
@@ -106,21 +102,15 @@ impl PageTable {
     /// holes in the field ids as well as struct fields which have no data pages.
     pub async fn write(&self, writer: &mut dyn Writer, min_field_id: i32) -> Result<usize> {
         if self.pages.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "empty page table".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("empty page table".into()));
         }
 
         let observed_min = *self.pages.keys().min().unwrap();
         if min_field_id > *self.pages.keys().min().unwrap() {
-            return Err(Error::invalid_input(
-                format!(
-                    "field_id_offset {} is greater than the minimum field_id {}",
-                    min_field_id, observed_min
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "field_id_offset {} is greater than the minimum field_id {}",
+                min_field_id, observed_min
+            )));
         }
         let max_field_id = *self.pages.keys().max().unwrap();
         let field_ids = min_field_id..=max_field_id;

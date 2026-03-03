@@ -369,6 +369,7 @@ def test_blob_extension_write_external(tmp_path):
         table,
         tmp_path / "test_ds_v2_external",
         data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
     )
 
     blob = ds.take_blobs("blob", indices=[0])[0]
@@ -410,6 +411,7 @@ def test_blob_extension_write_external_slice(tmp_path):
         table,
         tmp_path / "ds",
         data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
     )
 
     blobs = ds.take_blobs("blob", indices=[0, 1, 2])

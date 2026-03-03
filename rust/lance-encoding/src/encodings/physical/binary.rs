@@ -12,7 +12,6 @@
 use arrow_array::OffsetSizeTrait;
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
-use snafu::location;
 
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
@@ -22,11 +21,11 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_VALUES,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb21::compressive_encoding::Compression;
 use crate::format::pb21::CompressiveEncoding;
-use crate::format::{pb21, ProtobufUtils21};
+use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::{ProtobufUtils21, pb21};
 
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
@@ -249,14 +248,13 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with BinaryMiniBlockEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -411,8 +409,10 @@ impl BlockCompressor for VariableEncoder {
                         Ok(LanceBuffer::from(output))
                     }
                     _ => {
-                        panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
-                variable_width_data.bits_per_offset);
+                        panic!(
+                            "BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
+                            variable_width_data.bits_per_offset
+                        );
                     }
                 }
             }
@@ -479,10 +479,9 @@ impl BlockDecompressor for BinaryBlockDecompressor {
                     (bits_per_offset, bytes_start_offset, 17)
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                    ));
                 }
             }
         } else {
@@ -498,10 +497,9 @@ impl BlockDecompressor for BinaryBlockDecompressor {
                     (bits_per_offset, bytes_start_offset, 16)
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                    ));
                 }
             }
         };
@@ -529,8 +527,8 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 #[cfg(test)]
 pub mod tests {
     use arrow_array::{
-        builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, StringArray,
+        builder::{LargeStringBuilder, StringBuilder},
     };
     use arrow_schema::{DataType, Field};
 
@@ -546,8 +544,8 @@ pub mod tests {
 
     use crate::{
         testing::{
-            check_basic_random, check_round_trip_encoding_of_data, FnArrayGeneratorProvider,
-            TestCases,
+            FnArrayGeneratorProvider, TestCases, check_basic_random,
+            check_round_trip_encoding_of_data,
         },
         version::LanceFileVersion,
     };

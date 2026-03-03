@@ -3,7 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, make_array, Array, ArrayRef, LargeListArray, ListArray};
+use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, cast::AsArray, make_array};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -234,9 +234,9 @@ mod tests {
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use arrow_array::{
-        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
-        UInt64Array, UInt8Array,
+        UInt8Array, UInt64Array,
+        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
     };
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -244,7 +244,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::{
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

@@ -5,21 +5,21 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, cast::as_primitive_array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
-use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
+use lance::dataset::{Dataset, WriteMode, WriteParams, builder::DatasetBuilder};
 use lance::index::vector::VectorIndexParams;
-use lance_arrow::{as_fixed_size_list_array, FixedSizeListArrayExt};
+use lance_arrow::{FixedSizeListArrayExt, as_fixed_size_list_array};
 use lance_index::{
-    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexType,
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;
 

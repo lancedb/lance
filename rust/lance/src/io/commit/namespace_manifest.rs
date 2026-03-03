@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
+use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
 };
-use lance_namespace::LanceNamespace;
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use object_store::path::Path;
 use object_store::ObjectStore as OSObjectStore;
+use object_store::path::Path;
 
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {
@@ -97,12 +97,11 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         let response = self.namespace.create_table_version(request).await?;
 
         // Get version info from response
-        let version_info = response
-            .version
-            .ok_or_else(|| lance_core::Error::Internal {
-                message: "create_table_version response missing version info".to_string(),
-                location: snafu::location!(),
-            })?;
+        let version_info = response.version.ok_or_else(|| {
+            lance_core::Error::internal(
+                "create_table_version response missing version info".to_string(),
+            )
+        })?;
 
         Ok(ManifestLocation {
             version: version_info.version as u64,
@@ -121,10 +120,9 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        Err(lance_core::Error::NotSupported {
-            source: "put_if_not_exists is not supported for namespace-backed stores".into(),
-            location: snafu::location!(),
-        })
+        Err(lance_core::Error::not_supported_source(
+            "put_if_not_exists is not supported for namespace-backed stores".into(),
+        ))
     }
 
     async fn put_if_exists(
@@ -135,9 +133,8 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        Err(lance_core::Error::NotSupported {
-            source: "put_if_exists is not supported for namespace-backed stores".into(),
-            location: snafu::location!(),
-        })
+        Err(lance_core::Error::not_supported_source(
+            "put_if_exists is not supported for namespace-backed stores".into(),
+        ))
     }
 }

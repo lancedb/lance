@@ -8,7 +8,7 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use async_trait::async_trait;
-    use futures::{future::join_all, StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, future::join_all};
     use lance_core::{Error, Result};
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
@@ -17,13 +17,12 @@ mod test {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
-    use snafu::location;
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
         Dataset,
+        dataset::{ReadParams, WriteMode, WriteParams},
     };
     use lance_core::utils::tempfile::TempStrDir;
 
@@ -48,10 +47,7 @@ mod test {
             let store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(path) => Ok(path.clone()),
-                None => Err(Error::NotFound {
-                    uri: uri.to_string(),
-                    location: location!(),
-                }),
+                None => Err(Error::not_found(uri.to_string())),
             }
         }
 
@@ -85,13 +81,10 @@ mod test {
 
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
-                Some(_) => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
-                    location!(),
-                )),
+                Some(_) => Err(Error::io(format!(
+                    "manifest already exists for uri: {}, version: {}",
+                    uri, version
+                ))),
                 None => {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
@@ -116,13 +109,10 @@ mod test {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
                 }
-                None => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
-                    location!(),
-                )),
+                None => Err(Error::io(format!(
+                    "manifest already exists for uri: {}, version: {}",
+                    uri, version
+                ))),
             }
         }
     }

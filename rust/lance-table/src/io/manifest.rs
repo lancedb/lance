@@ -10,20 +10,19 @@ use lance_file::{
 };
 use object_store::path::Path;
 use prost::Message;
-use snafu::location;
 use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
-    encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder},
+    encodings::{Encoder, binary::BinaryEncoder, plain::PlainEncoder},
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, Transaction, MAGIC};
+use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
 
 use super::commit::ManifestLocation;
 
@@ -59,14 +58,12 @@ pub async fn read_manifest(
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: file size is smaller than 16 bytes".to_string(),
-            location!(),
         ));
     }
     if !buf.ends_with(MAGIC) {
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: magic number does not match".to_string(),
-            location!(),
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
@@ -99,14 +96,11 @@ pub async fn read_manifest(
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::invalid_input(
-            format!(
-                "Invalid format: manifest length does not match. Expected {}, got {}",
-                recorded_length,
-                buf.len()
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Invalid format: manifest length does not match. Expected {}, got {}",
+            recorded_length,
+            buf.len()
+        )));
     }
 
     let proto = pb::Manifest::decode(buf)?;
@@ -177,48 +171,40 @@ pub async fn write_manifest(
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
     let is_legacy_storage = manifest.should_use_legacy_format();
     for field_id in 0..max_field_id + 1 {
-        if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
-            if field.data_type().is_dictionary() && is_legacy_storage {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                    Error::io(
-                        format!("Lance field {} misses dictionary info", field.name),
-                        location!(),
-                    )
-                })?;
+        if let Some(field) = manifest.schema.mut_field_by_id(field_id)
+            && field.data_type().is_dictionary()
+            && is_legacy_storage
+        {
+            let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                Error::io(format!("Lance field {} misses dictionary info", field.name))
+            })?;
 
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                    Error::io(
-                        format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ),
-                        location!(),
-                    )
-                })?;
+            let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                Error::io(format!(
+                    "Lance field {} is dictionary type, but misses the dictionary value array",
+                    field.name
+                ))
+            })?;
 
-                let data_type = value_arr.data_type();
-                let pos = match data_type {
-                    dt if dt.is_numeric() => {
-                        let mut encoder = PlainEncoder::new(writer, dt);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    dt if dt.is_binary_like() => {
-                        let mut encoder = BinaryEncoder::new(writer);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    _ => {
-                        return Err(Error::schema(
-                            format!(
-                                "Does not support {} as dictionary value type",
-                                value_arr.data_type()
-                            ),
-                            location!(),
-                        ));
-                    }
-                };
-                dict_info.offset = pos;
-                dict_info.length = value_arr.len();
-            }
+            let data_type = value_arr.data_type();
+            let pos = match data_type {
+                dt if dt.is_numeric() => {
+                    let mut encoder = PlainEncoder::new(writer, dt);
+                    encoder.encode(&[value_arr]).await?
+                }
+                dt if dt.is_binary_like() => {
+                    let mut encoder = BinaryEncoder::new(writer);
+                    encoder.encode(&[value_arr]).await?
+                }
+                _ => {
+                    return Err(Error::schema(format!(
+                        "Does not support {} as dictionary value type",
+                        value_arr.data_type()
+                    )));
+                }
+            };
+            dict_info.offset = pos;
+            dict_info.length = value_arr.len();
         }
     }
 
@@ -257,7 +243,7 @@ mod test {
     use lance_file::previous::{
         reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
     };
-    use rand::{distr::Alphanumeric, Rng};
+    use rand::{Rng, distr::Alphanumeric};
     use tokio::io::AsyncWriteExt;
 
     use super::*;

@@ -11,13 +11,13 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{limit::GlobalLimitExec, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::Expr;
 use lance_core::Result;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DeduplicateExec, MemtableGenTagExec, MEMTABLE_GEN_COLUMN, ROW_ADDRESS_COLUMN};
+use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
 
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
@@ -105,11 +105,11 @@ impl LsmScanPlanner {
 
             // Sort locally by (pk ASC, _rowaddr DESC)
             let local_sort_exprs = self.build_local_sort_exprs(&scan)?;
-            let lex_ordering =
-                LexOrdering::new(local_sort_exprs).ok_or_else(|| lance_core::Error::Internal {
-                    message: "Failed to create LexOrdering from sort expressions".to_string(),
-                    location: snafu::location!(),
-                })?;
+            let lex_ordering = LexOrdering::new(local_sort_exprs).ok_or_else(|| {
+                lance_core::Error::internal(
+                    "Failed to create LexOrdering from sort expressions".to_string(),
+                )
+            })?;
             let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, scan));
 
             // Only tag with generation if user wants _memtable_gen in output
@@ -141,11 +141,11 @@ impl LsmScanPlanner {
             // Use SortPreservingMergeExec to merge K pre-sorted streams
             // IMPORTANT: Only merge by pk columns, not _rowaddr!
             let merge_sort_exprs = self.build_merge_sort_exprs(&sorted_plans[0])?;
-            let lex_ordering =
-                LexOrdering::new(merge_sort_exprs).ok_or_else(|| lance_core::Error::Internal {
-                    message: "Failed to create LexOrdering from sort expressions".to_string(),
-                    location: snafu::location!(),
-                })?;
+            let lex_ordering = LexOrdering::new(merge_sort_exprs).ok_or_else(|| {
+                lance_core::Error::internal(
+                    "Failed to create LexOrdering from sort expressions".to_string(),
+                )
+            })?;
 
             // UnionExec to combine all partitions (ordered by _memtable_gen DESC)
             #[allow(deprecated)]
@@ -186,10 +186,7 @@ impl LsmScanPlanner {
         // Sort by PK columns (ASC) to group duplicates together
         for col in &self.pk_columns {
             let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(
-                    format!("Column '{}' not found in schema", col),
-                    snafu::location!(),
-                )
+                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
             })?;
             sort_exprs.push(PhysicalSortExpr {
                 expr: Arc::new(Column::new(col, idx)),
@@ -202,10 +199,10 @@ impl LsmScanPlanner {
 
         // Sort by _rowaddr DESC (higher address = newer within generation)
         let (addr_idx, _) = schema.column_with_name(ROW_ADDRESS_COLUMN).ok_or_else(|| {
-            lance_core::Error::invalid_input(
-                format!("Column '{}' not found in schema", ROW_ADDRESS_COLUMN),
-                snafu::location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Column '{}' not found in schema",
+                ROW_ADDRESS_COLUMN
+            ))
         })?;
         sort_exprs.push(PhysicalSortExpr {
             expr: Arc::new(Column::new(ROW_ADDRESS_COLUMN, addr_idx)),
@@ -239,10 +236,7 @@ impl LsmScanPlanner {
         // Sort by PK columns (ASC) only - NOT _rowaddr!
         for col in &self.pk_columns {
             let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(
-                    format!("Column '{}' not found in schema", col),
-                    snafu::location!(),
-                )
+                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
             })?;
             sort_exprs.push(PhysicalSortExpr {
                 expr: Arc::new(Column::new(col, idx)),
@@ -456,9 +450,9 @@ mod integration_tests {
     use futures::TryStreamExt;
     use uuid::Uuid;
 
+    use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
     use crate::dataset::mem_wal::scanner::data_source::RegionSnapshot;
-    use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
@@ -983,8 +977,8 @@ mod integration_tests {
         String,
     ) {
         use crate::index::CreateIndexBuilder;
-        use lance_index::scalar::ScalarIndexParams;
         use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
 
         let schema = create_pk_schema();
         let temp_dir = tempfile::tempdir().unwrap();

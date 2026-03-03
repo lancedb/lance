@@ -87,11 +87,7 @@ impl AsBytes for [u8] {
 
 impl AsBytes for bool {
     fn as_bytes(&self) -> impl AsRef<[u8]> {
-        if *self {
-            [1u8]
-        } else {
-            [0u8]
-        }
+        if *self { [1u8] } else { [0u8] }
     }
 }
 

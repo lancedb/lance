@@ -85,8 +85,8 @@ mod tests {
     use super::*;
     use crate::{dataset::WriteParams, io::exec::LanceScanExec};
     use arrow_array::{
-        builder::{FixedSizeListBuilder, Int32Builder},
         Float64Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+        builder::{FixedSizeListBuilder, Int32Builder},
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use datafusion::prelude::*;
@@ -172,10 +172,12 @@ mod tests {
             .unwrap()
             .children()[0];
 
-        assert!(physical_plan
-            .as_any()
-            .downcast_ref::<LanceScanExec>()
-            .is_some());
+        assert!(
+            physical_plan
+                .as_any()
+                .downcast_ref::<LanceScanExec>()
+                .is_some()
+        );
 
         let expected_fields = schema
             .fields()

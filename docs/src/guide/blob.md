@@ -90,6 +90,12 @@ ds = lance.write_dataset(
 )
 ```
 
+Note:
+
+- By default, external blob URIs must map to a registered non-dataset-root base path.
+- If you need to reference external objects outside those bases, set
+  `allow_external_blob_outside_bases=True` when writing.
+
 ### Example: packed external blobs (single container file)
 
 ```python
@@ -134,7 +140,12 @@ rows = pa.table(
     schema=schema,
 )
 
-ds = lance.write_dataset(rows, "./packed_blobs_v22.lance", data_storage_version="2.2")
+ds = lance.write_dataset(
+    rows,
+    "./packed_blobs_v22.lance",
+    data_storage_version="2.2",
+    allow_external_blob_outside_bases=True,
+)
 ```
 
 ## Blob v2 Read Patterns

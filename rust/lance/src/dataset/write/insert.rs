@@ -17,21 +17,20 @@ use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use snafu::location;
 
+use crate::Dataset;
+use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
-use crate::dataset::ReadParams;
-use crate::Dataset;
 use crate::{Error, Result};
 use tracing::info;
 
-use super::commit::CommitBuilder;
-use super::resolve_commit_handler;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
+use super::commit::CommitBuilder;
+use super::resolve_commit_handler;
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -142,18 +141,14 @@ impl<'a> InsertBuilder<'a> {
         // TODO: This should be able to split the data up based on max_rows_per_file
         // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "No data to write".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("No data to write".into()));
         }
         let schema = data[0].schema();
         for batch in data.iter().skip(1) {
             if batch.schema() != schema {
-                return Err(Error::InvalidInput {
-                    source: "All record batches must have the same schema".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "All record batches must have the same schema".into(),
+                ));
             }
         }
         let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
@@ -223,12 +218,10 @@ impl<'a> InsertBuilder<'a> {
                         auto_cleanup_params.interval.to_string(),
                     );
 
-                    let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
-                        Error::InvalidInput {
-                            source: e.into(),
-                            location: location!(),
-                        }
-                    })?;
+                    let duration = auto_cleanup_params
+                        .older_than
+                        .to_std()
+                        .map_err(|e| Error::invalid_input_source(e.into()))?;
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.older_than"),
                         format_duration(duration).to_string(),
@@ -274,10 +267,7 @@ impl<'a> InsertBuilder<'a> {
         // Write mode
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::DatasetAlreadyExists {
-                    uri: ds.uri.clone(),
-                    location: location!(),
-                });
+                return Err(Error::dataset_already_exists(ds.uri.clone()));
             }
             (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
@@ -287,58 +277,54 @@ impl<'a> InsertBuilder<'a> {
         }
 
         // Validate schema
-        if matches!(context.params.mode, WriteMode::Append) {
-            if let WriteDestination::Dataset(dataset) = &context.dest {
-                // If the dataset is already using (or not using) stable row ids, we need to match
-                // and ignore whatever the user provided as input
-                if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
-                    log::info!(
-                        "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
-                        context.params.enable_stable_row_ids,
-                        dataset.manifest.uses_stable_row_ids()
-                    );
-                    context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-                }
-
-                let schema_cmp_opts = SchemaCompareOptions {
-                    compare_dictionary: dataset.manifest.should_use_legacy_format(),
-                    compare_nullability: NullabilityComparison::Ignore,
-                    allow_missing_if_nullable: true,
-                    ignore_field_order: true,
-                    ..Default::default()
-                };
-
-                data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+        if matches!(context.params.mode, WriteMode::Append)
+            && let WriteDestination::Dataset(dataset) = &context.dest
+        {
+            // If the dataset is already using (or not using) stable row ids, we need to match
+            // and ignore whatever the user provided as input
+            if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
+                log::info!(
+                    "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
+                    context.params.enable_stable_row_ids,
+                    dataset.manifest.uses_stable_row_ids()
+                );
+                context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }
+
+            let schema_cmp_opts = SchemaCompareOptions {
+                compare_dictionary: dataset.manifest.should_use_legacy_format(),
+                compare_nullability: NullabilityComparison::Ignore,
+                allow_missing_if_nullable: true,
+                ignore_field_order: true,
+                ..Default::default()
+            };
+
+            data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
         // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
             if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
-                return Err(Error::InvalidInput {
-                    source: format!(
+                return Err(Error::invalid_input_source(
+                    format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
                         field.name
                     )
                     .into(),
-                    location: location!(),
-                });
+                ));
             }
         }
 
         // Feature flags
-        if let WriteDestination::Dataset(dataset) = &context.dest {
-            if !can_write_dataset(dataset.manifest.writer_feature_flags) {
-                let message = format!(
-                    "This dataset cannot be written by this version of Lance. \
+        if let WriteDestination::Dataset(dataset) = &context.dest
+            && !can_write_dataset(dataset.manifest.writer_feature_flags)
+        {
+            let message = format!(
+                "This dataset cannot be written by this version of Lance. \
                 Please upgrade Lance to write to this dataset.\n Flags: {}",
-                    dataset.manifest.writer_feature_flags
-                );
-                return Err(Error::NotSupported {
-                    source: message.into(),
-                    location: location!(),
-                });
-            }
+                dataset.manifest.writer_feature_flags
+            );
+            return Err(Error::not_supported_source(message.into()));
         }
 
         Ok(())
@@ -522,15 +508,12 @@ mod test {
 
     #[tokio::test]
     async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "blob",
-            DataType::Binary,
-            false,
-        )
-        .with_metadata(HashMap::from([(
-            BLOB_META_KEY.to_string(),
-            "true".to_string(),
-        )]))]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::Binary, false).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]))],

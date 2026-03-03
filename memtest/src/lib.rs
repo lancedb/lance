@@ -18,7 +18,7 @@ pub struct MemtestStats {
 ///
 /// # Safety
 /// The `stats` pointer must be valid and properly aligned
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn memtest_get_stats(stats: *mut MemtestStats) {
     if stats.is_null() {
         return;
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn memtest_get_stats(stats: *mut MemtestStats) {
 }
 
 /// Reset all statistics to zero
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn memtest_reset_stats() {
     STATS.reset();
 }

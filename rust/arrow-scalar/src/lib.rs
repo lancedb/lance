@@ -16,7 +16,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{make_array, new_null_array, ArrayRef};
+use arrow_array::{ArrayRef, make_array, new_null_array};
 use arrow_cast::display::ArrayFormatter;
 use arrow_data::transform::MutableArrayData;
 use arrow_row::{OwnedRow, RowConverter, SortField};

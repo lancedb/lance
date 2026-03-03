@@ -3,9 +3,8 @@
 
 use crate::{format::pb, rowids::bitmap::Bitmap};
 use lance_core::{Error, Result};
-use snafu::location;
 
-use super::{encoded_array::EncodedU64Array, RowIdSequence, U64Segment};
+use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
 use prost::Message;
 
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
@@ -31,7 +30,7 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             Some(Range(pb_seg::Range { start, end })) => Ok(Self::Range(start..end)),
             Some(RangeWithHoles(pb_seg::RangeWithHoles { start, end, holes })) => {
                 let holes = holes
-                    .ok_or_else(|| Error::invalid_input("missing hole", location!()))?
+                    .ok_or_else(|| Error::invalid_input("missing hole"))?
                     .try_into()?;
                 Ok(Self::RangeWithHoles {
                     range: start..end,
@@ -50,8 +49,8 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             Some(SortedArray(array)) => Ok(Self::SortedArray(EncodedU64Array::try_from(array)?)),
             Some(Array(array)) => Ok(Self::Array(EncodedU64Array::try_from(array)?)),
             // TODO: why non-exhaustive?
-            // Some(_) => Err(Error::invalid_input("unknown segment type", location!())),
-            None => Err(Error::invalid_input("missing segment type", location!())),
+            // Some(_) => Err(Error::invalid_input("unknown segment type")),
+            None => Err(Error::invalid_input("missing segment type")),
         }
     }
 }
@@ -102,8 +101,8 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                 Ok(Self::U64(values))
             }
             // TODO: shouldn't this enum be non-exhaustive?
-            // Some(_) => Err(Error::invalid_input("unknown array type", location!())),
-            None => Err(Error::invalid_input("missing array type", location!())),
+            // Some(_) => Err(Error::invalid_input("unknown array type")),
+            None => Err(Error::invalid_input("missing array type")),
         }
     }
 }

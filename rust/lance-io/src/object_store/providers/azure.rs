@@ -10,18 +10,17 @@ use std::{
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
-use opendal::{services::Azblob, Operator};
-use snafu::location;
+use opendal::{Operator, services::Azblob};
 
 use object_store::{
-    azure::{AzureConfigKey, MicrosoftAzureBuilder},
     RetryConfig,
+    azure::{AzureConfigKey, MicrosoftAzureBuilder},
 };
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -36,9 +35,7 @@ impl AzureBlobStoreProvider {
     ) -> Result<Arc<dyn OSObjectStore>> {
         let container = base_path
             .host_str()
-            .ok_or_else(|| {
-                Error::invalid_input("Azure URL must contain container name", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("Azure URL must contain container name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -56,10 +53,7 @@ impl AzureBlobStoreProvider {
 
         let operator = Operator::from_iter::<Azblob>(config_map)
             .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create Azure Blob operator: {:?}", e),
-                    location!(),
-                )
+                Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
             })?
             .finish();
 
@@ -156,10 +150,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
                 if account.is_none() {
                     account = StorageOptions::find_configured_storage_account(&ENV_OPTIONS.0);
                 }
-                let account = account.ok_or(Error::invalid_input(
-                    "Unable to find object store prefix: no Azure account name in URI, and no storage account configured.",
-                    location!(),
-                ))?;
+                let account = account.ok_or(Error::invalid_input("Unable to find object store prefix: no Azure account name in URI, and no storage account configured."))?;
                 (authority, account)
             }
         };
@@ -174,10 +165,10 @@ impl StorageOptions {
     fn from_env() -> Self {
         let mut opts = HashMap::<String, String>::new();
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    opts.insert(config_key.as_ref().to_string(), value.to_string());
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase())
+            {
+                opts.insert(config_key.as_ref().to_string(), value.to_string());
             }
         }
         Self(opts)

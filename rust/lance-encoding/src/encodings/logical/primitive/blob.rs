@@ -8,22 +8,21 @@
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, make_array, Array, UInt64Array};
+use arrow_array::{Array, UInt64Array, cast::AsArray, make_array};
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
-use snafu::location;
+use futures::{FutureExt, future::BoxFuture};
 
 use lance_core::{
-    cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt, Error, Result,
+    Error, Result, cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt,
 };
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
     encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
     repdef::{DefinitionInterpretation, RepDefUnraveler},
-    EncodingsIo,
 };
 
 /// How many bytes to target in each unloaded / loaded shard.  A larger value means
@@ -140,23 +139,18 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
 
         // Need to extract out the repdef information
         let DataBlock::Struct(descriptions) = &decoded.data else {
-            return Err(Error::Internal {
-                message: "Expected struct data block for descriptions".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected struct data block for descriptions",
+            ));
         };
         let mut description_children = descriptions.children.iter();
         let DataBlock::FixedWidth(positions) = description_children.next().expect_ok()? else {
-            return Err(Error::Internal {
-                message: "Expected fixed width data block for positions".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected fixed width data block for positions",
+            ));
         };
         let DataBlock::FixedWidth(sizes) = description_children.next().expect_ok()? else {
-            return Err(Error::Internal {
-                message: "Expected fixed width data block for sizes".into(),
-                location: location!(),
-            });
+            return Err(Error::internal("Expected fixed width data block for sizes"));
         };
         let positions = positions.data.borrow_to_typed_slice::<u64>();
         let sizes = sizes.data.borrow_to_typed_slice::<u64>();
@@ -294,10 +288,9 @@ impl StructuralPageScheduler for BlobPageScheduler {
                 // This can't happen yet today so being a little lazy but if it did happen we just
                 // need to concatenate the descriptions.  I'm guessing by then we might be doing something
                 // different than "load all descriptors in initialize" anyways.
-                return Err(Error::NotSupported {
-                    source: "Expected exactly one descriptor decoder".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Expected exactly one descriptor decoder".into(),
+                ));
             }
             let desc_decoder_task = desc_decoders.pop().unwrap();
             let mut desc_decoder = desc_decoder_task.decoder_fut.await?;

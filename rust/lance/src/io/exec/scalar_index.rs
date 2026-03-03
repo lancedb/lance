@@ -5,33 +5,33 @@ use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
-    dataset::rowids::load_row_id_sequences,
-    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
+    dataset::rowids::load_row_id_sequences,
+    index::{DatasetIndexInternalExt, prefilter::DatasetPreFilter},
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
-    common::{stats::Precision, Statistics},
+    common::{Statistics, stats::Precision},
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
+    Error, ROW_ID_FIELD, Result,
     utils::{
         address::RowAddress,
         mask::{RowAddrMask, RowAddrTreeMap},
     },
-    Error, Result, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -40,19 +40,18 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
+    DatasetIndexExt, IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
-        expression::{
-            IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch,
-            INDEX_EXPR_RESULT_SCHEMA,
-        },
         SargableQuery, ScalarIndex,
+        expression::{
+            INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
+            ScalarIndexSearch,
+        },
     },
-    DatasetIndexExt, IndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::{debug_span, instrument};
 
 #[async_trait]
@@ -66,10 +65,7 @@ impl ScalarIndexLoader for Dataset {
         let idx = self
             .load_scalar_index(IndexCriteria::default().with_name(index_name))
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
-                location: location!()
-            })?;
+            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
         self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }
@@ -746,17 +742,17 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
-        scalar::{
-            expression::{ScalarIndexExpr, ScalarIndexSearch},
-            SargableQuery, ScalarIndexParams,
-        },
         DatasetIndexExt, IndexType,
+        scalar::{
+            SargableQuery, ScalarIndexParams,
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+        },
     };
 
     use crate::{
+        Dataset,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
-        Dataset,
     };
 
     use super::{MapIndexExec, ScalarIndexExec};

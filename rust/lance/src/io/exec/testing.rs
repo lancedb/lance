@@ -13,8 +13,8 @@ use datafusion::{
     common::Statistics,
     execution::context::TaskContext,
     physical_plan::{
-        execution_plan::{Boundedness, EmissionType},
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};

@@ -11,12 +11,12 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result as DFResult,
-    physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule},
+    physical_optimizer::{PhysicalOptimizerRule, optimizer::PhysicalOptimizer},
     physical_plan::{
-        coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec, ExecutionPlan,
+        ExecutionPlan, coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec,
     },
 };
-use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
+use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 
 /// Rule that eliminates [TakeExec] nodes that are immediately followed by another [TakeExec].
 #[derive(Debug)]

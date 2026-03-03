@@ -5,17 +5,17 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 
 use lance_core::Result;
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     format::ProtobufUtils,
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 #[derive(Debug)]

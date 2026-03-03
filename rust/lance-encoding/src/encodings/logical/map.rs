@@ -9,7 +9,6 @@ use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     decoder::{
@@ -197,20 +196,18 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         let (entries_field, keys_sorted) = match &self.data_type {
             DataType::Map(field, keys_sorted) => {
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: "Map type decoder does not support keys_sorted=true now"
+                    return Err(Error::not_supported_source(
+                        "Map type decoder does not support keys_sorted=true now"
                             .to_string()
                             .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
                 (field.clone(), *keys_sorted)
             }
             _ => {
-                return Err(Error::Schema {
-                    message: "Map decoder did not have a map field".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::schema(
+                    "Map decoder did not have a map field".to_string(),
+                ));
             }
         };
 
@@ -218,10 +215,7 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         let entries = array
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .ok_or_else(|| Error::Schema {
-                message: "Map entries should be a StructArray".to_string(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::schema("Map entries should be a StructArray".to_string()))?
             .clone();
 
         // Build the MapArray from offsets, entries, validity, and keys_sorted
@@ -239,15 +233,15 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, MapBuilder, StringBuilder},
         Array, Int32Array, MapArray, StringArray, StructArray,
+        builder::{Int32Builder, MapBuilder, StringBuilder},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::encoder::{default_encoding_strategy, ColumnIndexSequence, EncodingOptions};
+    use crate::encoder::{ColumnIndexSequence, EncodingOptions, default_encoding_strategy};
     use crate::{
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
     use arrow_schema::Field as ArrowField;

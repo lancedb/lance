@@ -3,8 +3,8 @@
 
 //! Key existence tracking for merge insert conflict detection.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use arrow_array::cast::AsArray;
@@ -17,7 +17,6 @@ use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_table::format::pb;
-use snafu::location;
 
 // Default bloom filter config: 8192 items @ 0.00057 fpp -> 16KiB filter
 pub const BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS: u64 = 8192;
@@ -95,7 +94,7 @@ impl KeyExistenceFilterBuilder {
     pub fn might_intersect(&self, other: &Self) -> Result<bool> {
         self.sbbf
             .might_intersect(&other.sbbf)
-            .map_err(|e| lance_core::Error::invalid_input(e.to_string(), location!()))
+            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))
     }
 
     pub fn field_ids(&self) -> &[i32] {
@@ -195,16 +194,13 @@ impl KeyExistenceFilter {
                 },
             ) => {
                 if a_num_items != b_num_items || (a_prob - b_prob).abs() > f64::EPSILON {
-                    return Err(lance_core::Error::invalid_input(
-                        format!(
-                            "Bloom filter config mismatch: ({}, {}) vs ({}, {})",
-                            a_num_items, a_prob, b_num_items, b_prob
-                        ),
-                        location!(),
-                    ));
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "Bloom filter config mismatch: ({}, {}) vs ({}, {})",
+                        a_num_items, a_prob, b_num_items, b_prob
+                    )));
                 }
                 let has = Sbbf::bytes_might_intersect(a_bits, b_bits)
-                    .map_err(|e| lance_core::Error::invalid_input(e.to_string(), location!()))?;
+                    .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
                 Ok((has, has))
             }
         }

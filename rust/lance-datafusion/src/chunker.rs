@@ -7,12 +7,12 @@ use std::{collections::VecDeque, task::Context};
 
 use arrow::compute::kernels;
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::DataFusionError;
-use futures::{ready, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, ready};
 
-use lance_core::error::DataFusionResult;
 use lance_core::Result;
+use lance_core::error::DataFusionResult;
 
 /// Wraps a [`SendableRecordBatchStream`] into a stream of RecordBatch chunks of
 /// a given size.  This slices but does not copy any buffers.
@@ -316,7 +316,7 @@ mod tests {
     use arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt};
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
 
     use crate::datagen::DatafusionDatagenExt;
 

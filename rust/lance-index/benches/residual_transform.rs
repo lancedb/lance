@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, types::Float32Type};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::residual::ResidualTransform;
 use lance_index::vector::transform::Transformer;

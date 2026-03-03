@@ -30,19 +30,18 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
-use object_store::path::Path;
 use object_store::PutMode;
 use object_store::PutOptions;
+use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use uuid::Uuid;
 
 use super::util::{manifest_filename, parse_bit_reversed_filename, region_manifest_path};
@@ -107,26 +106,19 @@ impl RegionManifestStore {
         let path = self.manifest_dir.child(filename.as_str());
 
         let data = self.object_store.inner.get(&path).await.map_err(|e| {
-            Error::io(
-                format!(
-                    "Failed to read manifest version {} for region {}: {}",
-                    version, self.region_id, e
-                ),
-                location!(),
-            )
+            Error::io(format!(
+                "Failed to read manifest version {} for region {}: {}",
+                version, self.region_id, e
+            ))
         })?;
 
         let bytes = data
             .bytes()
             .await
-            .map_err(|e| Error::io(format!("Failed to read manifest bytes: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to read manifest bytes: {}", e)))?;
 
-        let pb_manifest = pb::RegionManifest::decode(bytes).map_err(|e| {
-            Error::io(
-                format!("Failed to decode manifest protobuf: {}", e),
-                location!(),
-            )
-        })?;
+        let pb_manifest = pb::RegionManifest::decode(bytes)
+            .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
 
         RegionManifest::try_from(pb_manifest)
     }
@@ -160,9 +152,7 @@ impl RegionManifestStore {
                 .inner
                 .put(&temp_path, Bytes::from(bytes).into())
                 .await
-                .map_err(|e| {
-                    Error::io(format!("Failed to write temp manifest: {}", e), location!())
-                })?;
+                .map_err(|e| Error::io(format!("Failed to write temp manifest: {}", e)))?;
 
             // Atomically rename to final path
             match self
@@ -175,24 +165,18 @@ impl RegionManifestStore {
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(
-                        format!(
-                            "Manifest version {} already exists for region {}",
-                            version, self.region_id
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!(
+                        "Manifest version {} already exists for region {}",
+                        version, self.region_id
+                    )));
                 }
                 Err(e) => {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(
-                        format!(
-                            "Failed to write manifest version {} for region {}: {}",
-                            version, self.region_id, e
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!(
+                        "Failed to write manifest version {} for region {}: {}",
+                        version, self.region_id, e
+                    )));
                 }
             }
         } else {
@@ -208,21 +192,15 @@ impl RegionManifestStore {
                 .await
                 .map_err(|e| {
                     if matches!(e, object_store::Error::AlreadyExists { .. }) {
-                        Error::io(
-                            format!(
-                                "Manifest version {} already exists for region {}",
-                                version, self.region_id
-                            ),
-                            location!(),
-                        )
+                        Error::io(format!(
+                            "Manifest version {} already exists for region {}",
+                            version, self.region_id
+                        ))
                     } else {
-                        Error::io(
-                            format!(
-                                "Failed to write manifest version {} for region {}: {}",
-                                version, self.region_id, e
-                            ),
-                            location!(),
-                        )
+                        Error::io(format!(
+                            "Failed to write manifest version {} for region {}: {}",
+                            version, self.region_id, e
+                        ))
                     }
                 })?;
         }
@@ -265,11 +243,11 @@ impl RegionManifestStore {
 
             let mut found_any = false;
             while let Some((version, result)) = futures.next().await {
-                if let Ok(true) = result {
-                    if version > latest_found {
-                        latest_found = version;
-                        found_any = true;
-                    }
+                if let Ok(true) = result
+                    && version > latest_found
+                {
+                    latest_found = version;
+                    found_any = true;
                 }
             }
 
@@ -289,10 +267,10 @@ impl RegionManifestStore {
         match self.object_store.inner.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(Error::io(
-                format!("HEAD request failed for version {}: {}", version, e),
-                location!(),
-            )),
+            Err(e) => Err(Error::io(format!(
+                "HEAD request failed for version {}: {}",
+                version, e
+            ))),
         }
     }
 
@@ -346,12 +324,11 @@ impl RegionManifestStore {
         for item in list_result {
             match item {
                 Ok(meta) => {
-                    if let Some(filename) = meta.location.filename() {
-                        if filename.ends_with(".binpb") {
-                            if let Some(version) = parse_bit_reversed_filename(filename) {
-                                versions.push(version);
-                            }
-                        }
+                    if let Some(filename) = meta.location.filename()
+                        && filename.ends_with(".binpb")
+                        && let Some(version) = parse_bit_reversed_filename(filename)
+                    {
+                        versions.push(version);
                     }
                 }
                 Err(e) => {
@@ -420,13 +397,10 @@ impl RegionManifestStore {
         };
 
         self.write(&new_manifest).await.map_err(|e| {
-            Error::io(
-                format!(
-                    "Failed to claim region {} (version {}): another writer may have claimed it: {}",
-                    self.region_id, next_version, e
-                ),
-                location!(),
-            )
+            Error::io(format!(
+                "Failed to claim region {} (version {}): another writer may have claimed it: {}",
+                self.region_id, next_version, e
+            ))
         })?;
 
         info!(
@@ -453,13 +427,10 @@ impl RegionManifestStore {
         region_id: Uuid,
     ) -> Result<()> {
         match manifest {
-            Some(m) if m.writer_epoch > local_epoch => Err(Error::io(
-                format!(
-                    "Writer fenced: local epoch {} < stored epoch {} for region {}",
-                    local_epoch, m.writer_epoch, region_id
-                ),
-                location!(),
-            )),
+            Some(m) if m.writer_epoch > local_epoch => Err(Error::io(format!(
+                "Writer fenced: local epoch {} < stored epoch {} for region {}",
+                local_epoch, m.writer_epoch, region_id
+            ))),
             _ => Ok(()),
         }
     }
@@ -492,7 +463,7 @@ impl RegionManifestStore {
             let current = self
                 .read_latest()
                 .await?
-                .ok_or_else(|| Error::io("Region manifest not found", location!()))?;
+                .ok_or_else(|| Error::io("Region manifest not found"))?;
 
             // Step 2: Check fencing
             Self::check_fenced_against(&Some(current.clone()), local_epoch, self.region_id)?;
@@ -502,13 +473,10 @@ impl RegionManifestStore {
 
             // Validate epoch matches
             if new_manifest.writer_epoch != local_epoch {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Manifest epoch {} doesn't match local epoch {}",
-                        new_manifest.writer_epoch, local_epoch
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Manifest epoch {} doesn't match local epoch {}",
+                    new_manifest.writer_epoch, local_epoch
+                )));
             }
 
             // Step 4: Try to commit
@@ -529,13 +497,10 @@ impl RegionManifestStore {
             }
         }
 
-        Err(Error::io(
-            format!(
-                "Failed to update manifest for region {} after {} attempts",
-                self.region_id, MAX_RETRIES
-            ),
-            location!(),
-        ))
+        Err(Error::io(format!(
+            "Failed to update manifest for region {} after {} attempts",
+            self.region_id, MAX_RETRIES
+        )))
     }
 }
 

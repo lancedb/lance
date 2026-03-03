@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::error::Result;
-use crate::traits::{export_vec, IntoJava};
+use crate::traits::{IntoJava, export_vec};
+use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::jbyte;
-use jni::JNIEnv;
 use lance::table::format::IndexMetadata;
 use lance_index::IndexDescription;
 use prost::Message;

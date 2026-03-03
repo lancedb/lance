@@ -115,8 +115,7 @@ use arrow_array::OffsetSizeTrait;
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use lance_core::{utils::bit::log_2_ceil, Error, Result};
-use snafu::location;
+use lance_core::{Error, Result, utils::bit::log_2_ceil};
 
 use crate::buffer::LanceBuffer;
 
@@ -1000,7 +999,7 @@ impl RepDefBuilder {
                         validity: None,
                         num_values: all_num_values,
                         dimension: all_dimension,
-                    })
+                    });
                 }
                 LayerKind::Offsets => {}
             }
@@ -1123,9 +1122,11 @@ impl RepDefBuilder {
                 )
             })
             .collect::<Vec<_>>();
-        debug_assert!(builders
-            .iter()
-            .all(|b| b.num_layers() == builders[0].num_layers()));
+        debug_assert!(
+            builders
+                .iter()
+                .all(|b| b.num_layers() == builders[0].num_layers())
+        );
 
         let total_len = combined_layers.last().unwrap().num_values()
             + combined_layers
@@ -1307,7 +1308,7 @@ impl RepDefUnraveler {
 
         let to_offset = |val: usize| {
             T::from_usize(val)
-            .ok_or_else(|| Error::invalid_input("A single batch had more than i32::MAX values and so a large container type is required", location!()))
+            .ok_or_else(|| Error::invalid_input("A single batch had more than i32::MAX values and so a large container type is required"))
         };
         self.current_rep_cmp += 1;
         if let Some(def_levels) = &mut self.def_levels {

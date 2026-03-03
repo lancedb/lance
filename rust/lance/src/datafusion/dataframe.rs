@@ -9,13 +9,13 @@ use std::{
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{streaming::StreamingTable, Session},
+    catalog::{Session, streaming::StreamingTable},
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
-    execution::{context::SessionContext, TaskContext},
+    execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
+    physical_plan::{ExecutionPlan, SendableRecordBatchStream, streaming::PartitionStream},
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};

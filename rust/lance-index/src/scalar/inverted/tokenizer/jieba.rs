@@ -4,7 +4,7 @@
 use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
 
 use lance_core::{Error, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {
@@ -19,10 +19,10 @@ pub trait JiebaTokenizerBuilder: Sized {
 
     fn load(p: &Path) -> Result<Self> {
         if !p.is_dir() {
-            return Err(Error::invalid_input(
-                format!("Invalid directory path: {}", p.display()),
-                snafu::location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Invalid directory path: {}",
+                p.display()
+            )));
         }
         let config_path = p.join(JIEBA_LANGUAGE_MODEL_CONFIG_FILE);
         let config = if config_path.exists() {
@@ -76,27 +76,21 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
         let file = std::fs::File::open(main_dict_path)?;
         let mut f = std::io::BufReader::new(file);
         let mut jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
-            Error::invalid_input(
-                format!(
-                    "Failed to load Jieba dictionary from {}: {}",
-                    main_dict_path.display(),
-                    e
-                ),
-                snafu::location!(),
-            )
+            Error::invalid_input(format!(
+                "Failed to load Jieba dictionary from {}: {}",
+                main_dict_path.display(),
+                e
+            ))
         })?;
         for user_dict_path in &self.user_dict_paths() {
             let file = std::fs::File::open(user_dict_path)?;
             let mut f = std::io::BufReader::new(file);
             jieba.load_dict(&mut f).map_err(|e| {
-                Error::invalid_input(
-                    format!(
-                        "Failed to load Jieba user dictionary from {}: {}",
-                        user_dict_path.display(),
-                        e
-                    ),
-                    snafu::location!(),
-                )
+                Error::invalid_input(format!(
+                    "Failed to load Jieba user dictionary from {}: {}",
+                    user_dict_path.display(),
+                    e
+                ))
             })?
         }
         let tokenizer = JiebaTokenizer { jieba };

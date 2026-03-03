@@ -1,0 +1,4 @@
+disallowed-macros = [
+  { path = "location", reason = "Use #[track_caller] + #[snafu(implicit)] instead of manual location construction.", allow-invalid = true },
+  { path = "snafu::location", reason = "Use #[track_caller] + #[snafu(implicit)] instead of manual location construction." },
+]

@@ -15,13 +15,12 @@ use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::location;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
 
 use super::{
-    current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
-    ManifestNamingScheme, MANIFEST_EXTENSION,
+    MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
+    default_resolve_version, make_staging_manifest_path,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
@@ -209,7 +208,6 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
             Error::corrupt_file(
                 path.clone(),
                 "Path does not follow known manifest naming convention.",
-                location!(),
             )
         })
 }
@@ -391,10 +389,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Err(Error::NotFound { .. }) => {
                 let path = default_resolve_version(base_path, version, object_store)
                     .await
-                    .map_err(|_| Error::NotFound {
-                        uri: format!("{}@{}", base_path, version),
-                        location: location!(),
-                    })?
+                    .map_err(|_| Error::not_found(format!("{}@{}", base_path, version)))?
                     .path;
                 match object_store.head(&path).await {
                     Ok(ObjectMeta { size, e_tag, .. }) => {
@@ -425,10 +420,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
-                        return Err(Error::NotFound {
-                            uri: path.to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_found(path.to_string()));
                     }
                     Err(e) => return Err(e.into()),
                 }

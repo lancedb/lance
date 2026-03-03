@@ -4,31 +4,30 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
-use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_physical_plan::Statistics;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{
-    Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET,
-    ROW_OFFSET_FIELD,
+    Error as LanceError, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET, ROW_OFFSET_FIELD,
+    Result as LanceResult,
 };
 use lance_table::rowids::RowIdIndex;
-use snafu::location;
 
+use crate::Dataset;
 use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
-use crate::Dataset;
 
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 
@@ -357,18 +356,15 @@ impl AddRowOffsetExec {
         frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
     ) -> LanceResult<Self> {
         let input_schema = input.schema();
-        let row_addr_pos = input_schema
-            .index_of(ROW_ADDR)
-            .map_err(|_| LanceError::Internal {
-                message: format!("Input plan does not have a {} column", ROW_ADDR),
-                location: location!(),
-            })?;
+        let row_addr_pos = input_schema.index_of(ROW_ADDR).map_err(|_| {
+            LanceError::internal(format!("Input plan does not have a {} column", ROW_ADDR))
+        })?;
 
         if input_schema.field_with_name(ROW_OFFSET).is_ok() {
-            return Err(LanceError::Internal {
-                message: format!("Input plan already has a {} column", ROW_OFFSET),
-                location: location!(),
-            });
+            return Err(LanceError::internal(format!(
+                "Input plan already has a {} column",
+                ROW_OFFSET
+            )));
         }
 
         let mut fields = input.schema().fields().iter().cloned().collect::<Vec<_>>();
@@ -445,7 +441,12 @@ impl AddRowOffsetExec {
             if frag_id != last_frag_id {
                 last_frag_id = frag_id;
                 let Some(frag_info) = frag_id_to_offset.get(&frag_id) else {
-                    return Err(DataFusionError::External(Box::new(LanceError::Internal { message: format!("A row address referred to a fragment {} that wasn't in the frag_id_to_offset map", frag_id), location: location!() })));
+                    return Err(DataFusionError::External(Box::new(LanceError::internal(
+                        format!(
+                            "A row address referred to a fragment {} that wasn't in the frag_id_to_offset map",
+                            frag_id
+                        ),
+                    ))));
                 };
                 last_frag_offset = frag_info.row_offset;
                 last_frag_delete_count = 0;

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::{Dataset, ProjectionRequest, WriteParams};
 use lance_file::version::LanceFileVersion;
 use std::collections::HashMap;

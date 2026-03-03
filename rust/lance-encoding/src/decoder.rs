@@ -220,16 +220,15 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::future::{maybe_done, BoxFuture, MaybeDone};
+use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
+use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
-use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -438,7 +437,6 @@ impl<'a> ColumnInfoIter<'a> {
         self.next().ok_or_else(|| {
             Error::invalid_input(
                 "there were more fields in the schema than provided column indices / infos",
-                location!(),
             )
         })
     }
@@ -525,13 +523,10 @@ impl CoreFieldDecoderStrategy {
             .column_encoding
             .as_ref()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "the column at index {} was missing a ColumnEncoding",
-                        column_info.index
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "the column at index {} was missing a ColumnEncoding",
+                    column_info.index
+                ))
             })?;
         if matches!(
             column_encoding,
@@ -539,7 +534,10 @@ impl CoreFieldDecoderStrategy {
         ) {
             Ok(())
         } else {
-            Err(Error::invalid_input(format!("the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it", column_info.index, field_name, column_encoding), location!()))
+            Err(Error::invalid_input(format!(
+                "the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it",
+                column_info.index, field_name, column_encoding
+            )))
         }
     }
 
@@ -603,12 +601,12 @@ impl CoreFieldDecoderStrategy {
     fn check_simple_struct(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
         Self::ensure_values_encoded(column_info, field_name)?;
         if column_info.page_infos.len() != 1 {
-            return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
+            return Err(Error::invalid_input_source(format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into()));
         }
         let encoding = &column_info.page_infos[0].encoding;
         match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
-            _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
+            _ => Err(Error::invalid_input_source(format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into())),
         }
     }
 
@@ -799,10 +797,7 @@ impl CoreFieldDecoderStrategy {
                 //  because converting a rust arrow map field to the python arrow field will
                 //  lose the keys_sorted property.
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
                 let child_scheduler =
@@ -896,14 +891,13 @@ impl CoreFieldDecoderStrategy {
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
                     Ok(scheduler)
                 } else {
-                    Err(Error::NotSupported {
-                        source: format!(
+                    Err(Error::not_supported_source(
+                        format!(
                             "No way to decode into a dictionary field of type {}",
                             value_type
                         )
                         .into(),
-                        location: location!(),
-                    })
+                    ))
                 }
             }
             DataType::List(_) | DataType::LargeList(_) => {
@@ -1423,9 +1417,7 @@ impl BatchDecodeStream {
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1435,7 +1427,10 @@ impl BatchDecodeStream {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1479,10 +1474,7 @@ impl BatchDecodeStream {
                     // worker threads to keep making progress.
                     tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
                         .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                        .map_err(|err| Error::wrapped(err.into()))?
                 };
                 (task, num_rows)
             });
@@ -1633,9 +1625,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     fn next_batch_task(&mut self) -> Result<Option<RecordBatch>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1645,7 +1635,10 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1772,9 +1765,7 @@ impl StructuralBatchDecodeStream {
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1784,7 +1775,10 @@ impl StructuralBatchDecodeStream {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1823,10 +1817,7 @@ impl StructuralBatchDecodeStream {
                             async move { next_task.into_batch(emitted_batch_size_warning) },
                         )
                         .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                        .map_err(|err| Error::wrapped(err.into()))?
                     } else {
                         next_task.into_batch(emitted_batch_size_warning)
                     }
@@ -2554,10 +2545,7 @@ impl NextDecodeTask {
                 Ok(batch)
             }
             Err(e) => {
-                let e = Error::Internal {
-                    message: format!("Error decoding batch: {}", e),
-                    location: location!(),
-                };
+                let e = Error::internal(format!("Error decoding batch: {}", e));
                 Err(e)
             }
         }
