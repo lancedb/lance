@@ -33,10 +33,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
-use crate::dataset::blob::{
-    preprocess_blob_batches, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
-};
 use crate::Dataset;
+use crate::dataset::blob::{
+    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, preprocess_blob_batches,
+};
 use crate::session::Session;
 
 use super::DATA_DIR;

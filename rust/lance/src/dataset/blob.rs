@@ -1127,7 +1127,7 @@ mod tests {
 
     use arrow::{
         array::AsArray,
-        datatypes::{UInt32Type, UInt64Type, UInt8Type},
+        datatypes::{UInt8Type, UInt32Type, UInt64Type},
     };
     use arrow_array::RecordBatch;
     use arrow_array::{RecordBatchIterator, UInt32Array};
