@@ -624,19 +624,23 @@ BSS is particularly effective for:
 
 #### Dictionary Encoding Controls
 
-Dictionary encoding is attempted for supported primitive pages and gated by a few heuristics.
+Dictionary encoding is gated by a few heuristics.
+The decision is made on the leaf value page, so nested types can still benefit.
+For example, `List<u32>` can use dictionary encoding for its `u32` values.
 
-- `lance-encoding:dict-divisor` (default `2`): cardinality budget starts from `num_values / divisor`
-- `lance-encoding:dict-size-ratio` (default `0.8`): encoded dictionary representation must stay below this ratio of raw size
+Two field-level metadata keys control when dictionary encoding is attempted:
+
+- `lance-encoding:dict-divisor` (default `2`): the encoder computes a unique-value budget as `num_values / divisor`
+- `lance-encoding:dict-size-ratio` (default `0.8`): the estimated dictionary-encoded representation must stay below this ratio of the raw page size
 
 There are additional global guards available as environment variables:
 
-- `LANCE_ENCODING_DICT_TOO_SMALL` (minimum page size before trying dictionary encoding, default `100`)
-- `LANCE_ENCODING_DICT_DIVISOR` (fallback divisor when field metadata is not set)
+- `LANCE_ENCODING_DICT_TOO_SMALL` (minimum page size before trying dictionary encoding, default `100` values)
+- `LANCE_ENCODING_DICT_DIVISOR` (fallback divisor when field metadata is not set, default `2`)
 - `LANCE_ENCODING_DICT_MAX_CARDINALITY` (upper cap for dictionary entries, default `100000`)
-- `LANCE_ENCODING_DICT_SIZE_RATIO` (fallback ratio when field metadata is not set)
+- `LANCE_ENCODING_DICT_SIZE_RATIO` (fallback ratio when field metadata is not set, default `0.8`)
 
-Dictionary encoding is effective for low-cardinality data where values repeat frequently.
+Dictionary encoding is effective when values repeat frequently and the number of distinct values stays low.
 
 #### Dictionary Values Compression
 
