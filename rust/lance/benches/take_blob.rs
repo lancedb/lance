@@ -182,6 +182,7 @@ async fn prepare_dataset(version: LanceFileVersion, cache_repetition_index: bool
         LanceFileVersion::V2_0 => "v2_0",
         LanceFileVersion::V2_1 => "v2_1",
         LanceFileVersion::V2_2 => "v2_2",
+        LanceFileVersion::V2_3 => "v2_3",
         LanceFileVersion::Legacy => "legacy",
         LanceFileVersion::Stable => "stable",
         LanceFileVersion::Next => "next",
