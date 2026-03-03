@@ -20,11 +20,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_io::object_store::ObjectStore;
@@ -550,23 +550,29 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-        let mut batch_stream = stream::iter(posting_lists.into_iter())
-            .map(move |posting_list| {
-                let docs_for_batches = docs_for_batches.clone();
-                let schema_for_batches = schema_for_batches.clone();
-                tokio::task::spawn_blocking(move || {
-                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches)
-                })
-            })
-            .buffered(get_num_compute_intensive_cpus());
+        let (batch_sender, mut batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let producer = spawn_cpu(move || {
+            for posting_list in posting_lists {
+                let batch = posting_list
+                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
+                if batch_sender.send(batch).is_err() {
+                    // Consumer dropped early (e.g. write failed); stop producing.
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        while let Some(batch_result) = batch_stream.next().await {
-            let batch = batch_result??;
+        let mut write_result: Result<()> = Ok(());
+        while let Some(batch) = batch_receiver.recv().await {
             num_posting_lists += 1;
             let start = std::time::Instant::now();
-            writer.write_record_batch(batch).await?;
+            if let Err(err) = writer.write_record_batch(batch).await {
+                write_result = Err(err);
+                break;
+            }
             write_duration += start.elapsed();
 
             if num_posting_lists % 500_000 == 0 {
@@ -578,6 +584,9 @@ impl InnerBuilder {
                 );
             }
         }
+        drop(batch_receiver);
+        producer.await?;
+        write_result?;
 
         writer.finish().await?;
         Ok(())
