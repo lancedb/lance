@@ -867,16 +867,14 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    /// Serialized `RoaringTreemap` of the original row addresses read from the
-    /// source fragments during compaction.
+    /// Serialized `RoaringTreemap` of the row addresses from the original
+    /// fragments that were read during compaction.
     ///
-    /// `Some` for datasets using address-style row IDs. During commit, these
-    /// addresses are transposed to the new fragment layout to build an old-to-new
-    /// mapping for index remapping. Also triggers fragment ID reservation since
-    /// address-style fragments don't have pre-allocated IDs.
-    ///
-    /// `None` for datasets using stable row IDs, which handle remapping via
-    /// row ID sequences instead.
+    /// - `None` when configured with stable row IDs because the row ID
+    ///   sequences are rechunked directly.
+    /// - `Some` then these addresses are either (1) written to storage for
+    ///   deferred index remap post-processing, or (2) used with reserved
+    ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
 }
 
@@ -1324,12 +1322,11 @@ pub async fn commit_compaction(
                 row_id_map.extend(transposed);
             }
         } else if options.defer_index_remap {
-            let changed_row_addrs = task.row_addrs.unwrap_or_else(|| {
-                let empty = RoaringTreemap::new();
-                let mut bytes = Vec::with_capacity(empty.serialized_size());
-                empty.serialize_into(&mut bytes).unwrap();
-                bytes
-            });
+            let changed_row_addrs = task.row_addrs.ok_or_else(|| {
+                Error::internal(
+                    "defer_index_remap requires row_addrs but none were provided".to_string(),
+                )
+            })?;
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
                 old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
