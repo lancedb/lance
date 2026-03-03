@@ -563,10 +563,7 @@ impl InnerBuilder {
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         while let Some(batch_result) = batch_stream.next().await {
-            let batch = batch_result.map_err(|err| Error::Internal {
-                message: format!("Failed to join posting list batch task: {}", err),
-                location: location!(),
-            })??;
+            let batch = batch_result??;
             num_posting_lists += 1;
             let start = std::time::Instant::now();
             writer.write_record_batch(batch).await?;
