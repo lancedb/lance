@@ -20,7 +20,7 @@ use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
-use lance_core::{cache::LanceCache, Result};
+use lance_core::{Result, cache::LanceCache};
 use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
@@ -32,9 +32,9 @@ use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
-        CreatedIndex, ScalarIndex,
     },
 };
 

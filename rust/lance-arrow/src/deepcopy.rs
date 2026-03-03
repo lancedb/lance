@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow_data::{transform::MutableArrayData, ArrayData, ArrayDataBuilder};
+use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())

@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use arrow::{array::AsArray, buffer::NullBuffer};
-use arrow_array::{make_array, Array, ArrayRef, Float32Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
-use lance_core::{Error, Result, ROW_ID};
-use lance_linalg::distance::{multivec_distance, DistanceType};
+use lance_core::{Error, ROW_ID, Result};
+use lance_linalg::distance::{DistanceType, multivec_distance};
 use snafu::location;
 use tracing::instrument;
 

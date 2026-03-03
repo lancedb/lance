@@ -34,17 +34,17 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::write::{CacheConfig, IndexStore, MemTable};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::kmeans::{train_kmeans, KMeansParams};
+use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::{DistanceType, MetricType};

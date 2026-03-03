@@ -15,7 +15,7 @@ use snafu::location;
 use crate::format::pb;
 
 use crate::rowids::version::{
-    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+    RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
 };
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
@@ -225,7 +225,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
                 return Err(Error::NotSupported {
                     source: "Unknown deletion file type".into(),
                     location: location!(),
-                })
+                });
             }
         };
         let num_deleted_rows = if value.num_deleted_rows == 0 {
@@ -536,7 +536,7 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use object_store::path::Path;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     #[test]
     fn test_new_fragment() {

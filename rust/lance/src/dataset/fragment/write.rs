@@ -4,8 +4,8 @@
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
 use lance_core::Error;
+use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
@@ -17,10 +17,10 @@ use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
-use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
-use crate::Result;
+use crate::dataset::{DATA_DIR, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
 ///
@@ -277,10 +277,10 @@ impl<'a> FragmentCreateBuilder<'a> {
     ) -> Result<(SendableRecordBatchStream, Schema)> {
         if let Some(schema) = self.schema {
             return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
-            if let Some(schema) = self.existing_dataset_schema().await? {
-                return Ok((source.into_stream(), schema));
-            }
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
+            && let Some(schema) = self.existing_dataset_schema().await?
+        {
+            return Ok((source.into_stream(), schema));
         }
         source.into_stream_and_schema().await
     }

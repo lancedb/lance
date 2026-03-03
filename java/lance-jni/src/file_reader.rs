@@ -7,17 +7,17 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::{jint, jlong},
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
@@ -27,9 +27,9 @@ use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
+    ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
-    ReadBatchParams,
 };
 use object_store::path::Path;
 
@@ -94,7 +94,7 @@ fn create_java_reader_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
     Ok(res)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_openNative<'local>(
     mut env: JNIEnv<'local>,
     _reader_class: JObject,
@@ -146,7 +146,7 @@ fn inner_open<'local>(
     reader.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_closeNative<'local>(
     mut env: JNIEnv<'local>,
     reader: JObject,
@@ -162,7 +162,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_closeNative<'local>(
     JObject::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_numRowsNative(
     mut env: JNIEnv<'_>,
     reader: JObject,
@@ -194,7 +194,7 @@ fn inner_num_rows(env: &mut JNIEnv<'_>, reader: JObject) -> Result<jlong> {
     Ok(reader.num_rows() as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_populateSchemaNative(
     mut env: JNIEnv,
     reader: JObject,
@@ -212,7 +212,7 @@ fn inner_populate_schema(env: &mut JNIEnv, reader: JObject, schema_addr: jlong) 
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
     mut env: JNIEnv<'_>,
     reader: JObject,

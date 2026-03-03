@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{types::Float32Type, Array, FixedSizeListArray};
+use arrow::array::{Array, FixedSizeListArray, types::Float32Type};
 use arrow::array::{AsArray, FixedSizeListBuilder, Float32Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -21,8 +21,8 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
     hnsw::{
-        builder::{HnswBuildParams, HnswQueryParams},
         HNSW,
+        builder::{HnswBuildParams, HnswQueryParams},
     },
 };
 use lance_linalg::distance::DistanceType;

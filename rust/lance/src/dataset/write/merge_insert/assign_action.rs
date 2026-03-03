@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{MergeInsertParams, WhenNotMatchedBySource};
-use crate::{dataset::WhenMatched, Result};
+use crate::{Result, dataset::WhenMatched};
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::{col, Case, Expr};
+use datafusion_expr::{Case, Expr, col};
 use snafu::location;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be

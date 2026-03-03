@@ -11,7 +11,7 @@ use geo_traits::{
 use geo_types::Coord;
 use geoarrow_array::array::RectArray;
 use geoarrow_array::builder::RectBuilder;
-use geoarrow_array::{downcast_geoarrow_array, GeoArrowArray, GeoArrowArrayAccessor};
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, downcast_geoarrow_array};
 use geoarrow_schema::{BoxType, Dimension};
 use lance_core::error::ArrowResult;
 use serde::{Deserialize, Serialize};

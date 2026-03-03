@@ -33,8 +33,8 @@ use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::compute_partitions_arrow_array;
-use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::DistanceType;
 
@@ -578,10 +578,10 @@ impl IvfPqMemIndex {
         // Group vectors by partition
         let mut partition_groups: Vec<Vec<usize>> = vec![Vec::new(); self.num_partitions];
         for (row_idx, partition_id) in partition_ids.iter().enumerate().take(batch.num_rows()) {
-            if let Some(pid) = partition_id {
-                if (*pid as usize) < self.num_partitions {
-                    partition_groups[*pid as usize].push(row_idx);
-                }
+            if let Some(pid) = partition_id
+                && (*pid as usize) < self.num_partitions
+            {
+                partition_groups[*pid as usize].push(row_idx);
             }
         }
 
@@ -690,10 +690,10 @@ impl IvfPqMemIndex {
         // Group vectors by partition
         let mut partition_groups: Vec<Vec<usize>> = vec![Vec::new(); self.num_partitions];
         for (idx, pid) in partition_ids.iter().enumerate() {
-            if let Some(pid) = pid {
-                if (*pid as usize) < self.num_partitions {
-                    partition_groups[*pid as usize].push(idx);
-                }
+            if let Some(pid) = pid
+                && (*pid as usize) < self.num_partitions
+            {
+                partition_groups[*pid as usize].push(idx);
             }
         }
 

@@ -7,9 +7,9 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch, UInt64Array};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array, types::Float32Type};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 #[cfg(target_os = "linux")]
@@ -18,9 +18,9 @@ use pprof::criterion::{Output, PProfProfiler};
 use lance_core::ROW_ID_FIELD;
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
-    hnsw::builder::{HnswBuildParams, HnswQueryParams, HNSW},
+    hnsw::builder::{HNSW, HnswBuildParams, HnswQueryParams},
     quantizer::Quantization,
-    sq::{builder::SQBuildParams, ScalarQuantizer},
+    sq::{ScalarQuantizer, builder::SQBuildParams},
     storage::StorageBuilder,
 };
 use lance_linalg::distance::DistanceType;

@@ -116,13 +116,13 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap {
-            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
-                // In theory, this should never error. But if we do, just
-                // recover gracefully.
-                log::error!("Failed to serialize fragment bitmap: {}", e);
-                fragment_bitmap.clear();
-            }
+        if let Some(bitmap) = &idx.fragment_bitmap
+            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
+        {
+            // In theory, this should never error. But if we do, just
+            // recover gracefully.
+            log::error!("Failed to serialize fragment bitmap: {}", e);
+            fragment_bitmap.clear();
         }
 
         Self {

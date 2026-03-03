@@ -9,7 +9,7 @@
 ///
 /// This benchmark is primarily intended for developers to use for profiling and debugging.  The python
 /// benchmark is more comprehensive and will cover regression testing.
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance_index::scalar::FullTextSearchQuery;

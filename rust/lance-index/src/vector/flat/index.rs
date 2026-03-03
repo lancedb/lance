@@ -11,7 +11,7 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
@@ -20,15 +20,15 @@ use crate::{
     metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
+        DIST_COL, Query,
         graph::OrderedNode,
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{DistCalculator, VectorStore},
         v3::subindex::IvfSubIndex,
-        Query, DIST_COL,
     },
 };
 
-use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
+use super::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results

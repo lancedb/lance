@@ -211,10 +211,12 @@ mod tests {
     #[tokio::test]
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
-        assert!(no_cache
-            .index_cache
-            .get_unsized::<dyn VectorIndex>("abc")
-            .await
-            .is_none());
+        assert!(
+            no_cache
+                .index_cache
+                .get_unsized::<dyn VectorIndex>("abc")
+                .await
+                .is_none()
+        );
     }
 }

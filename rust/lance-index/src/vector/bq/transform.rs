@@ -10,7 +10,7 @@ use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, Re
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{norm_squared_fsl, DistanceType};
+use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use snafu::location;
 use tracing::instrument;
 

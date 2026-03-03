@@ -7,8 +7,8 @@
 //! WAL files use bit-reversed naming to distribute files evenly across S3 keyspace.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 
 use uuid::Uuid;
 
-use super::util::{region_wal_path, wal_entry_filename, WatchableOnceCell};
+use super::util::{WatchableOnceCell, region_wal_path, wal_entry_filename};
 
 use super::index::IndexStore;
 use super::memtable::batch_store::{BatchStore, StoredBatch};

@@ -3,28 +3,28 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use super::refs::{Ref, Refs};
-use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use crate::{session::Session, Dataset, Error, Result};
+use crate::{Dataset, Error, Result, session::Session};
 use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
-    StorageOptionsAccessor, DEFAULT_CLOUD_IO_PARALLELISM,
+    DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
+    ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
 };
-use lance_namespace::models::DescribeTableRequest;
 use lance_namespace::LanceNamespace;
+use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
     format::Manifest,
     io::commit::external_manifest::ExternalManifestCommitHandler,
-    io::commit::{commit_handler_from_url, CommitHandler},
+    io::commit::{CommitHandler, commit_handler_from_url},
 };
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
-use object_store::{path::Path, DynObjectStore};
+use object_store::{DynObjectStore, path::Path};
 use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
@@ -666,12 +666,12 @@ impl DatasetBuilder {
                     .await;
             }
         }
-        if let Some(version_number) = version_number {
-            if version_number != dataset.manifest.version {
-                return Err(Error::VersionNotFound {
-                    message: format!("version {} not found", version_number),
-                });
-            }
+        if let Some(version_number) = version_number
+            && version_number != dataset.manifest.version
+        {
+            return Err(Error::VersionNotFound {
+                message: format!("version {} not found", version_number),
+            });
         }
         Ok(dataset)
     }

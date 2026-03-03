@@ -7,7 +7,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;

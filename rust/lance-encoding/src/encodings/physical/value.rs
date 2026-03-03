@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_buffer::{bit_util, BooleanBufferBuilder};
+use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use snafu::location;
 
 use crate::buffer::LanceBuffer;
@@ -13,12 +13,12 @@ use crate::data::{
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
-    MAX_MINIBLOCK_VALUES,
+    MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
+    MiniBlockCompressor,
 };
+use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
 use crate::format::pb21::{self, CompressiveEncoding};
-use crate::format::ProtobufUtils21;
 
 use lance_core::{Error, Result};
 
@@ -758,12 +758,12 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, new_null_array, types::UInt32Type, Array, ArrayRef, Decimal128Array,
-        FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+        make_array, new_null_array, types::UInt32Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -777,8 +777,8 @@ pub(crate) mod tests {
         },
         format::pb21::compressive_encoding::Compression,
         testing::{
-            check_basic_random, check_round_trip_encoding_generated,
-            check_round_trip_encoding_of_data, FnArrayGeneratorProvider, TestCases,
+            FnArrayGeneratorProvider, TestCases, check_basic_random,
+            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
         },
         version::LanceFileVersion,
     };
@@ -837,13 +837,9 @@ pub(crate) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_simple_range() {
-        let items = Arc::new(Int32Array::from_iter((0..5000).map(|i| {
-            if i % 2 == 0 {
-                Some(i)
-            } else {
-                None
-            }
-        })));
+        let items = Arc::new(Int32Array::from_iter(
+            (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+        ));
 
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
 
@@ -901,13 +897,9 @@ pub(crate) mod tests {
         // Same as above but with mixed validity
         let data2 = (0..100)
             .map(|_| {
-                Arc::new(Int32Array::from_iter((0..100).map(|i| {
-                    if i % 2 == 0 {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                }))) as Arc<dyn Array>
+                Arc::new(Int32Array::from_iter(
+                    (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+                )) as Arc<dyn Array>
             })
             .collect::<Vec<_>>();
 
@@ -915,13 +907,9 @@ pub(crate) mod tests {
         // TODO: Re-enable once the all-null path is complete
         let _data3 = (0..100)
             .map(|chunk_idx| {
-                Arc::new(Int32Array::from_iter((0..100).map(|i| {
-                    if chunk_idx < 50 {
-                        None
-                    } else {
-                        Some(i)
-                    }
-                }))) as Arc<dyn Array>
+                Arc::new(Int32Array::from_iter(
+                    (0..100).map(|i| if chunk_idx < 50 { None } else { Some(i) }),
+                )) as Arc<dyn Array>
             })
             .collect::<Vec<_>>();
 

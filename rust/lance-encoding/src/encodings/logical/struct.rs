@@ -21,12 +21,12 @@ use crate::{
     format::pb,
     repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray, cast::AsArray};
 use arrow_schema::{DataType, Fields};
 use futures::{
+    FutureExt, StreamExt, TryStreamExt,
     future::BoxFuture,
     stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
 use lance_arrow::FieldExt;
@@ -146,8 +146,7 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
             let child_scan = next_child.ready_scan_lines.pop_front().unwrap();
             trace!(
                 "Scheduled {} rows for child {}",
-                child_scan.rows_scheduled,
-                next_child.col_idx
+                child_scan.rows_scheduled, next_child.col_idx
             );
             next_child.rows_scheduled += child_scan.rows_scheduled;
             next_child.rows_remaining -= child_scan.rows_scheduled;
@@ -598,14 +597,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
         Array, ArrayRef, Int32Array, ListArray, StructArray,
+        builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
     use crate::{
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

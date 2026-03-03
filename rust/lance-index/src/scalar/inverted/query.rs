@@ -783,10 +783,10 @@ pub fn collect_query_tokens(
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
+        if let Some(inclusive) = inclusive
+            && !inclusive.contains(&token.text)
+        {
+            continue;
         }
         tokens.push(token.text.clone());
     }
@@ -802,10 +802,10 @@ pub fn collect_doc_tokens(
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
+        if let Some(inclusive) = inclusive
+            && !inclusive.contains(&token.text)
+        {
+            continue;
         }
         tokens.push(token.text.clone());
     }

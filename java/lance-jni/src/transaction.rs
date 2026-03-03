@@ -1,36 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::blocking_dataset::{extract_namespace_info, BlockingDataset, NATIVE_DATASET};
-use crate::error::Result;
-use crate::storage_options::JavaStorageOptionsProvider;
-use crate::traits::{
-    export_vec, import_vec_from_method, FromJObjectWithEnv, FromJString, IntoJava, JLance,
-};
-use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::RT;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::error::Result;
+use crate::storage_options::JavaStorageOptionsProvider;
+use crate::traits::{
+    FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
+};
+use crate::utils::{to_java_map, to_rust_map};
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jint};
-use jni::JNIEnv;
+use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
-use lance::dataset::CommitBuilder;
-use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::ObjectStoreParams;
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::StorageOptionsProvider;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -279,7 +279,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeReadTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -608,7 +608,7 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
@@ -1338,7 +1338,7 @@ fn export_update_map<'a>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     mut env: JNIEnv<'local>,

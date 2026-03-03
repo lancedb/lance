@@ -220,11 +220,11 @@ impl BTreeMemIndex {
 
         for entry in self.lookup.iter() {
             let key = entry.key();
-            if let Some(last) = result.last_mut() {
-                if last.0 == key.value {
-                    last.1.push(key.row_position);
-                    continue;
-                }
+            if let Some(last) = result.last_mut()
+                && last.0 == key.value
+            {
+                last.1.push(key.row_position);
+                continue;
             }
             result.push((key.value.clone(), vec![key.row_position]));
         }
@@ -575,8 +575,8 @@ mod tests {
         assert_eq!(snapshot.len(), 3);
 
         // Snapshot should be in sorted order
-        assert_eq!(snapshot[0].0 .0, ScalarValue::Int32(Some(0)));
-        assert_eq!(snapshot[1].0 .0, ScalarValue::Int32(Some(1)));
-        assert_eq!(snapshot[2].0 .0, ScalarValue::Int32(Some(2)));
+        assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
+        assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
+        assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
     }
 }

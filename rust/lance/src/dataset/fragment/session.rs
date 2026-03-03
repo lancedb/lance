@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::fragment::{
-    resolve_actual_row_ids, FileFragment, FragReadConfig, FragmentReader,
+    FileFragment, FragReadConfig, FragmentReader, resolve_actual_row_ids,
 };
 use arrow_array::RecordBatch;
-use lance_core::datatypes::Schema;
 use lance_core::Result;
+use lance_core::datatypes::Schema;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -70,12 +70,12 @@ impl FragmentSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::WriteParams;
     use crate::Dataset;
+    use crate::dataset::WriteParams;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ADDR;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_encoding::version::LanceFileVersion;
     use rstest::rstest;
     use std::sync::Arc;

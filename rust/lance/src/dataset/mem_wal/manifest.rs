@@ -30,16 +30,16 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
-use object_store::path::Path;
 use object_store::PutMode;
 use object_store::PutOptions;
+use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -243,11 +243,11 @@ impl RegionManifestStore {
 
             let mut found_any = false;
             while let Some((version, result)) = futures.next().await {
-                if let Ok(true) = result {
-                    if version > latest_found {
-                        latest_found = version;
-                        found_any = true;
-                    }
+                if let Ok(true) = result
+                    && version > latest_found
+                {
+                    latest_found = version;
+                    found_any = true;
                 }
             }
 
@@ -324,12 +324,11 @@ impl RegionManifestStore {
         for item in list_result {
             match item {
                 Ok(meta) => {
-                    if let Some(filename) = meta.location.filename() {
-                        if filename.ends_with(".binpb") {
-                            if let Some(version) = parse_bit_reversed_filename(filename) {
-                                versions.push(version);
-                            }
-                        }
+                    if let Some(filename) = meta.location.filename()
+                        && filename.ends_with(".binpb")
+                        && let Some(version) = parse_bit_reversed_filename(filename)
+                    {
+                        versions.push(version);
                     }
                 }
                 Err(e) => {

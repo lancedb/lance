@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::fragment::write::generate_random_filename;
-use crate::dataset::WriteParams;
-use crate::dataset::DATA_DIR;
-use crate::datatypes::Schema;
 use crate::Dataset;
 use crate::Result;
+use crate::dataset::DATA_DIR;
+use crate::dataset::WriteParams;
+use crate::dataset::fragment::write::generate_random_filename;
+use crate::datatypes::Schema;
 use lance_arrow::DataTypeExt;
 use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};

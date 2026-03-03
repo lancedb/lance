@@ -8,7 +8,7 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use async_trait::async_trait;
-    use futures::{future::join_all, StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, future::join_all};
     use lance_core::{Error, Result};
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
@@ -22,8 +22,8 @@ mod test {
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
         Dataset,
+        dataset::{ReadParams, WriteMode, WriteParams},
     };
     use lance_core::utils::tempfile::TempStrDir;
 

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::Dataset;
 use crate::datafusion::LanceTableProvider;
 use crate::dataset::utils::SchemaAdapter;
-use crate::Dataset;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
@@ -122,7 +122,7 @@ impl SqlQuery {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_string_matches};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -133,8 +133,8 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datagen::{array, gen_batch};
 
     #[tokio::test]

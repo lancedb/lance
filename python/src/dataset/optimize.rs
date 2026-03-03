@@ -15,8 +15,8 @@
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionOptions,
-        CompactionPlan, CompactionTask, RewriteResult,
+        CompactionMetrics, CompactionOptions, CompactionPlan, CompactionTask, RewriteResult,
+        commit_compaction, compact_files, plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};

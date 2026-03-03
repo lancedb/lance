@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::Schema;
 use arrow_select;
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -12,13 +12,13 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
+        DisplayAs, ExecutionPlan, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, ExecutionPlan, PlanProperties,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
@@ -27,23 +27,24 @@ use snafu::location;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
 use crate::dataset::write::merge_insert::inserted_rows::{
-    extract_key_value_from_batch, KeyExistenceFilter, KeyExistenceFilterBuilder,
+    KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    create_duplicate_row_error, format_key_values_on_columns, SourceDedupeBehavior,
+    SourceDedupeBehavior, create_duplicate_row_error, format_key_values_on_columns,
 };
 use crate::{
+    Dataset,
     dataset::{
         transaction::{Operation, Transaction},
         write::{
+            WriteParams,
             merge_insert::{
-                assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats,
-                MERGE_ACTION_COLUMN,
+                MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
+                exec::MergeInsertMetrics,
             },
-            write_fragments_internal, WriteParams,
+            write_fragments_internal,
         },
     },
-    Dataset,
 };
 
 use super::apply_deletions;
@@ -582,16 +583,16 @@ impl FullSchemaMergeInsertExec {
                             merge_state_clone.clone(),
                         ) {
                             Ok((update_batch_opt, insert_batch_opt)) => {
-                                if let Some(update_batch) = update_batch_opt {
-                                    if update_tx.send(Ok(update_batch)).is_err() {
-                                        break;
-                                    }
+                                if let Some(update_batch) = update_batch_opt
+                                    && update_tx.send(Ok(update_batch)).is_err()
+                                {
+                                    break;
                                 }
 
-                                if let Some(insert_batch) = insert_batch_opt {
-                                    if insert_tx.send(Ok(insert_batch)).is_err() {
-                                        break;
-                                    }
+                                if let Some(insert_batch) = insert_batch_opt
+                                    && insert_tx.send(Ok(insert_batch)).is_err()
+                                {
+                                    break;
                                 }
                             }
                             Err(e) => {
@@ -736,10 +737,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                 write!(
                     f,
                     "MergeInsert: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
-                    on_keys,
-                    when_matched,
-                    when_not_matched,
-                    when_not_matched_by_source
+                    on_keys, when_matched, when_not_matched, when_not_matched_by_source
                 )
             }
             datafusion::physical_plan::DisplayFormatType::TreeRender => {

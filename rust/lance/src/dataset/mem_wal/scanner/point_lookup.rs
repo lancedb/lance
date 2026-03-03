@@ -9,15 +9,15 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion::common::ScalarValue;
-use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::prelude::Expr;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{compute_pk_hash_from_scalars, BloomFilterGuardExec, CoalesceFirstExec};
+use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 
 /// Plans point lookup queries over LSM data.
 ///

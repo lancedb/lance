@@ -4,7 +4,7 @@
 use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
 
 use lance_core::{Error, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {

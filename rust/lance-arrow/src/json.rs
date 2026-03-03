@@ -998,10 +998,12 @@ mod tests {
         // Invalid JSONPath syntax should return error
         let result = json_array.json_path(0, "invalid path without $");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to extract JSONPath"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to extract JSONPath")
+        );
     }
 
     #[test]

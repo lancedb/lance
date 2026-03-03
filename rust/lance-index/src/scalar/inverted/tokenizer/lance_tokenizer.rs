@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::json::JSON_EXT_NAME;
 use serde_json::Value;
 use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
@@ -57,10 +57,10 @@ impl DocType {
     pub fn prefix_len(&self, token: &str) -> usize {
         match self {
             Self::Json => {
-                if let Some(pos) = token.find(',') {
-                    if let Some(second_pos) = token[pos + 1..].find(',') {
-                        return pos + second_pos + 2;
-                    }
+                if let Some(pos) = token.find(',')
+                    && let Some(second_pos) = token[pos + 1..].find(',')
+                {
+                    return pos + second_pos + 2;
                 }
                 panic!("json token must be in format of <path>,<type>,<value>")
             }
@@ -209,7 +209,7 @@ fn flatten_triplet(
                 return Err(lance_core::Error::InvalidInput {
                     source: format!("Invalid triple type: {}", v_type).into(),
                     location: location!(),
-                })
+                });
             }
         }
     }
@@ -300,7 +300,7 @@ impl TokenStream for TTStream {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::tokenizer::lance_tokenizer::{
-        flatten_json, flatten_triplet, JsonTokenizer, LanceTokenizer,
+        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
     use serde_json::Value;
     use tantivy::tokenizer::{SimpleTokenizer, Token};

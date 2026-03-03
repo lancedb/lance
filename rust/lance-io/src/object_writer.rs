@@ -9,10 +9,10 @@ use std::task::Poll;
 use crate::object_store::ObjectStore as LanceObjectStore;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use object_store::MultipartUpload;
-use object_store::{path::Path, Error as OSError, ObjectStore, Result as OSResult};
+use object_store::{Error as OSError, ObjectStore, Result as OSResult, path::Path};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
@@ -214,7 +214,7 @@ impl ObjectWriter {
         loop {
             match &mut mut_self.state {
                 UploadState::Started(_) | UploadState::Done(_) => break,
-                UploadState::CreatingUpload(ref mut fut) => match fut.poll_unpin(cx) {
+                UploadState::CreatingUpload(fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
 
@@ -283,7 +283,7 @@ impl ObjectWriter {
                     }
                     break;
                 }
-                UploadState::PuttingSingle(ref mut fut) | UploadState::Completing(ref mut fut) => {
+                UploadState::PuttingSingle(fut) | UploadState::Completing(fut) => {
                     match fut.poll_unpin(cx) {
                         Poll::Ready(Ok(mut res)) => {
                             res.size = mut_self.cursor;
@@ -313,12 +313,12 @@ impl Drop for ObjectWriter {
             // Take ownership of the state.
             let state =
                 std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-            if let UploadState::InProgress { mut upload, .. } = state {
-                if let Ok(handle) = Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = upload.abort().await;
-                    });
-                }
+            if let UploadState::InProgress { mut upload, .. } = state
+                && let Ok(handle) = Handle::try_current()
+            {
+                handle.spawn(async move {
+                    let _ = upload.abort().await;
+                });
             }
         }
     }

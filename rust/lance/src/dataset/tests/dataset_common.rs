@@ -16,9 +16,9 @@ use futures::TryStreamExt;
 use lance_file::version::LanceFileVersion;
 use lance_table::format::WriterVersion;
 
-use crate::dataset::write::WriteParams;
-use crate::dataset::WriteMode;
 use crate::Dataset;
+use crate::dataset::WriteMode;
+use crate::dataset::write::WriteParams;
 
 // Used to validate that futures returned are Send.
 pub(super) fn require_send<T: Send>(t: T) -> T {

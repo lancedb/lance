@@ -55,7 +55,7 @@ async fn test_binary_copy_with_defer_remap() {
 
 async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use std::sync::Arc;
 
     let fixed_list_dt =
@@ -668,7 +668,7 @@ async fn test_binary_copy_compaction_with_complex_schema() {
 async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVersion) {
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 
     let row_num = 1_000;
 

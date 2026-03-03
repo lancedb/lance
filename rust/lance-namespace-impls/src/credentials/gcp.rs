@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use google_cloud_auth::credentials;
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
@@ -54,7 +54,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{redact_credential, CredentialVendor, VendedCredentials, VendedPermission};
+use super::{CredentialVendor, VendedCredentials, VendedPermission, redact_credential};
 
 /// GCP STS token exchange endpoint for downscoping credentials.
 const STS_TOKEN_EXCHANGE_URL: &str = "https://sts.googleapis.com/v1/token";
@@ -710,7 +710,11 @@ impl GcpCredentialVendor {
 
         info!(
             "GCP credentials vended (web identity): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
-            bucket, prefix, self.config.permission, expires_at_millis, redact_credential(&downscoped_token)
+            bucket,
+            prefix,
+            self.config.permission,
+            expires_at_millis,
+            redact_credential(&downscoped_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -772,7 +776,11 @@ impl GcpCredentialVendor {
 
         info!(
             "GCP credentials vended (api_key): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
-            bucket, prefix, permission, expires_at_millis, redact_credential(&downscoped_token)
+            bucket,
+            prefix,
+            permission,
+            expires_at_millis,
+            redact_credential(&downscoped_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -833,7 +841,11 @@ impl CredentialVendor for GcpCredentialVendor {
 
                 info!(
                     "GCP credentials vended (static): bucket={}, prefix={}, permission={}, expires_at={}, token={}",
-                    bucket, prefix, self.config.permission, expires_at_millis, redact_credential(&downscoped_token)
+                    bucket,
+                    prefix,
+                    self.config.permission,
+                    expires_at_millis,
+                    redact_credential(&downscoped_token)
                 );
 
                 Ok(VendedCredentials::new(storage_options, expires_at_millis))

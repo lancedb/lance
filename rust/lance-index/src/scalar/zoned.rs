@@ -13,7 +13,7 @@ use futures::TryStreamExt;
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::{Result, ROW_ADDR};
+use lance_core::{ROW_ADDR, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 
 //
@@ -508,10 +508,12 @@ mod tests {
         let processor = MockProcessor::new();
         let result = ZoneTrainer::new(processor, 0);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("zone capacity must be greater than zero"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("zone capacity must be greater than zero")
+        );
     }
 
     #[tokio::test]

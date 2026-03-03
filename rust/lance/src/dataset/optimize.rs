@@ -90,20 +90,20 @@ use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::utils::make_rowid_capture_stream;
-use super::{write_fragments_internal, WriteMode, WriteParams};
-use crate::dataset::utils::CapturedRowIds;
-use crate::io::commit::{commit_transaction, migrate_fragments};
+use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use crate::dataset::utils::CapturedRowIds;
+use crate::io::commit::{commit_transaction, migrate_fragments};
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::Error;
-use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
+use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
@@ -1399,9 +1399,9 @@ mod tests {
     mod binary_copy;
     use self::remapping::RemappedIndex;
     use super::*;
+    use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
-    use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1414,9 +1414,9 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::Error;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::Error;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -2350,11 +2350,13 @@ mod tests {
             // Verify RewriteResult for deferred index remap
             assert!(deferred_result.row_id_map.is_none());
             assert!(deferred_result.changed_row_addrs.is_some());
-            assert!(!deferred_result
-                .changed_row_addrs
-                .as_ref()
-                .unwrap()
-                .is_empty());
+            assert!(
+                !deferred_result
+                    .changed_row_addrs
+                    .as_ref()
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(!deferred_result.original_fragments.is_empty());
             assert!(!deferred_result.new_fragments.is_empty());
 

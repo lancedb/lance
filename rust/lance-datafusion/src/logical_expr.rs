@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
 use datafusion::logical_expr::{Between, ScalarUDF, ScalarUDFImpl};
+use datafusion::logical_expr::{BinaryExpr, Operator, expr::ScalarFunction};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
@@ -194,7 +194,9 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
     match expr {
         // Coerce regexp_match to boolean by checking for non-null
         Expr::ScalarFunction(sf) if sf.func.name() == "regexp_match" => {
-            log::warn!("regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead");
+            log::warn!(
+                "regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead"
+            );
             Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
 

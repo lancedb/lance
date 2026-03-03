@@ -9,7 +9,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray};
+use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
@@ -521,9 +521,9 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
+        Array, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
-        Array, FixedSizeListArray,
     };
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
@@ -534,7 +534,7 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{check_specific_random, TestCases},
+        testing::{TestCases, check_specific_random},
         version::LanceFileVersion,
     };
 

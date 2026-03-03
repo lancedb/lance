@@ -15,7 +15,7 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
 };
-use crate::{pb, Any};
+use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
 mod as_bytes;
 pub mod sbbf;
@@ -34,13 +34,13 @@ use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::cache::LanceCache;
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -1162,27 +1162,27 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
-    use arrow_array::{record_batch, RecordBatch, UInt64Array};
+    use arrow_array::{RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
     use lance_core::{
+        ROW_ADDR,
         cache::LanceCache,
         utils::{mask::RowAddrTreeMap, tempfile::TempObjDir},
-        ROW_ADDR,
     };
     use lance_io::object_store::ObjectStore;
 
     use crate::scalar::{
+        BloomFilterQuery, ScalarIndex, SearchResult,
         bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
         lance_format::LanceIndexStore,
-        BloomFilterQuery, ScalarIndex, SearchResult,
     };
 
-    use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
 
     // Adds a _rowaddr column emulating each batch as a new fragment

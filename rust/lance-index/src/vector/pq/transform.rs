@@ -4,7 +4,7 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, cast::AsArray};
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};

@@ -4,33 +4,33 @@
 use std::{collections::HashMap, sync::Arc};
 
 use jni::{
+    JNIEnv,
     objects::{JByteArray, JMap, JObject, JValue, JValueGen},
     sys::jlong,
-    JNIEnv,
 };
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        commit_compaction, plan_compaction, CompactionMetrics, CompactionOptions, CompactionPlan,
-        CompactionTask, IndexRemapperOptions, RewriteResult, TaskData,
+        CompactionMetrics, CompactionOptions, CompactionPlan, CompactionTask, IndexRemapperOptions,
+        RewriteResult, TaskData, commit_compaction, plan_compaction,
     },
 };
 
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::{
-        export_vec, import_vec_from_method, import_vec_to_rust, FromJObjectWithEnv, IntoJava,
+        FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
     },
     utils::{
         build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_long_obj,
         to_java_optional,
     },
-    RT,
 };
 
 use crate::error::Result;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -95,7 +95,7 @@ fn inner_plan_compaction<'local>(
     plan.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -171,7 +171,7 @@ fn inner_commit_compaction<'local>(
     committed_metrics.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,                            // CompactionTask itself
@@ -258,8 +258,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;JLjava/util/Map;[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str =
-    "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {

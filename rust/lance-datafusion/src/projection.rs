@@ -15,13 +15,13 @@ use std::{
 use tracing::instrument;
 
 use lance_core::{
+    Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+    Result, WILDCARD,
     datatypes::{OnMissing, Projectable, Projection, Schema},
-    Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
-    ROW_OFFSET, WILDCARD,
 };
 
 use crate::{
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{LanceExecutionOptions, OneShotExec, execute_plan},
     planner::Planner,
 };
 

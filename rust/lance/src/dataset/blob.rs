@@ -4,12 +4,12 @@
 use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
-use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
+use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
+use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_schema::DataType as ArrowDataType;
-use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use object_store::path::Path;
 use snafu::location;
@@ -21,7 +21,7 @@ use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
-use lance_core::{utils::address::RowAddress, Error, Result};
+use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_io::traits::{Reader, Writer};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
@@ -979,25 +979,25 @@ mod tests {
     use arrow_array::{RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
-    use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+    use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, DataTypeExt};
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
 
     use lance_core::{
-        utils::tempfile::{TempDir, TempStrDir},
         Error, Result,
+        utils::tempfile::{TempDir, TempStrDir},
     };
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::version::LanceFileVersion;
 
     use super::data_file_key_from_path;
     use crate::{
-        blob::{blob_field, BlobArrayBuilder},
+        Dataset,
+        blob::{BlobArrayBuilder, blob_field},
         dataset::WriteParams,
         utils::test::TestDatasetGenerator,
-        Dataset,
     };
 
     struct BlobTestFixture {
@@ -1094,10 +1094,12 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(dataset
-            .fragments()
-            .iter()
-            .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1))));
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1)))
+        );
 
         MultiBaseBlobFixture {
             _test_dir: test_dir,
@@ -1480,10 +1482,12 @@ mod tests {
             result.is_err(),
             "Blob v2 should be rejected for file version 2.1"
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Blob v2 requires file version >= 2.2"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Blob v2 requires file version >= 2.2")
+        );
     }
 
     async fn preprocess_kind_with_schema_metadata(metadata_value: &str, data_len: usize) -> u8 {

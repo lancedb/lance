@@ -316,8 +316,8 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
 /// Implementation of json_extract_with_type function
 fn json_extract_with_type_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    use arrow_array::builder::{LargeBinaryBuilder, UInt8Builder};
     use arrow_array::StructArray;
+    use arrow_array::builder::{LargeBinaryBuilder, UInt8Builder};
 
     common::validate_arg_count(args, 2, "json_extract_with_type")?;
 

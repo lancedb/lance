@@ -31,33 +31,33 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, DETACHED_VERSION_MASK,
+    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    WriterVersion, is_detached_version, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use snafu::location;
 
 use super::ObjectStore;
+use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult,
-    TRANSACTIONS_DIR,
+    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
+    write_manifest_file,
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
+use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
-use crate::session::Session;
-use crate::Dataset;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::{is_system_index, DatasetIndexExt};
+use lance_index::{DatasetIndexExt, is_system_index};
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::path::Path;
@@ -342,8 +342,8 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     e
                 ),
                 location: location!(),
-            })? {
-                if actual_file_version > data_storage_version {
+            })?
+                && actual_file_version > data_storage_version {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
                         data_storage_version,
@@ -351,21 +351,19 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     );
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
-            }
     } else {
         // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
         // match the data storage version.  This is a sanity assertion to prevent data corruption.
-        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
-            if actual_file_version != data_storage_version {
-                return Err(Error::Internal {
-                    message: format!(
-                        "The operation added files with version {}.  However, the data storage version is {}.",
-                        actual_file_version,
-                        data_storage_version
-                    ),
-                    location: location!(),
-                });
-            }
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
+            && actual_file_version != data_storage_version
+        {
+            return Err(Error::Internal {
+                message: format!(
+                    "The operation added files with version {}.  However, the data storage version is {}.",
+                    actual_file_version, data_storage_version
+                ),
+                location: location!(),
+            });
         }
     }
     Ok(())
@@ -419,10 +417,10 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
             .rev()
             .flat_map(|file| file.fields.iter_mut())
         {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
-                if seen_fields.insert(*field_id) {
-                    *field_id = *new_field_id;
-                }
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                && seen_fields.insert(*field_id)
+            {
+                *field_id = *new_field_id;
             }
         }
         seen_fields.clear();
@@ -602,7 +600,10 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
         if index.index_details.is_none() {
-            log::debug!("the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.", index.uuid);
+            log::debug!(
+                "the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.",
+                index.uuid
+            );
         }
     }
 
@@ -998,7 +999,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1009,10 +1010,10 @@ mod tests {
 
     use super::*;
 
+    use crate::Dataset;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
@@ -1199,11 +1200,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let batches =
-            vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()])
-                    .unwrap(),
-            ];
+        let batches = vec![
+            RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()]).unwrap(),
+        ];
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();

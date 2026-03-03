@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{builder::LargeBinaryBuilder, builder::StringBuilder, ArrayRef, StructArray};
+use arrow_array::{ArrayRef, StructArray, builder::LargeBinaryBuilder, builder::StringBuilder};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
@@ -143,8 +143,8 @@ impl BlobArrayBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::cast::AsArray;
     use arrow_array::Array;
+    use arrow_array::cast::AsArray;
 
     #[test]
     fn test_field_metadata() {

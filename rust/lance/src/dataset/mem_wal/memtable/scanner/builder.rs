@@ -12,7 +12,7 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
@@ -721,12 +721,11 @@ impl MemTableScanner {
         }
 
         // Check if we can use a BTree index for the filter
-        if self.use_index {
-            if let Some(predicate) = self.extract_btree_predicate() {
-                if self.has_btree_index(predicate.column()) {
-                    return self.plan_btree_query(&predicate).await;
-                }
-            }
+        if self.use_index
+            && let Some(predicate) = self.extract_btree_predicate()
+            && self.has_btree_index(predicate.column())
+        {
+            return self.plan_btree_query(&predicate).await;
         }
 
         // Fall back to full scan

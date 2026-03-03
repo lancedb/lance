@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
+use arrow_array::{Array, ArrayRef, UInt8Array, cast::AsArray};
 use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};

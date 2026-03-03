@@ -4,18 +4,18 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use object_store::path::Path;
 use url::Url;
 
-use crate::object_store::uri_to_url;
 use crate::object_store::WrappingObjectStore;
+use crate::object_store::uri_to_url;
 
-use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
+use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -231,11 +231,11 @@ impl ObjectStoreRegistry {
                         .active_stores
                         .write()
                         .expect("ObjectStoreRegistry lock poisoned");
-                    if let Some(store) = cache_lock.get(&cache_key) {
-                        if store.upgrade().is_none() {
-                            // Remove the weak reference if it is no longer valid
-                            cache_lock.remove(&cache_key);
-                        }
+                    if let Some(store) = cache_lock.get(&cache_key)
+                        && store.upgrade().is_none()
+                    {
+                        // Remove the weak reference if it is no longer valid
+                        cache_lock.remove(&cache_key);
                     }
                 }
             }

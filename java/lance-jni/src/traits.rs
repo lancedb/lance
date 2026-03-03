@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::JNIEnv;
+use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 
 use crate::error::Result;
 

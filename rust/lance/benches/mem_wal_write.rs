@@ -43,15 +43,15 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::{
     FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, RegionWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;

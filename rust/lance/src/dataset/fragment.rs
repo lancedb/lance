@@ -14,18 +14,18 @@ use std::sync::Arc;
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+    RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
-use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
@@ -33,20 +33,20 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::previous::reader::{
-    read_batch as previous_read_batch, FileReader as PreviousFileReader,
+    FileReader as PreviousFileReader, read_batch as previous_read_batch,
 };
 use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::version::LanceFileVersion;
-use lance_file::{determine_file_version, LanceEncodingsIo};
+use lance_file::{LanceEncodingsIo, determine_file_version};
+use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
-    wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
-    RowIdAndDeletesConfig,
+    ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
+    wrap_with_row_id_and_delete,
 };
 use snafu::location;
 
@@ -57,9 +57,9 @@ use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
 
 use super::updater::Updater;
-use super::{schema_evolution, NewColumnTransform, WriteParams};
-use crate::dataset::fragment::session::FragmentSession;
+use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
+use crate::dataset::fragment::session::FragmentSession;
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// A Fragment of a Lance [`Dataset`].
@@ -1118,7 +1118,13 @@ impl FileFragment {
         if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
             Ok(self.metadata.physical_rows.unwrap())
         } else {
-            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+            Err(Error::Internal {
+                message: format!(
+                    "The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}",
+                    self.id()
+                ),
+                location: location!(),
+            })
         }
     }
 
@@ -1133,7 +1139,13 @@ impl FileFragment {
                 ..
             }) => Ok(*num_deleted),
             None => Ok(0),
-            _ => Err(Error::Internal { message: format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()), location: location!() }),
+            _ => Err(Error::Internal {
+                message: format!(
+                    "The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}",
+                    self.id()
+                ),
+                location: location!(),
+            }),
         }
     }
 
@@ -1281,19 +1293,19 @@ impl FileFragment {
                 ));
             }
         }
-        if let Some(physical_rows) = self.metadata.physical_rows {
-            if physical_rows != *expected_length {
-                return Err(Error::corrupt_file(
-                    self.dataset
-                        .data_file_dir(&self.metadata.files[0])?
-                        .child(self.metadata.files[0].path.as_str()),
-                    format!(
-                        "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
-                        expected_length, physical_rows
-                    ),
-                    location!(),
-                ));
-            }
+        if let Some(physical_rows) = self.metadata.physical_rows
+            && physical_rows != *expected_length
+        {
+            return Err(Error::corrupt_file(
+                self.dataset
+                    .data_file_dir(&self.metadata.files[0])?
+                    .child(self.metadata.files[0].path.as_str()),
+                format!(
+                    "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
+                    expected_length, physical_rows
+                ),
+                location!(),
+            ));
         }
 
         if let Some(deletion_vector) = deletion_vector? {
@@ -1303,21 +1315,21 @@ impl FileFragment {
                 .as_ref()
                 .unwrap()
                 .num_deleted_rows
+                && num_deletions != deletion_vector.len()
             {
-                if num_deletions != deletion_vector.len() {
-                    return Err(Error::corrupt_file(
-                        deletion_file_path(
-                            &self.dataset.base,
-                            self.metadata.id,
-                            self.metadata.deletion_file.as_ref().unwrap(),
-                        ),
-                        format!(
-                            "deletion vector length does not match metadata. Metadata: {} Deletion vector: {}",
-                            num_deletions, deletion_vector.len()
-                        ),
-                        location!(),
-                    ));
-                }
+                return Err(Error::corrupt_file(
+                    deletion_file_path(
+                        &self.dataset.base,
+                        self.metadata.id,
+                        self.metadata.deletion_file.as_ref().unwrap(),
+                    ),
+                    format!(
+                        "deletion vector length does not match metadata. Metadata: {} Deletion vector: {}",
+                        num_deletions,
+                        deletion_vector.len()
+                    ),
+                    location!(),
+                ));
             }
 
             for offset in deletion_vector.iter() {
@@ -1329,7 +1341,10 @@ impl FileFragment {
                             self.metadata.id,
                             deletion_file_meta,
                         ),
-                        format!("deletion vector contains an offset that is out of range. Offset: {} Fragment length: {}", offset, expected_length),
+                        format!(
+                            "deletion vector contains an offset that is out of range. Offset: {} Fragment length: {}",
+                            offset, expected_length
+                        ),
                         location!(),
                     ));
                 }
@@ -2062,14 +2077,13 @@ impl FragmentReader {
         self.with_row_last_updated_at_version = true;
 
         // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none() {
-            if let Some(meta) = &self.fragment.last_updated_at_version_meta {
-                if let Ok(sequence) = meta.load_sequence() {
-                    self.last_updated_at_sequence = Some(Arc::new(sequence));
-                }
-            }
-            // If no metadata or load fails, sequence remains None (will default to version 1)
+        if self.last_updated_at_sequence.is_none()
+            && let Some(meta) = &self.fragment.last_updated_at_version_meta
+            && let Ok(sequence) = meta.load_sequence()
+        {
+            self.last_updated_at_sequence = Some(Arc::new(sequence));
         }
+        // If no metadata or load fails, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -2084,14 +2098,13 @@ impl FragmentReader {
         self.with_row_created_at_version = true;
 
         // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none() {
-            if let Some(meta) = &self.fragment.created_at_version_meta {
-                if let Ok(sequence) = meta.load_sequence() {
-                    self.created_at_sequence = Some(Arc::new(sequence));
-                }
-            }
-            // If no metadata or load fails, sequence remains None (will default to version 1)
+        if self.created_at_sequence.is_none()
+            && let Some(meta) = &self.fragment.created_at_version_meta
+            && let Ok(sequence) = meta.load_sequence()
+        {
+            self.created_at_sequence = Some(Arc::new(sequence));
         }
+        // If no metadata or load fails, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -2244,7 +2257,7 @@ impl FragmentReader {
                 return Err(Error::Internal {
                     message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
                     location: location!(),
-                })
+                });
             }
             ReadBatchParams::RangeFull => {
                 ReadBatchParams::Range(batch_offset..(batch_offset + rows_in_batch))
@@ -2409,10 +2422,8 @@ impl FragmentReader {
         batch_size: u32,
         skip_deleted_rows: bool,
     ) -> Result<ReadBatchFutStream> {
-        if skip_deleted_rows {
-            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
-                range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
-            }
+        if skip_deleted_rows && let Some(deletion_vector) = self.deletion_vec.as_ref() {
+            range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
         }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
@@ -2632,9 +2643,9 @@ mod tests {
         ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen_batch, RowCount};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{RowCount, array, gen_batch};
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
@@ -2644,8 +2655,8 @@ mod tests {
     use super::*;
     use crate::{
         dataset::{
-            transaction::{Operation, UpdateMode},
             InsertBuilder,
+            transaction::{Operation, UpdateMode},
         },
         session::Session,
         utils::test::TestDatasetGenerator,

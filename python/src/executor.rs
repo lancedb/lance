@@ -15,7 +15,7 @@
 use std::sync::mpsc::RecvTimeoutError;
 
 use futures::Future;
-use pyo3::{exceptions::PyRuntimeError, PyResult, Python};
+use pyo3::{PyResult, Python, exceptions::PyRuntimeError};
 
 pub const SIGNAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 

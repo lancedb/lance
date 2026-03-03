@@ -19,18 +19,18 @@ use crate::{
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
-        pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
         ProtobufUtils21,
+        pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
 use itertools::Itertools;
-use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::DataTypeExt;
+use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
     error::{Error, LanceOptionExt},
@@ -59,16 +59,17 @@ use crate::{
 };
 use crate::{
     repdef::{
-        build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator,
-        ControlWordParser, DefinitionInterpretation, RepDefSlicer,
+        CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
+        RepDefSlicer, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
-use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
+use lance_core::{Result, datatypes::Field, utils::tokio::spawn_cpu};
 
 use crate::constants::{DICT_DIVISOR_META_KEY, DICT_SIZE_RATIO_META_KEY};
 use crate::version::LanceFileVersion;
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
     decoder::{
@@ -81,7 +82,6 @@ use crate::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
-    EncodingsIo,
 };
 
 pub mod blob;
@@ -573,9 +573,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let should_cache_this_chunk = needs_caching[idx];
 
             let decoded_chunk = match &chunk_cache {
-                Some((cached_chunk_idx, ref cached_chunk))
-                    if *cached_chunk_idx == chunk.chunk_idx =>
-                {
+                Some((cached_chunk_idx, cached_chunk)) if *cached_chunk_idx == chunk.chunk_idx => {
                     // Clone only when we have a cache hit (much cheaper than decoding)
                     cached_chunk.clone()
                 }
@@ -1376,7 +1374,7 @@ impl MiniBlockScheduler {
                         )
                         .into(),
                         location: location!(),
-                    })
+                    });
                 }
             };
             Some(MiniBlockSchedulerDictionary {
@@ -1559,7 +1557,9 @@ impl ChunkInstructions {
             while rows_needed > 0 || need_preamble {
                 // Check if we've gone past the last block (should not happen)
                 if block_index >= rep_index.blocks.len() {
-                    log::warn!("schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early");
+                    log::warn!(
+                        "schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early"
+                    );
                     break;
                 }
 
@@ -2458,21 +2458,21 @@ impl StructuralPageScheduler for FullZipScheduler {
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        if self.enable_cache {
-            if let Some(rep_index) = self.rep_index {
-                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
-                let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
-                let io_clone = io.clone();
-                return async move {
-                    let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
-                    let state = Arc::new(FullZipCacheableState {
-                        rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
-                    });
-                    self.cached_state = Some(state.clone());
-                    Ok(state as Arc<dyn CachedPageData>)
-                }
-                .boxed();
+        if self.enable_cache
+            && let Some(rep_index) = self.rep_index
+        {
+            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+            let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+            let io_clone = io.clone();
+            return async move {
+                let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                let state = Arc::new(FullZipCacheableState {
+                    rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
+                });
+                self.cached_state = Some(state.clone());
+                Ok(state as Arc<dyn CachedPageData>)
             }
+            .boxed();
         }
         std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
@@ -3165,8 +3165,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
         trace!(
             "Current range is {:?} and current page has {} rows",
-            range,
-            cur_page.num_rows
+            range, cur_page.num_rows
         );
         // Skip entire pages until we have some overlap with our next range
         while cur_page.num_rows + self.global_row_offset <= range.start {
@@ -5052,36 +5051,35 @@ impl PrimitiveStructuralEncoder {
                 };
             }
 
-            if let DataType::Struct(fields) = &field.data_type() {
-                if fields.is_empty() {
-                    if has_repdef_info {
-                        return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
-                    }
-                    // This is maybe a little confusing but the reader should never look at this anyways and it
-                    // seems like overkill to invent a new layout just for "empty structs".
-                    return Self::encode_simple_all_null(column_idx, num_values, row_number);
+            if let DataType::Struct(fields) = &field.data_type()
+                && fields.is_empty()
+            {
+                if has_repdef_info {
+                    return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
                 }
+                // This is maybe a little confusing but the reader should never look at this anyways and it
+                // seems like overkill to invent a new layout just for "empty structs".
+                return Self::encode_simple_all_null(column_idx, num_values, row_number);
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            if version.resolve() >= LanceFileVersion::V2_2 {
-                if let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-                {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using constant layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    return constant::encode_constant_page(
-                        column_idx,
-                        scalar,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    );
-                }
+            if version.resolve() >= LanceFileVersion::V2_2
+                && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+            {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using constant layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                return constant::encode_constant_page(
+                    column_idx,
+                    scalar,
+                    repdef,
+                    row_number,
+                    num_rows,
+                );
             }
 
             let requires_full_zip_packed_struct =
@@ -5305,10 +5303,10 @@ mod tests {
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
-    use crate::format::ProtobufUtils21;
-    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
     use arrow_schema::DataType;
@@ -6044,7 +6042,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_initialize_is_lazy() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6160,7 +6158,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_initialize_caches_rep_index_when_enabled() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6246,10 +6244,12 @@ mod tests {
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let cached_data = scheduler.initialize(&io_dyn).await.unwrap();
-        assert!(cached_data
-            .as_arc_any()
-            .downcast_ref::<FullZipCacheableState>()
-            .is_some());
+        assert!(
+            cached_data
+                .as_arc_any()
+                .downcast_ref::<FullZipCacheableState>()
+                .is_some()
+        );
         assert!(scheduler.cached_state.is_some());
         assert_eq!(
             io.requests(),
@@ -6261,7 +6261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_full_page_bypasses_rep_index_io() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6379,7 +6379,7 @@ mod tests {
     /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
     #[tokio::test]
     async fn test_fuzz_issue_4492_empty_rep_values() {
-        use lance_datagen::{array, gen_batch, RowCount, Seed};
+        use lance_datagen::{RowCount, Seed, array, gen_batch};
 
         let seed = 1823859942947654717u64;
         let num_rows = 2741usize;
@@ -6418,7 +6418,7 @@ mod tests {
         file_version: LanceFileVersion,
     ) {
         use crate::constants::MINICHUNK_SIZE_META_KEY;
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use arrow_array::{ArrayRef, StringArray};
         use std::sync::Arc;
 
@@ -6503,23 +6503,25 @@ mod tests {
                 let col = &cols[0];
 
                 // Navigate to the dictionary encoding in the page layout
-                if let Some(PageEncoding::Structural(page_layout)) = &col.final_pages.first().map(|p| &p.description) {
-                    // Check that dictionary is wrapped with general compression
-                    if let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) = &page_layout.layout {
-                        if let Some(dictionary_encoding) = &mini_block.dictionary {
-                            match dictionary_encoding.compression.as_ref() {
-                                Some(Compression::General(general)) => {
-                                    // Verify it's using LZ4 or Zstd
-                                    let compression = general.compression.as_ref().unwrap();
-                                    assert!(
-                                        compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmLz4
-                                        || compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmZstd,
-                                        "Expected LZ4 or Zstd compression for large dictionary"
-                                    );
-                                }
-                                _ => panic!("Expected General compression for large dictionary"),
-                            }
+                if let Some(PageEncoding::Structural(page_layout)) =
+                    &col.final_pages.first().map(|p| &p.description)
+                    && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                        &page_layout.layout
+                    && let Some(dictionary_encoding) = &mini_block.dictionary
+                {
+                    match dictionary_encoding.compression.as_ref() {
+                        Some(Compression::General(general)) => {
+                            // Verify it's using LZ4 or Zstd
+                            let compression = general.compression.as_ref().unwrap();
+                            assert!(
+                                compression.scheme()
+                                    == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                    || compression.scheme()
+                                        == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                "Expected LZ4 or Zstd compression for large dictionary"
+                            );
                         }
+                        _ => panic!("Expected General compression for large dictionary"),
                     }
                 }
             }));
@@ -6530,7 +6532,7 @@ mod tests {
     #[tokio::test]
     async fn test_dictionary_encode_int64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Int64Array};
         use std::collections::HashMap;
@@ -6566,7 +6568,7 @@ mod tests {
     #[tokio::test]
     async fn test_dictionary_encode_float64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Float64Array};
         use std::collections::HashMap;
@@ -6773,8 +6775,8 @@ mod tests {
         version: LanceFileVersion,
     ) -> crate::encoder::EncodedPage {
         use crate::encoder::{
-            default_encoding_strategy, ColumnIndexSequence, EncodingOptions, OutOfLineBuffers,
-            MIN_PAGE_BUFFER_ALIGNMENT,
+            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+            default_encoding_strategy,
         };
         use crate::repdef::RepDefBuilder;
 

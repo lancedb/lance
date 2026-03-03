@@ -4,8 +4,8 @@
 use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
 
 use arrow_array::{
-    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
+    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
 };
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
@@ -16,11 +16,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
+use crate::{ReadBatchParams, traits::Reader};
 use crate::{
-    encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
+    encodings::{AsyncIndex, Decoder, binary::BinaryDecoder, plain::PlainDecoder},
     traits::ProtoStruct,
 };
-use crate::{traits::Reader, ReadBatchParams};
 use lance_core::{Error, Result};
 
 pub mod tracking_store;
@@ -259,12 +259,12 @@ mod tests {
     use object_store::path::Path;
 
     use crate::{
+        Error, Result,
         object_reader::CloudObjectReader,
-        object_store::{ObjectStore, DEFAULT_DOWNLOAD_RETRY_COUNT},
+        object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
-        Error, Result,
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we

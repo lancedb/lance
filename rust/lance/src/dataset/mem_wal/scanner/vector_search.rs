@@ -12,10 +12,10 @@ use arrow_schema::SortOptions;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
 
@@ -122,9 +122,9 @@ impl LsmVectorSearchPlanner {
         mut self,
         bloom_filters: impl IntoIterator<Item = (u64, Arc<Sbbf>)>,
     ) -> Self {
-        for (gen, bf) in bloom_filters {
+        for (generation, bf) in bloom_filters {
             self.bloom_filters.push(GenerationBloomFilter {
-                generation: gen,
+                generation,
                 bloom_filter: bf,
             });
         }
@@ -319,7 +319,7 @@ mod tests {
     use super::*;
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::{
-        builder::FixedSizeListBuilder, Int32Array, RecordBatch, RecordBatchIterator,
+        Int32Array, RecordBatch, RecordBatchIterator, builder::FixedSizeListBuilder,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use std::collections::HashMap;

@@ -12,15 +12,14 @@ use arrow::{
     },
 };
 use arrow_array::{
-    make_array,
-    types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
     LargeStringArray, ListArray, MapArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
+    RecordBatchOptions, RecordBatchReader, StringArray, StructArray, make_array,
+    types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
-use futures::{stream::BoxStream, StreamExt};
-use rand::{distr::Uniform, Rng, RngCore, SeedableRng};
+use futures::{StreamExt, stream::BoxStream};
+use rand::{Rng, RngCore, SeedableRng, distr::Uniform};
 use rand_distr::Zipf;
 use random_word;
 
@@ -2197,9 +2196,10 @@ impl BatchGeneratorBuilder {
         if !batch_size_bytes.0.is_multiple_of(bytes_per_row) {
             match rounding {
                 RoundingBehavior::ExactOrErr => {
-                    return Err(ArrowError::NotYetImplemented(
-                        format!("Exact rounding requested but not possible.  Batch size requested {}, row size: {}", batch_size_bytes.0, bytes_per_row))
-                    );
+                    return Err(ArrowError::NotYetImplemented(format!(
+                        "Exact rounding requested but not possible.  Batch size requested {}, row size: {}",
+                        batch_size_bytes.0, bytes_per_row
+                    )));
                 }
                 RoundingBehavior::RoundUp => {
                     num_rows = RowCount::from(num_rows.0 + 1);
@@ -2258,11 +2258,11 @@ const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
 
-    use arrow::datatypes::{Int16Type, Int64Type, Int8Type};
+    use arrow::datatypes::{Int8Type, Int16Type, Int64Type};
     use arrow_array::types::{
         Decimal128Type, Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
         DurationNanosecondType, DurationSecondType, Float16Type, Float32Type, Float64Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     };
     use arrow_array::{
         ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
@@ -2987,12 +2987,11 @@ pub fn rand_field(field: &Field) -> Box<dyn ArrayGenerator> {
         array::rand_type(field.data_type())
     };
 
-    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY) {
-        if let Ok(cardinality) = cardinality_str.parse::<usize>() {
-            if cardinality > 0 {
-                generator = array::low_cardinality(generator, cardinality);
-            }
-        }
+    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY)
+        && let Ok(cardinality) = cardinality_str.parse::<usize>()
+        && cardinality > 0
+    {
+        generator = array::low_cardinality(generator, cardinality);
     }
 
     generator
@@ -3017,8 +3016,8 @@ pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
 #[cfg(test)]
 mod tests {
 
-    use arrow::datatypes::{Float32Type, Int16Type, Int8Type, UInt32Type};
-    use arrow_array::{BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array};
+    use arrow::datatypes::{Float32Type, Int8Type, Int16Type, UInt32Type};
+    use arrow_array::{BooleanArray, Float32Array, Int8Array, Int16Array, Int32Array, UInt32Array};
 
     use super::*;
 

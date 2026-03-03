@@ -4,7 +4,7 @@
 use crate::{format::pb, rowids::bitmap::Bitmap};
 use lance_core::{Error, Result};
 
-use super::{encoded_array::EncodedU64Array, RowIdSequence, U64Segment};
+use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
 use prost::Message;
 
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
