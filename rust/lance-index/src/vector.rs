@@ -28,6 +28,10 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub use ivf::PartitionComputer;
+#[cfg(feature = "gemm-partitioner")]
+pub use ivf::GemmPartitionComputer;
+#[cfg(feature = "gpu-partitioner")]
+pub use ivf::GpuPartitionComputer;
 pub mod kmeans;
 pub mod pq;
 pub mod quantizer;

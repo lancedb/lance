@@ -75,6 +75,8 @@ bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
 lance-datagen.workspace = true
 rangemap.workspace = true
+gemm = { version = "0.19", optional = true }
+cudarc = { version = "0.19", optional = true, features = ["cublas", "nvrtc", "cuda-12020"] }
 
 [dev-dependencies]
 approx.workspace = true
@@ -92,6 +94,8 @@ geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-sch
 protoc = ["dep:protobuf-src"]
 tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
 tokenizer-jieba = ["dep:jieba-rs"]
+gemm-partitioner = ["dep:gemm"]
+gpu-partitioner = ["dep:cudarc"]
 
 [build-dependencies]
 prost-build.workspace = true

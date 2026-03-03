@@ -30,11 +30,19 @@ use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
 pub mod builder;
+#[cfg(feature = "gemm-partitioner")]
+mod gemm_partitioner;
+#[cfg(feature = "gpu-partitioner")]
+mod gpu_partitioner;
 pub mod shuffler;
 pub mod storage;
 mod transform;
 
 pub use transform::PartitionComputer;
+#[cfg(feature = "gemm-partitioner")]
+pub use gemm_partitioner::GemmPartitionComputer;
+#[cfg(feature = "gpu-partitioner")]
+pub use gpu_partitioner::GpuPartitionComputer;
 
 /// Create an IVF from the flatten centroids.
 ///
