@@ -11,6 +11,7 @@ pub const LEGACY_FORMAT_VERSION: &str = "0.1";
 pub const V2_FORMAT_2_0: &str = "2.0";
 pub const V2_FORMAT_2_1: &str = "2.1";
 pub const V2_FORMAT_2_2: &str = "2.2";
+pub const V2_FORMAT_2_3: &str = "2.3";
 
 /// Lance file version
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd, strum::EnumIter)]
@@ -31,9 +32,10 @@ pub enum LanceFileVersion {
     /// The latest stable release (also the default version for new datasets)
     Stable,
     V2_1,
+    V2_2,
     /// The latest unstable release
     Next,
-    V2_2,
+    V2_3,
 }
 
 impl LanceFileVersion {
@@ -41,7 +43,7 @@ impl LanceFileVersion {
     pub fn resolve(&self) -> Self {
         match self {
             Self::Stable => Self::V2_0,
-            Self::Next => Self::V2_1,
+            Self::Next => Self::V2_3,
             _ => *self,
         }
     }
@@ -59,6 +61,7 @@ impl LanceFileVersion {
             (2, 0) => Ok(Self::V2_0),
             (2, 1) => Ok(Self::V2_1),
             (2, 2) => Ok(Self::V2_2),
+            (2, 3) => Ok(Self::V2_3),
             _ => Err(Error::invalid_input_source(
                 format!("Unknown Lance storage version: {}.{}", major, minor).into(),
             )),
@@ -71,6 +74,7 @@ impl LanceFileVersion {
             Self::V2_0 => (2, 0),
             Self::V2_1 => (2, 1),
             Self::V2_2 => (2, 2),
+            Self::V2_3 => (2, 3),
             Self::Stable => self.resolve().to_numbers(),
             Self::Next => self.resolve().to_numbers(),
         }
@@ -105,6 +109,7 @@ impl std::fmt::Display for LanceFileVersion {
                 Self::V2_0 => V2_FORMAT_2_0,
                 Self::V2_1 => V2_FORMAT_2_1,
                 Self::V2_2 => V2_FORMAT_2_2,
+                Self::V2_3 => V2_FORMAT_2_3,
                 Self::Stable => "stable",
                 Self::Next => "next",
             }
@@ -121,6 +126,7 @@ impl FromStr for LanceFileVersion {
             V2_FORMAT_2_0 => Ok(Self::V2_0),
             V2_FORMAT_2_1 => Ok(Self::V2_1),
             V2_FORMAT_2_2 => Ok(Self::V2_2),
+            V2_FORMAT_2_3 => Ok(Self::V2_3),
             "stable" => Ok(Self::Stable),
             "legacy" => Ok(Self::Legacy),
             "next" => Ok(Self::Next),

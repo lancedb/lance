@@ -744,6 +744,7 @@ impl FileWriter {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
             LanceFileVersion::V2_2 => (2, 2),
+            LanceFileVersion::V2_3 => (2, 3),
             _ => panic!("Unsupported version: {}", version),
         }
     }
