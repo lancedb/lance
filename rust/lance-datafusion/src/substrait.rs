@@ -165,7 +165,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             "Window functions or subqueries not allowed in filter expression",
         )),
         // Pass through operators, nested children may have field references
-        RexType::ScalarFunction(ref mut func) => {
+        RexType::ScalarFunction(func) => {
             #[allow(deprecated)]
             for arg in &mut func.args {
                 remap_expr_references(arg, mapping)?;
@@ -178,7 +178,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::IfThen(ref mut ifthen) => {
+        RexType::IfThen(ifthen) => {
             for clause in ifthen.ifs.iter_mut() {
                 remap_expr_references(clause.r#if.as_mut().unwrap(), mapping)?;
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
@@ -186,21 +186,21 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             remap_expr_references(ifthen.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SwitchExpression(ref mut switch) => {
+        RexType::SwitchExpression(switch) => {
             for clause in switch.ifs.iter_mut() {
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
             }
             remap_expr_references(switch.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SingularOrList(ref mut orlist) => {
+        RexType::SingularOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 remap_expr_references(opt, mapping)?;
             }
             remap_expr_references(orlist.value.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::MultiOrList(ref mut orlist) => {
+        RexType::MultiOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 for field in opt.fields.iter_mut() {
                     remap_expr_references(field, mapping)?;
@@ -211,11 +211,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::Cast(ref mut cast) => {
+        RexType::Cast(cast) => {
             remap_expr_references(cast.input.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::Selection(ref mut sel) => {
+        RexType::Selection(sel) => {
             // Finally, the selection, which might actually have field references
             let root_type = sel.root_type.as_mut().unwrap();
             // These types of references do not reference input fields so no remap needed

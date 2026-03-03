@@ -262,18 +262,12 @@ impl Error {
 
     #[track_caller]
     pub fn dataset_already_exists(uri: impl Into<String>) -> Self {
-        DatasetAlreadyExistsSnafu {
-            uri: uri.into(),
-        }
-        .build()
+        DatasetAlreadyExistsSnafu { uri: uri.into() }.build()
     }
 
     #[track_caller]
     pub fn dataset_not_found(path: impl Into<String>, source: BoxedError) -> Self {
-        DatasetNotFoundSnafu {
-            path: path.into(),
-        }
-        .into_error(source)
+        DatasetNotFoundSnafu { path: path.into() }.into_error(source)
     }
 
     #[track_caller]
@@ -292,10 +286,7 @@ impl Error {
 
     #[track_caller]
     pub fn not_found(uri: impl Into<String>) -> Self {
-        NotFoundSnafu {
-            uri: uri.into(),
-        }
-        .build()
+        NotFoundSnafu { uri: uri.into() }.build()
     }
 
     #[track_caller]
