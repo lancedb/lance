@@ -12,6 +12,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use tokio::time::Instant;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
@@ -2690,6 +2691,8 @@ impl Dataset {
         batch_readhead: Option<usize>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
+        let initial_io_stats = self.object_store().io_stats_snapshot();
+        let start = Instant::now();
         let index_dir = self.indices_dir().child(index_uuid);
         match index_type {
             IndexType::Inverted => {
@@ -2726,7 +2729,16 @@ impl Dataset {
                 std::io::ErrorKind::InvalidInput,
                 format!("Unsupported index type (patched): {}", index_type),
             )))),
-        }
+        }?;
+        let secs = start.elapsed().as_secs_f64();
+        let final_io_stats = self.object_store().io_stats_snapshot();
+        let iops = final_io_stats.read_iops - initial_io_stats.read_iops;
+        let iops_per_sec = (iops as f64) / secs;
+        let bytes_read = final_io_stats.read_bytes - initial_io_stats.read_bytes;
+        let bytes_read_per_sec = (bytes_read as f64) / secs;
+        log::info!("merge_index_metadata: IOPS: {}, IOPS/s: {:.3}, bytes read: {}, bytes read/s: {:3}",
+            iops, iops_per_sec, bytes_read, bytes_read_per_sec);
+        Ok(())
     }
 }
 
