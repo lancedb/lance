@@ -21,7 +21,6 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
-use snafu::location;
 
 mod optimize;
 
@@ -45,14 +44,11 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         // `path` can be a nested path (e.g. "b.c") which will not be found by
         // `RecordBatch::column_by_name`. We project exactly one column and validate it directly.
         if batch.num_columns() != 1 {
-            return Err(Error::Internal {
-                message: format!(
-                    "Expected exactly one column in validation scan for {}, got {}",
-                    path,
-                    batch.num_columns()
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Expected exactly one column in validation scan for {}, got {}",
+                path,
+                batch.num_columns()
+            )));
         }
         let col = batch.column(0);
         if col.null_count() > 0 {
@@ -362,10 +358,9 @@ pub(super) async fn add_columns_to_fragments(
             // Check that the schema is compatible considering all the new columns must be nullable
             let schema = Schema::try_from(output_schema.as_ref())?;
             if !schema.all_fields_nullable() {
-                return Err(Error::InvalidInput {
-                    source: "All-null columns must be nullable.".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "All-null columns must be nullable.".into(),
+                ));
             }
 
             let fragments = fragments
@@ -378,10 +373,9 @@ pub(super) async fn add_columns_to_fragments(
             // use the NullReader for fragments that have missing columns and we can't mix legacy
             // and non-legacy readers when reading the fragment.
             if dataset.is_legacy_storage() {
-                return Err(Error::NotSupported {
-                    source: "Cannot add all-null columns to legacy dataset version.".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Cannot add all-null columns to legacy dataset version.".into(),
+                ));
             }
 
             Ok((output_schema, fragments))
@@ -537,10 +531,9 @@ async fn add_columns_from_stream(
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
-        return Err(Error::InvalidInput {
-            source: "Stream produced more values than expected for dataset".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            "Stream produced more values than expected for dataset".into(),
+        ));
     }
 
     Ok(new_fragments)
@@ -745,9 +738,8 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
 /// Exclude the fields from `other` Schema, and returns a new Schema.
 pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> Result<Schema> {
-    let other: Schema = other.try_into().map_err(|_| Error::Schema {
-        message: "The other schema is not compatible with this schema".to_string(),
-        location: location!(),
+    let other: Schema = other.try_into().map_err(|_| {
+        Error::schema("The other schema is not compatible with this schema".to_string())
     })?;
     let mut fields = vec![];
     for field in source.fields.iter() {

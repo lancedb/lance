@@ -248,12 +248,11 @@ impl GcpCredentialVendor {
     pub async fn new(config: GcpCredentialVendorConfig) -> Result<Self> {
         let credential = credentials::create_access_token_credential()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to create GCP credentials: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         Ok(Self {
@@ -268,21 +267,19 @@ impl GcpCredentialVendor {
         let url = uri_to_url(uri)?;
 
         if url.scheme() != "gs" {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Unsupported GCS URI scheme '{}', expected 'gs'",
                     url.scheme()
                 )
                 .into(),
-                location: snafu::location!(),
-            });
+            ));
         }
 
         let bucket = url
             .host_str()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("GCS URI '{}' missing bucket", uri).into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source(format!("GCS URI '{}' missing bucket", uri).into())
             })?
             .to_string();
 
@@ -297,12 +294,11 @@ impl GcpCredentialVendor {
     /// using the IAM Credentials API. Otherwise, uses the configured credential
     /// directly.
     async fn get_source_token(&self) -> Result<String> {
-        let base_token = self.credential.get_token().await.map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let base_token = self.credential.get_token().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to get GCP token: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         // If service account impersonation is configured, use generateAccessToken API
@@ -340,12 +336,11 @@ impl GcpCredentialVendor {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to call IAM generateAccessToken: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         if !response.status().is_success() {
@@ -354,23 +349,18 @@ impl GcpCredentialVendor {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "IAM generateAccessToken failed for '{}' with status {}: {}",
-                    service_account, status, body
-                ))),
-                location: snafu::location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
+                "IAM generateAccessToken failed for '{}' with status {}: {}",
+                service_account, status, body
+            )))));
         }
 
-        let token_response: GenerateAccessTokenResponse =
-            response.json().await.map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to parse generateAccessToken response: {}",
-                    e
-                ))),
-                location: snafu::location!(),
-            })?;
+        let token_response: GenerateAccessTokenResponse = response.json().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to parse generateAccessToken response: {}",
+                e
+            ))))
+        })?;
 
         Ok(token_response.access_token)
     }
@@ -454,12 +444,11 @@ impl GcpCredentialVendor {
         source_token: &str,
         access_boundary: &CredentialAccessBoundary,
     ) -> Result<(String, u64)> {
-        let options_json = serde_json::to_string(access_boundary).map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let options_json = serde_json::to_string(access_boundary).map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to serialize access boundary: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         let params = [
@@ -485,12 +474,11 @@ impl GcpCredentialVendor {
             .form(&params)
             .send()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to call STS token exchange: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         if !response.status().is_success() {
@@ -499,23 +487,18 @@ impl GcpCredentialVendor {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "STS token exchange failed with status {}: {}",
-                    status, body
-                ))),
-                location: snafu::location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
+                "STS token exchange failed with status {}: {}",
+                status, body
+            )))));
         }
 
-        let token_response: TokenExchangeResponse =
-            response.json().await.map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to parse STS response: {}",
-                    e
-                ))),
-                location: snafu::location!(),
-            })?;
+        let token_response: TokenExchangeResponse = response.json().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to parse STS response: {}",
+                e
+            ))))
+        })?;
 
         // Calculate expiration time
         // Use expires_in from response if available, otherwise default to 1 hour
@@ -608,10 +591,11 @@ impl GcpCredentialVendor {
             .config
             .workload_identity_provider
             .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "gcp_workload_identity_provider must be configured for OIDC token exchange"
-                    .into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    "gcp_workload_identity_provider must be configured for OIDC token exchange"
+                        .into(),
+                )
             })?;
 
         // Normalize audience to full format expected by GCP STS
@@ -639,34 +623,28 @@ impl GcpCredentialVendor {
             .form(&params)
             .send()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to exchange OIDC token for GCP token: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "GCP STS token exchange failed with status {}: {}",
-                    status, body
-                ))),
-                location: snafu::location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
+                "GCP STS token exchange failed with status {}: {}",
+                status, body
+            )))));
         }
 
-        let token_response: TokenExchangeResponse =
-            response.json().await.map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to parse GCP STS token response: {}",
-                    e
-                ))),
-                location: snafu::location!(),
-            })?;
+        let token_response: TokenExchangeResponse = response.json().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to parse GCP STS token response: {}",
+                e
+            ))))
+        })?;
 
         let federated_token = token_response.access_token;
 
@@ -727,14 +705,11 @@ impl GcpCredentialVendor {
         prefix: &str,
         api_key: &str,
     ) -> Result<VendedCredentials> {
-        let salt = self
-            .config
-            .api_key_salt
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "api_key_salt must be configured to use API key authentication".into(),
-                location: snafu::location!(),
-            })?;
+        let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "api_key_salt must be configured to use API key authentication".into(),
+            )
+        })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
 
@@ -749,10 +724,7 @@ impl GcpCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::InvalidInput {
-                    source: "Invalid API key".into(),
-                    location: snafu::location!(),
-                }
+                Error::invalid_input_source("Invalid API key".into())
             })?;
 
         debug!(
@@ -818,10 +790,9 @@ impl CredentialVendor for GcpCredentialVendor {
                 let api_key = id.api_key.as_ref().unwrap();
                 self.vend_with_api_key(&bucket, &prefix, api_key).await
             }
-            Some(_) => Err(Error::InvalidInput {
-                source: "Identity provided but neither auth_token nor api_key is set".into(),
-                location: snafu::location!(),
-            }),
+            Some(_) => Err(Error::invalid_input_source(
+                "Identity provided but neither auth_token nor api_key is set".into(),
+            )),
             None => {
                 // Static credential vending using ADC
                 let source_token = self.get_source_token().await?;

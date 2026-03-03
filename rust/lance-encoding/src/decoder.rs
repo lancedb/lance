@@ -229,7 +229,6 @@ use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
-use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -602,12 +601,12 @@ impl CoreFieldDecoderStrategy {
     fn check_simple_struct(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
         Self::ensure_values_encoded(column_info, field_name)?;
         if column_info.page_infos.len() != 1 {
-            return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
+            return Err(Error::invalid_input_source(format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into()));
         }
         let encoding = &column_info.page_infos[0].encoding;
         match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
-            _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
+            _ => Err(Error::invalid_input_source(format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into())),
         }
     }
 
@@ -798,10 +797,7 @@ impl CoreFieldDecoderStrategy {
                 //  because converting a rust arrow map field to the python arrow field will
                 //  lose the keys_sorted property.
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
                 let child_scheduler =
@@ -895,14 +891,13 @@ impl CoreFieldDecoderStrategy {
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
                     Ok(scheduler)
                 } else {
-                    Err(Error::NotSupported {
-                        source: format!(
+                    Err(Error::not_supported_source(
+                        format!(
                             "No way to decode into a dictionary field of type {}",
                             value_type
                         )
                         .into(),
-                        location: location!(),
-                    })
+                    ))
                 }
             }
             DataType::List(_) | DataType::LargeList(_) => {
@@ -1479,10 +1474,7 @@ impl BatchDecodeStream {
                     // worker threads to keep making progress.
                     tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
                         .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                        .map_err(|err| Error::wrapped(err.into()))?
                 };
                 (task, num_rows)
             });
@@ -1825,10 +1817,7 @@ impl StructuralBatchDecodeStream {
                             async move { next_task.into_batch(emitted_batch_size_warning) },
                         )
                         .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                        .map_err(|err| Error::wrapped(err.into()))?
                     } else {
                         next_task.into_batch(emitted_batch_size_warning)
                     }
@@ -2556,10 +2545,7 @@ impl NextDecodeTask {
                 Ok(batch)
             }
             Err(e) => {
-                let e = Error::Internal {
-                    message: format!("Error decoding batch: {}", e),
-                    location: location!(),
-                };
+                let e = Error::internal(format!("Error decoding batch: {}", e));
                 Err(e)
             }
         }

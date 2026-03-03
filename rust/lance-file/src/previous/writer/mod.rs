@@ -24,7 +24,6 @@ use lance_io::encodings::{
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -377,10 +376,9 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 )
                 .await
             }
-            _ => Err(Error::Schema {
-                message: format!("FileWriter::write: unsupported data type: {data_type}"),
-                location: location!(),
-            }),
+            _ => Err(Error::schema(format!(
+                "FileWriter::write: unsupported data type: {data_type}"
+            ))),
         }
     }
 
@@ -470,14 +468,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             for struct_array in arrays {
                 let arr = struct_array
                     .column_by_name(&child.name)
-                    .ok_or(Error::Schema {
-                        message: format!(
-                            "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
-                            child.name,
-                            struct_array.data_type()
-                        ),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::schema(format!(
+                        "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                        child.name,
+                        struct_array.data_type()
+                    )))?;
                 arrs.push(arr);
             }
             Self::write_array(object_writer, child, arrs.as_slice(), batch_id, page_table).await?;

@@ -36,7 +36,6 @@ use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use std::borrow::Cow;
 
 use object_store::path::Path;
-use snafu::location;
 use tracing::instrument;
 
 use crate::previous::format::metadata::Metadata;
@@ -339,15 +338,13 @@ impl FileReader {
         let batches = stream::iter(indices_in_batches)
             .map(|batch| async move {
                 if batch.batch_id >= num_batches as i32 {
-                    Err(Error::InvalidInput {
-                        source: format!("batch_id: {} out of bounds", batch.batch_id).into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        format!("batch_id: {} out of bounds", batch.batch_id).into(),
+                    ))
                 } else if *batch.offsets.last().expect("got empty batch") > num_rows {
-                    Err(Error::InvalidInput {
-                        source: format!("indices: {:?} out of bounds", batch.offsets).into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        format!("indices: {:?} out of bounds", batch.offsets).into(),
+                    ))
                 } else {
                     self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                         .await
@@ -743,10 +740,9 @@ where
             positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
         ),
         ReadBatchParams::Ranges(_) => {
-            return Err(Error::Internal {
-                message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
+            ));
         }
         ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..positions.value(*end).as_usize())

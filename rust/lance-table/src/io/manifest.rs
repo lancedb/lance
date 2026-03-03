@@ -10,7 +10,6 @@ use lance_file::{
 };
 use object_store::path::Path;
 use prost::Message;
-use snafu::location;
 use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tracing::instrument;
@@ -59,14 +58,12 @@ pub async fn read_manifest(
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: file size is smaller than 16 bytes".to_string(),
-            location!(),
         ));
     }
     if !buf.ends_with(MAGIC) {
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: magic number does not match".to_string(),
-            location!(),
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;

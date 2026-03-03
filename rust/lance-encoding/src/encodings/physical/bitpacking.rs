@@ -20,7 +20,6 @@ use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use byteorder::{ByteOrder, LittleEndian};
 use lance_bitpacking::BitPacking;
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -219,14 +218,13 @@ impl MiniBlockCompressor for InlineBitpacking {
     fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with BitpackMiniBlockEncoder",
                     chunk.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }

@@ -70,7 +70,6 @@ use lance_table::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::cmp::Ordering;
 use std::{
     collections::{HashMap, HashSet},
@@ -1559,10 +1558,9 @@ impl Transaction {
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
-            return Err(Error::NotSupported {
-                source: "Cannot enable stable row ids on existing dataset".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                "Cannot enable stable row ids on existing dataset".into(),
+            ));
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -1605,10 +1603,9 @@ impl Transaction {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
                 } else {
-                    return Err(Error::Internal {
-                        message: "Cannot create a new dataset without a schema".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(
+                        "Cannot create a new dataset without a schema".to_string(),
+                    ));
                 }
             }
         };
@@ -1633,10 +1630,9 @@ impl Transaction {
                 (None, true) => Some(0),
                 (_, false) => None,
                 (Some(_), true) => {
-                    return Err(Error::NotSupported {
-                        source: "Cannot enable stable row ids on existing dataset".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(
+                        "Cannot enable stable row ids on existing dataset".into(),
+                    ));
                 }
             }
         };
@@ -1644,20 +1640,18 @@ impl Transaction {
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
+                .ok_or_else(|| {
+                    Error::internal(format!(
                         "No current manifest was provided while building manifest for operation {}",
                         self.operation.name()
-                    ),
-                    location: location!(),
+                    ))
                 });
 
         match &self.operation {
             Operation::Clone { .. } => {
-                return Err(Error::Internal {
-                    message: "Clone operation should not enter build_manifest.".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Clone operation should not enter build_manifest.".to_string(),
+                ));
             }
             Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -1849,12 +1843,11 @@ impl Transaction {
                                 lance_table::format::RowDatasetVersionMeta::from_sequence(
                                     &created_at_seq,
                                 )
-                                .map_err(|e| Error::Internal {
-                                    message: format!(
+                                .map_err(|e| {
+                                    Error::internal(format!(
                                         "Failed to create created_at version metadata: {}",
                                         e
-                                    ),
-                                    location: location!(),
+                                    ))
                                 })?,
                             );
 
@@ -2246,10 +2239,9 @@ impl Transaction {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
                     } else {
-                        return Err(Error::InvalidInput {
-                            source: format!("Field with id {} does not exist", field_id).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            format!("Field with id {} does not exist", field_id).into(),
+                        ));
                     }
                 }
             }
@@ -2567,9 +2559,21 @@ impl Transaction {
         for group in groups {
             // If the old fragments are contiguous, find the range
             let replace_range = {
-                let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| Error::CommitConflict { version, source:
-                    format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() , location:location!()})?.0;
+                let start = final_fragments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.id == group.old_fragments[0].id)
+                    .ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            version,
+                            format!(
+                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                                group.old_fragments[0].id
+                            )
+                            .into(),
+                        )
+                    })?
+                    .0;
 
                 // Verify old_fragments matches contiguous range
                 let mut i = 1;
@@ -2610,10 +2614,10 @@ impl Transaction {
         let mut pure_update_frag_ids = Vec::new();
 
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if let Some(row_id_meta) = &fragment.row_id_meta {
                 let existing_row_count = match row_id_meta {
@@ -2637,10 +2641,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if fragment.row_id_meta.is_some() {
                 // we may meet merge insert case, it only has partial row ids.
@@ -2672,11 +2676,9 @@ impl Transaction {
                         let combined_sequence = match &fragment.row_id_meta {
                             Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
                             _ => {
-                                return Err(Error::Internal {
-                                    message: "Failed to deserialize existing row ID sequence"
-                                        .into(),
-                                    location: location!(),
-                                });
+                                return Err(Error::internal(
+                                    "Failed to deserialize existing row ID sequence",
+                                ));
                             }
                         };
 
@@ -2692,13 +2694,10 @@ impl Transaction {
                     }
                     Ordering::Greater => {
                         // More row IDs than physical rows - this shouldn't happen
-                        return Err(Error::Internal {
-                            message: format!(
-                                "Fragment has more row IDs ({}) than physical rows ({})",
-                                existing_row_count, physical_rows
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(format!(
+                            "Fragment has more row IDs ({}) than physical rows ({})",
+                            existing_row_count, physical_rows
+                        )));
                     }
                 }
             } else {
@@ -2924,10 +2923,9 @@ impl TryFrom<pb::Transaction> for Transaction {
 
                 // Error if both are present
                 if has_new_fields && has_old_fields {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot mix old and new style UpdateConfig fields".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "Cannot mix old and new style UpdateConfig fields".into(),
+                    ));
                 }
 
                 if has_old_fields {
@@ -3012,10 +3010,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
             None => {
-                return Err(Error::Internal {
-                    message: "Transaction message did not contain an operation".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Transaction message did not contain an operation".to_string(),
+                ));
             }
         };
         Ok(Self {

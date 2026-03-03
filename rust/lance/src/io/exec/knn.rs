@@ -50,7 +50,6 @@ use lance_index::vector::{DIST_Q_C_COLUMN, VectorIndex};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
-use snafu::location;
 use tokio::sync::Notify;
 
 use crate::dataset::Dataset;
@@ -385,10 +384,9 @@ impl ANNIvfPartitionExec {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
-            return Err(Error::Execution {
-                message: "ANNIVFPartitionExec node: no index found for query".to_string(),
-                location: location!(),
-            });
+            return Err(Error::execution(
+                "ANNIVFPartitionExec node: no index found for query".to_string(),
+            ));
         }
 
         let schema = KNN_PARTITION_SCHEMA.clone();
@@ -615,13 +613,10 @@ impl ANNIvfSubIndexExec {
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
-            return Err(Error::Index {
-                message: format!(
-                    "ANNSubIndexExec node: input schema does not have \"{}\" column",
-                    PART_ID_COLUMN
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "ANNSubIndexExec node: input schema does not have \"{}\" column",
+                PART_ID_COLUMN
+            )));
         }
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),

@@ -9,7 +9,6 @@ use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     decoder::{
@@ -197,20 +196,18 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         let (entries_field, keys_sorted) = match &self.data_type {
             DataType::Map(field, keys_sorted) => {
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: "Map type decoder does not support keys_sorted=true now"
+                    return Err(Error::not_supported_source(
+                        "Map type decoder does not support keys_sorted=true now"
                             .to_string()
                             .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
                 (field.clone(), *keys_sorted)
             }
             _ => {
-                return Err(Error::Schema {
-                    message: "Map decoder did not have a map field".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::schema(
+                    "Map decoder did not have a map field".to_string(),
+                ));
             }
         };
 
@@ -218,10 +215,7 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         let entries = array
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .ok_or_else(|| Error::Schema {
-                message: "Map entries should be a StructArray".to_string(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::schema("Map entries should be a StructArray".to_string()))?
             .clone();
 
         // Build the MapArray from offsets, entries, validity, and keys_sorted

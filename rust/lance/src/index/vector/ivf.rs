@@ -92,7 +92,6 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use snafu::location;
 use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
@@ -163,10 +162,10 @@ impl IVFIndex {
         index_cache: LanceCache,
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
-            return Err(Error::Index {
-                message: format!("IVF sub index must be loadable, got: {:?}", sub_index),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "IVF sub index must be loadable, got: {:?}",
+                sub_index
+            )));
         }
 
         let num_partitions = ivf.num_partitions();
@@ -212,14 +211,11 @@ impl IVFIndex {
                 part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
-                    return Err(Error::Index {
-                        message: format!(
-                            "partition id {} is out of range of {} partitions",
-                            partition_id,
-                            self.ivf.num_partitions()
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "partition id {} is out of range of {} partitions",
+                        partition_id,
+                        self.ivf.num_partitions()
+                    )));
                 }
 
                 let range = self.ivf.row_range(partition_id);
@@ -278,10 +274,9 @@ pub(crate) async fn optimize_vector_indices(
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
-        return Err(Error::Index {
-            message: "optimizing vector index: no existing index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "optimizing vector index: no existing index found".to_string(),
+        ));
     }
 
     // try cast to v1 IVFIndex,
@@ -308,10 +303,9 @@ pub(crate) async fn optimize_vector_indices(
     let first_idx = existing_indices[0]
         .as_any()
         .downcast_ref::<IVFIndex>()
-        .ok_or(Error::Index {
-            message: "optimizing vector index: the first index isn't IVF".to_string(),
-            location: location!(),
-        })?;
+        .ok_or(Error::index(
+            "optimizing vector index: the first index isn't IVF".to_string(),
+        ))?;
 
     let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
         optimize_ivf_pq_indices(
@@ -348,10 +342,9 @@ pub(crate) async fn optimize_vector_indices(
         )
         .await?
     } else {
-        return Err(Error::Index {
-            message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
+        ));
     };
 
     // never change the index version,
@@ -368,10 +361,9 @@ pub(crate) async fn optimize_vector_indices_v2(
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
-        return Err(Error::Index {
-            message: "optimizing vector index: no existing index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "optimizing vector index: no existing index found".to_string(),
+        ));
     }
     let existing_indices = existing_indices
         .iter()
@@ -614,10 +606,9 @@ async fn optimize_ivf_pq_indices(
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
         .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
-                message: "optimizing vector index: it is not a IVF index".to_string(),
-                location: location!(),
-            })
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
+                "optimizing vector index: it is not a IVF index".to_string(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     write_pq_partitions(
@@ -699,10 +690,9 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
         .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
-                message: "optimizing vector index: it is not a IVF index".to_string(),
-                location: location!(),
-            })
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
+                "optimizing vector index: it is not a IVF index".to_string(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -850,19 +840,13 @@ fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>>
                         .iter()
                         .map(|v| *v as f32)
                         .collect::<Vec<_>>()),
-                    _ => Err(Error::Index {
-                        message: format!(
-                            "IVF centroids must be FixedSizeList of floating number, got: {}",
-                            row.data_type()
-                        ),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::index(format!(
+                        "IVF centroids must be FixedSizeList of floating number, got: {}",
+                        row.data_type()
+                    ))),
                 }
             } else {
-                Err(Error::Index {
-                    message: "Invalid centroid".to_string(),
-                    location: location!(),
-                })
+                Err(Error::index("Invalid centroid".to_string()))
             }
         })
         .collect()
@@ -1008,10 +992,7 @@ impl VectorIndex for IVFIndex {
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "Flat index does not support load".to_string(),
-            location: location!(),
-        })
+        Err(Error::index("Flat index does not support load".to_string()))
     }
 
     async fn partition_reader(
@@ -1043,10 +1024,9 @@ impl VectorIndex for IVFIndex {
 
         // Currently, remapping for IVF is implemented in remap_index_file which
         // mirrors some of the other IVF routines like build_ivf_pq_index
-        Err(Error::Index {
-            message: "Remapping IVF in this way not supported".to_string(),
-            location: location!(),
-        })
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -1176,26 +1156,22 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
 
 fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
     if ivf.precomputed_partitions_file.is_some() && ivf.centroids.is_none() {
-        return Err(Error::Index {
-            message: "precomputed_partitions_file requires centroids to be set".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "precomputed_partitions_file requires centroids to be set".to_string(),
+        ));
     }
 
     if ivf.precomputed_shuffle_buffers.is_some() && ivf.centroids.is_none() {
-        return Err(Error::Index {
-            message: "precomputed_shuffle_buffers requires centroids to be set".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "precomputed_shuffle_buffers requires centroids to be set".to_string(),
+        ));
     }
 
     if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitions_file.is_some() {
-        return Err(Error::Index {
-            message:
-                "precomputed_shuffle_buffers and precomputed_partitions_file are mutually exclusive"
-                    .to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "precomputed_shuffle_buffers and precomputed_partitions_file are mutually exclusive"
+                .to_string(),
+        ));
     }
 
     Ok(())
@@ -1204,10 +1180,9 @@ fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
 fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
     sanity_check_ivf_params(ivf)?;
     if ivf.precomputed_shuffle_buffers.is_some() && pq.codebook.is_none() {
-        return Err(Error::Index {
-            message: "precomputed_shuffle_buffers requires codebooks to be set".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "precomputed_shuffle_buffers requires codebooks to be set".to_string(),
+        ));
     }
 
     Ok(())
@@ -1242,14 +1217,11 @@ pub async fn build_ivf_model(
     if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != num_partitions * dim {
-            return Err(Error::Index {
-                message: format!(
-                    "IVF centroids length mismatch: {} != {}",
-                    centroids.len(),
-                    num_partitions * dim,
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "IVF centroids length mismatch: {} != {}",
+                centroids.len(),
+                num_partitions * dim,
+            )));
         }
         return Ok(IvfModel::new(centroids.clone(), None));
     }
@@ -1533,13 +1505,10 @@ pub(crate) async fn remap_index_file_v3(
                 .remap(mapping)
                 .await
             }
-            _ => Err(Error::Index {
-                message: format!(
-                    "the field type {} is not supported for FLAT index",
-                    element_type
-                ),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "the field type {} is not supported for FLAT index",
+                element_type
+            ))),
         },
         (SubIndexType::Flat, QuantizationType::Product) => {
             IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
@@ -1631,10 +1600,7 @@ pub(crate) async fn remap_index_file(
         .sub_index
         .as_any()
         .downcast_ref::<PQIndex>()
-        .ok_or_else(|| Error::NotSupported {
-            source: "Remapping a non-pq sub-index".into(),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::not_supported_source("Remapping a non-pq sub-index".into()))?;
 
     let metadata = IvfPQIndexMetadata {
         name,
@@ -1927,15 +1893,9 @@ pub async fn finalize_distributed_merge(
         .file_schema
         .metadata
         .get(IVF_METADATA_KEY)
-        .ok_or_else(|| Error::Index {
-            message: "IVF meta missing in unified auxiliary".to_string(),
-            location: location!(),
-        })?
+        .ok_or_else(|| Error::index("IVF meta missing in unified auxiliary".to_string()))?
         .parse()
-        .map_err(|_| Error::Index {
-            message: "IVF index parse error".to_string(),
-            location: location!(),
-        })?;
+        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
 
     let raw_ivf_bytes = aux_reader.read_global_buffer(ivf_buf_idx).await?;
     let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
@@ -2002,11 +1962,11 @@ pub async fn finalize_distributed_merge(
                 .get(DISTANCE_TYPE_KEY)
                 .cloned()
                 .unwrap_or_else(|| "l2".to_string());
-            let index_type = requested_index_type.ok_or_else(|| Error::Index {
-                message:
+            let index_type = requested_index_type.ok_or_else(|| {
+                Error::index(
                     "Index type must be provided when auxiliary metadata is missing index metadata"
                         .to_string(),
-                location: location!(),
+                )
             })?;
             serde_json::to_string(&IndexMetadata {
                 index_type: index_type.to_string(),
@@ -2252,14 +2212,11 @@ async fn train_ivf_model(
             )
             .await
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Unsupported data type {} with distance type {}",
-                values.data_type(),
-                distance_type
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::index(format!(
+            "Unsupported data type {} with distance type {}",
+            values.data_type(),
+            distance_type
+        ))),
     }
 }
 

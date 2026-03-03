@@ -18,7 +18,6 @@ use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
-use snafu::location;
 use storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage};
 use tracing::instrument;
 
@@ -103,13 +102,10 @@ impl ProductQuantizer {
         match self.num_bits {
             4 => self.transform_impl::<4, T>(vectors),
             8 => self.transform_impl::<8, T>(vectors),
-            _ => Err(Error::Index {
-                message: format!(
-                    "ProductQuantization: num_bits {} not supported",
-                    self.num_bits
-                ),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "ProductQuantization: num_bits {} not supported",
+                self.num_bits
+            ))),
         }
     }
 
@@ -120,23 +116,19 @@ impl ProductQuantizer {
     where
         T::Native: Float + L2 + Dot,
     {
-        let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
+        let fsl = vectors
+            .as_fixed_size_list_opt()
+            .ok_or(Error::index(format!(
                 "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
                 vectors.data_type()
-            ),
-            location: location!(),
-        })?;
+            )))?;
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
         if NUM_BITS == 4 && !num_sub_vectors.is_multiple_of(2) {
-            return Err(Error::Index {
-                message: format!(
-                    "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
-                    num_sub_vectors,
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
+                num_sub_vectors,
+            )));
         }
         let codebook = self.codebook.values().as_primitive::<T>();
 
@@ -251,10 +243,10 @@ impl ProductQuantizer {
             DataType::Float64 => {
                 self.dot_distances_impl::<datatypes::Float64Type>(key.as_primitive(), code)
             }
-            _ => Err(Error::Index {
-                message: format!("unsupported data type: {}", key.data_type()),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "unsupported data type: {}",
+                key.data_type()
+            ))),
         }
     }
 
@@ -297,10 +289,10 @@ impl ProductQuantizer {
             DataType::Float64 => {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float64Type>(key.as_primitive()))
             }
-            _ => Err(Error::Index {
-                message: format!("unsupported data type: {}", key.data_type()),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "unsupported data type: {}",
+                key.data_type()
+            ))),
         }
     }
 
@@ -382,13 +374,10 @@ impl Quantization for ProductQuantizer {
         params: &Self::BuildParams,
     ) -> Result<Self> {
         assert_eq!(data.null_count(), 0);
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "PQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "PQ builder: input is not a FixedSizeList: {}",
+            data.data_type()
+        )))?;
 
         if let Some(codebook) = params.codebook.as_ref() {
             return Ok(Self::new(
@@ -428,22 +417,21 @@ impl Quantization for ProductQuantizer {
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
-        let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
+        let fsl = vectors
+            .as_fixed_size_list_opt()
+            .ok_or(Error::index(format!(
                 "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
                 vectors.data_type()
-            ),
-            location: location!(),
-        })?;
+            )))?;
 
         match fsl.value_type() {
             DataType::Float16 => self.transform::<datatypes::Float16Type>(vectors),
             DataType::Float32 => self.transform::<datatypes::Float32Type>(vectors),
             DataType::Float64 => self.transform::<datatypes::Float64Type>(vectors),
-            _ => Err(Error::Index {
-                message: format!("unsupported data type: {}", fsl.value_type()),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "unsupported data type: {}",
+                fsl.value_type()
+            ))),
         }
     }
 
@@ -527,10 +515,7 @@ impl TryFrom<Quantizer> for ProductQuantizer {
     fn try_from(value: Quantizer) -> Result<Self> {
         match value {
             Quantizer::Product(pq) => Ok(pq),
-            _ => Err(Error::Index {
-                message: "Expect to be a ProductQuantizer".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::index("Expect to be a ProductQuantizer".to_string())),
         }
     }
 }

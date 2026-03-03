@@ -23,7 +23,6 @@ use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::location;
 use tracing::instrument;
 
 use lance_core::{Error, ROW_ID, Result, traits::DatasetTakeRows};
@@ -60,16 +59,15 @@ pub(super) async fn build_partitions(
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
-        return Err(Error::Schema {
-            message: format!("column {} does not exist in data stream", column),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "column {} does not exist in data stream",
+            column
+        )));
     }
     if schema.column_with_name(ROW_ID).is_none() {
-        return Err(Error::Schema {
-            message: "ROW ID is not set when building index partitions".to_string(),
-            location: location!(),
-        });
+        return Err(Error::schema(
+            "ROW ID is not set when building index partitions".to_string(),
+        ));
     }
 
     let ivf_transformer = lance_index::vector::ivf::IvfTransformer::with_pq(
@@ -145,10 +143,9 @@ fn add_precomputed_partitions(
     partition_map: &[Vec<i32>],
     part_id_field: &ArrowField,
 ) -> Result<RecordBatch> {
-    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-        message: "column does not exist".to_string(),
-        location: location!(),
-    })?;
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or(Error::index("column does not exist".to_string()))?;
     let part_ids = UInt32Array::from_iter_values(
         row_ids
             .as_primitive::<UInt64Type>()
@@ -261,16 +258,15 @@ pub(super) async fn build_hnsw_partitions(
 ) -> Result<(Vec<HnswMetadata>, IvfModel)> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
-        return Err(Error::Schema {
-            message: format!("column {} does not exist in data stream", column),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "column {} does not exist in data stream",
+            column
+        )));
     }
     if schema.column_with_name(ROW_ID).is_none() {
-        return Err(Error::Schema {
-            message: "ROW ID is not set when building index partitions".to_string(),
-            location: location!(),
-        });
+        return Err(Error::schema(
+            "ROW ID is not set when building index partitions".to_string(),
+        ));
     }
 
     let ivf_model = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(

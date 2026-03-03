@@ -24,7 +24,6 @@ use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
@@ -96,10 +95,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
-            _ => Err(Error::Index {
-                message: "Invalid index type".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
 }

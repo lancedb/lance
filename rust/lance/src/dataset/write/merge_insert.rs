@@ -99,7 +99,7 @@ use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
-use snafu::{ResultExt, location};
+use snafu::ResultExt;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
@@ -1182,17 +1182,14 @@ impl MergeInsertJob {
                             branch = ?dataset.manifest().branch,
                             "Non-existent fragment id returned from merge result",
                         );
-                        Error::Internal {
-                            message: format!(
-                                "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
-                                frag_id,
-                                dataset.uri(),
-                                dataset.manifest().version,
-                                dataset.manifest_location().path,
-                                dataset.manifest().branch.as_deref().unwrap_or("main"),
-                            ),
-                            location: location!(),
-                        }
+                        Error::internal(format!(
+                            "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
+                            frag_id,
+                            dataset.uri(),
+                            dataset.manifest().version,
+                            dataset.manifest_location().path,
+                            dataset.manifest().branch.as_deref().unwrap_or("main"),
+                        ))
                     })?;
                     let metadata = fragment.metadata.clone();
 
@@ -1217,10 +1214,10 @@ impl MergeInsertJob {
                     tasks.spawn(fut);
                 }
                 _ => {
-                    return Err(Error::Internal {
-                        message: format!("Got non-fragment id from merge result: {:?}", frag_id),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Got non-fragment id from merge result: {:?}",
+                        frag_id
+                    )));
                 }
             };
         }
@@ -1413,13 +1410,11 @@ impl MergeInsertJob {
             plan.as_any()
                 .downcast_ref::<exec::FullSchemaMergeInsertExec>()
         {
-            let stats = full_exec.merge_stats().ok_or_else(|| Error::Internal {
-                message: "Merge stats not available - execution may not have completed".into(),
-                location: location!(),
+            let stats = full_exec.merge_stats().ok_or_else(|| {
+                Error::internal("Merge stats not available - execution may not have completed")
             })?;
-            let transaction = full_exec.transaction().ok_or_else(|| Error::Internal {
-                message: "Transaction not available - execution may not have completed".into(),
-                location: location!(),
+            let transaction = full_exec.transaction().ok_or_else(|| {
+                Error::internal("Transaction not available - execution may not have completed")
             })?;
             let affected_rows = full_exec.affected_rows().map(RowAddrTreeMap::from);
             let inserted_rows_filter = full_exec.inserted_rows_filter();
@@ -1428,21 +1423,18 @@ impl MergeInsertJob {
             .as_any()
             .downcast_ref::<exec::DeleteOnlyMergeInsertExec>()
         {
-            let stats = delete_exec.merge_stats().ok_or_else(|| Error::Internal {
-                message: "Merge stats not available - execution may not have completed".into(),
-                location: location!(),
+            let stats = delete_exec.merge_stats().ok_or_else(|| {
+                Error::internal("Merge stats not available - execution may not have completed")
             })?;
-            let transaction = delete_exec.transaction().ok_or_else(|| Error::Internal {
-                message: "Transaction not available - execution may not have completed".into(),
-                location: location!(),
+            let transaction = delete_exec.transaction().ok_or_else(|| {
+                Error::internal("Transaction not available - execution may not have completed")
             })?;
             let affected_rows = delete_exec.affected_rows().map(RowAddrTreeMap::from);
             (stats, transaction, affected_rows, None)
         } else {
-            return Err(Error::Internal {
-                message: "Expected FullSchemaMergeInsertExec or DeleteOnlyMergeInsertExec".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected FullSchemaMergeInsertExec or DeleteOnlyMergeInsertExec",
+            ));
         };
 
         Ok((transaction, stats, affected_rows, inserted_rows_filter))
@@ -1554,8 +1546,7 @@ impl MergeInsertJob {
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
             ) {
-                return Err(Error::NotSupported { source:
-                    "Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into(), location: location!() });
+                return Err(Error::not_supported_source("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into()));
             }
 
             // We will have a different commit path here too, as we are modifying
@@ -1602,12 +1593,11 @@ impl MergeInsertJob {
                     fragment_sizes,
                     true,
                 )
-                .map_err(|e| Error::Internal {
-                    message: format!(
+                .map_err(|e| {
+                    Error::internal(format!(
                         "Captured row ids not equal to number of rows written: {}",
                         e
-                    ),
-                    location: location!(),
+                    ))
                 })?;
 
                 for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
@@ -1743,10 +1733,7 @@ impl MergeInsertJob {
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
-            return Err(Error::NotSupported {
-                source: "This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
         }
 
         // Create an empty batch with the provided schema to pass to create_plan
@@ -1786,10 +1773,7 @@ impl MergeInsertJob {
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
         // Check if we can use create_plan
         if !self.can_use_create_plan(source.schema().as_ref()).await? {
-            return Err(Error::NotSupported {
-                source: "This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
         }
 
         // Clone self since create_plan consumes the job

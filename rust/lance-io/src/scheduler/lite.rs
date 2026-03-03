@@ -32,7 +32,6 @@ use std::{
 
 use bytes::Bytes;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN};
 
@@ -134,13 +133,9 @@ impl IoTask {
                 num_bytes: 0,
                 priority: 0,
             },
-            data: Err(Error::IO {
-                source: Box::new(Error::IO {
-                    source: "I/O Task cancelled".to_string().into(),
-                    location: location!(),
-                }),
-                location: location!(),
-            }),
+            data: Err(Error::io_source(Box::new(Error::io_source(
+                "I/O Task cancelled".to_string().into(),
+            )))),
         };
         was_running
     }
@@ -218,10 +213,10 @@ impl IoTask {
             backpressure_reservation,
         } = self.state
         else {
-            return Err(Error::Internal {
-                message: format!("Task with id {} not in finished state", self.id),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Task with id {} not in finished state",
+                self.id
+            )));
         };
         Ok((data, backpressure_reservation))
     }
@@ -402,10 +397,7 @@ impl IoQueueState {
             if let Some(reservation) = error.backpressure_reservation {
                 self.backpressure_throttle.release(reservation);
             }
-            Err(Error::Internal {
-                message: error.message,
-                location: location!(),
-            })
+            Err(Error::internal(error.message))
         } else {
             Ok(())
         }
@@ -529,10 +521,10 @@ impl IoQueue {
         let mut state = self.state.lock().unwrap();
         let Some(task) = state.tasks.get_mut(&task_id) else {
             // This should never happen and indicates a bug
-            return Poll::Ready(Err(Error::Internal {
-                message: format!("Task with id {} was lost", task_id),
-                location: location!(),
-            }));
+            return Poll::Ready(Err(Error::internal(format!(
+                "Task with id {} was lost",
+                task_id
+            ))));
         };
         match task.poll(cx) {
             Poll::Ready(_) => {

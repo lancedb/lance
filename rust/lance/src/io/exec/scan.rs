@@ -30,7 +30,6 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::location;
 use tracing::Instrument;
 
 use crate::dataset::Dataset;
@@ -239,11 +238,10 @@ impl LanceStream {
                         .count_rows(None)
                         // count_rows should be a fast operation in v2 files
                         .now_or_never()
-                        .ok_or(Error::Internal {
-                            message: "Encountered fragment without row count metadata in v2 file"
+                        .ok_or(Error::internal(
+                            "Encountered fragment without row count metadata in v2 file"
                                 .to_string(),
-                            location: location!(),
-                        })??;
+                        ))??;
                     if rows_to_skip >= num_rows_in_frag as u64 {
                         rows_to_skip -= num_rows_in_frag as u64;
                     } else {

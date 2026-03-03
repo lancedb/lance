@@ -3,7 +3,6 @@
 use std::{collections::HashMap, sync::Arc};
 
 use lance_core::{Error, Result};
-use snafu::location;
 
 #[cfg(feature = "geo")]
 use crate::scalar::rtree::RTreeIndexPlugin;
@@ -86,10 +85,9 @@ impl IndexPluginRegistry {
                 } else {
                     ""
                 };
-                Error::InvalidInput {
-                    source: format!("No scalar index plugin found for name '{name}'{hint}").into(),
-                    location: location!(),
-                }
+                Error::invalid_input_source(
+                    format!("No scalar index plugin found for name '{name}'{hint}").into(),
+                )
             })
     }
 

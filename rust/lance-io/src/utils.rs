@@ -14,7 +14,6 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::{ReadBatchParams, traits::Reader};
 use crate::{
@@ -70,10 +69,9 @@ pub async fn read_fixed_stride_array(
     params: impl Into<ReadBatchParams>,
 ) -> Result<ArrayRef> {
     if !data_type.is_fixed_stride() {
-        return Err(Error::Schema {
-            message: format!("{data_type} is not a fixed stride type"),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "{data_type} is not a fixed stride type"
+        )));
     }
     // TODO: support more than plain encoding here.
     let decoder = PlainDecoder::new(reader, data_type, position, length)?;

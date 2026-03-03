@@ -107,7 +107,6 @@ use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use tracing::info;
 
 mod binary_copy;
@@ -959,10 +958,9 @@ async fn rewrite_files(
     );
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && options.enable_binary_copy_force {
-        return Err(Error::NotSupported {
-            source: format!("compaction task {}: binary copy is not supported", task_id).into(),
-            location: location!(),
-        });
+        return Err(Error::not_supported_source(
+            format!("compaction task {}: binary copy is not supported", task_id).into(),
+        ));
     }
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
@@ -1019,10 +1017,9 @@ async fn rewrite_files(
         .await?;
 
         if new_fragments.is_empty() && options.enable_binary_copy_force {
-            return Err(Error::NotSupported {
-                source: format!("compaction task {}: binary copy is not supported", task_id).into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                format!("compaction task {}: binary copy is not supported", task_id).into(),
+            ));
         }
 
         if needs_remapping {
@@ -1031,13 +1028,10 @@ async fn rewrite_files(
             for frag in &fragments {
                 let frag_id = frag.id as u32;
                 let count = u64::try_from(frag.physical_rows.unwrap_or(0)).map_err(|_| {
-                    Error::Internal {
-                        message: format!(
-                            "Fragment {} has too many physical rows to represent as row addresses",
-                            frag.id
-                        ),
-                        location: location!(),
-                    }
+                    Error::internal(format!(
+                        "Fragment {} has too many physical rows to represent as row addresses",
+                        frag.id
+                    ))
                 })?;
                 let start = u64::from(lance_core::utils::address::RowAddress::first_row(frag_id));
                 addrs.insert_range(start..start + count);
@@ -1063,10 +1057,9 @@ async fn rewrite_files(
     log::info!("Compaction task {}: file written", task_id);
 
     let (row_id_map, changed_row_addrs) = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
+        let captured_ids = row_ids_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
         // This code path is only when we use address style ids.
         let row_addrs = captured_ids.row_addrs(None).into_owned();
 
@@ -1217,9 +1210,8 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load created_at sequence (default to version 1 if missing)
         let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
-            version_meta.load_sequence().map_err(|e| Error::Internal {
-                message: format!("Failed to load created_at version sequence: {}", e),
-                location: location!(),
+            version_meta.load_sequence().map_err(|e| {
+                Error::internal(format!("Failed to load created_at version sequence: {}", e))
             })?
         } else {
             // Default: treat all rows as created at version 1
@@ -1228,9 +1220,11 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load last_updated_at sequence (default to same as created_at sequence)
         let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
-            version_meta.load_sequence().map_err(|e| Error::Internal {
-                message: format!("Failed to load last_updated_at version sequence: {}", e),
-                location: location!(),
+            version_meta.load_sequence().map_err(|e| {
+                Error::internal(format!(
+                    "Failed to load last_updated_at version sequence: {}",
+                    e
+                ))
             })?
         } else {
             created_at_seq.clone()

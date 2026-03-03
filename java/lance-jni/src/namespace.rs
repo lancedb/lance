@@ -202,45 +202,39 @@ impl JavaLanceNamespace {
         json: &str,
         request_class: &str,
     ) -> lance_core::Result<JObject<'a>> {
-        let jrequest_json = env.new_string(json).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let jrequest_json = env.new_string(json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to create request JSON string: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         // Create ObjectMapper
         let object_mapper_class = env
             .find_class("com/fasterxml/jackson/databind/ObjectMapper")
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to find ObjectMapper class: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let object_mapper = env
             .new_object(&object_mapper_class, "()V", &[])
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to create ObjectMapper: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         // Get request class
-        let request_class_obj =
-            env.find_class(request_class)
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to find request class {}: {}",
-                        request_class, e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+        let request_class_obj = env.find_class(request_class).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to find request class {}: {}",
+                request_class, e
+            ))))
+        })?;
 
         // Call objectMapper.readValue(json, class)
         env.call_method(
@@ -252,20 +246,18 @@ impl JavaLanceNamespace {
                 JValue::Object(&request_class_obj),
             ],
         )
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to deserialize request via ObjectMapper: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
         .l()
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "ObjectMapper.readValue did not return an object: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })
     }
 
@@ -274,22 +266,20 @@ impl JavaLanceNamespace {
         // Create ObjectMapper
         let object_mapper_class = env
             .find_class("com/fasterxml/jackson/databind/ObjectMapper")
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to find ObjectMapper class: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let object_mapper = env
             .new_object(&object_mapper_class, "()V", &[])
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to create ObjectMapper: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         // Call objectMapper.writeValueAsString(obj)
@@ -300,30 +290,27 @@ impl JavaLanceNamespace {
                 "(Ljava/lang/Object;)Ljava/lang/String;",
                 &[JValue::Object(response_obj)],
             )
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to serialize response via ObjectMapper: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?
             .l()
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "ObjectMapper.writeValueAsString did not return a string: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         let response_str: String = env
             .get_string(&JString::from(response_json_obj))
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to convert response JSON to string: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?
             .into();
 
@@ -349,25 +336,20 @@ impl JavaLanceNamespace {
         let response_class = response_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -381,50 +363,42 @@ impl JavaLanceNamespace {
                     &method_sig,
                     &[JValue::Object(&request_obj)],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "{} did not return an object: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
             if response_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             // Serialize Java response to JSON via ObjectMapper
             let response_str = Self::serialize_response(&mut env, &response_obj)?;
 
-            serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            serde_json::from_str(&response_str).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to deserialize response: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -443,25 +417,20 @@ impl JavaLanceNamespace {
         let request_class = request_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -474,23 +443,21 @@ impl JavaLanceNamespace {
                 &method_sig,
                 &[JValue::Object(&request_obj)],
             )
-            .map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to call {}: {}",
                     method_name, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -509,25 +476,20 @@ impl JavaLanceNamespace {
         let request_class = request_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -541,52 +503,44 @@ impl JavaLanceNamespace {
                     &method_sig,
                     &[JValue::Object(&request_obj)],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
-            let response_obj = result.l().map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            let response_obj = result.l().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "{} did not return an object: {}",
                     method_name, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
             if response_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             let response_str: String = env
                 .get_string(&JString::from(response_obj))
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to convert response to string: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .into();
 
             Ok(response_str)
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -605,25 +559,20 @@ impl JavaLanceNamespace {
         let request_class = request_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -637,60 +586,51 @@ impl JavaLanceNamespace {
                     &method_sig,
                     &[JValue::Object(&request_obj)],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
-            let long_obj = result.l().map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            let long_obj = result.l().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "{} did not return an object: {}",
                     method_name, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
             if long_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             // Unbox Long to long
             let long_value = env
                 .call_method(&long_obj, "longValue", "()J", &[])
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call longValue: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .j()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "longValue did not return a long: {}",
                         e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
             Ok(long_value)
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -713,38 +653,30 @@ impl JavaLanceNamespace {
         let response_class = response_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
 
-            let jdata = env
-                .byte_array_from_slice(&data)
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to create byte array: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let jdata = env.byte_array_from_slice(&data).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to create byte array: {}",
+                    e
+                ))))
+            })?;
 
             // Call the interface method with request object and byte array
             let method_sig = format!("(L{};[B)L{};", request_class, response_class);
@@ -755,50 +687,42 @@ impl JavaLanceNamespace {
                     &method_sig,
                     &[JValue::Object(&request_obj), JValue::Object(&jdata)],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "{} did not return an object: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
             if response_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             // Serialize Java response to JSON via ObjectMapper
             let response_str = Self::serialize_response(&mut env, &response_obj)?;
 
-            serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            serde_json::from_str(&response_str).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to deserialize response: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -817,25 +741,20 @@ impl JavaLanceNamespace {
         let request_class = request_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -849,52 +768,42 @@ impl JavaLanceNamespace {
                     &method_sig,
                     &[JValue::Object(&request_obj)],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
-            let response_obj = result.l().map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            let response_obj = result.l().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "{} did not return an object: {}",
                     method_name, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
             if response_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             let byte_array = JByteArray::from(response_obj);
-            let bytes = env
-                .convert_byte_array(byte_array)
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to convert byte array: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let bytes = env.convert_byte_array(byte_array).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to convert byte array: {}",
+                    e
+                ))))
+            })?;
 
             Ok(Bytes::from(bytes))
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 
@@ -918,25 +827,20 @@ impl JavaLanceNamespace {
         let response_class = response_class.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let mut env = jvm.attach_current_thread().map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                ))))
+            })?;
 
             // Serialize request to JSON
-            let request_json =
-                serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to serialize request: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+            let request_json = serde_json::to_string(&request).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to serialize request: {}",
+                    e
+                ))))
+            })?;
 
             // Deserialize JSON to Java request object via ObjectMapper
             let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
@@ -944,20 +848,18 @@ impl JavaLanceNamespace {
             // Call getter method to extract extra string (e.g., getIndexName)
             let extra_string_obj = env
                 .call_method(&request_obj, getter_method, "()Ljava/lang/String;", &[])
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         getter_method, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "{} did not return an object: {}",
                         getter_method, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
             // Call the interface method with request object and extra string
@@ -975,50 +877,42 @@ impl JavaLanceNamespace {
                         JValue::Object(&extra_string_obj),
                     ],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "Failed to call {}: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?
                 .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
+                .map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                         "{} did not return an object: {}",
                         method_name, e
-                    ))),
-                    location: snafu::location!(),
+                    ))))
                 })?;
 
             if response_obj.is_null() {
-                return Err(lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "{} returned null",
-                        method_name
-                    ))),
-                    location: snafu::location!(),
-                });
+                return Err(lance_core::Error::io_source(Box::new(
+                    std::io::Error::other(format!("{} returned null", method_name)),
+                )));
             }
 
             // Serialize Java response to JSON via ObjectMapper
             let response_str = Self::serialize_response(&mut env, &response_obj)?;
 
-            serde_json::from_str(&response_str).map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            serde_json::from_str(&response_str).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                     "Failed to deserialize response: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to spawn blocking task: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?
     }
 }

@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
-use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
@@ -482,28 +481,26 @@ pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core
             _ => remainder.contains(piece),
         };
         if !res {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
                     "Expected string to match:\nExpected: {}\nActual: {}",
                     expected_pattern, actual
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         let idx = remainder.find(piece).unwrap();
         remainder = &remainder[idx + piece.len()..];
     }
 
     if !remainder.is_empty() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
                 "Expected string to match:\nExpected: {}\nActual: {}",
                 expected_pattern, actual
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
 
     Ok(())

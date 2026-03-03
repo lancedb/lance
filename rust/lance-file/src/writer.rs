@@ -28,7 +28,6 @@ use log::{debug, warn};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::location;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
@@ -150,9 +149,11 @@ impl PageMetadataSpill {
         page: &pbfile::column_metadata::Page,
     ) -> Result<()> {
         page.encode_length_delimited(&mut self.column_buffers[column_idx])
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                location: location!(),
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
             })?;
         if self.column_buffers[column_idx].len() >= self.per_column_limit {
             self.flush_column(column_idx).await?;
@@ -188,10 +189,10 @@ fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Pag
     while cursor.has_remaining() {
         let page =
             pbfile::column_metadata::Page::decode_length_delimited(&mut cursor).map_err(|e| {
-                Error::IO {
-                    source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                    location: location!(),
-                }
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
             })?;
         pages.push(page);
     }
@@ -487,16 +488,16 @@ impl FileWriter {
             .iter()
             .zip(self.column_writers.iter_mut())
             .map(|(field, column_writer)| {
-                let array = batch
-                    .column_by_name(&field.name)
-                    .ok_or(Error::InvalidInput {
-                        source: format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                        location: location!(),
-                    })?;
+                let array =
+                    batch
+                        .column_by_name(&field.name)
+                        .ok_or(Error::invalid_input_source(
+                            format!(
+                                "Cannot write batch.  The batch was missing the column `{}`",
+                                field.name
+                            )
+                            .into(),
+                        ))?;
                 let repdef = RepDefBuilder::default();
                 let num_rows = array.len() as u64;
                 column_writer.maybe_encode(
@@ -528,10 +529,9 @@ impl FileWriter {
             return Ok(());
         }
         if num_rows > u32::MAX as u64 {
-            return Err(Error::InvalidInput {
-                source: "cannot write Lance files with more than 2^32 rows".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "cannot write Lance files with more than 2^32 rows".into(),
+            ));
         }
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
@@ -551,7 +551,7 @@ impl FileWriter {
         self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
             Some(rows_written) => rows_written,
             None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
+                return Err(Error::invalid_input_source(format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into()));
             }
         };
 
@@ -596,10 +596,7 @@ impl FileWriter {
                     let data = reader
                         .get_range(offset as usize..(offset as usize + len as usize))
                         .await
-                        .map_err(|e| Error::IO {
-                            source: Box::new(e),
-                            location: location!(),
-                        })?;
+                        .map_err(|e| Error::io_source(Box::new(e)))?;
                     pages.extend(decode_spilled_chunk(&data)?);
                 }
                 metadata.pages = pages;

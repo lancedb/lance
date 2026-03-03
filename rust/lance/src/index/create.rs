@@ -26,7 +26,6 @@ use lance_index::{
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
 use lance_table::format::IndexMetadata;
-use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
@@ -122,19 +121,17 @@ impl<'a> CreateIndexBuilder<'a> {
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
         if self.columns.len() != 1 {
-            return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
         }
         let column_input = &self.columns[0];
         // Use case-insensitive lookup for both simple and nested paths.
         // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
         let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column_input}' does not exist"),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column_input}' does not exist"
+            )));
         };
         let field = *field_path.last().unwrap();
         // Reconstruct the column path with correct case from schema
@@ -176,30 +173,22 @@ impl<'a> CreateIndexBuilder<'a> {
         };
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists, \
-                        please specify a different name or use replace=True"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index name '{index_name} already exists, \
+                    please specify a different name or use replace=True"
+                )));
             };
             if idx.fields != [field.id] {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists with different fields, \
-                        please specify a different name"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index name '{index_name} already exists with different fields, \
+                    please specify a different name"
+                )));
             }
         }
 
         let index_id = match &self.index_uuid {
-            Some(uuid_str) => Uuid::parse_str(uuid_str).map_err(|e| Error::Index {
-                message: format!("Invalid UUID string provided: {}", e),
-                location: location!(),
-            })?,
+            Some(uuid_str) => Uuid::parse_str(uuid_str)
+                .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
             None => Uuid::new_v4(),
         };
         let created_index = match (self.index_type, self.params.index_name()) {
@@ -262,9 +251,8 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index("Scalar index type must take a ScalarIndexParams".to_string())
                     })?;
                 build_scalar_index(
                     self.dataset,
@@ -284,9 +272,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index(
+                            "Inverted index type must take a InvertedIndexParams".to_string(),
+                        )
                     })?;
 
                 let params =
@@ -319,9 +308,8 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
 
                 if train {
@@ -388,10 +376,9 @@ impl<'a> CreateIndexBuilder<'a> {
                     .to_vector()
                     // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::internal(
+                        "unable to cast index extension to vector".to_string(),
+                    ))?;
 
                 if train {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
@@ -405,19 +392,14 @@ impl<'a> CreateIndexBuilder<'a> {
                 }
             }
             (IndexType::FragmentReuse, _) => {
-                return Err(Error::Index {
-                    message: "Fragment reuse index can only be created through compaction"
-                        .to_string(),
-                    location: location!(),
-                });
+                return Err(Error::index(
+                    "Fragment reuse index can only be created through compaction".to_string(),
+                ));
             }
             (index_type, index_name) => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index type {index_type} with name {index_name} is not supported"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index type {index_type} with name {index_name} is not supported"
+                )));
             }
         };
 
@@ -472,9 +454,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .iter()
             .find(|idx| idx.uuid == index_uuid)
             .cloned()
-            .ok_or_else(|| Error::Internal {
-                message: format!("Index with UUID {} not found after commit", index_uuid),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Index with UUID {} not found after commit",
+                    index_uuid
+                ))
             })
     }
 }

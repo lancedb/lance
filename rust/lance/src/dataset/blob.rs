@@ -12,7 +12,6 @@ use arrow_schema::DataType as ArrowDataType;
 use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use url::Url;
@@ -778,10 +777,9 @@ pub(super) async fn take_blobs(
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
     if !projection.fields[0].is_blob() {
-        return Err(Error::InvalidInput {
-            location: location!(),
-            source: format!("the column '{}' is not a blob column", column).into(),
-        });
+        return Err(Error::invalid_input_source(
+            format!("the column '{}' is not a blob column", column).into(),
+        ));
     }
     let description_and_addr = dataset
         .take_builder(row_ids, projection)?
@@ -816,10 +814,9 @@ pub async fn take_blobs_by_addresses(
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
     if !projection.fields[0].is_blob() {
-        return Err(Error::InvalidInput {
-            location: location!(),
-            source: format!("the column '{}' is not a blob column", column).into(),
-        });
+        return Err(Error::invalid_input_source(
+            format!("the column '{}' is not a blob column", column).into(),
+        ));
     }
 
     // Convert Schema to ProjectionPlan
@@ -863,14 +860,11 @@ fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVers
     {
         return Ok(BlobVersion::V2);
     }
-    Err(Error::InvalidInput {
-        source: format!(
-            "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
-            fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
-        )
-        .into(),
-        location: location!(),
-    })
+    Err(Error::invalid_input_source(format!(
+        "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
+        fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+    )
+    .into()))
 }
 
 fn collect_blob_files_v1(
@@ -1080,16 +1074,10 @@ async fn resolve_blob_read_location(
 
     let frag = dataset
         .get_fragment(frag_id as usize)
-        .ok_or_else(|| Error::Internal {
-            message: "Fragment not found".to_string(),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::internal("Fragment not found".to_string()))?;
     let data_file = frag
         .data_file_for_field(blob_field_id)
-        .ok_or_else(|| Error::Internal {
-            message: "Data file not found for blob field".to_string(),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::internal("Data file not found for blob field".to_string()))?;
     let data_file_dir = dataset.data_file_dir(data_file)?;
     let data_file_path = data_file_dir.child(data_file.path.as_str());
     let data_file_key = data_file_key_from_path(data_file.path.as_str()).to_string();

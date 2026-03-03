@@ -62,7 +62,6 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
 use serde_json::json;
-use snafu::location;
 use tracing::{info, instrument};
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
@@ -250,16 +249,12 @@ pub(crate) async fn remap_index(
     let matched = indices
         .iter()
         .find(|i| i.uuid == *index_id)
-        .ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", index_id),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
 
     if matched.fields.len() > 1 {
-        return Err(Error::Index {
-            message: "Remapping indices with multiple fields is not supported".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Remapping indices with multiple fields is not supported".to_string(),
+        ));
     }
 
     if row_id_map.values().all(|v| v.is_none()) {
@@ -319,10 +314,7 @@ pub(crate) async fn remap_index(
                     let inverted_index = scalar_index
                         .as_any()
                         .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
-                        .ok_or(Error::Index {
-                            message: "expected inverted index".to_string(),
-                            location: location!(),
-                        })?;
+                        .ok_or(Error::index("expected inverted index".to_string()))?;
                     if inverted_index.is_legacy() {
                         log::warn!(
                             "reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
@@ -373,10 +365,10 @@ pub(crate) async fn remap_index(
             }
         }
         _ => {
-            return Err(Error::Index {
-                message: format!("Index type {} is not supported", generic.index_type()),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index type {} is not supported",
+                generic.index_type()
+            )));
         }
     };
 
@@ -432,10 +424,7 @@ struct IndexDescriptionImpl {
 impl IndexDescriptionImpl {
     fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
         if segments.is_empty() {
-            return Err(Error::Index {
-                message: "Index metadata is empty".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index("Index metadata is empty".to_string()));
         }
 
         // We assume the type URL and details are the same for all segments
@@ -443,28 +432,22 @@ impl IndexDescriptionImpl {
 
         let name = example_metadata.name.clone();
         if !segments.iter().all(|shard| shard.name == name) {
-            return Err(Error::Index {
-                message: "Index name should be identical across all segments".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index name should be identical across all segments".to_string(),
+            ));
         }
 
         let field_ids = &example_metadata.fields;
         if !segments.iter().all(|shard| shard.fields == *field_ids) {
-            return Err(Error::Index {
-                message: "Index fields should be identical across all segments".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index fields should be identical across all segments".to_string(),
+            ));
         }
         let field_ids = field_ids.iter().map(|id| *id as u32).collect();
 
         // This should not fail as we have already filtered out indexes without index details.
-        let index_details = example_metadata.index_details.as_ref().ok_or(Error::Index {
-            message:
-                "Index details are required for index description.  This index must be retrained to support this method."
-                    .to_string(),
-            location: location!(),
-        })?;
+        let index_details = example_metadata.index_details.as_ref().ok_or(Error::index("Index details are required for index description.  This index must be retrained to support this method."
+            .to_string()))?;
         let type_url = &index_details.type_url;
         if !segments.iter().all(|shard| {
             shard
@@ -473,11 +456,9 @@ impl IndexDescriptionImpl {
                 .map(|d| d.type_url == *type_url)
                 .unwrap_or(false)
         }) {
-            return Err(Error::Index {
-                message: "Index type URL should be present and identical across all segments"
-                    .to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index type URL should be present and identical across all segments".to_string(),
+            ));
         }
 
         let details = IndexDetails(index_details.clone());
@@ -492,10 +473,7 @@ impl IndexDescriptionImpl {
             let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
-            .ok_or_else(|| Error::Index {
-                message: "Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
 
             for fragment in dataset.get_fragments() {
                 if fragment_bitmap.contains(fragment.id() as u32) {
@@ -618,10 +596,7 @@ impl DatasetIndexExt for Dataset {
     async fn drop_index(&mut self, name: &str) -> Result<()> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", name)));
         }
 
         let transaction = Transaction::new(
@@ -642,10 +617,7 @@ impl DatasetIndexExt for Dataset {
     async fn prewarm_index(&self, name: &str) -> Result<()> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", name)));
         }
 
         let index = self
@@ -751,10 +723,9 @@ impl DatasetIndexExt for Dataset {
         index_id: Uuid,
     ) -> Result<()> {
         let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
         };
 
         // TODO: We will need some way to determine the index details here.  Perhaps
@@ -924,10 +895,7 @@ impl DatasetIndexExt for Dataset {
     async fn index_statistics(&self, index_name: &str) -> Result<String> {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", index_name)));
         }
 
         if index_name == FRAG_REUSE_INDEX_NAME {
@@ -951,10 +919,7 @@ impl DatasetIndexExt for Dataset {
     ) -> Result<SendableRecordBatchStream> {
         let indices = self.load_indices_by_name(index_name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", index_name)));
         }
         let column = self.schema().field_by_id(indices[0].fields[0]).unwrap();
 
@@ -993,11 +958,12 @@ fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> 
     for frags in indexed_fragments_per_delta {
         let mut sum = 0usize;
         for frag in frags {
-            sum += frag.num_rows().ok_or_else(|| Error::Internal {
-                message: "Fragment should have row counts, please upgrade lance and \
-                                      trigger a single write to fix this"
-                    .to_string(),
-                location: location!(),
+            sum += frag.num_rows().ok_or_else(|| {
+                Error::internal(
+                    "Fragment should have row counts, please upgrade lance and \
+                                  trigger a single write to fix this"
+                        .to_string(),
+                )
             })?;
         }
         rows_per_delta.push(sum);
@@ -1018,10 +984,8 @@ fn unique_indexed_fragment_count(indexed_fragments_per_delta: &[Vec<Fragment>]) 
 }
 
 fn serialize_index_statistics(stats: &serde_json::Value) -> Result<String> {
-    serde_json::to_string(stats).map_err(|e| Error::Index {
-        message: format!("Failed to serialize index statistics: {}", e),
-        location: location!(),
-    })
+    serde_json::to_string(stats)
+        .map_err(|e| Error::index(format!("Failed to serialize index statistics: {}", e)))
 }
 
 async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) -> Result<String> {
@@ -1030,13 +994,12 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
         "Detecting out-dated fragment metadata, migrating dataset. \
                         To disable migration, set LANCE_AUTO_MIGRATION=false"
     );
-    ds.delete("false").await.map(|_| ()).map_err(|err| Error::Execution {
-        message: format!(
+    ds.delete("false").await.map(|_| ()).map_err(|err| {
+        Error::execution(format!(
             "Failed to migrate dataset while calculating index statistics. \
-                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
+                        To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
             err
-        ),
-        location: location!(),
+        ))
     })?;
     ds.index_statistics(index_name).await
 }
@@ -1170,12 +1133,11 @@ async fn gather_fragment_statistics(
         if auto_migrate_corruption() {
             return Ok(None);
         }
-        return Err(Error::Internal {
-            message: "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
-                                  and trigger a single write to fix this"
+        return Err(Error::internal(
+            "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                              and trigger a single write to fix this"
                 .to_string(),
-            location: location!(),
-        });
+        ));
     };
 
     let num_unindexed_fragments = ds.fragments().len() - num_indexed_fragments;
@@ -1315,10 +1277,10 @@ impl DatasetIndexInternalExt for Dataset {
         // scalar indices, we may start having this file with scalar indices too.  Once that happens
         // we can just read this file and look at the `implementation` or `index_type` fields to
         // determine what kind of index it is.
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         if self.object_store.exists(&index_file).await? {
@@ -1343,10 +1305,10 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
         let index = scalar::open_scalar_index(self, column, &index_meta, metrics).await?;
 
@@ -1374,10 +1336,10 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
@@ -1406,10 +1368,9 @@ impl DatasetIndexInternalExt for Dataset {
                         )
                         .await
                     }
-                    None => Err(Error::Internal {
-                        message: "Index proto was missing implementation field".into(),
-                        location: location!(),
-                    }),
+                    None => Err(Error::internal(
+                        "Index proto was missing implementation field",
+                    )),
                 }
             }
 
@@ -1450,10 +1411,7 @@ impl DatasetIndexInternalExt for Dataset {
                     .schema()
                     .metadata
                     .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::Index {
-                        message: "Index Metadata not found".to_owned(),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
                 let index_metadata: lance_index::IndexMetadata =
                     serde_json::from_str(index_metadata)?;
 
@@ -1490,13 +1448,10 @@ impl DatasetIndexInternalExt for Dataset {
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                         }
-                        _ => Err(Error::Index {
-                            message: format!(
-                                "the field type {} is not supported for FLAT index",
-                                field.data_type()
-                            ),
-                            location: location!(),
-                        }),
+                        _ => Err(Error::index(format!(
+                            "the field type {} is not supported for FLAT index",
+                            field.data_type()
+                        ))),
                     },
 
                     "IVF_PQ" => {
@@ -1580,18 +1535,16 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
-                    _ => Err(Error::Index {
-                        message: format!("Unsupported index type: {}", index_metadata.index_type),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::index(format!(
+                        "Unsupported index type: {}",
+                        index_metadata.index_type
+                    ))),
                 }
             }
 
-            _ => Err(Error::Index {
-                message: "unsupported index version (maybe need to upgrade your lance version)"
-                    .to_owned(),
-                location: location!(),
-            }),
+            _ => Err(Error::index(
+                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
+            )),
         };
         let index = index?;
         metrics.record_index_load();
@@ -1613,10 +1566,7 @@ impl DatasetIndexInternalExt for Dataset {
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::Index {
-                        message: format!("Index with id {} does not exist", uuid_clone),
-                        location: location!(),
-                    })?;
+                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid_clone)))?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
@@ -1651,10 +1601,10 @@ impl DatasetIndexInternalExt for Dataset {
 
         let uuid = mem_wal_meta.uuid.to_string();
 
-        let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(&uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index = open_mem_wal_index(index_meta)?;
 
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
@@ -1705,11 +1655,10 @@ impl DatasetIndexInternalExt for Dataset {
             idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
-                message: format!(
+            let field = schema.field_by_id(field).ok_or_else(|| {
+                Error::internal(format!(
                     "Index referenced a field with id {field} which did not exist in the schema"
-                ),
-                location: location!(),
+                ))
             })?;
 
             // Build the full field path for nested fields
@@ -1774,10 +1723,9 @@ impl DatasetIndexInternalExt for Dataset {
         let indices = self.load_indices_by_name(name).await?;
         let mut total_fragment_bitmap = RoaringBitmap::new();
         for idx in indices.iter() {
-            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
-                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                location: location!(),
-            })?;
+            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::index(
+                "Please upgrade lance to 0.8+ to use this function".to_string(),
+            ))?;
         }
         Ok(self
             .fragments()
@@ -1792,10 +1740,9 @@ impl DatasetIndexInternalExt for Dataset {
         indices
             .iter()
             .map(|index| {
-                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::Index {
-                    message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                    location: location!(),
-                })?;
+                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::index(
+                    "Please upgrade lance to 0.8+ to use this function".to_string(),
+                ))?;
                 let mut indexed_frags = Vec::with_capacity(fragment_bitmap.len() as usize);
                 for frag in self.fragments().iter() {
                     if fragment_bitmap.contains(frag.id as u32) {
@@ -1811,18 +1758,20 @@ impl DatasetIndexInternalExt for Dataset {
         let source_indices = source_dataset.load_indices_by_name(index_name).await?;
 
         if source_indices.is_empty() {
-            return Err(Error::Index {
-                message: format!("Index '{}' not found in source dataset", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index '{}' not found in source dataset",
+                index_name
+            )));
         }
 
         let source_index = source_indices
             .iter()
             .min_by_key(|idx| idx.created_at)
-            .ok_or_else(|| Error::Index {
-                message: format!("Could not determine oldest index for '{}'", index_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "Could not determine oldest index for '{}'",
+                    index_name
+                ))
             })?;
 
         let mut field_names = Vec::new();
@@ -1830,42 +1779,37 @@ impl DatasetIndexInternalExt for Dataset {
             let source_field = source_dataset
                 .schema()
                 .field_by_id(*field_id)
-                .ok_or_else(|| Error::Index {
-                    message: format!("Field with id {} not found in source dataset", field_id),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Field with id {} not found in source dataset",
+                        field_id
+                    ))
                 })?;
 
-            let target_field =
-                self.schema()
-                    .field(&source_field.name)
-                    .ok_or_else(|| Error::Index {
-                        message: format!(
-                            "Field '{}' required by index '{}' not found in target dataset",
-                            source_field.name, index_name
-                        ),
-                        location: location!(),
-                    })?;
+            let target_field = self.schema().field(&source_field.name).ok_or_else(|| {
+                Error::index(format!(
+                    "Field '{}' required by index '{}' not found in target dataset",
+                    source_field.name, index_name
+                ))
+            })?;
 
             if source_field.data_type() != target_field.data_type() {
-                return Err(Error::Index {
-                    message: format!(
-                        "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
-                        source_field.name,
-                        source_field.data_type(),
-                        target_field.data_type()
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
+                    source_field.name,
+                    source_field.data_type(),
+                    target_field.data_type()
+                )));
             }
 
             field_names.push(source_field.name.as_str());
         }
 
         if field_names.is_empty() {
-            return Err(Error::Index {
-                message: format!("Index '{}' has no fields", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index '{}' has no fields",
+                index_name
+            )));
         }
 
         if let Some(index_details) = &source_index.index_details {
@@ -1931,28 +1875,27 @@ fn resolve_index_column(
     if column_arg == index_meta.name {
         // Get the actual column from index metadata
         if let Some(field_id) = index_meta.fields.first() {
-            let field = schema.field_by_id(*field_id).ok_or_else(|| Error::Index {
-                message: format!(
+            let field = schema.field_by_id(*field_id).ok_or_else(|| {
+                Error::index(format!(
                     "Index '{}' references field with id {} which does not exist in schema",
                     index_meta.name, field_id
-                ),
-                location: location!(),
+                ))
             })?;
             let field_path = schema.field_path(*field_id)?;
             return Ok((field_path, Arc::new(field.clone())));
         } else {
-            return Err(Error::Index {
-                message: format!("Index '{}' has no fields", index_meta.name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index '{}' has no fields",
+                index_meta.name
+            )));
         }
     }
 
     // Column doesn't exist and is not the index name
-    Err(Error::Index {
-        message: format!("Column '{}' does not exist in the schema", column_arg),
-        location: location!(),
-    })
+    Err(Error::index(format!(
+        "Column '{}' does not exist in the schema",
+        column_arg
+    )))
 }
 
 fn is_vector_field(data_type: DataType) -> bool {

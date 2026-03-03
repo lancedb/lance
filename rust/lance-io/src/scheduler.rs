@@ -5,7 +5,6 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -393,10 +392,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
-            Err(Error::Wrapped {
-                error: self.err.take().unwrap(),
-                location: location!(),
-            })
+            Err(Error::wrapped(self.err.take().unwrap()))
         } else {
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
@@ -473,10 +469,9 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
     fn cancel(self) {
-        (self.when_done)(Err(Error::Internal {
-            message: "Scheduler closed before I/O was completed".to_string(),
-            location: location!(),
-        }));
+        (self.when_done)(Err(Error::internal(
+            "Scheduler closed before I/O was completed".to_string(),
+        )));
     }
 
     async fn run(self) {

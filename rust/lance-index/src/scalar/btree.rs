@@ -62,7 +62,6 @@ use object_store::path::Path;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
-use snafu::location;
 use tracing::{info, instrument};
 
 mod flat;
@@ -903,13 +902,12 @@ impl LazyRangedIndexReader {
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
-        let (page_file_name, offset) =
-            self.ranges_to_files
-                .get(&page_idx)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Unexpected page index, index {} is out of range.", page_idx),
-                    location: location!(),
-                })?;
+        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
+            Error::internal(format!(
+                "Unexpected page index, index {} is out of range.",
+                page_idx
+            ))
+        })?;
         let reader = self.get_reader(page_file_name).await?;
         Ok((reader.clone(), page_idx - *offset))
     }
@@ -1401,10 +1399,9 @@ impl Index for BTreeIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "BTreeIndex is not vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "BTreeIndex is not vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1435,10 +1432,9 @@ impl Index for BTreeIndex {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1658,20 +1654,14 @@ struct BatchStats {
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
     if values.is_empty() {
-        return Err(Error::Internal {
-            message: "received an empty batch in btree training".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "received an empty batch in btree training".to_string(),
+        ));
     }
-    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
-        message: format!("failed to get min value from batch: {}", e),
-        location: location!(),
-    })?;
-    let max =
-        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
-            message: format!("failed to get max value from batch: {}", e),
-            location: location!(),
-        })?;
+    let min = ScalarValue::try_from_array(&values, 0)
+        .map_err(|e| Error::internal(format!("failed to get min value from batch: {}", e)))?;
+    let max = ScalarValue::try_from_array(&values, values.len() - 1)
+        .map_err(|e| Error::internal(format!("failed to get max value from batch: {}", e)))?;
 
     Ok(BatchStats {
         min,
@@ -1918,15 +1908,12 @@ async fn list_page_lookup_files(
     }
 
     if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::Internal {
-            message: format!(
-                "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-                index_dir,
-                part_page_files.len(),
-                part_lookup_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
+            index_dir,
+            part_page_files.len(),
+            part_lookup_files.len()
+        )));
     }
 
     Ok((part_page_files, part_lookup_files))
@@ -1945,22 +1932,18 @@ async fn merge_metadata_files(
     batch_readhead: Option<usize>,
 ) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
-        return Err(Error::Internal {
-            message: "No partition files provided for merging".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "No partition files provided for merging".to_string(),
+        ));
     }
 
     // Step 1: Create lookup map for page files by partition ID
     if part_lookup_files.len() != part_page_files.len() {
-        return Err(Error::Internal {
-            message: format!(
-                "Number of partition lookup files ({}) does not match number of partition page files ({})",
-                part_lookup_files.len(),
-                part_page_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Number of partition lookup files ({}) does not match number of partition page files ({})",
+            part_lookup_files.len(),
+            part_page_files.len()
+        )));
     }
     let mut page_files_map = HashMap::new();
     for page_file in part_page_files {
@@ -1972,13 +1955,10 @@ async fn merge_metadata_files(
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
         if !page_files_map.contains_key(&partition_id) {
-            return Err(Error::Internal {
-                message: format!(
-                    "No corresponding page file found for lookup file: {} (partition_id: {})",
-                    lookup_file, partition_id
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "No corresponding page file found for lookup file: {} (partition_id: {})",
+                lookup_file, partition_id
+            )));
         }
     }
 
@@ -2181,21 +2161,15 @@ async fn merge_pages_and_lookups(
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
 fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatch> {
-    let (page_idx_pos, _) =
-        batch
-            .schema()
-            .column_with_name("page_idx")
-            .ok_or_else(|| Error::Internal {
-                message: "Column 'page_idx' not found in RecordBatch schema".to_string(),
-                location: location!(),
-            })?;
+    let (page_idx_pos, _) = batch.schema().column_with_name("page_idx").ok_or_else(|| {
+        Error::internal("Column 'page_idx' not found in RecordBatch schema".to_string())
+    })?;
     let page_idx_array = batch
         .column(page_idx_pos)
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Failed to downcast 'page_idx' column to UInt32Array".to_string(),
-            location: location!(),
+        .ok_or_else(|| {
+            Error::internal("Failed to downcast 'page_idx' column to UInt32Array".to_string())
         })?;
     let offset_array = UInt32Array::from(vec![offset; page_idx_array.len()]);
     let new_page_idx_array_ref = add(page_idx_array, &offset_array)?;
@@ -2232,14 +2206,13 @@ async fn merge_pages(
     let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name =
-            (*page_files_map
-                .get(&partition_id)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Page file not found for partition ID: {}", partition_id),
-                    location: location!(),
-                })?)
-            .clone();
+        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Page file not found for partition ID: {}",
+                partition_id
+            ))
+        })?)
+        .clone();
 
         let reader = store.open_index_file(&page_file_name).await?;
 
@@ -2325,23 +2298,25 @@ fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<(u64, String)
 /// Expected format: "part_{partition_id}_{suffix}.lance"
 fn extract_partition_id(filename: &str) -> Result<u64> {
     if !filename.starts_with("part_") {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
     let parts: Vec<&str> = filename.split('_').collect();
     if parts.len() < 3 {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
-    parts[1].parse::<u64>().map_err(|_| Error::Internal {
-        message: format!("Failed to parse partition ID from filename: {}", filename),
-        location: location!(),
+    parts[1].parse::<u64>().map_err(|_| {
+        Error::internal(format!(
+            "Failed to parse partition ID from filename: {}",
+            filename
+        ))
     })
 }
 
@@ -2540,10 +2515,9 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A btree index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A btree index can only be created on a non-nested field.".into(),
+            ));
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;

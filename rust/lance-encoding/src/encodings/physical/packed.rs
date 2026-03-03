@@ -14,7 +14,6 @@ use std::{convert::TryInto, sync::Arc};
 use arrow_array::types::UInt64Type;
 
 use lance_core::{Error, Result, datatypes::Field};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -92,14 +91,11 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                     ProtobufUtils21::packed_struct(value_array_encoding, bits_per_values),
                 ))
             }
-            _ => Err(Error::InvalidInput {
-                source: format!(
-                    "Cannot compress a data block of type {} with PackedStructFixedWidthBlockEncoder",
-                    data.name()
-                )
-                .into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(format!(
+                "Cannot compress a data block of type {} with PackedStructFixedWidthBlockEncoder",
+                data.name()
+            )
+            .into())),
         }
     }
 }

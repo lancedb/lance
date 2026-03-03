@@ -23,7 +23,6 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
-use snafu::location;
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -331,10 +330,7 @@ async fn do_take_rows(
 
         let returned_row_addr = one_batch
             .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::Internal {
-                message: "_rowaddr column not found".into(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
             .as_primitive::<UInt64Type>()
             .values();
 
@@ -363,14 +359,11 @@ async fn do_take_rows(
     if builder.with_row_address || projection.must_add_row_offset {
         // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
-            return Err(Error::NotSupported  {
-            source: format!(
+            return Err(Error::not_supported_source(format!(
                 "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
                 row_addrs.len(),
                 batch.num_rows()
-            ).into(),
-            location: location!(),
-            });
+            ).into()));
         }
 
         let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));

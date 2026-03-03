@@ -166,9 +166,8 @@ impl AwsCredentialVendor {
 
         let bucket = url
             .host_str()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("S3 URI '{}' missing bucket", uri).into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source(format!("S3 URI '{}' missing bucket", uri).into())
             })?
             .to_string();
 
@@ -325,9 +324,10 @@ impl AwsCredentialVendor {
         prefix: &str,
         permission: VendedPermission,
     ) -> Result<VendedCredentials> {
-        let credentials = credentials.ok_or_else(|| Error::IO {
-            source: Box::new(std::io::Error::other("STS response missing credentials")),
-            location: snafu::location!(),
+        let credentials = credentials.ok_or_else(|| {
+            Error::io_source(Box::new(std::io::Error::other(
+                "STS response missing credentials",
+            )))
         })?;
 
         let access_key_id = credentials.access_key_id().to_string();
@@ -390,12 +390,11 @@ impl AwsCredentialVendor {
             .duration_seconds(duration_secs)
             .send()
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
                     "AssumeRoleWithWebIdentity failed for role '{}': {}",
                     self.config.role_arn, e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         self.extract_credentials(
@@ -413,14 +412,11 @@ impl AwsCredentialVendor {
         prefix: &str,
         api_key: &str,
     ) -> Result<VendedCredentials> {
-        let salt = self
-            .config
-            .api_key_salt
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "api_key_salt must be configured to use API key authentication".into(),
-                location: snafu::location!(),
-            })?;
+        let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "api_key_salt must be configured to use API key authentication".into(),
+            )
+        })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
 
@@ -435,10 +431,7 @@ impl AwsCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::InvalidInput {
-                    source: "Invalid API key".into(),
-                    location: snafu::location!(),
-                }
+                Error::invalid_input_source("Invalid API key".into())
             })?;
 
         let policy = Self::build_policy(bucket, prefix, permission);
@@ -459,12 +452,11 @@ impl AwsCredentialVendor {
             .duration_seconds(duration_secs)
             .external_id(&key_hash); // Use hash as external_id
 
-        let response = request.send().await.map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let response = request.send().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "AssumeRole with API key failed for role '{}': {}",
                 self.config.role_arn, e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         self.extract_credentials(response.credentials(), bucket, prefix, permission)
@@ -503,12 +495,11 @@ impl AwsCredentialVendor {
             request = request.external_id(external_id);
         }
 
-        let response = request.send().await.map_err(|e| Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let response = request.send().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
                 "AssumeRole failed for role '{}': {}",
                 self.config.role_arn, e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         self.extract_credentials(
@@ -555,10 +546,9 @@ impl CredentialVendor for AwsCredentialVendor {
             }
             Some(_) => {
                 // Identity provided but neither api_key nor auth_token set
-                Err(Error::InvalidInput {
-                    source: "Identity provided but neither api_key nor auth_token is set".into(),
-                    location: snafu::location!(),
-                })
+                Err(Error::invalid_input_source(
+                    "Identity provided but neither api_key nor auth_token is set".into(),
+                ))
             }
             None => {
                 // Use AssumeRole with static configuration

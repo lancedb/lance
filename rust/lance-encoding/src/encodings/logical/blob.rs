@@ -15,7 +15,6 @@ use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
     Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
 };
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -90,11 +89,9 @@ impl BlobStructuralEncoder {
                     let encoded_page = encoded_page?;
 
                     let PageEncoding::Structural(inner_layout) = encoded_page.description else {
-                        return Err(Error::Internal {
-                            message: "Expected inner encoding to return structural layout"
-                                .to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(
+                            "Expected inner encoding to return structural layout".to_string(),
+                        ));
                     };
 
                     let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);
@@ -128,12 +125,11 @@ impl FieldEncoder for BlobStructuralEncoder {
         }
 
         // Convert input array to LargeBinary
-        let binary_array = array
-            .as_binary_opt::<i64>()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("Expected LargeBinary array, got {}", array.data_type()).into(),
-                location: location!(),
-            })?;
+        let binary_array = array.as_binary_opt::<i64>().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Expected LargeBinary array, got {}", array.data_type()).into(),
+            )
+        })?;
 
         let repdef = RepDefBuilder::serialize(vec![repdef]);
 
@@ -284,44 +280,38 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
         let kind_col = struct_arr
             .column_by_name("kind")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `kind` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `kind` field".into())
             })?
             .as_primitive::<UInt8Type>();
         let data_col = struct_arr
             .column_by_name("data")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `data` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `data` field".into())
             })?
             .as_binary::<i64>();
         let uri_col = struct_arr
             .column_by_name("uri")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `uri` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `uri` field".into())
             })?
             .as_string::<i32>();
         let blob_id_col = struct_arr
             .column_by_name("blob_id")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `blob_id` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `blob_id` field".into())
             })?
             .as_primitive::<UInt32Type>();
         let blob_size_col = struct_arr
             .column_by_name("blob_size")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `blob_size` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `blob_size` field".into())
             })?
             .as_primitive::<UInt64Type>();
         let packed_position_col = struct_arr
             .column_by_name("position")
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Blob v2 struct missing `position` field".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `position` field".into())
             })?
             .as_primitive::<UInt64Type>();
 

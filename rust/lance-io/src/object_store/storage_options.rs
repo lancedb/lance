@@ -23,7 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
-use snafu::location;
 use tokio::sync::RwLock;
 
 use crate::{Error, Result};
@@ -133,17 +132,12 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
             ..Default::default()
         };
 
-        let response = self
-            .namespace
-            .describe_table(request)
-            .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to fetch storage options: {}",
-                    e
-                ))),
-                location: location!(),
-            })?;
+        let response = self.namespace.describe_table(request).await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to fetch storage options: {}",
+                e
+            ))))
+        })?;
 
         Ok(response.storage_options)
     }
@@ -321,10 +315,9 @@ impl StorageOptionsAccessor {
             return if let Some(initial) = &self.initial_options {
                 Ok(Some(super::StorageOptions(initial.clone())))
             } else {
-                Err(Error::IO {
-                    source: Box::new(std::io::Error::other("No storage options available")),
-                    location: location!(),
-                })
+                Err(Error::io_source(Box::new(std::io::Error::other(
+                    "No storage options available",
+                ))))
             };
         };
 
@@ -346,29 +339,21 @@ impl StorageOptionsAccessor {
             provider.provider_id()
         );
 
-        let storage_options_map =
-            provider
-                .fetch_storage_options()
-                .await
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to fetch storage options: {}",
-                        e
-                    ))),
-                    location: location!(),
-                })?;
+        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to fetch storage options: {}",
+                e
+            ))))
+        })?;
 
         let Some(options) = storage_options_map else {
             // Provider returned None, fall back to initial options
             if let Some(initial) = &self.initial_options {
                 return Ok(Some(super::StorageOptions(initial.clone())));
             }
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(
-                    "Provider returned no storage options",
-                )),
-                location: location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(
+                "Provider returned no storage options",
+            ))));
         };
 
         let expires_at_millis = options

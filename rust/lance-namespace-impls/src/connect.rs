@@ -186,11 +186,9 @@ impl ConnectBuilder {
                 Ok(Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
             }
             #[cfg(not(feature = "rest"))]
-            "rest" => Err(Error::Namespace {
-                source: "REST namespace implementation requires 'rest' feature to be enabled"
-                    .into(),
-                location: snafu::location!(),
-            }),
+            "rest" => Err(Error::namespace_source(
+                "REST namespace implementation requires 'rest' feature to be enabled".into(),
+            )),
             "dir" => {
                 // Create directory implementation (always available)
                 let mut builder = crate::dir::DirectoryNamespaceBuilder::from_properties(
@@ -205,15 +203,14 @@ impl ConnectBuilder {
                     .await
                     .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
             }
-            _ => Err(Error::Namespace {
-                source: format!(
+            _ => Err(Error::namespace_source(
+                format!(
                     "Implementation '{}' is not available. Supported: dir{}",
                     self.impl_name,
                     if cfg!(feature = "rest") { ", rest" } else { "" }
                 )
                 .into(),
-                location: snafu::location!(),
-            }),
+            )),
         }
     }
 }

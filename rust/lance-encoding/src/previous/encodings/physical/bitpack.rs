@@ -14,7 +14,6 @@ use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
 use num_traits::{AsPrimitive, PrimInt};
-use snafu::location;
 
 use lance_arrow::DataTypeExt;
 use lance_bitpacking::BitPacking;
@@ -329,10 +328,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                         }
                     }
                     _ => {
-                        return Err(Error::InvalidInput {
-                            source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source("Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into()));
                     }
                 }
                 let encoding =
@@ -348,10 +344,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 })
             }
             _ => {
-                Err(Error::InvalidInput {
-                    source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
-                    location: location!(),
-                })
+                Err(Error::invalid_input_source("Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into()))
             }
         }
     }
@@ -469,10 +462,7 @@ struct BitpackedForNonNegPageDecoder {
 impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         if ![8, 16, 32, 64].contains(&self.uncompressed_bits_per_value) {
-            return Err(Error::InvalidInput {
-                source: "BitpackedForNonNegPageDecoder should only has uncompressed_bits_per_value of 8, 16, 32, or 64".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("BitpackedForNonNegPageDecoder should only has uncompressed_bits_per_value of 8, 16, 32, or 64".into()));
         }
 
         let elem_size_in_bytes = self.uncompressed_bits_per_value / 8;
@@ -714,10 +704,9 @@ impl ArrayEncoder for BitpackedArrayEncoder {
         let mut dst_offset = 0;
 
         let DataBlock::FixedWidth(unpacked) = data else {
-            return Err(Error::InvalidInput {
-                source: "Bitpacking only supports fixed width data blocks".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Bitpacking only supports fixed width data blocks".into(),
+            ));
         };
 
         pack_bits(

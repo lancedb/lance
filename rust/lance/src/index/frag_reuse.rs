@@ -14,7 +14,6 @@ use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineConte
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
-use snafu::location;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -34,18 +33,14 @@ pub async fn load_frag_reuse_index_details(
             .type_url
             .ends_with("FragmentReuseIndexDetails")
     {
-        return Err(Error::Index {
-            message: "Index details is not for the fragment reuse index".into(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Index details is not for the fragment reuse index",
+        ));
     }
 
     let proto = details_any.unwrap().to_msg::<FragmentReuseIndexDetails>()?;
     match &proto.content {
-        None => Err(Error::Index {
-            message: "Index details content is not found".into(),
-            location: location!(),
-        }),
+        None => Err(Error::index("Index details content is not found")),
         Some(Content::Inline(content)) => {
             Ok(Arc::new(FragReuseIndexDetails::try_from(content.clone())?))
         }

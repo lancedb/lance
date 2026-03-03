@@ -23,7 +23,6 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
-use snafu::location;
 
 /// Manifest of a dataset
 ///
@@ -879,10 +878,7 @@ impl TryFrom<pb::Manifest> for Manifest {
         if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
         {
-            return Err(Error::Internal {
-                message: "All fragments must have row ids".into(),
-                location: location!(),
-            });
+            return Err(Error::internal("All fragments must have row ids"));
         }
 
         let data_storage_format = match p.data_format {
@@ -1036,13 +1032,10 @@ impl SelfDescribingFileReader for PreviousFileReader {
         cache: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
-        let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
-            message: format!(
-                "Attempt to open file at {} as self-describing but it did not contain a manifest",
-                reader.path(),
-            ),
-            location: location!(),
-        })?;
+        let manifest_position = metadata.manifest_position.ok_or(Error::internal(format!(
+            "Attempt to open file at {} as self-describing but it did not contain a manifest",
+            reader.path(),
+        )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         if manifest.should_use_legacy_format() {
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;

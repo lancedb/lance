@@ -91,3 +91,6 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[lints.clippy]
+disallowed_macros = "deny"

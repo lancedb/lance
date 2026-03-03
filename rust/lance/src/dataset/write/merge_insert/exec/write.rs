@@ -22,7 +22,6 @@ use futures::{StreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
-use snafu::location;
 
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
@@ -878,12 +877,11 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     fragment_sizes,
                     true,
                 )
-                .map_err(|e| Error::Internal {
-                    message: format!(
+                .map_err(|e| {
+                    Error::internal(format!(
                         "Captured row ids not equal to number of rows written: {}",
                         e
-                    ),
-                    location: location!(),
+                    ))
                 })?;
 
                 for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
