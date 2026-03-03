@@ -155,7 +155,7 @@ impl DatasetPreFilter {
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {
                                     let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.iter()).unwrap();
+                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
                                     Cow::<RowIdSequence>::Owned(row_ids)
                                 } else {
                                     Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
