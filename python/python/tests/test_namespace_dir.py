@@ -416,6 +416,7 @@ class TestTableOperations:
             temp_namespace.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
+
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors Rust tests."""
 
