@@ -10,20 +10,19 @@ use lance_file::{
 };
 use object_store::path::Path;
 use prost::Message;
-use snafu::location;
 use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
-    encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder},
+    encodings::{Encoder, binary::BinaryEncoder, plain::PlainEncoder},
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, Transaction, MAGIC};
+use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
 
 use super::commit::ManifestLocation;
 
@@ -59,14 +58,12 @@ pub async fn read_manifest(
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: file size is smaller than 16 bytes".to_string(),
-            location!(),
         ));
     }
     if !buf.ends_with(MAGIC) {
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: magic number does not match".to_string(),
-            location!(),
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
@@ -245,7 +242,7 @@ mod test {
     use lance_file::previous::{
         reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
     };
-    use rand::{distr::Alphanumeric, Rng};
+    use rand::{Rng, distr::Alphanumeric};
     use tokio::io::AsyncWriteExt;
 
     use super::*;

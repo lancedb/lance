@@ -42,7 +42,6 @@ use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
 use roaring::RoaringBitmap;
-use snafu::location;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
@@ -323,10 +322,9 @@ impl ZoneMapIndex {
                     }
                 }))
             }
-            SargableQuery::FullTextSearch(_) => Err(Error::NotSupported {
-                source: "full text search is not supported for zonemap indexes".into(),
-                location: location!(),
-            }),
+            SargableQuery::FullTextSearch(_) => Err(Error::not_supported_source(
+                "full text search is not supported for zonemap indexes".into(),
+            )),
         }
     }
 
@@ -472,10 +470,9 @@ impl Index for ZoneMapIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::InvalidInput {
-            source: "ZoneMapIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "ZoneMapIndex is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -529,10 +526,9 @@ impl ScalarIndex for ZoneMapIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::InvalidInput {
-            source: "ZoneMapIndex does not support remap".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "ZoneMapIndex does not support remap".into(),
+        ))
     }
 
     /// Add the new data , creating an updated version of the index in `dest_store`
@@ -842,10 +838,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A zone map index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A zone map index can only be created on a non-nested field.".into(),
+            ));
         }
 
         let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
@@ -878,17 +873,17 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "ZoneMap index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "ZoneMap index does not support fragment training".into(),
+            ));
         }
 
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {

@@ -19,7 +19,6 @@ use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
-use snafu::location;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -401,14 +400,11 @@ pub async fn rewrite_files_binary_copy(
                         .encode_to_vec();
                     let baseline_bytes = &baseline_col_encoding_bytes[col_idx];
                     if src_col_encoding_bytes != *baseline_bytes {
-                        return Err(Error::Execution {
-                            message: format!(
-                                "binary copy: The ColumnEncoding of column {} is incompatible with the first file, \
-                                making it impossible to safely concatenate buffers",
-                                col_idx
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::execution(format!(
+                            "binary copy: The ColumnEncoding of column {} is incompatible with the first file, \
+                            making it impossible to safely concatenate buffers",
+                            col_idx
+                        )));
                     }
                     let ranges: Vec<Range<u64>> = src_column_info
                         .buffer_offsets_and_sizes

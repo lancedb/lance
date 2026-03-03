@@ -52,7 +52,6 @@ use lance_index::{
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::{debug_span, instrument};
 
 #[async_trait]
@@ -66,10 +65,7 @@ impl ScalarIndexLoader for Dataset {
         let idx = self
             .load_scalar_index(IndexCriteria::default().with_name(index_name))
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
-                location: location!()
-            })?;
+            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
         self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }

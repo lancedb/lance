@@ -33,7 +33,6 @@ use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::{Error, Result};
 use log::trace;
-use snafu::location;
 
 #[derive(Debug)]
 struct StructuralSchedulingJobWithStatus<'a> {
@@ -286,12 +285,11 @@ impl StructuralStructDecoder {
             }
             DataType::Map(entries_field, keys_sorted) => {
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: "Map data type with keys_sorted=true is not supported yet"
+                    return Err(Error::not_supported_source(
+                        "Map data type with keys_sorted=true is not supported yet"
                             .to_string()
                             .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
                 let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
                 Ok(Box::new(StructuralMapDecoder::new(
@@ -388,12 +386,8 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::try_new(self.child_fields, children, validity).map_err(|e| {
-            Error::InvalidInput {
-                source: e.to_string().into(),
-                location: location!(),
-            }
-        })?;
+        let array = StructArray::try_new(self.child_fields, children, validity)
+            .map_err(|e| Error::invalid_input_source(e.to_string().into()))?;
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,

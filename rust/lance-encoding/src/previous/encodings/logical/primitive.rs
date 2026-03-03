@@ -8,7 +8,6 @@ use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
-use snafu::location;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
 use crate::previous::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
@@ -342,13 +341,10 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         if self.physical_decoder.as_ref().is_none() {
-            return Err(lance_core::Error::Internal {
-                message: format!(
-                    "drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
-                    self.data_type, self.column_index
-                ),
-                location: location!(),
-            });
+            return Err(lance_core::Error::internal(format!(
+                "drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
+                self.data_type, self.column_index
+            )));
         }
 
         let rows_to_skip = self.rows_drained;
@@ -446,10 +442,10 @@ impl PrimitiveFieldEncoder {
         })
         .map(|res_res| {
             res_res.unwrap_or_else(|err| {
-                Err(Error::Internal {
-                    message: format!("Encoding task failed with error: {:?}", err),
-                    location: location!(),
-                })
+                Err(Error::internal(format!(
+                    "Encoding task failed with error: {:?}",
+                    err
+                )))
             })
         })
         .boxed())

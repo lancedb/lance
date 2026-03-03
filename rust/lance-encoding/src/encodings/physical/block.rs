@@ -23,7 +23,6 @@
 
 use arrow_buffer::ArrowNativeType;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use std::str::FromStr;
 
@@ -186,10 +185,7 @@ mod zstd {
                         .map_err(|e| e.to_string())
                 })
                 .as_ref()
-                .map_err(|e| Error::Internal {
-                    message: format!("Failed to create zstd compressor: {}", e),
-                    location: location!(),
-                })
+                .map_err(|e| Error::internal(format!("Failed to create zstd compressor: {}", e)))
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -262,10 +258,7 @@ mod zstd {
                 .lock()
                 .unwrap()
                 .compress_to_buffer(input_buf, &mut output_buf[start_pos..])
-                .map_err(|e| Error::Internal {
-                    message: format!("Zstd compression error: {}", e),
-                    location: location!(),
-                })?;
+                .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
 
             output_buf.truncate(start_pos + compressed_size);
             Ok(())
@@ -318,10 +311,7 @@ mod lz4 {
                 true,
                 &mut output_buf[start_pos..],
             )
-            .map_err(|err| Error::Internal {
-                message: format!("LZ4 compression error: {}", err),
-                location: location!(),
-            })?;
+            .map_err(|err| Error::internal(format!("LZ4 compression error: {}", err)))?;
 
             // Truncate to actual size
             output_buf.truncate(start_pos + compressed_size);
@@ -332,10 +322,7 @@ mod lz4 {
             // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
             // We can read this to know exactly how much space we need
             if input_buf.len() < 4 {
-                return Err(Error::Internal {
-                    message: "LZ4 compressed data too short".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal("LZ4 compressed data too short".to_string()));
             }
 
             // Read the uncompressed size from the first 4 bytes (little-endian)
@@ -352,10 +339,7 @@ mod lz4 {
             // Now decompress directly into the buffer slice
             let decompressed_size =
                 ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start_pos..])
-                    .map_err(|err| Error::Internal {
-                    message: format!("LZ4 decompression error: {}", err),
-                    location: location!(),
-                })?;
+                    .map_err(|err| Error::internal(format!("LZ4 decompression error: {}", err)))?;
 
             // Truncate to actual decompressed size (should be same as uncompressed_size)
             output_buf.truncate(start_pos + decompressed_size);
@@ -402,10 +386,9 @@ impl GeneralBufferCompressor {
     ) -> Result<Box<dyn BufferCompressor>> {
         match compression_config.scheme {
             // FSST has its own compression path and isn't implemented as a generic buffer compressor
-            CompressionScheme::Fsst => Err(Error::InvalidInput {
-                source: "fsst is not usable as a general buffer compressor".into(),
-                location: location!(),
-            }),
+            CompressionScheme::Fsst => Err(Error::invalid_input_source(
+                "fsst is not usable as a general buffer compressor".into(),
+            )),
             CompressionScheme::Zstd => {
                 #[cfg(feature = "zstd")]
                 {
@@ -415,10 +398,9 @@ impl GeneralBufferCompressor {
                 }
                 #[cfg(not(feature = "zstd"))]
                 {
-                    Err(Error::InvalidInput {
-                        source: "package was not built with zstd support".into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        "package was not built with zstd support".into(),
+                    ))
                 }
             }
             CompressionScheme::Lz4 => {
@@ -428,10 +410,9 @@ impl GeneralBufferCompressor {
                 }
                 #[cfg(not(feature = "lz4"))]
                 {
-                    Err(Error::InvalidInput {
-                        source: "package was not built with lz4 support".into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        "package was not built with lz4 support".into(),
+                    ))
                 }
             }
             CompressionScheme::None => Ok(Box::new(NoopBufferCompressor {})),
@@ -549,13 +530,10 @@ impl CompressedBufferEncoder {
 impl PerValueCompressor for CompressedBufferEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let data_type = data.name();
-        let data = data.as_variable_width().ok_or(Error::Internal {
-            message: format!(
-                "Attempt to use CompressedBufferEncoder on data of type {}",
-                data_type
-            ),
-            location: location!(),
-        })?;
+        let data = data.as_variable_width().ok_or(Error::internal(format!(
+            "Attempt to use CompressedBufferEncoder on data of type {}",
+            data_type
+        )))?;
 
         let data_bytes = &data.data;
         let mut compressed = Vec::with_capacity(data_bytes.len());
@@ -634,10 +612,9 @@ impl BlockCompressor for CompressedBufferEncoder {
                 BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: "Unsupported data block type".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Unsupported data block type".into(),
+                ));
             }
         };
 

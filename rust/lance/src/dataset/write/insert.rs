@@ -17,7 +17,6 @@ use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use snafu::location;
 
 use crate::Dataset;
 use crate::dataset::ReadParams;
@@ -142,18 +141,14 @@ impl<'a> InsertBuilder<'a> {
         // TODO: This should be able to split the data up based on max_rows_per_file
         // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "No data to write".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("No data to write".into()));
         }
         let schema = data[0].schema();
         for batch in data.iter().skip(1) {
             if batch.schema() != schema {
-                return Err(Error::InvalidInput {
-                    source: "All record batches must have the same schema".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "All record batches must have the same schema".into(),
+                ));
             }
         }
         let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
@@ -223,12 +218,10 @@ impl<'a> InsertBuilder<'a> {
                         auto_cleanup_params.interval.to_string(),
                     );
 
-                    let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
-                        Error::InvalidInput {
-                            source: e.into(),
-                            location: location!(),
-                        }
-                    })?;
+                    let duration = auto_cleanup_params
+                        .older_than
+                        .to_std()
+                        .map_err(|e| Error::invalid_input_source(e.into()))?;
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.older_than"),
                         format_duration(duration).to_string(),
@@ -274,10 +267,7 @@ impl<'a> InsertBuilder<'a> {
         // Write mode
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::DatasetAlreadyExists {
-                    uri: ds.uri.clone(),
-                    location: location!(),
-                });
+                return Err(Error::dataset_already_exists(ds.uri.clone()));
             }
             (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
@@ -315,14 +305,13 @@ impl<'a> InsertBuilder<'a> {
         // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
             if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
-                return Err(Error::InvalidInput {
-                    source: format!(
+                return Err(Error::invalid_input_source(
+                    format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
                         field.name
                     )
                     .into(),
-                    location: location!(),
-                });
+                ));
             }
         }
 
@@ -335,10 +324,7 @@ impl<'a> InsertBuilder<'a> {
                 Please upgrade Lance to write to this dataset.\n Flags: {}",
                 dataset.manifest.writer_feature_flags
             );
-            return Err(Error::NotSupported {
-                source: message.into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(message.into()));
         }
 
         Ok(())

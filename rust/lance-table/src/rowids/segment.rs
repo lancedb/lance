@@ -783,7 +783,7 @@ mod test {
             let mut b = Bitmap::new_full(16);
             b.clear(3); // Clear position 3 (value 13)
             b.clear(7); // Clear position 7 (value 17)
-                        // Clear positions 10-14 (values 20-24)
+            // Clear positions 10-14 (values 20-24)
             for i in 10..15 {
                 b.clear(i);
             }
@@ -840,9 +840,11 @@ mod test {
         let result = segment.with_new_high(15);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("New value 15 must be higher than current maximum 19"));
+        assert!(
+            error
+                .to_string()
+                .contains("New value 15 must be higher than current maximum 19")
+        );
     }
 
     #[test]
@@ -852,9 +854,11 @@ mod test {
         let result = segment.with_new_high(5);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("New value 5 must be higher than current maximum 5"));
+        assert!(
+            error
+                .to_string()
+                .contains("New value 5 must be higher than current maximum 5")
+        );
     }
 
     #[test]

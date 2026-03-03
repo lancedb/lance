@@ -13,7 +13,6 @@ use arrow_buffer::{
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
-use snafu::location;
 
 use lance_core::{Error, Result, datatypes::BLOB_DESC_FIELDS};
 
@@ -293,12 +292,11 @@ impl BlobFieldEncoder {
     }
 
     fn write_bins(array: ArrayRef, external_buffers: &mut OutOfLineBuffers) -> Result<ArrayRef> {
-        let binarray = array
-            .as_binary_opt::<i64>()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("Expected large_binary and received {}", array.data_type()).into(),
-                location: location!(),
-            })?;
+        let binarray = array.as_binary_opt::<i64>().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Expected large_binary and received {}", array.data_type()).into(),
+            )
+        })?;
         let mut positions = Vec::with_capacity(array.len());
         let mut sizes = Vec::with_capacity(array.len());
         let data = binarray.values();

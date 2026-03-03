@@ -39,7 +39,6 @@ use lance_index::scalar::{
 use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
-use snafu::location;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -65,10 +64,12 @@ impl TrainingRequest {
         column: &str,
         criteria: &TrainingCriteria,
     ) -> Result<SendableRecordBatchStream> {
-        let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-            source: format!("No column with name {}", column).into(),
-            location: location!(),
-        })?;
+        let column_field = dataset
+            .schema()
+            .field(column)
+            .ok_or(Error::invalid_input_source(
+                format!("No column with name {}", column).into(),
+            ))?;
 
         let mut fields = Vec::with_capacity(3);
         fields.push(arrow_schema::Field::new(
@@ -200,10 +201,9 @@ pub(crate) async fn load_training_data(
                 .zip(frags)
                 .map(|(id, frag)| {
                     let Some(frag) = frag else {
-                        return Err(Error::InvalidInput {
-                            source: format!("No fragment with id {}", id).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            format!("No fragment with id {}", id).into(),
+                        ));
                     };
                     Ok(frag.metadata().clone())
                 })
@@ -263,10 +263,12 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<SendableRecordBatchStream>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
-        location: location!(),
-    })?;
+    let field = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
     let field: arrow_schema::Field = field.into();
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
@@ -357,13 +359,13 @@ pub(crate) async fn infer_scalar_index_details(
     }
 
     let index_dir = dataset.indice_files_dir(index)?.child(uuid.clone());
-    let col = dataset.schema().field(column).ok_or(Error::Internal {
-        message: format!(
+    let col = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::internal(format!(
             "Index refers to column {} which does not exist in dataset schema",
             column
-        ),
-        location: location!(),
-    })?;
+        )))?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
@@ -443,14 +445,11 @@ pub fn index_matches_criteria(
     let index_details = index.index_details.clone().map(IndexDetails);
     let Some(index_details) = index_details else {
         if has_multiple_indices {
-            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
-                                    index.name,
-                                    index.fields.first().unwrap_or(&0),
-                                ).into(),
-                                location: location!(),
-                            });
+            return Err(Error::invalid_input_source(format!(
+                "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
+                index.name,
+                index.fields.first().unwrap_or(&0),
+            ).into()));
         }
 
         // If we don't have details then allow it for backwards compatibility
@@ -485,10 +484,10 @@ pub async fn initialize_scalar_index(
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {
-        return Err(Error::Index {
-            message: format!("Unsupported fields for scalar index: {:?}", field_names),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Unsupported fields for scalar index: {:?}",
+            field_names
+        )));
     }
 
     // Scalar indices currently support only single fields, use the first one
@@ -508,10 +507,10 @@ pub async fn initialize_scalar_index(
     // For Inverted index, we need to parse the params JSON and create InvertedIndexParams
     if index_type == IndexType::Inverted {
         // Extract the JSON string from ScalarIndexParams
-        let params_json = params.params.as_ref().ok_or_else(|| Error::Index {
-            message: "Inverted index params missing".to_string(),
-            location: location!(),
-        })?;
+        let params_json = params
+            .params
+            .as_ref()
+            .ok_or_else(|| Error::index("Inverted index params missing".to_string()))?;
 
         // Parse the JSON into InvertedIndexParams
         let inverted_params: InvertedIndexParams = serde_json::from_str(params_json)?;

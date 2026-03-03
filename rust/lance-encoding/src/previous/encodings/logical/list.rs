@@ -14,7 +14,6 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{Error, Result, cache::LanceCache};
 use log::trace;
-use snafu::location;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -761,7 +760,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             // shrink the read batch size if we detect the batches are going to be huge (maybe
             // even achieve this with a read_batch_bytes parameter, though some estimation may
             // still be required)
-            return Err(Error::NotSupported { source: format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into(), location: location!() });
+            return Err(Error::not_supported_source(format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into()));
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]

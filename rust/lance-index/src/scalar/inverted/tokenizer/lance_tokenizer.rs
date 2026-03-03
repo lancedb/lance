@@ -5,7 +5,6 @@ use arrow_schema::{DataType, Field};
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_arrow::json::JSON_EXT_NAME;
 use serde_json::Value;
-use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Document type for full text search.
@@ -37,15 +36,13 @@ impl TryFrom<&Field> for DocType {
             }
             DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
                 Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
-                _ => Err(lance_core::Error::InvalidInput {
-                    source: format!("field {} is not json", field.name()).into(),
-                    location: location!(),
-                }),
+                _ => Err(lance_core::Error::invalid_input_source(
+                    format!("field {} is not json", field.name()).into(),
+                )),
             },
-            _ => Err(lance_core::Error::InvalidInput {
-                source: format!("field {} is not json", field.name()).into(),
-                location: location!(),
-            }),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("field {} is not json", field.name()).into(),
+            )),
         }
     }
 }
@@ -171,10 +168,9 @@ fn flatten_triplet(
     for triple in text.split(';') {
         let parts: Vec<&str> = triple.splitn(3, ',').collect();
         if parts.len() != 3 {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!("Invalid triple format: {}", triple).into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                format!("Invalid triple format: {}", triple).into(),
+            ));
         }
         let field = parts[0];
         let v_type = parts[1];
@@ -206,10 +202,9 @@ fn flatten_triplet(
                 }
             }
             _ => {
-                return Err(lance_core::Error::InvalidInput {
-                    source: format!("Invalid triple type: {}", v_type).into(),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::invalid_input_source(
+                    format!("Invalid triple type: {}", v_type).into(),
+                ));
             }
         }
     }

@@ -48,7 +48,6 @@ use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
 
@@ -81,24 +80,22 @@ impl EvaluatedIndex {
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
         if batch.num_rows() != 2 {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Expected a batch with exactly 2 rows but there are {} rows",
                     batch.num_rows()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         if batch.num_columns() != 3 {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Expected a batch with exactly two columns but there are {} columns",
                     batch.num_columns()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
@@ -1150,9 +1147,10 @@ impl FilteredReadStream {
                 .map(move |batch| {
                     let batch = batch?;
                     let batch = datafusion_physical_plan::filter::batch_filter(&batch, &filter)
-                        .map_err(|e| Error::Execution {
-                            message: format!("Error applying filter expression to batch: {e}"),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::execution(format!(
+                                "Error applying filter expression to batch: {e}"
+                            ))
                         })?;
                     // Drop any fields loaded purely for the purpose of applying the filter
                     Ok(batch.project_by_schema(output_schema.as_ref())?)
@@ -1307,10 +1305,9 @@ impl FilteredReadOptions {
     /// entire fragment was deleted, it will not be read by this function.
     pub fn with_deleted_rows(mut self) -> Result<Self> {
         if self.scan_range_before_filter.is_some() || self.scan_range_after_filter.is_some() {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.with_deleted_rows = true;
         Ok(self)
@@ -1326,10 +1323,9 @@ impl FilteredReadOptions {
     /// and the range is 100..300, then scan will read rows 100..300 and return rows 200..300
     pub fn with_scan_range_before_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
         if self.with_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.scan_range_before_filter = Some(scan_range);
         Ok(self)
@@ -1345,10 +1341,9 @@ impl FilteredReadOptions {
     /// We currently do not support setting this when there is more than one partition.
     pub fn with_scan_range_after_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
         if self.with_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.scan_range_after_filter = Some(scan_range);
         Ok(self)
@@ -1405,10 +1400,9 @@ impl FilteredReadOptions {
         full_filter: Option<Expr>,
     ) -> Result<Self> {
         if refine_filter.is_some() && full_filter.is_none() {
-            return Err(Error::InvalidInput {
-                source: "refine_filter is set but full_filter is not".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "refine_filter is set but full_filter is not".into(),
+            ));
         }
         self.refine_filter = refine_filter;
         self.full_filter = full_filter;
@@ -1526,12 +1520,8 @@ impl FilteredReadExec {
         }
 
         if options.projection.is_empty() {
-            return Err(Error::InvalidInput {
-                source:
-                    "no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
-                        .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
+                .into()));
         }
 
         if options.scan_range_after_filter.is_some() {
@@ -1540,11 +1530,8 @@ impl FilteredReadExec {
                 && options.refine_filter.is_none()
                 && index_input.is_none()
             {
-                return Err(Error::InvalidInput {
-                    source: "scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source("scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
+                    .into()));
             }
 
             // TODO: support multi partition
@@ -1552,12 +1539,11 @@ impl FilteredReadExec {
                 options.threading_mode,
                 FilteredReadThreadingMode::MultiplePartitions(_)
             ) {
-                return Err(Error::NotSupported {
-                    source: "scan_range_after_filter not yet supported with multiple partitions"
+                return Err(Error::not_supported_source(
+                    "scan_range_after_filter not yet supported with multiple partitions"
                         .to_string()
                         .into(),
-                    location: location!(),
-                });
+                ));
             }
         }
         let output_schema = Arc::new(options.projection.to_arrow_schema());
@@ -1596,9 +1582,10 @@ impl FilteredReadExec {
                     let fragment = self
                         .dataset
                         .get_fragment(*fragment_id as usize)
-                        .ok_or_else(|| Error::InvalidInput {
-                            source: format!("Fragment {} not found", fragment_id).into(),
-                            location: location!(),
+                        .ok_or_else(|| {
+                            Error::invalid_input_source(
+                                format!("Fragment {} not found", fragment_id).into(),
+                            )
                         })?;
                     let num_rows = fragment.physical_rows().await?;
                     vec![0..num_rows as u64]
@@ -1636,11 +1623,9 @@ impl FilteredReadExec {
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
                     let mut index_search = index_input.execute(partition, ctx)?;
-                    let index_search_result =
-                        index_search.next().await.ok_or_else(|| Error::Internal {
-                            message: "Index search did not yield any results".to_string(),
-                            location: location!(),
-                        })??;
+                    let index_search_result = index_search.next().await.ok_or_else(|| {
+                        Error::internal("Index search did not yield any results".to_string())
+                    })??;
                     evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
                         &index_search_result,
                     )?));
@@ -1976,11 +1961,7 @@ impl ExecutionPlan for FilteredReadExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() > 1 {
             Err(DataFusionError::External(
-                Error::Internal {
-                    message: "A FilteredReadExec cannot have two children".to_string(),
-                    location: location!(),
-                }
-                .into(),
+                Error::internal("A FilteredReadExec cannot have two children".to_string()).into(),
             ))
         } else {
             let index_input = children.into_iter().next();

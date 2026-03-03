@@ -4,16 +4,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::path::Path;
 use object_store::ObjectStore as OSObjectStore;
+use object_store::path::Path;
 use object_store_opendal::OpendalStore;
-use opendal::{services::Huggingface, Operator};
+use opendal::{Operator, services::Huggingface};
 use url::Url;
 
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 

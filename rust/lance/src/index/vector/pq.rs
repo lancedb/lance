@@ -37,7 +37,6 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::location;
 use tracing::{Level, instrument, span};
 // Re-export
 pub use lance_index::vector::pq::PQBuildParams;
@@ -203,10 +202,9 @@ impl Index for PQIndex {
             frag_ids.dedup();
             Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
         } else {
-            Err(Error::Index {
-                message: "PQIndex::calculate_included_frags: PQ is not initialized".to_string(),
-                location: location!(),
-            })
+            Err(Error::index(
+                "PQIndex::calculate_included_frags: PQ is not initialized".to_string(),
+            ))
         }
     }
 }
@@ -223,10 +221,9 @@ impl VectorIndex for PQIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
-            return Err(Error::Index {
-                message: "PQIndex::search: PQ is not initialized".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "PQIndex::search: PQ is not initialized".to_string(),
+            ));
         }
         pre_filter.wait_for_ready().await?;
 
@@ -389,19 +386,17 @@ impl VectorIndex for PQIndex {
     }
 
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
-        let row_ids = self.row_ids.clone().ok_or(Error::Index {
-            message: "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
-            location: location!(),
-        })?;
+        let row_ids = self.row_ids.clone().ok_or(Error::index(
+            "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
+        ))?;
 
         let num_rows = row_ids.len();
         let mut fields = vec![ROW_ID_FIELD.clone()];
         let mut columns: Vec<ArrayRef> = vec![row_ids];
         if with_vector {
-            let transposed_codes = self.code.clone().ok_or(Error::Index {
-                message: "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
-                location: location!(),
-            })?;
+            let transposed_codes = self.code.clone().ok_or(Error::index(
+                "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
+            ))?;
             let original_codes = transpose(&transposed_codes, self.pq.num_sub_vectors, num_rows);
             fields.push(Field::new(
                 self.pq.column(),
@@ -529,10 +524,10 @@ pub async fn build_pq_model(
                 )?,
                 dt,
             )),
-            _ => Err(Error::Index {
-                message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "Wrong codebook data type: {:?}",
+                codebook.data_type()
+            ))),
         };
     }
     info!(
@@ -585,13 +580,10 @@ pub async fn build_pq_model(
             training_data.len(),
             num_codes
         );
-        return Err(Error::Unprocessable {
-            message: format!(
-                "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
-                available = training_data.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::unprocessable(format!(
+            "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
+            available = training_data.len()
+        )));
     }
 
     info!("Start train PQ: params={:#?}", params);

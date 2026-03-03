@@ -7,7 +7,6 @@ use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use lance_core::{Error, Result, utils::bit::is_pwr_two};
-use snafu::location;
 use std::borrow::Cow;
 
 /// A copy-on-write byte buffer.
@@ -232,7 +231,7 @@ impl LanceBuffer {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
             } else {
-                Err(Error::InvalidInput { source: format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {} bits per value", bits_per_value).into(), location: location!() })
+                Err(Error::invalid_input_source(format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {} bits per value", bits_per_value).into()))
             }
         }).collect::<Result<Vec<_>>>()?;
         let total_bytes_per_value = bytes_per_value.iter().sum::<u64>();

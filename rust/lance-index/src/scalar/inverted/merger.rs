@@ -4,7 +4,6 @@
 use fst::Streamer;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};
-use snafu::location;
 use std::sync::Arc;
 
 use crate::progress::IndexBuildProgress;
@@ -118,10 +117,9 @@ impl<'a> SizeBasedMerger<'a> {
         match self.with_position {
             Some(existing) => {
                 if existing != with_position {
-                    return Err(Error::Index {
-                        message: "partition position settings do not match".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "partition position settings do not match".to_string(),
+                    ));
                 }
             }
             None => {

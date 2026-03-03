@@ -25,15 +25,15 @@
 //! but is skipped during MemTable flush.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use tantivy::tokenizer::TokenStream;
 
 use super::RowPosition;

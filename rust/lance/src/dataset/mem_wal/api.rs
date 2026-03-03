@@ -10,23 +10,23 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MemWalIndexDetails, RegionSpec, MEM_WAL_INDEX_NAME};
+use lance_index::DatasetIndexExt;
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, RegionSpec};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::DatasetIndexExt;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
 
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::CommitBuilder;
-use crate::index::mem_wal::new_mem_wal_index_meta;
-use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
+use crate::dataset::CommitBuilder;
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::DatasetIndexInternalExt;
+use crate::index::mem_wal::new_mem_wal_index_meta;
 
+use super::RegionWriterConfig;
 use super::write::MemIndexConfig;
 use super::write::RegionWriter;
-use super::RegionWriterConfig;
 
 /// Configuration for initializing MemWAL on a Dataset.
 #[derive(Debug, Clone, Default)]
@@ -93,8 +93,10 @@ impl DatasetMemWalExt for Dataset {
         // Validate that the dataset has a primary key (required for MemWAL)
         let pk_fields = self.schema().unenforced_primary_key();
         if pk_fields.is_empty() {
-            return Err(Error::invalid_input("MemWAL requires a primary key on the dataset. \
-             Define a primary key using the 'lance-schema:unenforced-primary-key' Arrow field metadata."));
+            return Err(Error::invalid_input(
+                "MemWAL requires a primary key on the dataset. \
+             Define a primary key using the 'lance-schema:unenforced-primary-key' Arrow field metadata.",
+            ));
         }
 
         // Validate that all maintained_indexes exist on the dataset
@@ -207,7 +209,7 @@ impl DatasetMemWalExt for Dataset {
                     return Err(Error::invalid_input(format!(
                         "Unknown index type: {}",
                         index_type
-                    )))
+                    )));
                 }
             };
         }

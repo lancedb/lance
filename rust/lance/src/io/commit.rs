@@ -38,7 +38,6 @@ use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use rand::{Rng, rng};
-use snafu::location;
 
 use super::ObjectStore;
 use crate::Dataset;
@@ -251,10 +250,9 @@ async fn do_commit_new_dataset(
                 .await;
             Ok((manifest, manifest_location))
         }
-        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
-            uri: base_path.to_string(),
-            location: location!(),
-        }),
+        Err(CommitError::CommitConflict) => {
+            Err(crate::Error::dataset_already_exists(base_path.to_string()))
+        }
         Err(CommitError::OtherError(err)) => Err(err),
     }
 }
@@ -336,13 +334,10 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         // match the file version.  As a result, we need to check and see if they are out
         // of sync.
         if let Some(actual_file_version) =
-            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
-                message: format!(
-                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                    e
-                ),
-                location: location!(),
-            })?
+            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::internal(format!(
+                "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
+                e
+            )))?
                 && actual_file_version > data_storage_version {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
@@ -357,13 +352,10 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
             && actual_file_version != data_storage_version
         {
-            return Err(Error::Internal {
-                message: format!(
-                    "The operation added files with version {}.  However, the data storage version is {}.",
-                    actual_file_version, data_storage_version
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "The operation added files with version {}.  However, the data storage version is {}.",
+                actual_file_version, data_storage_version
+            )));
         }
     }
     Ok(())
@@ -506,9 +498,8 @@ pub(crate) async fn migrate_fragments(
                             object_store
                                 .size(&dataset.base.child("data").child(file.path.clone()))
                                 .map_ok(|size| {
-                                    NonZero::new(size).ok_or_else(|| Error::Internal {
-                                        message: format!("File {} has size 0", file.path),
-                                        location: location!(),
+                                    NonZero::new(size).ok_or_else(|| {
+                                        Error::internal(format!("File {} has size 0", file.path))
                                     })
                                 })
                                 .await?
@@ -586,7 +577,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 && !is_system_index(index)
         {
             debug_assert_eq!(index.fields.len(), 1);
-            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
+            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
                 .open_generic_index(
@@ -732,15 +723,14 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    Err(crate::Error::CommitConflict {
-        version: 0,
-        source: format!(
+    Err(crate::Error::commit_conflict_source(
+        0,
+        format!(
             "Failed find unused random u64 after {} retries.",
             commit_config.num_retries
         )
         .into(),
-        location: location!(),
-    })
+    ))
 }
 
 pub(crate) async fn commit_detached_transaction(
@@ -853,7 +843,9 @@ pub(crate) async fn commit_transaction(
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
-            return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+            return Err(Error::internal(
+                "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
+            ));
         }
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
@@ -977,15 +969,14 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    Err(crate::Error::CommitConflict {
-        version: target_version,
-        source: format!(
+    Err(crate::Error::commit_conflict_source(
+        target_version,
+        format!(
             "Failed to commit the transaction after {} retries.",
             commit_config.num_retries
         )
         .into(),
-        location: location!(),
-    })
+    ))
 }
 
 #[cfg(test)]

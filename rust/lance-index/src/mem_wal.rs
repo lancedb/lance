@@ -11,7 +11,6 @@ use lance_core::Error;
 use lance_table::format::pb;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use uuid::Uuid;
 
 use crate::{Index, IndexType};
@@ -391,10 +390,9 @@ impl Index for MemWalIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> lance_core::Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "MemWalIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "MemWalIndex is not a vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> lance_core::Result<serde_json::Value> {
@@ -405,9 +403,11 @@ impl Index for MemWalIndex {
             num_maintained_indexes: self.details.maintained_indexes.len(),
             num_index_catchup_entries: self.details.index_catchup.len(),
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize MemWAL index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize MemWAL index statistics: {}",
+                e
+            ))
         })
     }
 

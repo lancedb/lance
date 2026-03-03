@@ -14,7 +14,6 @@ use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, ROW_ID, Result};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
-use snafu::location;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -216,9 +215,8 @@ impl RetryExecutor for DeleteJob {
                     }
 
                     // Extract the row addresses from the receiver
-                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-                        message: format!("Failed to receive row ids: {}", err),
-                        location: location!(),
+                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
+                        Error::internal(format!("Failed to receive row ids: {}", err))
                     })?;
                     let row_id_index = get_row_id_index(&self.dataset).await?;
                     let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());

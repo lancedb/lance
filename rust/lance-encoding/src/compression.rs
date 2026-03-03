@@ -37,7 +37,7 @@ use crate::{
                 GeneralBlockDecompressor,
             },
             byte_stream_split::{
-                should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
+                ByteStreamSplitDecompressor, ByteStreamSplitEncoder, should_use_bss,
             },
             constant::ConstantDecompressor,
             fsst::{
@@ -56,8 +56,8 @@ use crate::{
         },
     },
     format::{
-        pb21::{compressive_encoding::Compression, CompressiveEncoding},
         ProtobufUtils21,
+        pb21::{CompressiveEncoding, compressive_encoding::Compression},
     },
     statistics::{GetStat, Stat},
     version::LanceFileVersion,
@@ -66,8 +66,7 @@ use crate::{
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
-use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
-use snafu::location;
+use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
@@ -555,14 +554,13 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // sophisticated approach.
                 Ok(Box::new(ValueEncoder::default()))
             }
-            _ => Err(Error::NotSupported {
-                source: format!(
+            _ => Err(Error::not_supported_source(
+                format!(
                     "Mini-block compression not yet supported for block type {}",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 
@@ -585,17 +583,16 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 let has_variable_child = struct_block.has_variable_width_child();
                 if has_variable_child {
                     if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::NotSupported {
-                            source: "Variable packed struct encoding requires Lance file version 2.2 or later".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
                     }
                     Ok(Box::new(PackedStructVariablePerValueEncoder::new(
                         self.clone(),
                         field.children.clone(),
                     )))
                 } else {
-                    Err(Error::invalid_input("Packed struct per-value compression should not be used for fixed-width-only structs"))
+                    Err(Error::invalid_input(
+                        "Packed struct per-value compression should not be used for fixed-width-only structs",
+                    ))
                 }
             }
             DataBlock::VariableWidth(variable_width) => {
@@ -635,7 +632,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         Ok(variable_compression)
                     }
                 } else {
-                    panic!("Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width.bits_per_offset);
+                    panic!(
+                        "Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.",
+                        variable_width.bits_per_offset
+                    );
                 }
             }
             _ => unreachable!(
@@ -766,10 +766,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             #[cfg(not(feature = "bitpacking"))]
-            Compression::InlineBitpacking(_) => Err(Error::NotSupported {
-                source: "this runtime was not built with bitpacking support".into(),
-                location: location!(),
-            }),
+            Compression::InlineBitpacking(_) => Err(Error::not_supported_source(
+                "this runtime was not built with bitpacking support".into(),
+            )),
             Compression::Variable(variable) => {
                 let Compression::Flat(offsets) = variable
                     .offsets
@@ -798,10 +797,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedWidthMiniBlockDecompressor::new(description),
             )),
-            Compression::VariablePackedStruct(_) => Err(Error::NotSupported {
-                source: "variable packed struct decoding is not yet implemented".into(),
-                location: location!(),
-            }),
+            Compression::VariablePackedStruct(_) => Err(Error::not_supported_source(
+                "variable packed struct decoding is not yet implemented".into(),
+            )),
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
@@ -884,15 +882,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 assert!(offsets.bits_per_value < u8::MAX as u64);
                 Ok(Box::new(VariableDecoder::default()))
             }
-            Compression::Fsst(ref fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
+            Compression::Fsst(fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::General(ref general) => {
-                Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                    general.compression.as_ref().expect_ok()?.scheme(),
-                )?))
-            }
+            Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                general.compression.as_ref().expect_ok()?.scheme(),
+            )?)),
             Compression::VariablePackedStruct(description) => {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
@@ -969,10 +965,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 {
                     Compression::Flat(flat) => flat.bits_per_value,
                     _ => {
-                        return Err(Error::InvalidInput {
-                            location: location!(),
-                            source: "OutOfLineBitpacking values must use Flat encoding".into(),
-                        })
+                        return Err(Error::invalid_input_source(
+                            "OutOfLineBitpacking values must use Flat encoding".into(),
+                        ));
                     }
                 };
                 Ok(Box::new(OutOfLineBitpacking::new(

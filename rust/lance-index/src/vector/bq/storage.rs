@@ -24,7 +24,6 @@ use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
@@ -125,22 +124,16 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
     }
 
     async fn load(reader: &PreviousFileReader) -> Result<Self> {
-        let metadata_str =
-            reader
-                .schema()
-                .metadata
-                .get(RABIT_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!(
-                        "Reading Rabit metadata: metadata key {} not found",
-                        RABIT_METADATA_KEY
-                    ),
-                    location: location!(),
-                })?;
-        serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-            message: format!("Failed to parse index metadata: {}", metadata_str),
-            location: location!(),
-        })
+        let metadata_str = reader
+            .schema()
+            .metadata
+            .get(RABIT_METADATA_KEY)
+            .ok_or(Error::index(format!(
+                "Reading Rabit metadata: metadata key {} not found",
+                RABIT_METADATA_KEY
+            )))?;
+        serde_json::from_str(metadata_str)
+            .map_err(|_| Error::index(format!("Failed to parse index metadata: {}", metadata_str)))
     }
 }
 

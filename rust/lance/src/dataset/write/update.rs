@@ -30,7 +30,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
-use snafu::{ResultExt, location};
+use snafu::ResultExt;
 
 /// Build an update operation.
 ///
@@ -110,14 +110,13 @@ impl UpdateBuilder {
         // TODO: support nested column references. This is mostly blocked on the
         // ability to insert them into the RecordBatch properly.
         if column.as_ref().contains('.') {
-            return Err(Error::NotSupported {
-                source: format!(
+            return Err(Error::not_supported_source(
+                format!(
                     "Nested column references are not yet supported. Referenced: {}",
                     column.as_ref(),
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
 
         let schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
@@ -272,10 +271,10 @@ impl UpdateJob {
 
         let expected_schema = self.dataset.schema().into();
         if schema.as_ref() != &expected_schema {
-            return Err(Error::Internal {
-                message: format!("Expected schema {:?} but got {:?}", expected_schema, schema),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Expected schema {:?} but got {:?}",
+                expected_schema, schema
+            )));
         }
 
         let updates_ref = self.updates.clone();
@@ -308,10 +307,9 @@ impl UpdateJob {
         )
         .await?;
 
-        let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
+        let removed_row_ids = row_id_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
             let fragment_sizes = new_fragments
@@ -322,12 +320,11 @@ impl UpdateJob {
                 fragment_sizes,
                 false,
             )
-            .map_err(|e| Error::Internal {
-                message: format!(
+            .map_err(|e| {
+                Error::internal(format!(
                     "Captured row ids not equal to number of rows written: {}",
                     e
-                ),
-                location: location!(),
+                ))
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);

@@ -45,32 +45,31 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use super::ManifestWriteConfig;
+use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
+use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
-    rowids::{write_row_ids, RowIdSequence},
+    rowids::{RowIdSequence, write_row_ids},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::cmp::Ordering;
 use std::{
     collections::{HashMap, HashSet},
@@ -1507,7 +1506,10 @@ impl Transaction {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested {
                 if user_requested != file_version {
-                    return Err(Error::invalid_input(format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version)));
+                    return Err(Error::invalid_input(format!(
+                        "User requested data storage version ({}) does not match version in data files ({})",
+                        user_requested, file_version
+                    )));
                 }
             }
             Ok(DataStorageFormat::new(file_version))
@@ -1556,10 +1558,9 @@ impl Transaction {
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
-            return Err(Error::NotSupported {
-                source: "Cannot enable stable row ids on existing dataset".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                "Cannot enable stable row ids on existing dataset".into(),
+            ));
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -1587,7 +1588,9 @@ impl Transaction {
             } else {
                 // OVERWRITE mode with initial_bases should have been rejected by validation
                 // This branch should never be reached
-                return Err(Error::invalid_input("OVERWRITE mode cannot register new bases. This should have been caught by validation."));
+                return Err(Error::invalid_input(
+                    "OVERWRITE mode cannot register new bases. This should have been caught by validation.",
+                ));
             }
         }
 
@@ -1600,10 +1603,9 @@ impl Transaction {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
                 } else {
-                    return Err(Error::Internal {
-                        message: "Cannot create a new dataset without a schema".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(
+                        "Cannot create a new dataset without a schema".to_string(),
+                    ));
                 }
             }
         };
@@ -1628,10 +1630,9 @@ impl Transaction {
                 (None, true) => Some(0),
                 (_, false) => None,
                 (Some(_), true) => {
-                    return Err(Error::NotSupported {
-                        source: "Cannot enable stable row ids on existing dataset".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(
+                        "Cannot enable stable row ids on existing dataset".into(),
+                    ));
                 }
             }
         };
@@ -1639,22 +1640,20 @@ impl Transaction {
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
+                .ok_or_else(|| {
+                    Error::internal(format!(
                         "No current manifest was provided while building manifest for operation {}",
                         self.operation.name()
-                    ),
-                    location: location!(),
+                    ))
                 });
 
         match &self.operation {
             Operation::Clone { .. } => {
-                return Err(Error::Internal {
-                    message: "Clone operation should not enter build_manifest.".to_string(),
-                    location: location!(),
-                })
+                return Err(Error::internal(
+                    "Clone operation should not enter build_manifest.".to_string(),
+                ));
             }
-            Operation::Append { ref fragments } => {
+            Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
@@ -1673,8 +1672,8 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
             }
             Operation::Delete {
-                ref updated_fragments,
-                ref deleted_fragment_ids,
+                updated_fragments,
+                deleted_fragment_ids,
                 ..
             } => {
                 // Remove the deleted fragments
@@ -1844,12 +1843,11 @@ impl Transaction {
                                 lance_table::format::RowDatasetVersionMeta::from_sequence(
                                     &created_at_seq,
                                 )
-                                .map_err(|e| Error::Internal {
-                                    message: format!(
+                                .map_err(|e| {
+                                    Error::internal(format!(
                                         "Failed to create created_at version metadata: {}",
                                         e
-                                    ),
-                                    location: location!(),
+                                    ))
                                 })?,
                             );
 
@@ -1914,7 +1912,7 @@ impl Transaction {
                     )?;
                 }
             }
-            Operation::Overwrite { ref fragments, .. } => {
+            Operation::Overwrite { fragments, .. } => {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
@@ -1933,9 +1931,9 @@ impl Transaction {
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
-                ref frag_reuse_index,
+                groups,
+                rewritten_indices,
+                frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -1983,7 +1981,7 @@ impl Transaction {
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
-            Operation::Merge { ref fragments, .. } => {
+            Operation::Merge { fragments, .. } => {
                 final_fragments.extend(fragments.clone());
 
                 // Some fields that have indices may have been removed, so we should
@@ -2015,7 +2013,9 @@ impl Transaction {
                 unreachable!()
             }
             Operation::DataReplacement { replacements } => {
-                log::warn!("Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution.");
+                log::warn!(
+                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
+                );
 
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
                     .iter()
@@ -2105,7 +2105,9 @@ impl Transaction {
 
                     // Nothing changed in the current fragment, which is not expected -- error out
                     if &new_frag == frag {
-                        return Err(Error::invalid_input("Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions"));
+                        return Err(Error::invalid_input(
+                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
+                        ));
                     }
                     final_fragments.push(new_frag);
                 }
@@ -2237,10 +2239,9 @@ impl Transaction {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
                     } else {
-                        return Err(Error::InvalidInput {
-                            source: format!("Field with id {} does not exist", field_id).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            format!("Field with id {} does not exist", field_id).into(),
+                        ));
                     }
                 }
             }
@@ -2503,7 +2504,9 @@ impl Transaction {
                     }
                     new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
                 } else {
-                    return Err(Error::invalid_input("The compaction plan included a rewrite group that was a split of indexed and non-indexed data"));
+                    return Err(Error::invalid_input(
+                        "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
+                    ));
                 }
             }
         }
@@ -2519,7 +2522,10 @@ impl Transaction {
 
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
-                return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id)));
+                return Err(Error::invalid_input(format!(
+                    "An invalid compaction plan must have been generated because multiple tasks modified the same index: {}",
+                    rewritten_index.old_id
+                )));
             }
 
             // Skip indices that no longer exist (may have been removed by concurrent operation)
@@ -2554,9 +2560,21 @@ impl Transaction {
         for group in groups {
             // If the old fragments are contiguous, find the range
             let replace_range = {
-                let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| Error::CommitConflict { version, source:
-                    format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() , location:location!()})?.0;
+                let start = final_fragments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.id == group.old_fragments[0].id)
+                    .ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            version,
+                            format!(
+                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                                group.old_fragments[0].id
+                            )
+                            .into(),
+                        )
+                    })?
+                    .0;
 
                 // Verify old_fragments matches contiguous range
                 let mut i = 1;
@@ -2597,10 +2615,10 @@ impl Transaction {
         let mut pure_update_frag_ids = Vec::new();
 
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if let Some(row_id_meta) = &fragment.row_id_meta {
                 let existing_row_count = match row_id_meta {
@@ -2624,10 +2642,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if fragment.row_id_meta.is_some() {
                 // we may meet merge insert case, it only has partial row ids.
@@ -2659,11 +2677,9 @@ impl Transaction {
                         let combined_sequence = match &fragment.row_id_meta {
                             Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
                             _ => {
-                                return Err(Error::Internal {
-                                    message: "Failed to deserialize existing row ID sequence"
-                                        .into(),
-                                    location: location!(),
-                                })
+                                return Err(Error::internal(
+                                    "Failed to deserialize existing row ID sequence",
+                                ));
                             }
                         };
 
@@ -2679,13 +2695,10 @@ impl Transaction {
                     }
                     Ordering::Greater => {
                         // More row IDs than physical rows - this shouldn't happen
-                        return Err(Error::Internal {
-                            message: format!(
-                                "Fragment has more row IDs ({}) than physical rows ({})",
-                                existing_row_count, physical_rows
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(format!(
+                            "Fragment has more row IDs ({}) than physical rows ({})",
+                            existing_row_count, physical_rows
+                        )));
                     }
                 }
             } else {
@@ -2911,10 +2924,9 @@ impl TryFrom<pb::Transaction> for Transaction {
 
                 // Error if both are present
                 if has_new_fields && has_old_fields {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot mix old and new style UpdateConfig fields".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "Cannot mix old and new style UpdateConfig fields".into(),
+                    ));
                 }
 
                 if has_old_fields {
@@ -2999,10 +3011,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
             None => {
-                return Err(Error::Internal {
-                    message: "Transaction message did not contain an operation".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Transaction message did not contain an operation".to_string(),
+                ));
             }
         };
         Ok(Self {
@@ -3545,10 +3556,12 @@ mod tests {
         let empty_fragments = vec![];
         let result = merge_fragments_valid(&manifest, &empty_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 2: Missing original fragments should fail
         let missing_fragments = vec![
@@ -3559,10 +3572,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &missing_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing original fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing original fragments")
+        );
 
         // Test 3: Reduced fragment count should fail
         let reduced_fragments = vec![
@@ -3572,10 +3587,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &reduced_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 4: Valid merge with all original fragments plus new ones should succeed
         let valid_fragments = vec![
@@ -4123,9 +4140,11 @@ mod tests {
 
         // Should keep only non-empty indices
         assert_eq!(indices.len(), 2);
-        assert!(indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4));
+        assert!(
+            indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4)
+        );
     }
 
     #[test]
@@ -4293,9 +4312,11 @@ mod tests {
         // Verify idx_c kept non-empty only
         let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
         assert_eq!(idx_c_indices.len(), 2);
-        assert!(idx_c_indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3));
+        assert!(
+            idx_c_indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3)
+        );
 
         // Verify idx_d kept
         assert!(indices.iter().any(|idx| idx.name == "idx_d"));

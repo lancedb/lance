@@ -10,7 +10,6 @@ use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
-use snafu::location;
 use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -20,10 +19,7 @@ pub async fn load_row_id_sequence(
 ) -> Result<Arc<RowIdSequence>> {
     // Virtual path to prevent collisions in the cache.
     match &fragment.row_id_meta {
-        None => Err(Error::Internal {
-            message: "Missing row id meta".into(),
-            location: location!(),
-        }),
+        None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {

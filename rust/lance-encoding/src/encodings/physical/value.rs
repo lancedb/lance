@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_buffer::{BooleanBufferBuilder, bit_util};
-use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{
@@ -473,14 +472,13 @@ impl MiniBlockCompressor for ValueEncoder {
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
             DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
                     chunk.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }

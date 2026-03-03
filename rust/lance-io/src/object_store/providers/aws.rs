@@ -23,7 +23,6 @@ use object_store::{
         AwsCredentialProvider,
     },
 };
-use snafu::location;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -378,12 +377,10 @@ impl CredentialProvider for AwsCredentialAdapter {
                 token: creds.session_token().map(|s| s.to_string()),
             }))
         } else {
-            let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(
-                |e| Error::Internal {
-                    message: format!("Failed to get AWS credentials: {:?}", e),
-                    location: location!(),
-                },
-            )?);
+            let refreshed_creds =
+                Arc::new(self.inner.provide_credentials().await.map_err(|e| {
+                    Error::internal(format!("Failed to get AWS credentials: {:?}", e))
+                })?);
 
             self.cache
                 .write()

@@ -14,7 +14,6 @@ use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use snafu::location;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
@@ -604,22 +603,17 @@ impl IvfSubIndex for HNSW {
             return Ok(Self::empty());
         }
 
-        let hnsw_metadata =
-            data.schema_ref()
-                .metadata()
-                .get(HNSW_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", HNSW_METADATA_KEY),
-                    location: location!(),
-                })?;
-        let hnsw_metadata: HnswMetadata =
-            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
-                message: format!(
-                    "Failed to decode HNSW metadata: {}, json: {}",
-                    e, hnsw_metadata
-                ),
-                location: location!(),
-            })?;
+        let hnsw_metadata = data
+            .schema_ref()
+            .metadata()
+            .get(HNSW_METADATA_KEY)
+            .ok_or(Error::index(format!("{} not found", HNSW_METADATA_KEY)))?;
+        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {}, json: {}",
+                e, hnsw_metadata
+            ))
+        })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -705,10 +699,9 @@ impl IvfSubIndex for HNSW {
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
-            return Err(Error::Index {
-                message: "ef must be greater than or equal to k".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "ef must be greater than or equal to k".to_string(),
+            ));
         }
 
         let schema = VECTOR_RESULT_SCHEMA.clone();

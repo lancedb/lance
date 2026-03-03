@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::exec::{get_session_context, LanceExecutionOptions};
+use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
@@ -16,8 +16,8 @@ use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionState;
@@ -655,7 +655,9 @@ impl Planner {
                 Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
             // For example, DATE '2020-01-01'
-            SQLExpr::TypedString(TypedString { data_type, value, .. }) => {
+            SQLExpr::TypedString(TypedString {
+                data_type, value, ..
+            }) => {
                 let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
                     expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
@@ -694,7 +696,12 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value))),
+                    Some(value) => {
+                        return Err(Error::invalid_input(format!(
+                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
+                            value
+                        )));
+                    }
                     None => None,
                 },
                 true,
@@ -711,7 +718,12 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value))),
+                    Some(value) => {
+                        return Err(Error::invalid_input(format!(
+                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
+                            value
+                        )));
+                    }
                     None => None,
                 },
                 false,
@@ -762,7 +774,9 @@ impl Planner {
                         _ => {
                             // Handle other cases like JSON access
                             // Note: JSON access is not supported in lance
-                            return Err(Error::invalid_input("Only dot notation or index access is supported for field access"));
+                            return Err(Error::invalid_input(
+                                "Only dot notation or index access is supported for field access",
+                            ));
                         }
                     };
 
@@ -791,7 +805,9 @@ impl Planner {
                 ));
                 Ok(between)
             }
-            _ => Err(Error::invalid_input(format!("Expression '{expr}' is not supported SQL in lance"))),
+            _ => Err(Error::invalid_input(format!(
+                "Expression '{expr}' is not supported SQL in lance"
+            ))),
         }
     }
 
@@ -977,7 +993,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
-        logical_expr::{col, lit, Cast},
+        logical_expr::{Cast, col, lit},
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;

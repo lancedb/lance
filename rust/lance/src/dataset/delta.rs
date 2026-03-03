@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::transaction::Transaction;
-use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::Dataset;
 use crate::Result;
+use crate::dataset::scanner::DatasetRecordBatchStream;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
 use lance_core::ROW_CREATED_AT_VERSION;
 use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -162,7 +162,9 @@ impl DatasetDeltaBuilder {
                 ));
             }
             (None, None, None, None, None) => {
-                return Err(Error::invalid_input("Must specify either compared_against_version or both with_begin_version and with_end_version"));
+                return Err(Error::invalid_input(
+                    "Must specify either compared_against_version or both with_begin_version and with_end_version",
+                ));
             }
             _ => {
                 return Err(Error::invalid_input(
@@ -459,7 +461,7 @@ mod tests {
     use chrono::Duration;
     use futures::TryStreamExt;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use mock_instant::thread_local::MockClock;
     use std::sync::Arc;
 
@@ -1418,7 +1420,7 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // Created at version 1
             assert_eq!(updated_at[i], 2); // Updated at version 2
-                                          // Keys should be in range [0, 30) but excluding [10, 20)
+            // Keys should be in range [0, 30) but excluding [10, 20)
             assert!(keys[i] < 30);
             assert!(keys[i] < 10 || keys[i] >= 20);
         }

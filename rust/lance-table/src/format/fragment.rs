@@ -10,7 +10,6 @@ use lance_file::version::LanceFileVersion;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::format::pb;
 
@@ -141,7 +140,6 @@ impl DataFile {
                 return Err(Error::corrupt_file(
                     base_path.child(self.path.clone()),
                     "contained unsorted or duplicate field ids",
-                    location!(),
                 ));
             }
         } else if self.column_indices.len() < self.fields.len() {
@@ -150,7 +148,6 @@ impl DataFile {
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
                 "contained fewer column_indices than fields",
-                location!(),
             ));
         }
         Ok(())
@@ -222,10 +219,9 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             0 => DeletionFileType::Array,
             1 => DeletionFileType::Bitmap,
             _ => {
-                return Err(Error::NotSupported {
-                    source: "Unknown deletion file type".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Unknown deletion file type".into(),
+                ));
             }
         };
         let num_deleted_rows = if value.num_deleted_rows == 0 {

@@ -29,7 +29,6 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuf
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -652,10 +651,10 @@ impl StructDataBlock {
                 Ok(unsafe { builder.build_unchecked() })
             }
         } else {
-            Err(Error::Internal {
-                message: format!("Expected Struct, got {:?}", data_type),
-                location: location!(),
-            })
+            Err(Error::internal(format!(
+                "Expected Struct, got {:?}",
+                data_type
+            )))
         }
     }
 
@@ -734,13 +733,10 @@ impl DictionaryDataBlock {
             16 => self.decode_helper::<UInt16Type>(),
             32 => self.decode_helper::<UInt32Type>(),
             64 => self.decode_helper::<UInt64Type>(),
-            _ => Err(lance_core::Error::Internal {
-                message: format!(
-                    "Unsupported dictionary index bit width: {} bits",
-                    self.indices.bits_per_value
-                ),
-                location: location!(),
-            }),
+            _ => Err(lance_core::Error::internal(format!(
+                "Unsupported dictionary index bit width: {} bits",
+                self.indices.bits_per_value
+            ))),
         }
     }
 
@@ -834,10 +830,9 @@ impl DataBlock {
             Self::VariableWidth(inner) => inner.into_arrow(data_type, validate),
             Self::Struct(inner) => inner.into_arrow(data_type, validate),
             Self::Dictionary(inner) => inner.into_arrow(data_type, validate),
-            Self::Opaque(_) => Err(Error::Internal {
-                message: "Cannot convert OpaqueBlock to Arrow".to_string(),
-                location: location!(),
-            }),
+            Self::Opaque(_) => Err(Error::internal(
+                "Cannot convert OpaqueBlock to Arrow".to_string(),
+            )),
         }
     }
 

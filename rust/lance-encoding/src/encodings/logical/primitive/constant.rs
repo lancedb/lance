@@ -3,27 +3,26 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{new_empty_array, Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, new_empty_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::FutureExt;
-use snafu::location;
+use futures::future::BoxFuture;
 
 use lance_core::{
-    cache::{Context, DeepSizeOf},
     Error, Result,
+    cache::{Context, DeepSizeOf},
 };
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::PageEncoding,
     encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefUnraveler},
-    EncodingsIo,
 };
 
 pub(crate) fn encode_constant_page(
@@ -149,24 +148,24 @@ impl ConstantPageScheduler {
                 (None, 0) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: missing scalar source",
-                    ))
+                    ));
                 }
                 (None, 2) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: ambiguous (2 buffers and no inline_value)",
-                    ))
+                    ));
                 }
                 (Some(_), n) => {
                     return Err(Error::invalid_input(format!(
                         "Invalid constant layout: inline_value present with {} buffers",
                         n
-                    )))
+                    )));
                 }
                 (None, n) => {
                     return Err(Error::invalid_input(format!(
                         "Invalid constant layout: unexpected buffer count {}",
                         n
-                    )))
+                    )));
                 }
             };
 
@@ -352,16 +351,14 @@ impl ConstantPageDecoder {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: repetition buffer too short".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: repetition buffer too short",
+                ));
             }
             if rep[start] != self.max_rep {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: row did not start at max_rep".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: row did not start at max_rep",
+                ));
             }
             let mut end = start + 1;
             while end < rep.len() && rep[end] != self.max_rep {

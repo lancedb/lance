@@ -30,7 +30,6 @@ use lance_core::{
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -1151,10 +1150,9 @@ impl IndexExprResult {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
             2 => Ok(Self::AtLeast(mask)),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+            )),
         }
     }
 

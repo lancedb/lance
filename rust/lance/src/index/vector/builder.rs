@@ -9,48 +9,49 @@ use std::{collections::HashMap, pin::Pin};
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::{self};
-use arrow::datatypes::{Float16Type, Float64Type, UInt64Type, UInt8Type};
+use arrow::datatypes::{Float16Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::types::Float32Type;
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, PrimitiveArray,
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
+use futures::{FutureExt, stream};
 use futures::{
-    prelude::stream::{StreamExt, TryStreamExt},
     Stream,
+    prelude::stream::{StreamExt, TryStreamExt},
 };
-use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::ROW_ID;
 use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::ROW_ID;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
-use lance_index::vector::shared::{write_unified_ivf_and_index_metadata, SupportedIvfIndexType};
+use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{ivf::storage::IvfModel, PART_ID_FIELD};
-use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
+use lance_index::vector::{PART_ID_FIELD, ivf::storage::IvfModel};
 use lance_index::{
-    pb,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, pb,
     vector::{
-        ivf::{storage::IVF_METADATA_KEY, IvfBuildParams},
+        DISTANCE_TYPE_KEY,
+        ivf::{IvfBuildParams, storage::IVF_METADATA_KEY},
         quantizer::Quantization,
         storage::{StorageBuilder, VectorStore},
         transform::Transformer,
@@ -58,29 +59,26 @@ use lance_index::{
             shuffler::{ShuffleReader, Shuffler},
             subindex::IvfSubIndex,
         },
-        DISTANCE_TYPE_KEY,
     },
-    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{
-    IndexMetadata, IndexType, INDEX_METADATA_SCHEMA_KEY, MAX_PARTITION_SIZE_FACTOR,
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata, IndexType, MAX_PARTITION_SIZE_FACTOR,
     MIN_PARTITION_SIZE_PERCENT,
 };
 use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
-use lance_linalg::distance::{DistanceType, Dot, Normalize, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
-use snafu::location;
-use tracing::{instrument, span, Level};
+use tracing::{Level, instrument, span};
 
+use crate::Dataset;
 use crate::dataset::ProjectionRequest;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
-use crate::Dataset;
 
 use super::v2::IVFIndex;
 use super::{
@@ -313,29 +311,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].clone();
         let mapping = Arc::new(mapping.clone());
-        let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
-            let existing_index = existing_index.clone();
-            let mapping = mapping.clone();
-            async move {
-                let ivf_index = existing_index
-                    .as_any()
-                    .downcast_ref::<IVFIndex<S, Q>>()
-                    .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
-                    .await?;
-                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                    Error::Internal {
-                        message: "failed to downcast partition entry".to_string(),
-                        location: location!(),
-                    },
-                )?;
+        let build_iter =
+            (0..ivf.num_partitions()).map(move |part_id| {
+                let existing_index = existing_index.clone();
+                let mapping = mapping.clone();
+                async move {
+                    let ivf_index = existing_index
+                        .as_any()
+                        .downcast_ref::<IVFIndex<S, Q>>()
+                        .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                    let part = ivf_index
+                        .load_partition(part_id, false, &NoOpMetricsCollector)
+                        .await?;
+                    let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
+                        Error::internal("failed to downcast partition entry".to_string()),
+                    )?;
 
-                let storage = part.storage.remap(&mapping)?;
-                let index = part.index.remap(&mapping, &storage)?;
-                Result::Ok(Some((storage, index, 0.0)))
-            }
-        });
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    Result::Ok(Some((storage, index, 0.0)))
+                }
+            });
 
         self.merge_partitions(
             stream::iter(build_iter)

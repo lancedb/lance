@@ -1485,17 +1485,13 @@ impl<'a> TransactionRebase<'a> {
                         .unwrap()
                         .take(5)
                         .collect::<Vec<_>>();
-                    return Err(crate::Error::RetryableCommitConflict {
-                        version: dataset.manifest.version,
-                        source: format!(
-                            "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
-                            self.transaction.uuid,
-                            dataset.manifest.version,
-                            sample_addressed.as_slice()
-                        )
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(crate::Error::retryable_commit_conflict_source(dataset.manifest.version, format!(
+                        "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
+                        self.transaction.uuid,
+                        dataset.manifest.version,
+                        sample_addressed.as_slice()
+                    )
+                        .into()));
                 }
 
                 let merged = existing_deletions.clone() | affected_rows.clone();
@@ -1574,10 +1570,9 @@ impl<'a> TransactionRebase<'a> {
                 })
             } else {
                 // We shouldn't hit this.
-                Err(crate::Error::Internal {
-                    message: "We have a transaction that needs to be rebased, but we don't have any affected rows.".into(),
-                    location: location!(),
-                })
+                Err(crate::Error::internal(
+                    "We have a transaction that needs to be rebased, but we don't have any affected rows.",
+                ))
             }
         } else {
             Ok(Transaction {
@@ -1789,10 +1784,7 @@ async fn initial_fragments_for_rebase(
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {
-    Error::Internal {
-        message: format!("function called against a wrong operation: {}", op),
-        location: location!(),
-    }
+    Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
 #[cfg(test)]

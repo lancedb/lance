@@ -36,7 +36,6 @@ use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
-use snafu::location;
 use {
     lance_linalg::distance::{
         Dot,
@@ -1363,12 +1362,9 @@ where
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(Error::Unprocessable {
-            message: format!(
-                "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
-            ),
-            location: location!(),
-        });
+        return Err(Error::unprocessable(format!(
+            "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
+        )));
     }
 
     // Only sample sample_rate * num_clusters. See Faiss

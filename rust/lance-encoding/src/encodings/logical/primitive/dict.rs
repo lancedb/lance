@@ -20,7 +20,6 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
 use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -100,15 +99,14 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
             DataType::Int16 => normalize_dict_nulls_impl::<Int16Type>(array),
             DataType::Int32 => normalize_dict_nulls_impl::<Int32Type>(array),
             DataType::Int64 => normalize_dict_nulls_impl::<Int64Type>(array),
-            _ => Err(Error::NotSupported {
-                source: format!("Unsupported dictionary key type: {}", key_type).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::not_supported_source(
+                format!("Unsupported dictionary key type: {}", key_type).into(),
+            )),
         },
-        _ => Err(Error::Internal {
-            message: format!("Data type is not a dictionary: {}", array.data_type()),
-            location: location!(),
-        }),
+        _ => Err(Error::internal(format!(
+            "Data type is not a dictionary: {}",
+            array.data_type()
+        ))),
     }
 }
 

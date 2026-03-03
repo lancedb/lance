@@ -8,22 +8,22 @@ use crate::aggregate::Aggregate;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    from_substrait_agg_func, from_substrait_rex, from_substrait_sorts, DefaultSubstraitConsumer,
+    DefaultSubstraitConsumer, from_substrait_agg_func, from_substrait_rex, from_substrait_sorts,
 };
 use datafusion_substrait::substrait::proto::{
+    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
     expression::{
+        RexType,
         field_reference::{ReferenceType, RootType},
-        reference_segment, RexType,
+        reference_segment,
     },
     expression_reference::ExprType,
     function_argument::ArgType,
-    r#type::{Kind, Struct},
     rel::RelType,
-    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
+    r#type::{Kind, Struct},
 };
 use lance_core::{Error, Result};
 use prost::Message;
-use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,10 +103,7 @@ fn remove_extension_types(
 ) -> Result<(NamedStruct, Arc<ArrowSchema>, HashMap<usize, usize>)> {
     let fields = substrait_schema.r#struct.as_ref().unwrap();
     if fields.types.len() != arrow_schema.fields.len() {
-        return Err(Error::InvalidInput {
-            source: "the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source("the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into()));
     }
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
@@ -244,7 +241,9 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                                 if let Some(new_index) = mapping.get(&(field.field as usize)) {
                                     field.field = *new_index as i32;
                                 } else {
-                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion"));
+                                    return Err(Error::invalid_input(
+                                        "pushdown filter referenced a field that is not yet supported by Substrait conversion",
+                                    ));
                                 }
                                 Ok(())
                             }
@@ -269,31 +268,27 @@ pub async fn parse_substrait(
 ) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
-        return Err(Error::InvalidInput {
-            source: "the provided substrait expression is empty (contains no expressions)".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            "the provided substrait expression is empty (contains no expressions)".into(),
+        ));
     }
     if envelope.referred_expr.len() > 1 {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "the provided substrait expression had {} expressions when only 1 was expected",
                 envelope.referred_expr.len()
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
     let mut expr = match &envelope.referred_expr[0].expr_type {
-        None => Err(Error::InvalidInput {
-            source: "the provided substrait had an expression but was missing an expr_type".into(),
-            location: location!(),
-        }),
+        None => Err(Error::invalid_input_source(
+            "the provided substrait had an expression but was missing an expr_type".into(),
+        )),
         Some(ExprType::Expression(expr)) => Ok(expr.clone()),
-        _ => Err(Error::InvalidInput {
-            source: "the provided substrait was not a scalar expression".into(),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input_source(
+            "the provided substrait was not a scalar expression".into(),
+        )),
     }?;
 
     // The Substrait may have come from a producer that uses extension types that DF doesn't support (e.g.
@@ -546,21 +541,21 @@ mod tests {
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
+        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
+        Version,
         expression::{
+            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
             field_reference::{ReferenceType, RootReference, RootType},
             literal::LiteralType,
             reference_segment::{self, StructField},
-            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
         },
         expression_reference::ExprType,
         extensions::{
-            simple_extension_declaration::{ExtensionFunction, MappingType},
             SimpleExtensionDeclaration, SimpleExtensionUri, SimpleExtensionUrn,
+            simple_extension_declaration::{ExtensionFunction, MappingType},
         },
         function_argument::ArgType,
-        r#type::{Boolean, Kind, Nullability, Struct, I32},
-        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
-        Version,
+        r#type::{Boolean, I32, Kind, Nullability, Struct},
     };
     use prost::Message;
 
@@ -859,10 +854,10 @@ mod tests {
     // ==================== Aggregate parsing tests ====================
 
     use datafusion_substrait::substrait::proto::{
+        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
         aggregate_function::AggregationInvocation,
         aggregate_rel::{Grouping, Measure},
         rel::RelType,
-        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
     };
 
     /// Helper to create a field reference expression for a column index

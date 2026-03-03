@@ -11,7 +11,6 @@ use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
-use snafu::location;
 
 use crate::{
     Dataset, Error, Result,
@@ -253,11 +252,10 @@ impl<'a> CommitBuilder<'a> {
                 Operation::Overwrite { .. } | Operation::Clone { .. }
             )
         {
-            return Err(Error::DatasetNotFound {
-                path: base_path.to_string(),
-                source: "The dataset must already exist unless the operation is Overwrite".into(),
-                location: location!(),
-            });
+            return Err(Error::dataset_not_found(
+                base_path.to_string(),
+                "The dataset must already exist unless the operation is Overwrite".into(),
+            ));
         }
 
         // Validate the operation before proceeding with the commit
@@ -298,14 +296,11 @@ impl<'a> CommitBuilder<'a> {
             if ds.manifest.data_storage_format != passed_storage_format
                 && !matches!(transaction.operation, Operation::Overwrite { .. })
             {
-                return Err(Error::InvalidInput {
-                        source: format!(
-                            "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                            ds.manifest.data_storage_format,
-                            passed_storage_format
-                        ).into(),
-                        location: location!(),
-                    });
+                return Err(Error::invalid_input_source(format!(
+                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
+                    ds.manifest.data_storage_format,
+                    passed_storage_format
+                ).into()));
             }
         }
 
@@ -318,10 +313,9 @@ impl<'a> CommitBuilder<'a> {
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
-                    return Err(Error::NotSupported {
-                        source: "detached commits cannot be used with v1 manifest paths".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(
+                        "detached commits cannot be used with v1 manifest paths".into(),
+                    ));
                 }
                 commit_detached_transaction(
                     dataset,
@@ -347,10 +341,9 @@ impl<'a> CommitBuilder<'a> {
             }
         } else if self.detached {
             // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
-            return Err(Error::NotSupported {
-                source: "detached commits cannot currently be used to create new datasets".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                "detached commits cannot currently be used to create new datasets".into(),
+            ));
         } else {
             commit_new_dataset(
                 object_store.as_ref(),
@@ -423,19 +416,17 @@ impl<'a> CommitBuilder<'a> {
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
         if transactions.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "No transactions to commit".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "No transactions to commit".into(),
+            ));
         }
         if transactions
             .iter()
             .any(|t| !matches!(t.operation, Operation::Append { .. }))
         {
-            return Err(Error::NotSupported {
-                source: "Only append transactions are supported in batch commits".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                "Only append transactions are supported in batch commits".into(),
+            ));
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();

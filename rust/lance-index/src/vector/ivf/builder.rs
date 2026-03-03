@@ -10,7 +10,6 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
-use snafu::location;
 
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
@@ -99,14 +98,11 @@ impl IvfBuildParams {
         centroids: Arc<FixedSizeListArray>,
     ) -> Result<Self> {
         if num_partitions != centroids.len() {
-            return Err(Error::Index {
-                message: format!(
-                    "IvfBuildParams::try_with_centroids: num_partitions {} != centroids.len() {}",
-                    num_partitions,
-                    centroids.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "IvfBuildParams::try_with_centroids: num_partitions {} != centroids.len() {}",
+                num_partitions,
+                centroids.len()
+            )));
         }
         Ok(Self {
             num_partitions: Some(num_partitions),

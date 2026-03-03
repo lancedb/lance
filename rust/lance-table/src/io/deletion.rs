@@ -17,7 +17,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{ResultExt, location};
+use snafu::ResultExt;
 use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType};
@@ -156,10 +156,7 @@ pub async fn read_deletion_file(
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path: path.clone(),
-                    location: location!(),
-                })?;
+                .context(CorruptFileSnafu { path: path.clone() })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -168,7 +165,6 @@ pub async fn read_deletion_file(
                         "Expected exactly one batch in deletion file, got {}",
                         batches.len()
                     ),
-                    location!(),
                 ));
             }
 
@@ -181,7 +177,6 @@ pub async fn read_deletion_file(
                         deletion_arrow_schema(),
                         batch.schema()
                     ),
-                    location!(),
                 ));
             }
 
@@ -198,7 +193,6 @@ pub async fn read_deletion_file(
                     return Err(Error::corrupt_file(
                         path,
                         "Null values are not allowed in deletion files",
-                        location!(),
                     ));
                 }
             }
@@ -213,10 +207,7 @@ pub async fn read_deletion_file(
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path,
-                    location: location!(),
-                })?;
+                .context(CorruptFileSnafu { path })?;
 
             Ok(DeletionVector::Bitmap(bitmap))
         }
