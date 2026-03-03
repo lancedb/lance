@@ -1116,7 +1116,9 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
         // 2MiB
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        }
 
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
@@ -1162,7 +1164,9 @@ mod tests {
             }
         }
 
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        }
     }
 
     #[tokio::test]

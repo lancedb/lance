@@ -1026,12 +1026,12 @@ impl RowSetOps for RowIdSet {
         let mut inner = RoaringTreemap::new();
         let mut last: Option<u64> = None;
         for value in iter {
-            if let Some(prev) = last {
-                if value < prev {
-                    return Err(Error::internal(
-                        "RowIdSet::from_sorted_iter called with non-sorted input",
-                    ));
-                }
+            if let Some(prev) = last
+                && value < prev
+            {
+                return Err(Error::internal(
+                    "RowIdSet::from_sorted_iter called with non-sorted input",
+                ));
             }
             inner.insert(value);
             last = Some(value);
