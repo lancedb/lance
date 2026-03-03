@@ -3146,6 +3146,12 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p = p.with_target_base_names_or_paths(target_bases_list);
         }
 
+        if let Some(allow_external) =
+            get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
+        {
+            p = p.with_allow_external_blob_outside_bases(allow_external);
+        }
+
         // Handle properties
         if let Some(props) =
             get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?

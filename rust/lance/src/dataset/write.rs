@@ -27,14 +27,16 @@ use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::dataset::blob::{BlobPreprocessor, preprocess_blob_batches};
+use crate::dataset::blob::{
+    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, preprocess_blob_batches,
+};
 use crate::session::Session;
 
 use super::DATA_DIR;
@@ -244,6 +246,10 @@ pub struct WriteParams {
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// Allow writing external blob URIs that cannot be mapped to any registered
+    /// non-dataset-root base path. When disabled, such rows are rejected.
+    pub allow_external_blob_outside_bases: bool,
 }
 
 impl Default for WriteParams {
@@ -268,6 +274,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            allow_external_blob_outside_bases: false,
         }
     }
 }
@@ -346,6 +353,14 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Configure whether external blobs outside registered bases are allowed.
+    pub fn with_allow_external_blob_outside_bases(self, allow: bool) -> Self {
+        Self {
+            allow_external_blob_outside_bases: allow,
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -370,6 +385,7 @@ pub async fn write_fragments(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn do_write_fragments(
+    dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -392,12 +408,24 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
+    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
+        && schema.fields.iter().any(|field| field.is_blob_v2())
+    {
+        Some(Arc::new(
+            build_external_base_resolver(dataset, &params).await?,
+        ))
+    } else {
+        None
+    };
+
     let writer_generator = WriterGenerator::new(
         object_store,
         base_dir,
         schema,
         storage_version,
         target_bases_info,
+        external_base_resolver,
+        params.allow_external_blob_outside_bases,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -541,6 +569,98 @@ pub async fn validate_and_resolve_target_bases(
     }
 }
 
+fn append_external_base_candidate(
+    base_path: &BasePath,
+    store_prefix: String,
+    extracted_path: Path,
+    candidates: &mut Vec<ExternalBaseCandidate>,
+    seen_base_ids: &mut HashSet<u32>,
+) {
+    if base_path.is_dataset_root {
+        return;
+    }
+    if seen_base_ids.insert(base_path.id) {
+        candidates.push(ExternalBaseCandidate {
+            base_id: base_path.id,
+            store_prefix,
+            base_path: extracted_path,
+        });
+    }
+}
+
+async fn append_external_initial_bases(
+    initial_bases: Option<&Vec<BasePath>>,
+    store_registry: Arc<ObjectStoreRegistry>,
+    store_params: &ObjectStoreParams,
+    candidates: &mut Vec<ExternalBaseCandidate>,
+    seen_base_ids: &mut HashSet<u32>,
+) -> Result<()> {
+    if let Some(initial_bases) = initial_bases {
+        for base_path in initial_bases {
+            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+                store_registry.clone(),
+                &base_path.path,
+                store_params,
+            )
+            .await?;
+            append_external_base_candidate(
+                base_path,
+                store.store_prefix.clone(),
+                extracted_path,
+                candidates,
+                seen_base_ids,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn build_external_base_resolver(
+    dataset: Option<&Dataset>,
+    params: &WriteParams,
+) -> Result<ExternalBaseResolver> {
+    let store_registry = dataset
+        .map(|ds| ds.session.store_registry())
+        .unwrap_or_else(|| params.store_registry());
+    let store_params = params.store_params.clone().unwrap_or_default();
+
+    let mut seen_base_ids = HashSet::new();
+    let mut candidates = vec![];
+
+    if let Some(dataset) = dataset {
+        for base_path in dataset.manifest.base_paths.values() {
+            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+                store_registry.clone(),
+                &base_path.path,
+                &store_params,
+            )
+            .await?;
+            append_external_base_candidate(
+                base_path,
+                store.store_prefix.clone(),
+                extracted_path,
+                &mut candidates,
+                &mut seen_base_ids,
+            );
+        }
+    }
+
+    append_external_initial_bases(
+        params.initial_bases.as_ref(),
+        store_registry.clone(),
+        &store_params,
+        &mut candidates,
+        &mut seen_base_ids,
+    )
+    .await?;
+
+    Ok(ExternalBaseResolver::new(
+        candidates,
+        store_registry,
+        store_params,
+    ))
+}
+
 /// Writes the given data to the dataset and returns fragments.
 ///
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
@@ -643,6 +763,7 @@ pub async fn write_fragments_internal(
     }
 
     let fragments = do_write_fragments(
+        dataset,
         object_store,
         base_dir,
         &schema,
@@ -765,17 +886,41 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
-    open_writer_with_options(object_store, schema, base_dir, storage_version, true, None).await
+    open_writer_with_options(
+        object_store,
+        schema,
+        base_dir,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-pub async fn open_writer_with_options(
+#[derive(Default)]
+struct WriterOptions {
+    add_data_dir: bool,
+    base_id: Option<u32>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
+}
+
+async fn open_writer_with_options(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
-    add_data_dir: bool,
-    base_id: Option<u32>,
+    options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
+    let WriterOptions {
+        add_data_dir,
+        base_id,
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    } = options;
+
     let data_file_key = generate_random_filename();
     let filename = format!("{}.lance", data_file_key);
 
@@ -816,6 +961,8 @@ pub async fn open_writer_with_options(
                 data_dir.clone(),
                 data_file_key.clone(),
                 schema,
+                external_base_resolver,
+                allow_external_blob_outside_bases,
             ))
         } else {
             None
@@ -853,6 +1000,8 @@ struct WriterGenerator {
     storage_version: LanceFileVersion,
     /// Target base information (if writing to specific bases)
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -864,6 +1013,8 @@ impl WriterGenerator {
         schema: &Schema,
         storage_version: LanceFileVersion,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
     ) -> Self {
         Self {
             object_store,
@@ -871,6 +1022,8 @@ impl WriterGenerator {
             schema: schema.clone(),
             storage_version,
             target_bases_info,
+            external_base_resolver,
+            allow_external_blob_outside_bases,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -896,16 +1049,26 @@ impl WriterGenerator {
                 &self.schema,
                 &base_info.base_dir,
                 self.storage_version,
-                base_info.is_dataset_root,
-                Some(base_info.base_id),
+                WriterOptions {
+                    add_data_dir: base_info.is_dataset_root,
+                    base_id: Some(base_info.base_id),
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         } else {
-            open_writer(
+            open_writer_with_options(
                 &self.object_store,
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
+                WriterOptions {
+                    add_data_dir: true,
+                    base_id: None,
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         };
@@ -1538,6 +1701,8 @@ mod tests {
             &schema,
             LanceFileVersion::Stable,
             Some(target_bases),
+            None,
+            false,
         );
 
         // Create a writer
@@ -1581,8 +1746,10 @@ mod tests {
             &schema,
             &base_dir,
             LanceFileVersion::Stable,
-            false, // Don't add /data
-            None,
+            WriterOptions {
+                add_data_dir: false, // Don't add /data
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1648,6 +1815,8 @@ mod tests {
             &schema,
             LanceFileVersion::Stable,
             Some(target_bases),
+            None,
+            false,
         );
 
         // Create test batch

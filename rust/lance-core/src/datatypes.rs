@@ -401,10 +401,14 @@ pub enum BlobKind {
     Packed = 1,
     /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
     Dedicated = 2,
-    /// Not stored by Lance; `blob_uri` holds an absolute external URI.
+    /// Not stored by Lance data files.
     ///
-    /// External blobs can have a position and a size. Users can specify a range for an external blob.
-    /// If the position is not set, it defaults to 0, which points to the beginning of the blob.
+    /// For external blobs:
+    /// - `blob_id == 0` means `blob_uri` is an absolute external URI.
+    /// - `blob_id > 0` means `blob_uri` is a path relative to `manifest.base_paths[blob_id]`.
+    ///
+    /// External blobs can have a position and a size. If the position is not set,
+    /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
 }
 
