@@ -624,40 +624,39 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         // Write dictionary values.
         let max_field_id = schema.max_field_id().unwrap_or(-1);
         for field_id in 0..max_field_id + 1 {
-            if let Some(field) = schema.mut_field_by_id(field_id)
-                && field.data_type().is_dictionary()
-            {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                    // and wrap it in here.
-                    Error::io(format!("Lance field {} misses dictionary info", field.name))
-                })?;
+            if let Some(field) = schema.mut_field_by_id(field_id) {
+                if field.data_type().is_dictionary() {
+                    let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                        // and wrap it in here.
+                        Error::io(format!("Lance field {} misses dictionary info", field.name))
+                    })?;
 
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ))
-                })?;
+                    let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                        Error::invalid_input(format!(
+                                                "Lance field {} is dictionary type, but misses the dictionary value array",
+                                                field.name))
+                    })?;
 
-                let data_type = value_arr.data_type();
-                let pos = match data_type {
-                    dt if dt.is_numeric() => {
-                        let mut encoder = PlainEncoder::new(writer, dt);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    dt if dt.is_binary_like() => {
-                        let mut encoder = BinaryEncoder::new(writer);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    _ => {
-                        return Err(Error::schema(format!(
-                            "Does not support {} as dictionary value type",
-                            value_arr.data_type()
-                        )));
-                    }
-                };
-                dict_info.offset = pos;
-                dict_info.length = value_arr.len();
+                    let data_type = value_arr.data_type();
+                    let pos = match data_type {
+                        dt if dt.is_numeric() => {
+                            let mut encoder = PlainEncoder::new(writer, dt);
+                            encoder.encode(&[value_arr]).await?
+                        }
+                        dt if dt.is_binary_like() => {
+                            let mut encoder = BinaryEncoder::new(writer);
+                            encoder.encode(&[value_arr]).await?
+                        }
+                        _ => {
+                            return Err(Error::schema(format!(
+                                "Does not support {} as dictionary value type",
+                                value_arr.data_type()
+                            )));
+                        }
+                    };
+                    dict_info.offset = pos;
+                    dict_info.length = value_arr.len();
+                }
             }
         }
         Ok(())
