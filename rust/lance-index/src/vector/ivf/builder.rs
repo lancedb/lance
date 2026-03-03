@@ -15,6 +15,8 @@ use snafu::location;
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
 
+use super::PartitionComputer;
+
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
 pub struct IvfBuildParams {
@@ -57,6 +59,10 @@ pub struct IvfBuildParams {
 
     /// Storage options used to load precomputed partitions.
     pub storage_options: Option<HashMap<String, String>>,
+
+    /// Optional custom partition computer for IVF assignment.
+    /// When set, replaces the default brute-force/SimpleIndex computation.
+    pub partition_computer: Option<Arc<dyn PartitionComputer>>,
 }
 
 impl Default for IvfBuildParams {
@@ -73,6 +79,7 @@ impl Default for IvfBuildParams {
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
             storage_options: None,
+            partition_computer: None,
         }
     }
 }
@@ -113,6 +120,11 @@ impl IvfBuildParams {
             centroids: Some(centroids),
             ..Default::default()
         })
+    }
+
+    pub fn with_partition_computer(mut self, computer: Arc<dyn PartitionComputer>) -> Self {
+        self.partition_computer = Some(computer);
+        self
     }
 }
 

@@ -34,6 +34,8 @@ pub mod shuffler;
 pub mod storage;
 mod transform;
 
+pub use transform::PartitionComputer;
+
 /// Create an IVF from the flatten centroids.
 ///
 /// Parameters
@@ -89,6 +91,50 @@ pub fn new_ivf_transformer_with_quantizer(
     }
 }
 
+/// Like [`new_ivf_transformer_with_quantizer`] but with a custom partition computer.
+pub fn new_ivf_transformer_with_quantizer_and_computer(
+    centroids: FixedSizeListArray,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+    partition_computer: Arc<dyn PartitionComputer>,
+) -> Result<IvfTransformer> {
+    match quantizer {
+        Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat_with_computer(
+            centroids,
+            metric_type,
+            vector_column,
+            range,
+            partition_computer,
+        )),
+        Quantizer::Product(pq) => Ok(IvfTransformer::with_pq_and_computer(
+            centroids,
+            metric_type,
+            vector_column,
+            pq,
+            range,
+            partition_computer,
+        )),
+        Quantizer::Scalar(sq) => Ok(IvfTransformer::with_sq_and_computer(
+            centroids,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+            partition_computer,
+        )),
+        Quantizer::Rabit(rq) => Ok(IvfTransformer::with_rq_and_computer(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
+            range,
+            partition_computer,
+        )),
+    }
+}
+
 /// IVF - IVF file partition
 ///
 #[derive(Debug)]
@@ -119,10 +165,33 @@ impl IvfTransformer {
         }
     }
 
+    /// Build a `PartitionTransformer`, optionally using a custom `PartitionComputer`.
+    fn make_partition_transformer(
+        centroids: &FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
+    ) -> PartitionTransformer {
+        let pt = PartitionTransformer::new(centroids.clone(), distance_type, vector_column);
+        match partition_computer {
+            Some(computer) => pt.with_partition_computer(computer),
+            None => pt,
+        }
+    }
+
     pub fn new_partition_transformer(
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
+    ) -> Self {
+        Self::new_partition_transformer_impl(centroids, distance_type, vector_column, None)
+    }
+
+    fn new_partition_transformer_impl(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -137,10 +206,11 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        let partition_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
+        let partition_transform = Arc::new(Self::make_partition_transformer(
+            &centroids,
             distance_type,
             vector_column,
+            partition_computer,
         ));
         transforms.push(partition_transform);
         Self::new(centroids, distance_type, transforms)
@@ -151,6 +221,32 @@ impl IvfTransformer {
         distance_type: DistanceType,
         vector_column: &str,
         range: Option<Range<u32>>,
+    ) -> Self {
+        Self::new_flat_impl(centroids, distance_type, vector_column, range, None)
+    }
+
+    pub fn new_flat_with_computer(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        range: Option<Range<u32>>,
+        partition_computer: Arc<dyn PartitionComputer>,
+    ) -> Self {
+        Self::new_flat_impl(
+            centroids,
+            distance_type,
+            vector_column,
+            range,
+            Some(partition_computer),
+        )
+    }
+
+    fn new_flat_impl(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        range: Option<Range<u32>>,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -165,10 +261,11 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        let ivf_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
+        let ivf_transform = Arc::new(Self::make_partition_transformer(
+            &centroids,
             dt,
             vector_column,
+            partition_computer,
         ));
         transforms.push(ivf_transform);
 
@@ -192,6 +289,35 @@ impl IvfTransformer {
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
+        Self::with_pq_impl(centroids, distance_type, vector_column, pq, range, None)
+    }
+
+    pub fn with_pq_and_computer(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        pq: ProductQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Arc<dyn PartitionComputer>,
+    ) -> Self {
+        Self::with_pq_impl(
+            centroids,
+            distance_type,
+            vector_column,
+            pq,
+            range,
+            Some(partition_computer),
+        )
+    }
+
+    fn with_pq_impl(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        pq: ProductQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -205,10 +331,11 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        let partition_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
+        let partition_transform = Arc::new(Self::make_partition_transformer(
+            &centroids,
             distance_type,
             vector_column,
+            partition_computer,
         ));
         transforms.push(partition_transform);
 
@@ -242,6 +369,35 @@ impl IvfTransformer {
         sq: ScalarQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
+        Self::with_sq_impl(centroids, metric_type, vector_column, sq, range, None)
+    }
+
+    fn with_sq_and_computer(
+        centroids: FixedSizeListArray,
+        metric_type: MetricType,
+        vector_column: &str,
+        sq: ScalarQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Arc<dyn PartitionComputer>,
+    ) -> Self {
+        Self::with_sq_impl(
+            centroids,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+            Some(partition_computer),
+        )
+    }
+
+    fn with_sq_impl(
+        centroids: FixedSizeListArray,
+        metric_type: MetricType,
+        vector_column: &str,
+        sq: ScalarQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -255,10 +411,11 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        let partition_transformer = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
+        let partition_transformer = Arc::new(Self::make_partition_transformer(
+            &centroids,
             distance_type,
             vector_column,
+            partition_computer,
         ));
         transforms.push(partition_transformer);
 
@@ -285,6 +442,35 @@ impl IvfTransformer {
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
+        Self::with_rq_impl(centroids, distance_type, vector_column, rq, range, None)
+    }
+
+    fn with_rq_and_computer(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        rq: RabitQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Arc<dyn PartitionComputer>,
+    ) -> Self {
+        Self::with_rq_impl(
+            centroids,
+            distance_type,
+            vector_column,
+            rq,
+            range,
+            Some(partition_computer),
+        )
+    }
+
+    fn with_rq_impl(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        rq: RabitQuantizer,
+        range: Option<Range<u32>>,
+        partition_computer: Option<Arc<dyn PartitionComputer>>,
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -299,8 +485,13 @@ impl IvfTransformer {
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
         let partition_transform = Arc::new(
-            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
-                .with_distance(true),
+            Self::make_partition_transformer(
+                &centroids,
+                distance_type,
+                vector_column,
+                partition_computer,
+            )
+            .with_distance(true),
         );
         transforms.push(partition_transform);
 

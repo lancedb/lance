@@ -27,6 +27,7 @@ pub mod flat;
 pub mod graph;
 pub mod hnsw;
 pub mod ivf;
+pub use ivf::PartitionComputer;
 pub mod kmeans;
 pub mod pq;
 pub mod quantizer;

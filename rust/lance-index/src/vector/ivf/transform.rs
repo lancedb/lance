@@ -25,6 +25,76 @@ use crate::vector::{CENTROID_DIST_COLUMN, CENTROID_DIST_FIELD, LOSS_METADATA_KEY
 
 use super::PART_ID_COLUMN;
 
+/// Pluggable backend for computing IVF partition assignments.
+///
+/// Implement this trait to inject custom partition assignment strategies
+/// (e.g. GEMM-tiled, GPU-accelerated) into Lance's IVF build pipeline.
+pub trait PartitionComputer: std::fmt::Debug + Send + Sync {
+    /// Assign each vector to its nearest centroid.
+    ///
+    /// Returns `(partition_ids, distances)`. `None` entries indicate
+    /// invalid or NaN vectors that could not be assigned.
+    fn compute_partitions(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<(Vec<Option<u32>>, Vec<Option<f32>>)>;
+}
+
+/// Default partition computer using Lance's built-in distance computation.
+///
+/// Uses `SimpleIndex` (HNSW over centroids) when the centroid set is large enough,
+/// otherwise falls back to brute-force `compute_partitions_arrow_array`.
+#[derive(Debug)]
+struct DefaultPartitionComputer {
+    centroids: FixedSizeListArray,
+    distance_type: DistanceType,
+    index: Option<SimpleIndex>,
+}
+
+impl DefaultPartitionComputer {
+    fn new(centroids: FixedSizeListArray, distance_type: DistanceType) -> Self {
+        let index = SimpleIndex::may_train_index(
+            centroids.values().clone(),
+            centroids.value_length() as usize,
+            distance_type,
+        )
+        .unwrap();
+
+        Self {
+            centroids,
+            distance_type,
+            index,
+        }
+    }
+}
+
+impl PartitionComputer for DefaultPartitionComputer {
+    fn compute_partitions(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<(Vec<Option<u32>>, Vec<Option<f32>>)> {
+        match &self.index {
+            Some(index) => Ok(vectors
+                .iter()
+                .map(|vec| match vec {
+                    Some(v) => {
+                        let (id, dist) = index.search(v).unwrap();
+                        (Some(id), Some(dist))
+                    }
+                    None => (None, None),
+                })
+                .unzip()),
+            None => {
+                Ok(compute_partitions_arrow_array(
+                    &self.centroids,
+                    vectors,
+                    self.distance_type,
+                )?)
+            }
+        }
+    }
+}
+
 /// PartitionTransformer
 ///
 /// It computes the partition ID for each row from the input batch,
@@ -36,12 +106,10 @@ use super::PART_ID_COLUMN;
 ///
 #[derive(Debug)]
 pub struct PartitionTransformer {
-    centroids: FixedSizeListArray,
-    distance_type: DistanceType,
     input_column: String,
     output_column: String,
     with_distance: bool,
-    index: Option<SimpleIndex>,
+    computer: Arc<dyn PartitionComputer>,
 }
 
 impl PartitionTransformer {
@@ -50,21 +118,17 @@ impl PartitionTransformer {
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
-        let index = SimpleIndex::may_train_index(
-            centroids.values().clone(),
-            centroids.value_length() as usize,
-            distance_type,
-        )
-        .unwrap();
-
         Self {
-            centroids,
-            distance_type,
+            computer: Arc::new(DefaultPartitionComputer::new(centroids, distance_type)),
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
             with_distance: false,
-            index,
         }
+    }
+
+    pub fn with_partition_computer(mut self, computer: Arc<dyn PartitionComputer>) -> Self {
+        self.computer = computer;
+        self
     }
 
     pub fn with_distance(mut self, with_distance: bool) -> Self {
@@ -109,19 +173,7 @@ impl Transformer for PartitionTransformer {
                 location: location!(),
             })?;
 
-        let (part_ids, dists) = match &self.index {
-            Some(index) => fsl
-                .iter()
-                .map(|vec| match vec {
-                    Some(v) => {
-                        let (id, dist) = index.search(v).unwrap();
-                        (Some(id), Some(dist))
-                    }
-                    None => (None, None),
-                })
-                .unzip(),
-            None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
-        };
+        let (part_ids, dists) = self.computer.compute_partitions(fsl)?;
         let loss = dists
             .iter()
             .map(|d| d.unwrap_or_default() as f64)

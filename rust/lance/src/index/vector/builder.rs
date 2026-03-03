@@ -626,15 +626,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let code_column = quantizer.column();
 
-        let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+        let partition_computer = self
+            .ivf_params
+            .as_ref()
+            .and_then(|p| p.partition_computer.clone());
+        let transformer = Arc::new(match partition_computer {
+            Some(computer) => {
+                lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_computer(
+                    ivf.centroids.clone().unwrap(),
+                    self.distance_type,
+                    &self.column,
+                    quantizer.into(),
+                    None,
+                    computer,
+                )?
+            }
+            None => lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 ivf.centroids.clone().unwrap(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
             )?,
-        );
+        });
 
         let precomputed_partitions = if let Some(params) = self.ivf_params.as_ref() {
             load_precomputed_partitions_if_available(params)
@@ -1735,15 +1749,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+        let partition_computer = self
+            .ivf_params
+            .as_ref()
+            .and_then(|p| p.partition_computer.clone());
+        let transformer = Arc::new(match partition_computer {
+            Some(computer) => {
+                lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_computer(
+                    centroids.clone(),
+                    self.distance_type,
+                    vector_field.name().as_str(),
+                    quantizer.into(),
+                    None,
+                    computer,
+                )?
+            }
+            None => lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 centroids.clone(),
                 self.distance_type,
                 vector_field.name().as_str(),
                 quantizer.into(),
                 None,
             )?,
-        );
+        });
 
         let num_rows = assign_ops
             .iter()

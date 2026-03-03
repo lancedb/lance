@@ -1655,6 +1655,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         shuffle_partition_batches: 1024 * 10, // Default
         shuffle_partition_concurrency: 2,     // Default
         storage_options: None,
+        partition_computer: None,
     }
 }
 
