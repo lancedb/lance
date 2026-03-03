@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::disallowed_macros)]
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -37,7 +36,6 @@ use pyo3::basic::CompareOp;
 use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
-use snafu::location;
 
 use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
@@ -450,10 +448,7 @@ pub fn write_fragments(
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
         Operation::Append { fragments, .. } => Ok(fragments),
-        _ => Err(Error::Internal {
-            message: "Unexpected operation".into(),
-            location: location!(),
-        }),
+        _ => Err(Error::internal("Unexpected operation")),
     };
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;

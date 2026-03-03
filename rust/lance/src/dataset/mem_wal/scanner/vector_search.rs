@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
-
 //! Vector search planner for LSM scanner.
 //!
 //! Provides KNN (K-Nearest Neighbors) search across LSM levels with staleness detection.
@@ -197,11 +195,9 @@ impl LsmVectorSearchPlanner {
             },
         }];
 
-        let lex_ordering =
-            LexOrdering::new(sort_expr).ok_or_else(|| lance_core::Error::Internal {
-                message: "Failed to create LexOrdering".to_string(),
-                location: snafu::location!(),
-            })?;
+        let lex_ordering = LexOrdering::new(sort_expr).ok_or_else(|| {
+            lance_core::Error::internal("Failed to create LexOrdering".to_string())
+        })?;
 
         let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, filtered));
         let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sorted, 0, Some(k)));

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
 
 use std::collections::HashMap;
 use std::str;
@@ -33,7 +32,6 @@ use pyo3::{
     pyclass,
     types::{IntoPyDict, PyDict},
 };
-use snafu::location;
 
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -1252,10 +1250,7 @@ impl Dataset {
                 {
                     Ok((start, end)) => Some(Ok(start..end)),
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
-                    Err(err) => Some(Err(lance::Error::InvalidInput {
-                        source: Box::new(err),
-                        location: location!(),
-                    })),
+                    Err(err) => Some(Err(lance::Error::invalid_input_source(Box::new(err)))),
                 }
             })
         });

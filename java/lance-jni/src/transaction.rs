@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
 
 use crate::Error;
 use crate::JNIEnvExt;
@@ -36,7 +35,6 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -946,14 +944,11 @@ impl FieldExt for Field {
         }
 
         if self.logical_type != base_field.logical_type {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
-                    "Expecting logical type {} but got {} for field {}",
-                    base_field.logical_type, self.logical_type, self.name
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(format!(
+                "Expecting logical type {} but got {} for field {}",
+                base_field.logical_type, self.logical_type, self.name
+            )
+            .into()));
         }
 
         if self.id < 0 {

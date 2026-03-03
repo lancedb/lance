@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
-
 //! Query planner for LSM scanner.
 
 use std::sync::Arc;
@@ -107,11 +105,11 @@ impl LsmScanPlanner {
 
             // Sort locally by (pk ASC, _rowaddr DESC)
             let local_sort_exprs = self.build_local_sort_exprs(&scan)?;
-            let lex_ordering =
-                LexOrdering::new(local_sort_exprs).ok_or_else(|| lance_core::Error::Internal {
-                    message: "Failed to create LexOrdering from sort expressions".to_string(),
-                    location: snafu::location!(),
-                })?;
+            let lex_ordering = LexOrdering::new(local_sort_exprs).ok_or_else(|| {
+                lance_core::Error::internal(
+                    "Failed to create LexOrdering from sort expressions".to_string(),
+                )
+            })?;
             let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, scan));
 
             // Only tag with generation if user wants _memtable_gen in output
@@ -143,11 +141,11 @@ impl LsmScanPlanner {
             // Use SortPreservingMergeExec to merge K pre-sorted streams
             // IMPORTANT: Only merge by pk columns, not _rowaddr!
             let merge_sort_exprs = self.build_merge_sort_exprs(&sorted_plans[0])?;
-            let lex_ordering =
-                LexOrdering::new(merge_sort_exprs).ok_or_else(|| lance_core::Error::Internal {
-                    message: "Failed to create LexOrdering from sort expressions".to_string(),
-                    location: snafu::location!(),
-                })?;
+            let lex_ordering = LexOrdering::new(merge_sort_exprs).ok_or_else(|| {
+                lance_core::Error::internal(
+                    "Failed to create LexOrdering from sort expressions".to_string(),
+                )
+            })?;
 
             // UnionExec to combine all partitions (ordered by _memtable_gen DESC)
             #[allow(deprecated)]

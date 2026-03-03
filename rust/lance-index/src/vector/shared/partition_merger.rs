@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
-
 //! Shared helpers for IVF partition merging and metadata writing.
 //!
 //! The helpers here are used by both the distributed index merger
@@ -103,10 +101,9 @@ impl SupportedIvfIndexType {
             (true, true, false) => Self::IvfHnswPq,
             (true, false, true) => Self::IvfHnswSq,
             _ => {
-                return Err(Error::NotSupported {
-                    source: "Unsupported index type combination detected".into(),
-                    location: snafu::location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Unsupported index type combination detected".into(),
+                ));
             }
         };
 

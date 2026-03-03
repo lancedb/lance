@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,13 +58,10 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
             // Attach current thread to JVM
             let mut env = jvm
                 .attach_current_thread()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to attach to JVM: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+                .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to attach to JVM: {}",
+                    e
+                )))))?;
 
             // Call fetchStorageOptions() method on Java object
             // Returns Map<String, String> with all storage options including optional EXPIRES_AT_MILLIS_KEY
@@ -77,21 +73,15 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
                     "()Ljava/util/Map;",
                     &[],
                 )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to call fetchStorageOptions: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
-
-            let result_obj = result.l().map_err(|e| lance_core::Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "fetchStorageOptions result is not an object: {}",
+                .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to call fetchStorageOptions: {}",
                     e
-                ))),
-                location: snafu::location!(),
-            })?;
+                )))))?;
+
+            let result_obj = result.l().map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "fetchStorageOptions result is not an object: {}",
+                e
+            )))))?;
 
             // Check if result is null
             if result_obj.is_null() {
@@ -100,55 +90,40 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
 
             // Convert Java Map to Rust HashMap
             let storage_options_map =
-                JMap::from_env(&mut env, &result_obj).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "fetchStorageOptions result is not a Map: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+                JMap::from_env(&mut env, &result_obj).map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "fetchStorageOptions result is not a Map: {}",
+                    e
+                )))))?;
 
             let mut storage_options = HashMap::new();
             let mut iter =
                 storage_options_map
                     .iter(&mut env)
-                    .map_err(|e| lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
-                            "Failed to iterate storage options: {}",
-                            e
-                        ))),
-                        location: snafu::location!(),
-                    })?;
+                    .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                        "Failed to iterate storage options: {}",
+                        e
+                    )))))?;
 
             while let Some((key, value)) =
-                iter.next(&mut env).map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to get next storage option entry: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?
+                iter.next(&mut env).map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to get next storage option entry: {}",
+                    e
+                )))))?
             {
                 let key_str: String = env
                     .get_string(&JString::from(key))
-                    .map_err(|e| lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
-                            "storage option key is not a string: {}",
-                            e
-                        ))),
-                        location: snafu::location!(),
-                    })?
+                    .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                        "storage option key is not a string: {}",
+                        e
+                    )))))?
                     .into();
 
                 let value_str: String = env
                     .get_string(&JString::from(value))
-                    .map_err(|e| lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
-                            "storage option value is not a string: {}",
-                            e
-                        ))),
-                        location: snafu::location!(),
-                    })?
+                    .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                        "storage option value is not a string: {}",
+                        e
+                    )))))?
                     .into();
 
                 storage_options.insert(key_str, value_str);
@@ -157,13 +132,10 @@ impl StorageOptionsProvider for JavaStorageOptionsProvider {
             Ok(Some(storage_options))
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
-                "Failed to spawn blocking task: {}",
-                e
-            ))),
-            location: snafu::location!(),
-        })?
+        .map_err(|e| lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+            "Failed to spawn blocking task: {}",
+            e
+        )))))?
     }
 
     fn provider_id(&self) -> String {

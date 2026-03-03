@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![allow(clippy::disallowed_macros)]
-
 //! Index merging mechanisms for distributed vector index building
 
 use crate::vector::shared::partition_merger::{
@@ -230,10 +228,10 @@ pub async fn init_writer_for_pq(
         FileWriterOptions::default(),
     )?;
     let mut pm_init = pm.clone();
-    let cb = pm_init.codebook.as_ref().ok_or_else(|| Error::Index {
-        message: "PQ codebook missing".to_string(),
-        location: snafu::location!(),
-    })?;
+    let cb = pm_init
+        .codebook
+        .as_ref()
+        .ok_or_else(|| Error::index("PQ codebook missing".to_string()))?;
     let codebook_tensor: pb::Tensor = pb::Tensor::try_from(cb)?;
     let buf = Bytes::from(codebook_tensor.encode_to_vec());
     let pos = w.add_global_buffer(buf).await?;
