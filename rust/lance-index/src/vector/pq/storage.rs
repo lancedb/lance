@@ -8,18 +8,18 @@
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{self, UInt8Type};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
+    FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
     types::{Float32Type, UInt64Type},
-    FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
 };
@@ -30,21 +30,19 @@ use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescri
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
-use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
+use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
-    pb,
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
     vector::{
+        PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
         transform::Transformer,
-        PQ_CODE_COLUMN,
     },
-    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
 pub const PQ_METADATA_KEY: &str = "lance:pq";
@@ -120,17 +118,12 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             .schema()
             .metadata
             .get(PQ_METADATA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading PQ storage: metadata key {} not found",
-                    PQ_METADATA_KEY
-                ),
-                location: location!(),
-            })?;
-        let mut metadata: Self = serde_json::from_str(metadata).map_err(|_| Error::Index {
-            message: format!("Failed to parse PQ metadata: {}", metadata),
-            location: location!(),
-        })?;
+            .ok_or(Error::index(format!(
+                "Reading PQ storage: metadata key {} not found",
+                PQ_METADATA_KEY
+            )))?;
+        let mut metadata: Self = serde_json::from_str(metadata)
+            .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
 
         debug_assert!(metadata.codebook.is_none());
         debug_assert!(metadata.codebook_tensor.is_empty());
@@ -203,17 +196,15 @@ impl ProductQuantizationStorage {
         }
 
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
-            return Err(Error::Index {
-                message: "Row ID column not found from PQ storage".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Row ID column not found from PQ storage".to_string(),
+            ));
         };
         let row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
-            .ok_or(Error::Index {
-                message: "Row ID column is not of type UInt64".to_string(),
-                location: location!(),
-            })?
+            .ok_or(Error::index(
+                "Row ID column is not of type UInt64".to_string(),
+            ))?
             .clone()
             .into();
 
@@ -374,18 +365,13 @@ impl ProductQuantizationStorage {
         let metadata_str = schema
             .metadata
             .get(INDEX_METADATA_SCHEMA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading PQ storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
-                ),
-                location: location!(),
-            })?;
-        let index_metadata: IndexMetadata =
-            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "Reading PQ storage: index key {} not found",
+                INDEX_METADATA_SCHEMA_KEY
+            )))?;
+        let index_metadata: IndexMetadata = serde_json::from_str(metadata_str).map_err(|_| {
+            Error::index(format!("Failed to parse index metadata: {}", metadata_str))
+        })?;
         let distance_type: DistanceType =
             DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
@@ -570,10 +556,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
         let codebook = metadata
             .codebook
             .as_ref()
-            .ok_or(Error::Index {
-                message: "Codebook not found in PQ metadata".to_string(),
-                location: location!(),
-            })?
+            .ok_or(Error::index(
+                "Codebook not found in PQ metadata".to_string(),
+            ))?
             .values()
             .as_primitive::<Float32Type>()
             .clone();

@@ -4,7 +4,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::{
-    cmp::{min, Reverse},
+    cmp::{Reverse, min},
     collections::BinaryHeap,
 };
 use std::{collections::HashMap, ops::Range};
@@ -31,31 +31,31 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
-use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
+use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -63,7 +63,7 @@ use super::{
     iter::CompressedPostingListIterator,
 };
 use super::{encoding::compress_positions, iter::PostingListIterator};
-use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
@@ -73,7 +73,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -147,10 +146,10 @@ impl FromStr for TokenSetFormat {
             "" => Ok(Self::Arrow),
             "arrow" => Ok(Self::Arrow),
             "fst" => Ok(Self::Fst),
-            other => Err(Error::Index {
-                message: format!("unsupported token set format {}", other),
-                location: location!(),
-            }),
+            other => Err(Error::index(format!(
+                "unsupported token set format {}",
+                other
+            ))),
         }
     }
 }
@@ -427,20 +426,17 @@ impl InvertedIndex {
 
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
-                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
-                    message: "params not found in metadata".to_owned(),
-                    location: location!(),
-                })?;
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
                 let params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                let partitions =
-                    reader
-                        .schema()
-                        .metadata
-                        .get("partitions")
-                        .ok_or(Error::Index {
-                            message: "partitions not found in metadata".to_owned(),
-                            location: location!(),
-                        })?;
+                let partitions = reader
+                    .schema()
+                    .metadata
+                    .get("partitions")
+                    .ok_or(Error::index("partitions not found in metadata".to_owned()))?;
                 let partitions: Vec<u64> = serde_json::from_str(partitions)?;
                 let token_set_format = reader
                     .schema()
@@ -505,7 +501,6 @@ impl Index for InvertedIndex {
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
         Err(Error::invalid_input(
             "inverted index cannot be cast to vector index",
-            location!(),
         ))
     }
 
@@ -739,11 +734,8 @@ impl InvertedPartition {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
             };
-            let lev =
-                fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
-                    message: format!("failed to construct the fuzzy query: {}", e),
-                    location: location!(),
-                })?;
+            let lev = fst::automaton::Levenshtein::new(token, fuzziness)
+                .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
 
             let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
@@ -760,10 +752,9 @@ impl InvertedPartition {
                     }
                 }
             } else {
-                return Err(Error::Index {
-                    message: "tokens is not fst, which is not expected".to_owned(),
-                    location: location!(),
-                });
+                return Err(Error::index(
+                    "tokens is not fst, which is not expected".to_owned(),
+                ));
             }
         }
         Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
@@ -1036,10 +1027,7 @@ impl TokenSet {
         for (token, token_id) in entries {
             builder
                 .insert(&token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
-                    location: location!(),
-                })?;
+                .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
         }
         Ok(builder.into_map())
     }
@@ -1063,27 +1051,19 @@ impl TokenSet {
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
             for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-                let token = token.ok_or(Error::Index {
-                    message: "found null token in token set".to_owned(),
-                    location: location!(),
-                })?;
+                let token =
+                    token.ok_or(Error::index("found null token in token set".to_owned()))?;
                 next_id = next_id.max(token_id + 1);
                 total_length += token.len();
-                tokens
-                    .insert(token, token_id as u64)
-                    .map_err(|e| Error::Index {
-                        message: format!("failed to insert token {}: {}", token, e),
-                        location: location!(),
-                    })?;
+                tokens.insert(token, token_id as u64).map_err(|e| {
+                    Error::index(format!("failed to insert token {}: {}", token, e))
+                })?;
             }
 
             Ok::<_, Error>((tokens.into_map(), next_id, total_length))
         })
         .await
-        .map_err(|err| Error::Execution {
-            message: format!("failed to spawn blocking task: {}", err),
-            location: location!(),
-        })??;
+        .map_err(|err| Error::execution(format!("failed to spawn blocking task: {}", err)))??;
 
         Ok(Self {
             tokens: TokenMap::Fst(tokens),
@@ -1095,43 +1075,40 @@ impl TokenSet {
     async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         if batch.num_rows() == 0 {
-            return Err(Error::Index {
-                message: "token set batch is empty".to_owned(),
-                location: location!(),
-            });
+            return Err(Error::index("token set batch is empty".to_owned()));
         }
 
         let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
         let bytes = fst_col.value(0);
-        let map = fst::Map::new(bytes.to_vec()).map_err(|e| Error::Index {
-            message: format!("failed to load fst tokens: {}", e),
-            location: location!(),
-        })?;
+        let map = fst::Map::new(bytes.to_vec())
+            .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
         let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        let next_id = next_id_col.values().first().copied().ok_or(Error::Index {
-            message: "token next id column is empty".to_owned(),
-            location: location!(),
-        })?;
+        let next_id = next_id_col
+            .values()
+            .first()
+            .copied()
+            .ok_or(Error::index("token next id column is empty".to_owned()))?;
 
         let total_length = total_length_col
             .values()
             .first()
             .copied()
-            .ok_or(Error::Index {
-                message: "token total length column is empty".to_owned(),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(
+                "token total length column is empty".to_owned(),
+            ))?;
 
         Ok(Self {
             tokens: TokenMap::Fst(map),
             next_id,
-            total_length: usize::try_from(total_length).map_err(|_| Error::Index {
-                message: format!("token total length {} overflows usize", total_length),
-                location: location!(),
+            total_length: usize::try_from(total_length).map_err(|_| {
+                Error::index(format!(
+                    "token total length {} overflows usize",
+                    total_length
+                ))
             })?,
         })
     }
@@ -1289,10 +1266,10 @@ impl PostingListReader {
     fn load_metadata(
         schema: &lance_core::datatypes::Schema,
     ) -> Result<(Vec<usize>, Option<Vec<f32>>)> {
-        let offsets = schema.metadata.get("offsets").ok_or(Error::Index {
-            message: "offsets not found in metadata".to_owned(),
-            location: location!(),
-        })?;
+        let offsets = schema
+            .metadata
+            .get("offsets")
+            .ok_or(Error::index("offsets not found in metadata".to_owned()))?;
         let offsets = serde_json::from_str(offsets)?;
 
         let max_scores = schema
@@ -1448,10 +1425,9 @@ impl PostingListReader {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1487,10 +1463,7 @@ impl PostingListReader {
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location!(),
-                        ),
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                         e => e
                     }
                 })?;
@@ -2418,17 +2391,16 @@ pub fn flat_full_text_search(
     if is_phrase_query(query) {
         return Err(Error::invalid_input(
             "phrase query is not supported for flat full text search, try using FTS index",
-            location!(),
         ));
     }
 
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
-        data_type => Err(Error::invalid_input(
-            format!("unsupported data type {} for inverted index", data_type),
-            location!(),
-        )),
+        data_type => Err(Error::invalid_input(format!(
+            "unsupported data type {} for inverted index",
+            data_type
+        ))),
     }
 }
 
@@ -2589,7 +2561,7 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2626,14 +2598,18 @@ mod tests {
                 .as_binary::<i64>(),
         )
         .unwrap();
-        assert!(doc_ids
-            .iter()
-            .zip(expected.doc_ids.iter())
-            .all(|(a, b)| a == b));
-        assert!(freqs
-            .iter()
-            .zip(expected.frequencies.iter())
-            .all(|(a, b)| a == b));
+        assert!(
+            doc_ids
+                .iter()
+                .zip(expected.doc_ids.iter())
+                .all(|(a, b)| a == b)
+        );
+        assert!(
+            freqs
+                .iter()
+                .zip(expected.frequencies.iter())
+                .all(|(a, b)| a == b)
+        );
     }
 
     #[test]

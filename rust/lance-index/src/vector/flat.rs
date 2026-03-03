@@ -7,12 +7,11 @@
 use std::sync::Arc;
 
 use arrow::{array::AsArray, buffer::NullBuffer};
-use arrow_array::{make_array, Array, ArrayRef, Float32Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
-use lance_core::{Error, Result, ROW_ID};
-use lance_linalg::distance::{multivec_distance, DistanceType};
-use snafu::location;
+use lance_core::{Error, ROW_ID, Result};
+use lance_linalg::distance::{DistanceType, multivec_distance};
 use tracing::instrument;
 
 use super::DIST_COL;
@@ -39,27 +38,24 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
 
     // Parse the field path using Lance's field path parsing logic
     // This properly handles backtick-escaped field names
-    let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| Error::Schema {
-        message: format!("Failed to parse field path '{}': {}", column, e),
-        location: location!(),
-    })?;
+    let parts = lance_core::datatypes::parse_field_path(column)
+        .map_err(|e| Error::schema(format!("Failed to parse field path '{}': {}", column, e)))?;
 
     if parts.is_empty() {
-        return Err(Error::Schema {
-            message: format!("Invalid empty field path: {}", column),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "Invalid empty field path: {}",
+            column
+        )));
     }
 
     // Get the root column
     let mut current_array: ArrayRef = batch
         .column_by_name(&parts[0])
-        .ok_or_else(|| Error::Schema {
-            message: format!(
+        .ok_or_else(|| {
+            Error::schema(format!(
                 "Column '{}' does not exist in batch (looking for root field '{}')",
                 column, parts[0]
-            ),
-            location: location!(),
+            ))
         })?
         .clone();
 
@@ -68,22 +64,20 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
         let struct_array = current_array
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .ok_or_else(|| Error::Schema {
-                message: format!(
+            .ok_or_else(|| {
+                Error::schema(format!(
                     "Cannot access nested field '{}' in column '{}': parent is not a struct",
                     part, column
-                ),
-                location: location!(),
+                ))
             })?;
 
         current_array = struct_array
             .column_by_name(part)
-            .ok_or_else(|| Error::Schema {
-                message: format!(
+            .ok_or_else(|| {
+                Error::schema(format!(
                     "Nested field '{}' does not exist in column '{}'",
                     part, column
-                ),
-                location: location!(),
+                ))
             })?
             .clone();
     }
@@ -138,10 +132,7 @@ pub async fn compute_distance(
 
         batch
             .try_with_column(distance_field(), distances)
-            .map_err(|e| Error::Execution {
-                message: format!("Failed to adding distance column: {}", e),
-                location: location!(),
-            })
+            .map_err(|e| Error::execution(format!("Failed to adding distance column: {}", e)))
     })
     .await?
 }

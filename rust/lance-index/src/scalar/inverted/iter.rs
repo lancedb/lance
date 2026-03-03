@@ -5,9 +5,9 @@ use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
 
 use super::{
+    PostingList,
     builder::BLOCK_SIZE,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
-    PostingList,
 };
 
 pub enum PostingListIterator<'a> {

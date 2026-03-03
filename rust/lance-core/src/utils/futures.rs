@@ -7,7 +7,7 @@ use std::{
     task::Waker,
 };
 
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use pin_project::pin_project;
 use tokio::sync::Semaphore;
 use tokio_util::sync::PollSemaphore;
@@ -119,18 +119,18 @@ impl<T: Clone> Stream for SharedStream<'_, T> {
             } else {
                 None
             };
-            if let Some(polling_side) = inner_state.polling.as_ref() {
-                if *polling_side != self.side {
-                    // Another task is already polling the inner stream, so we don't need to do anything
+            if let Some(polling_side) = inner_state.polling.as_ref()
+                && *polling_side != self.side
+            {
+                // Another task is already polling the inner stream, so we don't need to do anything
 
-                    // Per rust docs:
-                    //   Note that on multiple calls to poll, only the Waker from the Context
-                    //   passed to the most recent call should be scheduled to receive a wakeup.
-                    //
-                    // So it is safe to replace a potentially stale waker here.
-                    inner_state.waker = Some(cx.waker().clone());
-                    return std::task::Poll::Pending;
-                }
+                // Per rust docs:
+                //   Note that on multiple calls to poll, only the Waker from the Context
+                //   passed to the most recent call should be scheduled to receive a wakeup.
+                //
+                // So it is safe to replace a potentially stale waker here.
+                inner_state.waker = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
             }
             inner_state.polling = Some(self.side);
             // Release the mutex here as polling the inner stream is potentially expensive

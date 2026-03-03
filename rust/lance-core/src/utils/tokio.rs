@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::Ordering;
-use std::sync::{atomic, LazyLock};
+use std::sync::{LazyLock, atomic};
 use std::time::Duration;
 
 use crate::Result;

@@ -7,7 +7,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Tokens;
 
 use quote::quote;
-use syn::{parse_macro_input, punctuated::Punctuated, FnArg, ItemFn, ReturnType, Token};
+use syn::{FnArg, ItemFn, ReturnType, Token, parse_macro_input, punctuated::Punctuated};
 
 // The tracing initialization
 //

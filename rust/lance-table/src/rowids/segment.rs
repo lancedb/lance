@@ -5,7 +5,6 @@ use std::ops::{Range, RangeInclusive};
 
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 use deepsize::DeepSizeOf;
-use snafu::location;
 
 /// Different ways to represent a sequence of distinct u64s.
 ///
@@ -108,11 +107,11 @@ impl U64Segment {
     ) -> impl Iterator<Item = u64> + 'a {
         let mut existing = existing.into_iter().peekable();
         range.filter(move |val| {
-            if let Some(&existing_val) = existing.peek() {
-                if existing_val == *val {
-                    existing.next();
-                    return false;
-                }
+            if let Some(&existing_val) = existing.peek()
+                && existing_val == *val
+            {
+                existing.next();
+                return false;
             }
             true
         })
@@ -373,17 +372,14 @@ impl U64Segment {
     /// Produce a new segment that has `val` as the new highest value in the segment
     pub fn with_new_high(self, val: u64) -> lance_core::Result<Self> {
         // Check that the new value is higher than the current maximum
-        if let Some(range) = self.range() {
-            if val <= *range.end() {
-                return Err(lance_core::Error::invalid_input(
-                    format!(
-                        "New value {} must be higher than current maximum {}",
-                        val,
-                        range.end()
-                    ),
-                    location!(),
-                ));
-            }
+        if let Some(range) = self.range()
+            && val <= *range.end()
+        {
+            return Err(lance_core::Error::invalid_input(format!(
+                "New value {} must be higher than current maximum {}",
+                val,
+                range.end()
+            )));
         }
 
         Ok(match self {
@@ -474,11 +470,11 @@ impl U64Segment {
                     Self::SortedArray(EncodedU64Array::from(new_array))
                 }
                 EncodedU64Array::U32 { base, mut offsets } => {
-                    if let Some(offset) = val.checked_sub(base) {
-                        if offset <= u32::MAX as u64 {
-                            offsets.push(offset as u32);
-                            return Ok(Self::SortedArray(EncodedU64Array::U32 { base, offsets }));
-                        }
+                    if let Some(offset) = val.checked_sub(base)
+                        && offset <= u32::MAX as u64
+                    {
+                        offsets.push(offset as u32);
+                        return Ok(Self::SortedArray(EncodedU64Array::U32 { base, offsets }));
                     }
                     let mut new_array: Vec<u64> =
                         offsets.into_iter().map(|o| base + o as u64).collect();
@@ -513,11 +509,11 @@ impl U64Segment {
                     Self::Array(EncodedU64Array::from(new_array))
                 }
                 EncodedU64Array::U32 { base, mut offsets } => {
-                    if let Some(offset) = val.checked_sub(base) {
-                        if offset <= u32::MAX as u64 {
-                            offsets.push(offset as u32);
-                            return Ok(Self::Array(EncodedU64Array::U32 { base, offsets }));
-                        }
+                    if let Some(offset) = val.checked_sub(base)
+                        && offset <= u32::MAX as u64
+                    {
+                        offsets.push(offset as u32);
+                        return Ok(Self::Array(EncodedU64Array::U32 { base, offsets }));
                     }
                     let mut new_array: Vec<u64> =
                         offsets.into_iter().map(|o| base + o as u64).collect();
@@ -539,11 +535,11 @@ impl U64Segment {
         let make_new_iter = || {
             let mut vals_iter = vals.iter().copied().peekable();
             self.iter().filter(move |val| {
-                if let Some(&next_val) = vals_iter.peek() {
-                    if next_val == *val {
-                        vals_iter.next();
-                        return false;
-                    }
+                if let Some(&next_val) = vals_iter.peek()
+                    && next_val == *val
+                {
+                    vals_iter.next();
+                    return false;
                 }
                 true
             })
@@ -594,11 +590,11 @@ impl U64Segment {
 
         let mut positions = positions.iter().copied().peekable();
         let sequence = self.iter().enumerate().filter_map(move |(i, val)| {
-            if let Some(next_pos) = positions.peek() {
-                if *next_pos == i as u32 {
-                    positions.next();
-                    return None;
-                }
+            if let Some(next_pos) = positions.peek()
+                && *next_pos == i as u32
+            {
+                positions.next();
+                return None;
             }
             Some(val)
         });
@@ -787,7 +783,7 @@ mod test {
             let mut b = Bitmap::new_full(16);
             b.clear(3); // Clear position 3 (value 13)
             b.clear(7); // Clear position 7 (value 17)
-                        // Clear positions 10-14 (values 20-24)
+            // Clear positions 10-14 (values 20-24)
             for i in 10..15 {
                 b.clear(i);
             }
@@ -844,9 +840,11 @@ mod test {
         let result = segment.with_new_high(15);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("New value 15 must be higher than current maximum 19"));
+        assert!(
+            error
+                .to_string()
+                .contains("New value 15 must be higher than current maximum 19")
+        );
     }
 
     #[test]
@@ -856,9 +854,11 @@ mod test {
         let result = segment.with_new_high(5);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("New value 5 must be higher than current maximum 5"));
+        assert!(
+            error
+                .to_string()
+                .contains("New value 5 must be higher than current maximum 5")
+        );
     }
 
     #[test]

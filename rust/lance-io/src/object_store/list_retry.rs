@@ -5,7 +5,7 @@ use std::{sync::Arc, task::Poll};
 
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
-use object_store::{path::Path, ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, path::Path};
 
 /// A stream that does outer retries on list operations.
 ///

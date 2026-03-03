@@ -8,7 +8,6 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::vector::storage::VectorStore;
@@ -81,10 +80,7 @@ impl TryFrom<&str> for SubIndexType {
         match value {
             "FLAT" => Ok(Self::Flat),
             "HNSW" => Ok(Self::Hnsw),
-            _ => Err(Error::Index {
-                message: format!("unknown sub index type {}", value),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
     }
 }

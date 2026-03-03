@@ -5,20 +5,20 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
+use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use jni::JNIEnv;
 use lance::dataset::optimize::CompactionOptions;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
+use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::IndexParams;
 use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};

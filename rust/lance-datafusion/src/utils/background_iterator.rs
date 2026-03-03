@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use futures::ready;
 use futures::Stream;
+use futures::ready;
 use std::{
     future::Future,
     panic,

@@ -6,7 +6,6 @@ use std::str::FromStr;
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
-use snafu::location;
 
 pub const LEGACY_FORMAT_VERSION: &str = "0.1";
 pub const V2_FORMAT_2_0: &str = "2.0";
@@ -60,10 +59,9 @@ impl LanceFileVersion {
             (2, 0) => Ok(Self::V2_0),
             (2, 1) => Ok(Self::V2_1),
             (2, 2) => Ok(Self::V2_2),
-            _ => Err(Error::InvalidInput {
-                source: format!("Unknown Lance storage version: {}.{}", major, minor).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Unknown Lance storage version: {}.{}", major, minor).into(),
+            )),
         }
     }
 
@@ -128,10 +126,9 @@ impl FromStr for LanceFileVersion {
             "next" => Ok(Self::Next),
             // Version 0.3 is an alias of 2.0
             "0.3" => Ok(Self::V2_0),
-            _ => Err(Error::InvalidInput {
-                source: format!("Unknown Lance storage version: {}", value).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Unknown Lance storage version: {}", value).into(),
+            )),
         }
     }
 }

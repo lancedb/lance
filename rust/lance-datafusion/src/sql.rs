@@ -13,7 +13,6 @@ use datafusion::sql::sqlparser::{
 };
 
 use lance_core::{Error, Result};
-use snafu::location;
 #[derive(Debug, Default)]
 struct LanceDialect(GenericDialect);
 
@@ -55,9 +54,8 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection.ok_or_else(|| {
-        Error::invalid_input(format!("Filter is not valid: {filter}"), location!())
-    })?;
+    let expr =
+        selection.ok_or_else(|| Error::invalid_input(format!("Filter is not valid: {filter}")))?;
     Ok(expr.clone())
 }
 
@@ -80,9 +78,8 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection.ok_or_else(|| {
-        Error::invalid_input(format!("Expression is not valid: {expr}"), location!())
-    })?;
+    let expr = selection
+        .ok_or_else(|| Error::invalid_input(format!("Expression is not valid: {expr}")))?;
     Ok(expr.clone())
 }
 
@@ -97,10 +94,7 @@ fn parse_statement(statement: &str) -> Result<Statement> {
     let mut token_iter = tokenizer
         .tokenize()
         .map_err(|e| {
-            Error::invalid_input(
-                format!("Error tokenizing statement: {statement} ({e})"),
-                location!(),
-            )
+            Error::invalid_input(format!("Error tokenizing statement: {statement} ({e})"))
         })?
         .into_iter();
     let mut prev_token = token_iter.next().unwrap();
@@ -116,12 +110,7 @@ fn parse_statement(statement: &str) -> Result<Statement> {
     Parser::new(&dialect)
         .with_tokens(tokens)
         .parse_statement()
-        .map_err(|e| {
-            Error::invalid_input(
-                format!("Error parsing statement: {statement} ({e})"),
-                location!(),
-            )
-        })
+        .map_err(|e| Error::invalid_input(format!("Error parsing statement: {statement} ({e})")))
 }
 
 #[cfg(test)]

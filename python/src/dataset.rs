@@ -10,7 +10,7 @@ use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
-use arrow_array::{make_array, RecordBatch, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader, make_array};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -22,17 +22,17 @@ use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
+    PyResult,
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
-    PyResult,
 };
-use pyo3::{prelude::*, IntoPyObjectExt};
-use snafu::location;
 
+use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
@@ -40,27 +40,26 @@ use lance::dataset::scanner::{
     MaterializationStyle, QueryFilter,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::AutoCleanupParams;
-use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment,
-    progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner,
-    transaction::{Operation, Transaction},
-    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
-};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{
+    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
+    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
+    fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner,
+    transaction::{Operation, Transaction},
+};
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
+use lance::index::{DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::datatypes::BlobHandling;
 use lance_core::Error;
+use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
@@ -68,22 +67,22 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
-};
-use lance_index::{
+    DatasetIndexExt, IndexParams, IndexType,
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
-        sq::builder::SQBuildParams, Query as VectorQuery,
+        Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
+        pq::PQBuildParams, sq::builder::SQBuildParams,
     },
-    DatasetIndexExt, IndexParams, IndexType,
+};
+use lance_index::{
+    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -92,7 +91,7 @@ use crate::indices::{PyIndexConfig, PyIndexDescription};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
-use crate::schema::{logical_schema_from_lance, LanceSchema};
+use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
@@ -363,14 +362,11 @@ pub fn transforms_from_python(
                 let result = udf_obj
                     .call_method1(py, "_call", (py_batch,))
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format_python_error(err, py).unwrap(),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format_python_error(err, py).unwrap())
                     })?;
                 let result_batch: PyArrowType<RecordBatch> = result
                     .extract(py)
-                    .map_err(|err| lance::Error::invalid_input(err.to_string(), location!()))?;
+                    .map_err(|err| lance::Error::invalid_input(err.to_string()))?;
                 Ok(result_batch.0)
             })
         };
@@ -533,22 +529,24 @@ impl Dataset {
 
         // Handle read_params dict
         if let Some(read_params_dict) = read_params {
-            let cache_repetition_index = read_params_dict
+            let mut decoder_config = DecoderConfig::default();
+
+            if let Some(cache_repetition_index) = read_params_dict
                 .get_item("cache_repetition_index")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.cache_repetition_index = cache_repetition_index;
+            }
 
-            let validate_on_decode = read_params_dict
+            if let Some(validate_on_decode) = read_params_dict
                 .get_item("validate_on_decode")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.validate_on_decode = validate_on_decode;
+            }
 
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode,
-            };
             let file_reader_options = FileReaderOptions {
                 decoder_config,
                 ..Default::default()
@@ -831,7 +829,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(c), None) => {
                 scanner
@@ -1005,7 +1003,7 @@ impl Dataset {
                     other => {
                         return Err(PyValueError::new_err(format!(
                             "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
-                        )))
+                        )));
                     }
                 }
             } else {
@@ -1134,7 +1132,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(columns), None) => {
                 Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
@@ -1161,7 +1159,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(columns), None) => {
                 Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
@@ -1251,10 +1249,7 @@ impl Dataset {
                 {
                     Ok((start, end)) => Some(Ok(start..end)),
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
-                    Err(err) => Some(Err(lance::Error::InvalidInput {
-                        source: Box::new(err),
-                        location: location!(),
-                    })),
+                    Err(err) => Some(Err(lance::Error::invalid_input_source(Box::new(err)))),
                 }
             })
         });
@@ -1841,7 +1836,7 @@ impl Dataset {
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
-                )))
+                )));
             }
         };
 
@@ -1948,7 +1943,7 @@ impl Dataset {
                 let column_type = match self.ds.schema().field(columns[0]) {
                     Some(f) => f.data_type().clone(),
                     None => {
-                        return Err(PyValueError::new_err("Column not found in dataset schema."))
+                        return Err(PyValueError::new_err("Column not found in dataset schema."));
                     }
                 };
                 prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
@@ -2000,11 +1995,9 @@ impl Dataset {
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
         let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
-            let index_metadata = rt()
-                .block_on(None, builder.execute_uncommitted())?
-                .infer_error()?;
             // Note: We don't update self.ds here as the index is not committed
-            index_metadata
+            rt().block_on(None, builder.execute_uncommitted())?
+                .infer_error()?
         } else {
             // For regular indexing, use the standard execute path
             let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
@@ -3146,10 +3139,16 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         // Handle target_bases parameter (list of strings - base names or paths)
-        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")? {
-            if !target_bases_list.is_empty() {
-                p = p.with_target_base_names_or_paths(target_bases_list);
-            }
+        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")?
+            && !target_bases_list.is_empty()
+        {
+            p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        if let Some(allow_external) =
+            get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
+        {
+            p = p.with_allow_external_blob_outside_bases(allow_external);
         }
 
         // Handle properties
@@ -3266,29 +3265,30 @@ fn prepare_vector_index_params(
         }
 
         match (
-                kwargs.get_item("precomputed_shuffle_buffers")?,
-                kwargs.get_item("precomputed_shuffle_buffers_path")?
-            ) {
-                (Some(l), Some(p)) => {
-                    let path = Path::parse(p.to_string()).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to parse precomputed_shuffle_buffers_path: {}",
-                            e
-                        ))
-                    })?;
-                    let list = l.downcast::<PyList>()?
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect();
-                    ivf_params.precomputed_shuffle_buffers = Some((path, list));
-                },
-                (None, None) => {},
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+            kwargs.get_item("precomputed_shuffle_buffers")?,
+            kwargs.get_item("precomputed_shuffle_buffers_path")?,
+        ) {
+            (Some(l), Some(p)) => {
+                let path = Path::parse(p.to_string()).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "Failed to parse precomputed_shuffle_buffers_path: {}",
+                        e
                     ))
-                }
+                })?;
+                let list = l
+                    .downcast::<PyList>()?
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect();
+                ivf_params.precomputed_shuffle_buffers = Some((path, list));
             }
+            (None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(
+                    "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together.",
+                ));
+            }
+        }
 
         // Parse HNSW params
         if let Some(max_level) = kwargs.get_item("max_level")? {
@@ -3401,10 +3401,10 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::invalid_input(
-                format!("Failed to call begin() on WriteFragmentProgress: {}", e),
-                location!(),
-            )
+            lance::Error::invalid_input(format!(
+                "Failed to call begin() on WriteFragmentProgress: {}",
+                e
+            ))
         })?;
         Ok(())
     }
@@ -3418,10 +3418,10 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::invalid_input(
-                format!("Failed to call complete() on WriteFragmentProgress: {}", e),
-                location!(),
-            )
+            lance::Error::invalid_input(format!(
+                "Failed to call complete() on WriteFragmentProgress: {}",
+                e
+            ))
         })?;
         Ok(())
     }
@@ -3462,10 +3462,10 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(batch.map(|b| b.0))
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call get_batch() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 
@@ -3478,18 +3478,18 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(fragment)
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call get_fragment() on UDFCheckpointer: {}",
+                err
+            ))
         })?;
         fragment_data
             .map(|data| {
                 serde_json::from_str(&data).map_err(|err| {
-                    lance_core::Error::invalid_input(
-                        format!("Failed to deserialize fragment data: {}", err),
-                        location!(),
-                    )
+                    lance_core::Error::invalid_input(format!(
+                        "Failed to deserialize fragment data: {}",
+                        err
+                    ))
                 })
             })
             .transpose()
@@ -3503,19 +3503,16 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call insert_batch() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
         let data = serde_json::to_string(&fragment).map_err(|err| {
-            lance_core::Error::io(
-                format!("Failed to serialize fragment data: {}", err),
-                location!(),
-            )
+            lance_core::Error::io(format!("Failed to serialize fragment data: {}", err))
         })?;
         Python::attach(|py| {
             self.inner
@@ -3523,13 +3520,10 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!(
-                    "Failed to call insert_fragment() on UDFCheckpointer: {}",
-                    err
-                ),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 }
@@ -3669,42 +3663,42 @@ fn vector_query_params_from_dict(
     let mut minimum_nprobes = DEFAULT_NPROBES;
     let mut maximum_nprobes: Option<usize> = None;
 
-    if let Some(nprobes) = dict.get_item("nprobes")? {
-        if !nprobes.is_none() {
-            let extracted: usize = nprobes.extract()?;
-            minimum_nprobes = extracted;
-            maximum_nprobes = Some(extracted);
-        }
+    if let Some(nprobes) = dict.get_item("nprobes")?
+        && !nprobes.is_none()
+    {
+        let extracted: usize = nprobes.extract()?;
+        minimum_nprobes = extracted;
+        maximum_nprobes = Some(extracted);
     }
 
-    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")? {
-        if !min_nprobes.is_none() {
-            minimum_nprobes = min_nprobes.extract()?;
-        }
+    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")?
+        && !min_nprobes.is_none()
+    {
+        minimum_nprobes = min_nprobes.extract()?;
     }
 
-    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")? {
-        if !max_nprobes.is_none() {
-            maximum_nprobes = Some(max_nprobes.extract()?);
-        }
+    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")?
+        && !max_nprobes.is_none()
+    {
+        maximum_nprobes = Some(max_nprobes.extract()?);
     }
 
-    if let Some(maximum_nprobes_val) = maximum_nprobes {
-        if minimum_nprobes > maximum_nprobes_val {
-            return Err(PyValueError::new_err(
-                "minimum_nprobes must be <= maximum_nprobes",
-            ));
-        }
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && minimum_nprobes > maximum_nprobes_val
+    {
+        return Err(PyValueError::new_err(
+            "minimum_nprobes must be <= maximum_nprobes",
+        ));
     }
 
     if minimum_nprobes < 1 {
         return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
     }
 
-    if let Some(maximum_nprobes_val) = maximum_nprobes {
-        if maximum_nprobes_val < 1 {
-            return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
-        }
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && maximum_nprobes_val < 1
+    {
+        return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
     }
 
     let metric_type: Option<MetricType> = if let Some(metric) = dict.get_item("metric")? {
@@ -3724,11 +3718,7 @@ fn vector_query_params_from_dict(
     // and use Flat index over the raw vectors to refine the results.
     // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
     let refine_factor: Option<u32> = if let Some(rf) = dict.get_item("refine_factor")? {
-        if rf.is_none() {
-            None
-        } else {
-            rf.extract()?
-        }
+        if rf.is_none() { None } else { rf.extract()? }
     } else {
         None
     };

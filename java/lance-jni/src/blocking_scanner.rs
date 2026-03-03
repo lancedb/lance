@@ -10,22 +10,22 @@ use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE};
-use jni::{sys::jlong, JNIEnv};
+use jni::sys::{JNI_TRUE, jboolean, jint};
+use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
     PhraseQuery as FtsPhraseQuery,
 };
-use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
-    RT,
 };
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
@@ -196,7 +196,7 @@ fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> 
 ///////////////////
 // Write Methods //
 ///////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject,
@@ -388,7 +388,7 @@ fn inner_create_scanner<'local>(
     scanner.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_LanceScanner_releaseNativeScanner(
     mut env: JNIEnv,
     j_scanner: JObject,
@@ -433,7 +433,7 @@ fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
 //////////////////
 // Read Methods //
 //////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
     mut env: JNIEnv,
     j_scanner: JObject,
@@ -453,7 +453,7 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_LanceScanner_importFfiSchema(
     mut env: JNIEnv,
     j_scanner: JObject,
@@ -476,7 +476,7 @@ fn inner_import_ffi_schema(env: &mut JNIEnv, j_scanner: JObject, schema_addr: jl
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeCountRows(
     mut env: JNIEnv,
     j_scanner: JObject,

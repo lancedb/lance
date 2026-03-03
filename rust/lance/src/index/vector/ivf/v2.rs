@@ -6,10 +6,10 @@
 use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use crate::index::vector::{builder::index_type_string, IndexFileVersion};
+use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{
-    vector::{utils::PartitionLoadLock, VectorIndex},
     PreFilter,
+    vector::{VectorIndex, utils::PartitionLoadLock},
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
@@ -23,11 +23,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -36,30 +37,27 @@ use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::{
-    pb,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
-        v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY,
+        DISTANCE_TYPE_KEY, Query, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
+        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
-    Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
-use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 use lance_io::local::to_local_path;
 use lance_io::scheduler::SchedulerConfig;
 use lance_io::utils::CachedFileSize;
 use lance_io::{
-    object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
+    ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::{info, instrument};
 
-use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
+use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
 
 #[derive(Debug, DeepSizeOf)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
@@ -161,10 +159,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .schema()
                 .metadata
                 .get(INDEX_METADATA_SCHEMA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", DISTANCE_TYPE_KEY),
-                    location: location!(),
-                })?
+                .ok_or(Error::index(format!("{} not found", DISTANCE_TYPE_KEY)))?
                 .as_str(),
         )?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
@@ -173,15 +168,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .schema()
             .metadata
             .get(IVF_METADATA_KEY)
-            .ok_or(Error::Index {
-                message: format!("{} not found", IVF_METADATA_KEY),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
-            .map_err(|e| Error::Index {
-                message: format!("Failed to decode IVF position: {}", e),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::index(format!("Failed to decode IVF position: {}", e)))?;
         let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
         let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_pb_bytes)?)?;
 
@@ -189,10 +178,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .schema()
             .metadata
             .get(S::metadata_key())
-            .ok_or(Error::Index {
-                message: format!("{} not found", S::metadata_key()),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
         let storage_reader = FileReader::try_open(
@@ -242,14 +228,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
             metrics.record_part_load();
             if partition_id >= self.ivf.num_partitions() {
-                return Err(Error::Index {
-                    message: format!(
-                        "partition id {} is out of range of {} partitions",
-                        partition_id,
-                        self.ivf.num_partitions()
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "partition id {} is out of range of {} partitions",
+                    partition_id,
+                    self.ivf.num_partitions()
+                )));
             }
 
             let mtx = self.partition_locks.get_partition_mutex(partition_id);
@@ -315,13 +298,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if Q::use_residual(self.distance_type) {
-            let partition_centroids =
-                self.ivf
-                    .centroid(partition_id)
-                    .ok_or_else(|| Error::Index {
-                        message: format!("partition centroid {} does not exist", partition_id),
-                        location: location!(),
-                    })?;
+            let partition_centroids = self.ivf.centroid(partition_id).ok_or_else(|| {
+                Error::index(format!(
+                    "partition centroid {} does not exist",
+                    partition_id
+                ))
+            })?;
             let residual_key = sub(&query.key, &partition_centroids)?;
             let mut part_query = query.clone();
             part_query.key = residual_key;
@@ -388,10 +370,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
                 serde_json::map::Map::new()
             };
         let mut store_stats = serde_json::to_value(self.storage.metadata())?;
-        let store_stats = store_stats.as_object_mut().ok_or(Error::Internal {
-            message: "failed to get storage metadata".to_string(),
-            location: location!(),
-        })?;
+        let store_stats = store_stats.as_object_mut().ok_or(Error::internal(
+            "failed to get storage metadata".to_string(),
+        ))?;
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
@@ -449,7 +430,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         _pre_filter: Arc<dyn PreFilter>,
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
+        unimplemented!(
+            "IVFIndex not currently used as sub-index and top-level indices do partition-aware search"
+        )
     }
 
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
@@ -488,10 +471,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let part = part_entry
                 .as_any()
                 .downcast_ref::<PartitionEntry<S, Q>>()
-                .ok_or(Error::Internal {
-                    message: "failed to downcast partition entry".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
             let batch = part.index.search(
                 query.key,
                 k,
@@ -523,10 +505,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "Flat index does not support load".to_string(),
-            location: location!(),
-        })
+        Err(Error::index("Flat index does not support load".to_string()))
     }
 
     async fn partition_reader(
@@ -539,10 +518,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let partition = partition
             .as_any()
             .downcast_ref::<PartitionEntry<S, Q>>()
-            .ok_or(Error::Internal {
-                message: "failed to downcast partition entry".to_string(),
-                location: location!(),
-            })?;
+            .ok_or(Error::internal(
+                "failed to downcast partition entry".to_string(),
+            ))?;
         let store = &partition.storage;
         let schema = if with_vector {
             store.schema().clone()
@@ -576,10 +554,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        Err(Error::Index {
-            message: "Remapping IVF in this way not supported".to_string(),
-            location: location!(),
-        })
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -615,7 +592,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_le, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
@@ -626,53 +603,53 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
-        storage::RabitQuantizationMetadata, RQBuildParams, RQRotationType,
+        RQBuildParams, RQRotationType, storage::RabitQuantizationMetadata,
     };
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::finalize_distributed_merge;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
-        dataset::optimize::{compact_files, CompactionOptions},
-        index::vector::IndexFileVersion,
+        Dataset,
+        index::vector::{VectorIndex, VectorIndexParams},
     };
     use crate::{
-        index::vector::{VectorIndex, VectorIndexParams},
-        Dataset,
+        dataset::optimize::{CompactionOptions, compact_files},
+        index::vector::IndexFileVersion,
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{Result, ROW_ID};
+    use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
+    use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::kmeans::{train_kmeans, KMeansParams};
+    use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::DIST_COL;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
     };
-    use lance_linalg::distance::{multivec_distance, DistanceType};
+    use lance_linalg::distance::{DistanceType, multivec_distance};
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -3024,9 +3001,11 @@ mod tests {
             .max()
             .expect("expected at least one partition count");
         assert!(base_partition_count >= 2);
-        assert!(partitions_before
-            .iter()
-            .all(|count| *count == base_partition_count));
+        assert!(
+            partitions_before
+                .iter()
+                .all(|count| *count == base_partition_count)
+        );
 
         let indices_meta = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(indices_meta.len(), 2);

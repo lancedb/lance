@@ -18,37 +18,37 @@
 use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
-use pyo3::pyfunction;
-use pyo3::pymethods;
-use pyo3::types::PyDict;
-use pyo3::types::PyDictMethods;
-use pyo3::types::PyTuple;
 use pyo3::Bound;
 use pyo3::IntoPyObject;
 use pyo3::PyErr;
 use pyo3::PyResult;
 use pyo3::Python;
-use pyo3::{pyclass, Py, PyAny};
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
-use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::TrySendError;
+use pyo3::pyfunction;
+use pyo3::pymethods;
+use pyo3::types::PyDict;
+use pyo3::types::PyDictMethods;
+use pyo3::types::PyTuple;
+use pyo3::{Py, PyAny, pyclass};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::TrySendError;
 use std::thread::JoinHandle;
+use tracing::Event;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
 use tracing::subscriber;
-use tracing::Event;
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::Registry;
 
 static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
@@ -225,10 +225,10 @@ pub struct LoggingPassthroughRef(Arc<RwLock<Option<LoggingPassthroughState>>>);
 impl LoggingPassthroughRef {
     fn inner_do<F: FnOnce(&ChromeLayer<Registry>)>(&self, f: F) {
         let state_guard = self.0.read().unwrap();
-        if let Some(state) = state_guard.as_ref() {
-            if let Some(inner) = state.inner.as_ref() {
-                f(inner)
-            }
+        if let Some(state) = state_guard.as_ref()
+            && let Some(inner) = state.inner.as_ref()
+        {
+            f(inner)
         }
     }
 }

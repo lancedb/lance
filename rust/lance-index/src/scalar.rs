@@ -10,21 +10,20 @@ use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_common::{scalar::ScalarValue, Column};
+use datafusion_common::{Column, scalar::ScalarValue};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
+use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
-use futures::{future::BoxFuture, FutureExt, Stream};
-use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
+use futures::{FutureExt, Stream, future::BoxFuture};
+use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
@@ -96,10 +95,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
-            _ => Err(Error::Index {
-                message: "Invalid index type".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
 }
@@ -206,6 +202,7 @@ pub trait IndexReader: Send + Sync {
 }
 
 /// A stream that reads the original training data back out of the index
+#[allow(dead_code)]
 struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
     batch_size: u64,
@@ -213,6 +210,7 @@ struct IndexReaderStream {
     limit: u64,
 }
 
+#[allow(dead_code)]
 impl IndexReaderStream {
     async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
         let limit = reader.num_rows() as u64;
@@ -269,7 +267,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
-        -> Result<Box<dyn IndexWriter>>;
+    -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;

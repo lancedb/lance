@@ -22,9 +22,8 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
-use snafu::location;
 
-use super::super::builder::{FtsQuery, FtsQueryType, DEFAULT_WAND_FACTOR};
+use super::super::builder::{DEFAULT_WAND_FACTOR, FtsQuery, FtsQueryType};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -95,10 +94,10 @@ impl FtsIndexExec {
         // Verify the index exists for this column
         let column = &query.column;
         if indexes.get_fts_by_column(column).is_none() {
-            return Err(Error::invalid_input(
-                format!("No FTS index found for column '{}'", column),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "No FTS index found for column '{}'",
+                column
+            )));
         }
 
         // Build output schema: base fields + _score + optional _rowid
@@ -326,24 +325,24 @@ impl FtsIndexExec {
         }
 
         for &(pos, score) in results {
-            if let Some(batch_range) = self.find_batch(pos as usize) {
-                if let Some(stored) = self.batch_store.get(batch_range.batch_id) {
-                    let row_in_batch = (pos as usize - batch_range.start) as u32;
-                    let indices = UInt32Array::from(vec![row_in_batch]);
+            if let Some(batch_range) = self.find_batch(pos as usize)
+                && let Some(stored) = self.batch_store.get(batch_range.batch_id)
+            {
+                let row_in_batch = (pos as usize - batch_range.start) as u32;
+                let indices = UInt32Array::from(vec![row_in_batch]);
 
-                    // Take each column value
-                    for (col_idx, col) in stored.data.columns().iter().enumerate() {
-                        let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
-                        if all_columns.len() <= col_idx {
-                            all_columns.push(Vec::new());
-                        }
-                        all_columns[col_idx].push(taken);
+                // Take each column value
+                for (col_idx, col) in stored.data.columns().iter().enumerate() {
+                    let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
+                    if all_columns.len() <= col_idx {
+                        all_columns.push(Vec::new());
                     }
-
-                    all_rows.push(row_in_batch);
-                    all_scores.push(score);
-                    all_row_positions.push(pos);
+                    all_columns[col_idx].push(taken);
                 }
+
+                all_rows.push(row_in_batch);
+                all_scores.push(score);
+                all_row_positions.push(pos);
             }
         }
 

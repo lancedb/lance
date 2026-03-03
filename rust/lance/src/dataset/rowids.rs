@@ -8,9 +8,8 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
     format::{Fragment, RowIdMeta},
-    rowids::{read_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence},
+    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
-use snafu::location;
 use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -20,10 +19,7 @@ pub async fn load_row_id_sequence(
 ) -> Result<Arc<RowIdSequence>> {
     // Virtual path to prevent collisions in the cache.
     match &fragment.row_id_meta {
-        None => Err(Error::Internal {
-            message: "Missing row id meta".into(),
-            location: location!(),
-        }),
+        None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
@@ -129,11 +125,11 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
 
     use super::*;
 
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -141,9 +137,9 @@ mod test {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::datatypes::Schema;
-    use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
-    use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -277,9 +273,8 @@ mod test {
     #[tokio::test]
     async fn test_row_ids_append() {
         // Validate we handle row ids well when appending concurrently.
-        fn write_batch<'a>(uri: &'a str, start: &mut i32) -> impl Future<Output = Result<()>> + 'a {
-            let batch = sequence_batch(*start..(*start + 10));
-            *start += 10;
+        fn write_batch(uri: &str, start: i32) -> impl Future<Output = Result<()>> + '_ {
+            let batch = sequence_batch(start..(start + 10));
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
                 enable_stable_row_ids: true,
@@ -296,10 +291,11 @@ mod test {
         let tmp_path = &temp_dir;
         let mut start = 0;
         // Just do one first to create the dataset.
-        write_batch(tmp_path, &mut start).await.unwrap();
+        write_batch(tmp_path, start).await.unwrap();
+        start += 10;
         // Now do the rest concurrently.
         let futures = (0..5)
-            .map(|_| write_batch(tmp_path, &mut start))
+            .map(|offset| write_batch(tmp_path, start + offset * 10))
             .collect::<Vec<_>>();
         futures::future::try_join_all(futures).await.unwrap();
 

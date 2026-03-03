@@ -391,10 +391,10 @@ mod tests {
         ]))
     }
 
-    fn create_test_batch(schema: &Schema, ids: &[i32], gen: u64) -> RecordBatch {
+    fn create_test_batch(schema: &Schema, ids: &[i32], generation: u64) -> RecordBatch {
         let names: Vec<String> = ids.iter().map(|id| format!("name_{}", id)).collect();
         let distances: Vec<f32> = ids.iter().map(|id| *id as f32 * 0.1).collect();
-        let gens: Vec<u64> = vec![gen; ids.len()];
+        let gens: Vec<u64> = vec![generation; ids.len()];
 
         RecordBatch::try_new(
             Arc::new(schema.clone()),

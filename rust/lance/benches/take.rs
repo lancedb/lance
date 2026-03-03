@@ -6,7 +6,7 @@ use arrow_array::{
     UInt32Array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use futures::StreamExt;
 use lance::dataset::ProjectionRequest;
@@ -14,12 +14,12 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::LanceEncodingsIo;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
-use lance_file::LanceEncodingsIo;
+use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_io::ReadBatchParams;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

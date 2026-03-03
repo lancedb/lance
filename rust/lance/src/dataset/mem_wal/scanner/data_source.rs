@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef;
 use uuid::Uuid;
 
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Generation number in LSM tree.
 ///
@@ -28,13 +28,13 @@ impl LsmGeneration {
     ///
     /// # Panics
     ///
-    /// Panics if `gen` is 0, as generation 0 is reserved for the base table.
-    pub fn memtable(gen: u64) -> Self {
+    /// Panics if `generation` is 0, as generation 0 is reserved for the base table.
+    pub fn memtable(generation: u64) -> Self {
         assert!(
-            gen > 0,
+            generation > 0,
             "MemTable generation must be >= 1 (0 is reserved for base table)"
         );
-        Self(gen)
+        Self(generation)
     }
 
     /// Get the raw u64 value.
@@ -113,8 +113,8 @@ impl RegionSnapshot {
     }
 
     /// Set the current generation.
-    pub fn with_current_generation(mut self, gen: u64) -> Self {
-        self.current_generation = gen;
+    pub fn with_current_generation(mut self, generation: u64) -> Self {
+        self.current_generation = generation;
         self
     }
 

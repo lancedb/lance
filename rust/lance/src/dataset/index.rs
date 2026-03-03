@@ -6,21 +6,20 @@ pub mod frag_reuse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::dataset::optimize::remapping::RemapResult;
+use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
+use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
-use crate::Dataset;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::DatasetIndexExt;
-use lance_table::format::pb::VectorIndexDetails;
 use lance_table::format::IndexMetadata;
+use lance_table::format::pb::VectorIndexDetails;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
 
@@ -84,13 +83,10 @@ impl IndexRemapper for DatasetIndexRemapper {
                                 let field = index.fields.first().unwrap();
                                 let field =
                                     self.dataset.schema().field_by_id(*field).ok_or_else(|| {
-                                        Error::Internal {
-                                            message: format!(
-                                                "Index {} references field {} which does not exist",
-                                                index.uuid, field
-                                            ),
-                                            location: location!(),
-                                        }
+                                        Error::internal(format!(
+                                            "Index {} references field {} which does not exist",
+                                            index.uuid, field
+                                        ))
                                     })?;
 
                                 if matches!(field.data_type(), DataType::FixedSizeList(..)) {

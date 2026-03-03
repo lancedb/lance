@@ -5,9 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_encoding::{
-    encoder::{default_encoding_strategy, encode_batch, EncodingOptions},
+    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
     version::LanceFileVersion,
 };
 

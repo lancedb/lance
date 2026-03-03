@@ -10,8 +10,7 @@ use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, Re
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{norm_squared_fsl, DistanceType};
-use snafu::location;
+use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
@@ -74,33 +73,24 @@ impl Transformer for RQTransformer {
 
         let residual_vectors = batch
             .column_by_name(&self.vector_column)
-            .ok_or(Error::Index {
-                message: format!(
-                    "RQ Transform: column {} not found in batch",
-                    self.vector_column
-                ),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "RQ Transform: column {} not found in batch",
+                self.vector_column
+            )))?;
         let residual_vectors = residual_vectors
             .as_fixed_size_list_opt()
-            .ok_or(Error::Index {
-                message: format!(
-                    "RQ Transform: column {} is not a fixed size list, got {}",
-                    self.vector_column,
-                    residual_vectors.data_type(),
-                ),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "RQ Transform: column {} is not a fixed size list, got {}",
+                self.vector_column,
+                residual_vectors.data_type(),
+            )))?;
 
         let dist_v_c = batch
             .column_by_name(CENTROID_DIST_COLUMN)
-            .ok_or(Error::Index {
-                message: format!(
-                    "RQ Transform: column {} not found in batch",
-                    CENTROID_DIST_COLUMN
-                ),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "RQ Transform: column {} not found in batch",
+                CENTROID_DIST_COLUMN
+            )))?;
         let dist_v_c = dist_v_c.as_primitive::<Float32Type>();
 
         let res_norm_square = match self.distance_type {
@@ -108,13 +98,10 @@ impl Transformer for RQTransformer {
             DistanceType::L2 => dist_v_c.clone(),
             DistanceType::Dot => Float32Array::from(norm_squared_fsl(residual_vectors)),
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "RQ Transform: distance type {} not supported",
-                        self.distance_type
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "RQ Transform: distance type {} not supported",
+                    self.distance_type
+                )));
             }
         };
 
@@ -135,13 +122,10 @@ impl Transformer for RQTransformer {
                     .codes_res_dot_dists::<Float64Type>(residual_vectors)?,
             ),
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "RQ Transform: unsupported residual vector data type: {}",
-                        residual_vectors.data_type()
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "RQ Transform: unsupported residual vector data type: {}",
+                    residual_vectors.data_type()
+                )));
             }
         };
         debug_assert_eq!(codes_fsl.len(), batch.num_rows());
@@ -152,11 +136,9 @@ impl Transformer for RQTransformer {
                 // for dot, the add factor is `1 - v*c + |c|^2 = dist_v_c + |c|^2`
                 let part_ids = &batch[PART_ID_COLUMN];
                 let part_ids = part_ids.as_primitive::<UInt32Type>();
-                let centroids_norm_square =
-                    self.centroids_norm_square.as_ref().ok_or(Error::Index {
-                        message: "RQ Transform: centroids norm square not found".to_string(),
-                        location: location!(),
-                    })?;
+                let centroids_norm_square = self.centroids_norm_square.as_ref().ok_or(
+                    Error::index("RQ Transform: centroids norm square not found".to_string()),
+                )?;
                 let centroids_norm_square =
                     arrow::compute::take(centroids_norm_square, part_ids, None)?;
                 let centroids_norm_square = centroids_norm_square.as_primitive::<Float32Type>();
@@ -169,13 +151,10 @@ impl Transformer for RQTransformer {
                 )
             }
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "RQ Transform: distance type {} not supported",
-                        self.distance_type
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "RQ Transform: distance type {} not supported",
+                    self.distance_type
+                )));
             }
         };
 
@@ -197,13 +176,10 @@ impl Transformer for RQTransformer {
                 ),
             ),
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "RQ Transform: distance type {} not supported",
-                        self.distance_type
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "RQ Transform: distance type {} not supported",
+                    self.distance_type
+                )));
             }
         };
 

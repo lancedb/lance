@@ -19,25 +19,24 @@ use crate::{
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
-        pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
         ProtobufUtils21,
+        pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
 use itertools::Itertools;
-use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::DataTypeExt;
+use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
 use log::trace;
-use snafu::location;
 
 use crate::{
     compression::{
@@ -59,16 +58,17 @@ use crate::{
 };
 use crate::{
     repdef::{
-        build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator,
-        ControlWordParser, DefinitionInterpretation, RepDefSlicer,
+        CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
+        RepDefSlicer, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
-use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
+use lance_core::{Result, datatypes::Field, utils::tokio::spawn_cpu};
 
 use crate::constants::{DICT_DIVISOR_META_KEY, DICT_SIZE_RATIO_META_KEY};
 use crate::version::LanceFileVersion;
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
     decoder::{
@@ -81,7 +81,6 @@ use crate::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
-    EncodingsIo,
 };
 
 pub mod blob;
@@ -573,9 +572,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let should_cache_this_chunk = needs_caching[idx];
 
             let decoded_chunk = match &chunk_cache {
-                Some((cached_chunk_idx, ref cached_chunk))
-                    if *cached_chunk_idx == chunk.chunk_idx =>
-                {
+                Some((cached_chunk_idx, cached_chunk)) if *cached_chunk_idx == chunk.chunk_idx => {
                     // Clone only when we have a cache hit (much cheaper than decoding)
                     cached_chunk.clone()
                 }
@@ -609,13 +606,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 instructions.preamble_action,
             );
             if item_range.end - item_range.start > chunk.items_in_chunk {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Item range {:?} is greater than chunk items in chunk {:?}",
-                        item_range, chunk.items_in_chunk
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Item range {:?} is greater than chunk items in chunk {:?}",
+                    item_range, chunk.items_in_chunk
+                )));
             }
 
             // Now we append the data to the output buffers
@@ -633,13 +627,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
             let DataBlock::FixedWidth(indices) = data else {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
-                        data
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
+                    data
+                )));
             };
             data = DataBlock::Dictionary(DictionaryDataBlock::from_parts(
                 indices,
@@ -853,35 +844,26 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                 match decompressed {
                     DataBlock::FixedWidth(block) => {
                         if block.num_values != num_values {
-                            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "Unexpected {} level count after decompression: expected {}, got {}",
-                                    level_type, num_values, block.num_values
-                                )
-                                .into(),
-                                location: location!(),
-                            });
+                            return Err(Error::invalid_input_source(format!(
+                                "Unexpected {} level count after decompression: expected {}, got {}",
+                                level_type, num_values, block.num_values
+                            )
+                            .into()));
                         }
                         if block.bits_per_value != 16 {
-                            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "Unexpected {} level bit width after decompression: expected 16, got {}",
-                                    level_type, block.bits_per_value
-                                )
-                                .into(),
-                                location: location!(),
-                            });
+                            return Err(Error::invalid_input_source(format!(
+                                "Unexpected {} level bit width after decompression: expected 16, got {}",
+                                level_type, block.bits_per_value
+                            )
+                            .into()));
                         }
                         Ok(block.data.borrow_to_typed_slice::<u16>())
                     }
-                    _ => Err(Error::InvalidInput {
-                        source: format!(
-                            "Expected fixed-width data block for {} levels",
-                            level_type
-                        )
-                        .into(),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::invalid_input_source(format!(
+                        "Expected fixed-width data block for {} levels",
+                        level_type
+                    )
+                    .into())),
                 }
             };
 
@@ -1369,14 +1351,13 @@ impl MiniBlockScheduler {
                     crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!(
+                    return Err(Error::invalid_input_source(
+                        format!(
                             "Unsupported mini-block dictionary encoding: {:?}",
                             dictionary_encoding.compression.as_ref().unwrap()
                         )
                         .into(),
-                        location: location!(),
-                    })
+                    ));
                 }
             };
             Some(MiniBlockSchedulerDictionary {
@@ -1559,7 +1540,9 @@ impl ChunkInstructions {
             while rows_needed > 0 || need_preamble {
                 // Check if we've gone past the last block (should not happen)
                 if block_index >= rep_index.blocks.len() {
-                    log::warn!("schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early");
+                    log::warn!(
+                        "schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early"
+                    );
                     break;
                 }
 
@@ -2034,13 +2017,10 @@ impl FullZipReadSource {
                                 || range.start < base_offset
                                 || range.end > page_end
                             {
-                                return Err(Error::Internal {
-                                    message: format!(
-                                        "Requested range {:?} is outside page range {}..{}",
-                                        range, base_offset, page_end
-                                    ),
-                                    location: location!(),
-                                });
+                                return Err(Error::internal(format!(
+                                    "Requested range {:?} is outside page range {}..{}",
+                                    range, base_offset, page_end
+                                )));
                             }
                             let start = (range.start - base_offset) as usize;
                             let len = (range.end - range.start) as usize;
@@ -2208,20 +2188,15 @@ impl FullZipScheduler {
             PerValueDecompressor::Fixed(decompressor) => {
                 let bits_per_value = decompressor.bits_per_value();
                 if bits_per_value % 8 != 0 {
-                    return Err(lance_core::Error::NotSupported {
-                        source: "Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into(),
-                        location: location!(),
-                    });
+                    return Err(lance_core::Error::not_supported_source("Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into()));
                 }
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
                 if total_bytes_per_value == 0 {
-                    return Err(lance_core::Error::Internal {
-                        message: "Invalid encoding: per-row byte width must be greater than 0"
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(lance_core::Error::internal(
+                        "Invalid encoding: per-row byte width must be greater than 0",
+                    ));
                 }
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
@@ -2458,21 +2433,21 @@ impl StructuralPageScheduler for FullZipScheduler {
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        if self.enable_cache {
-            if let Some(rep_index) = self.rep_index {
-                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
-                let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
-                let io_clone = io.clone();
-                return async move {
-                    let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
-                    let state = Arc::new(FullZipCacheableState {
-                        rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
-                    });
-                    self.cached_state = Some(state.clone());
-                    Ok(state as Arc<dyn CachedPageData>)
-                }
-                .boxed();
+        if self.enable_cache
+            && let Some(rep_index) = self.rep_index
+        {
+            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+            let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+            let io_clone = io.clone();
+            return async move {
+                let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                let state = Arc::new(FullZipCacheableState {
+                    rep_index_buffer: LanceBuffer::from_bytes(rep_index_data[0].clone(), 1),
+                });
+                self.cached_state = Some(state.clone());
+                Ok(state as Arc<dyn CachedPageData>)
             }
+            .boxed();
         }
         std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
@@ -2717,50 +2692,38 @@ impl VariableFullZipDecoder {
         let offsets_slice = offsets.borrow_to_typed_slice::<T>();
         let offsets_slice = offsets_slice.as_ref();
         if offsets_slice.is_empty() {
-            return Err(Error::Internal {
-                message: "Variable offsets cannot be empty".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Variable offsets cannot be empty".to_string(),
+            ));
         }
 
         let base = offsets_slice[0];
         let end = *offsets_slice.last().unwrap();
         if end < base {
-            return Err(Error::Internal {
-                message: format!(
-                    "Invalid variable offsets: end ({end}) is less than base ({base})"
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Invalid variable offsets: end ({end}) is less than base ({base})"
+            )));
         }
 
-        let data_start = base.try_into().map_err(|_| Error::Internal {
-            message: format!("Variable offset ({base}) does not fit into usize"),
-            location: location!(),
+        let data_start = base.try_into().map_err(|_| {
+            Error::internal(format!("Variable offset ({base}) does not fit into usize"))
         })?;
-        let data_end = end.try_into().map_err(|_| Error::Internal {
-            message: format!("Variable offset ({end}) does not fit into usize"),
-            location: location!(),
+        let data_end = end.try_into().map_err(|_| {
+            Error::internal(format!("Variable offset ({end}) does not fit into usize"))
         })?;
         if data_end > data.len() {
-            return Err(Error::Internal {
-                message: format!(
-                    "Invalid variable offsets: end ({data_end}) exceeds data len ({})",
-                    data.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Invalid variable offsets: end ({data_end}) exceeds data len ({})",
+                data.len()
+            )));
         }
 
         let mut rebased_offsets = Vec::with_capacity(offsets_slice.len());
         for &offset in offsets_slice {
             if offset < base {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Invalid variable offsets: offset ({offset}) is less than base ({base})"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Invalid variable offsets: offset ({offset}) is less than base ({base})"
+                )));
             }
             rebased_offsets.push(offset - base);
         }
@@ -2780,10 +2743,9 @@ impl VariableFullZipDecoder {
         match bits_per_offset {
             32 => Self::slice_batch_data_and_rebase_offsets_typed::<u32>(data, offsets),
             64 => Self::slice_batch_data_and_rebase_offsets_typed::<u64>(data, offsets),
-            _ => Err(Error::Internal {
-                message: format!("Unsupported bits_per_offset={bits_per_offset}"),
-                location: location!(),
-            }),
+            _ => Err(Error::internal(format!(
+                "Unsupported bits_per_offset={bits_per_offset}"
+            ))),
         }
     }
 
@@ -3165,8 +3127,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
         trace!(
             "Current range is {:?} and current page has {} rows",
-            range,
-            cur_page.num_rows
+            range, cur_page.num_rows
         );
         // Skip entire pages until we have some overlap with our next range
         while cur_page.num_rows + self.global_row_offset <= range.start {
@@ -5052,36 +5013,35 @@ impl PrimitiveStructuralEncoder {
                 };
             }
 
-            if let DataType::Struct(fields) = &field.data_type() {
-                if fields.is_empty() {
-                    if has_repdef_info {
-                        return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
-                    }
-                    // This is maybe a little confusing but the reader should never look at this anyways and it
-                    // seems like overkill to invent a new layout just for "empty structs".
-                    return Self::encode_simple_all_null(column_idx, num_values, row_number);
+            if let DataType::Struct(fields) = &field.data_type()
+                && fields.is_empty()
+            {
+                if has_repdef_info {
+                    return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
                 }
+                // This is maybe a little confusing but the reader should never look at this anyways and it
+                // seems like overkill to invent a new layout just for "empty structs".
+                return Self::encode_simple_all_null(column_idx, num_values, row_number);
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            if version.resolve() >= LanceFileVersion::V2_2 {
-                if let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-                {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using constant layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    return constant::encode_constant_page(
-                        column_idx,
-                        scalar,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    );
-                }
+            if version.resolve() >= LanceFileVersion::V2_2
+                && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+            {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using constant layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                return constant::encode_constant_page(
+                    column_idx,
+                    scalar,
+                    repdef,
+                    row_number,
+                    num_rows,
+                );
             }
 
             let requires_full_zip_packed_struct =
@@ -5189,7 +5149,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                     )
                 } else {
-                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                    Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
                 }
             }
         })
@@ -5305,10 +5265,10 @@ mod tests {
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
-    use crate::format::ProtobufUtils21;
-    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
     use arrow_schema::DataType;
@@ -6044,7 +6004,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_initialize_is_lazy() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6160,7 +6120,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_initialize_caches_rep_index_when_enabled() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6246,10 +6206,12 @@ mod tests {
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let cached_data = scheduler.initialize(&io_dyn).await.unwrap();
-        assert!(cached_data
-            .as_arc_any()
-            .downcast_ref::<FullZipCacheableState>()
-            .is_some());
+        assert!(
+            cached_data
+                .as_arc_any()
+                .downcast_ref::<FullZipCacheableState>()
+                .is_some()
+        );
         assert!(scheduler.cached_state.is_some());
         assert_eq!(
             io.requests(),
@@ -6261,7 +6223,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_full_page_bypasses_rep_index_io() {
-        use futures::{future::BoxFuture, FutureExt};
+        use futures::{FutureExt, future::BoxFuture};
         use std::ops::Range;
         use std::sync::Mutex;
 
@@ -6379,7 +6341,7 @@ mod tests {
     /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
     #[tokio::test]
     async fn test_fuzz_issue_4492_empty_rep_values() {
-        use lance_datagen::{array, gen_batch, RowCount, Seed};
+        use lance_datagen::{RowCount, Seed, array, gen_batch};
 
         let seed = 1823859942947654717u64;
         let num_rows = 2741usize;
@@ -6418,7 +6380,7 @@ mod tests {
         file_version: LanceFileVersion,
     ) {
         use crate::constants::MINICHUNK_SIZE_META_KEY;
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use arrow_array::{ArrayRef, StringArray};
         use std::sync::Arc;
 
@@ -6503,23 +6465,25 @@ mod tests {
                 let col = &cols[0];
 
                 // Navigate to the dictionary encoding in the page layout
-                if let Some(PageEncoding::Structural(page_layout)) = &col.final_pages.first().map(|p| &p.description) {
-                    // Check that dictionary is wrapped with general compression
-                    if let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) = &page_layout.layout {
-                        if let Some(dictionary_encoding) = &mini_block.dictionary {
-                            match dictionary_encoding.compression.as_ref() {
-                                Some(Compression::General(general)) => {
-                                    // Verify it's using LZ4 or Zstd
-                                    let compression = general.compression.as_ref().unwrap();
-                                    assert!(
-                                        compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmLz4
-                                        || compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmZstd,
-                                        "Expected LZ4 or Zstd compression for large dictionary"
-                                    );
-                                }
-                                _ => panic!("Expected General compression for large dictionary"),
-                            }
+                if let Some(PageEncoding::Structural(page_layout)) =
+                    &col.final_pages.first().map(|p| &p.description)
+                    && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                        &page_layout.layout
+                    && let Some(dictionary_encoding) = &mini_block.dictionary
+                {
+                    match dictionary_encoding.compression.as_ref() {
+                        Some(Compression::General(general)) => {
+                            // Verify it's using LZ4 or Zstd
+                            let compression = general.compression.as_ref().unwrap();
+                            assert!(
+                                compression.scheme()
+                                    == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                    || compression.scheme()
+                                        == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                "Expected LZ4 or Zstd compression for large dictionary"
+                            );
                         }
+                        _ => panic!("Expected General compression for large dictionary"),
                     }
                 }
             }));
@@ -6530,7 +6494,7 @@ mod tests {
     #[tokio::test]
     async fn test_dictionary_encode_int64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Int64Array};
         use std::collections::HashMap;
@@ -6566,7 +6530,7 @@ mod tests {
     #[tokio::test]
     async fn test_dictionary_encode_float64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Float64Array};
         use std::collections::HashMap;
@@ -6773,8 +6737,8 @@ mod tests {
         version: LanceFileVersion,
     ) -> crate::encoder::EncodedPage {
         use crate::encoder::{
-            default_encoding_strategy, ColumnIndexSequence, EncodingOptions, OutOfLineBuffers,
-            MIN_PAGE_BUFFER_ALIGNMENT,
+            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+            default_encoding_strategy,
         };
         use crate::repdef::RepDefBuilder;
 

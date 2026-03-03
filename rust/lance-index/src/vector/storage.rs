@@ -10,26 +10,25 @@ use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
-use snafu::location;
 use std::{any::Any, sync::Arc};
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
-        ivf::storage::{IvfModel, IVF_METADATA_KEY},
+        ivf::storage::{IVF_METADATA_KEY, IvfModel},
         quantizer::Quantization,
     },
 };
 
-use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::DISTANCE_TYPE_KEY;
+use super::quantizer::{Quantizer, QuantizerMetadata};
 
 /// <section class="warning">
 ///  Internal API
@@ -134,10 +133,10 @@ impl<Q: Quantization> StorageBuilder<Q> {
         if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
                 .column_by_name(&self.vector_column)
-                .ok_or(Error::Index {
-                    message: format!("Vector column {} not found in batch", self.vector_column),
-                    location: location!(),
-                })?;
+                .ok_or(Error::index(format!(
+                    "Vector column {} not found in batch",
+                    self.vector_column
+                )))?;
             let codes = self.quantizer.quantize(vectors)?;
             batch = batch.drop_column(&self.vector_column)?.try_with_column(
                 arrow_schema::Field::new(self.quantizer.column(), codes.data_type().clone(), true),
@@ -189,25 +188,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             schema
                 .metadata
                 .get(DISTANCE_TYPE_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", DISTANCE_TYPE_KEY),
-                    location: location!(),
-                })?
+                .ok_or(Error::index(format!("{} not found", DISTANCE_TYPE_KEY)))?
                 .as_str(),
         )?;
 
         let ivf_pos = schema
             .metadata
             .get(IVF_METADATA_KEY)
-            .ok_or(Error::Index {
-                message: format!("{} not found", IVF_METADATA_KEY),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
-            .map_err(|e| Error::Index {
-                message: format!("Failed to decode IVF metadata: {}", e),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::index(format!("Failed to decode IVF metadata: {}", e)))?;
         let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
         let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
@@ -215,18 +205,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             schema
                 .metadata
                 .get(STORAGE_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", STORAGE_METADATA_KEY),
-                    location: location!(),
-                })?
+                .ok_or(Error::index(format!("{} not found", STORAGE_METADATA_KEY)))?
                 .as_str(),
         )?;
         debug_assert_eq!(metadata.len(), 1);
         // for now the metadata is the same for all partitions, so we just store one
-        let metadata = metadata.pop().ok_or(Error::Index {
-            message: "metadata is empty".to_string(),
-            location: location!(),
-        })?;
+        let metadata = metadata
+            .pop()
+            .ok_or(Error::index("metadata is empty".to_string()))?;
         let mut metadata: Q::Metadata = serde_json::from_str(&metadata)?;
         // we store large metadata (e.g. PQ codebook) in global buffer,
         // and the schema metadata just contains a pointer to the buffer

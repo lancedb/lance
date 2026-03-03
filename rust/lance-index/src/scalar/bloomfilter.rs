@@ -15,7 +15,7 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
 };
-use crate::{pb, Any};
+use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
 mod as_bytes;
 pub mod sbbf;
@@ -34,13 +34,12 @@ use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::cache::LanceCache;
 use roaring::RoaringBitmap;
-use snafu::location;
 
-use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -135,81 +134,49 @@ impl BloomFilterIndex {
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'fragment_id' column",
-                    location!(),
-                )
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'fragment_id' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'fragment_id' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'fragment_id' column is not UInt64")
             })?;
 
         let zone_start_col = data
             .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::invalid_input("BloomFilterIndex: missing 'zone_start' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'zone_start' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'zone_start' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'zone_start' column is not UInt64")
             })?;
 
         let zone_length_col = data
             .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'zone_length' column",
-                    location!(),
-                )
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'zone_length' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'zone_length' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'zone_length' column is not UInt64")
             })?;
 
         let bloom_filter_data_col = data
             .column_by_name("bloom_filter_data")
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'bloom_filter_data' column",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: missing 'bloom_filter_data' column")
             })?
             .as_any()
             .downcast_ref::<arrow_array::BinaryArray>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'bloom_filter_data' column is not Binary",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'bloom_filter_data' column is not Binary")
             })?;
 
         let has_null_col = data
             .column_by_name("has_null")
-            .ok_or_else(|| {
-                Error::invalid_input("BloomFilterIndex: missing 'has_null' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'has_null' column"))?
             .as_any()
             .downcast_ref::<arrow_array::BooleanArray>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: 'has_null' column is not Boolean",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: 'has_null' column is not Boolean")
             })?;
 
         let num_blocks = data.num_rows();
@@ -224,10 +191,7 @@ impl BloomFilterIndex {
 
             // Convert bytes back to Sbbf
             let bloom_filter = Sbbf::new(&bloom_filter_bytes).map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to deserialize bloom filter: {:?}", e),
-                    location!(),
-                )
+                Error::invalid_input(format!("Failed to deserialize bloom filter: {:?}", e))
             })?;
 
             blocks.push(BloomFilterStatistics {
@@ -318,14 +282,9 @@ impl BloomFilterIndex {
                     datafusion_common::ScalarValue::TimestampNanosecond(Some(val), _) => {
                         Ok(sbbf.check(val))
                     }
-                    _ => Err(Error::InvalidInput {
-                        source: format!(
-                            "Unsupported data type in bloom filter query: {:?}",
-                            target
-                        )
-                        .into(),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::invalid_input_source(
+                        format!("Unsupported data type in bloom filter query: {:?}", target).into(),
+                    )),
                 }
             }
             BloomFilterQuery::IsIn(values) => {
@@ -391,14 +350,10 @@ impl BloomFilterIndex {
                             sbbf.check(val)
                         }
                         _ => {
-                            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "Unsupported data type in bloom filter query: {:?}",
-                                    value
-                                )
-                                .into(),
-                                location: location!(),
-                            });
+                            return Err(Error::invalid_input_source(
+                                format!("Unsupported data type in bloom filter query: {:?}", value)
+                                    .into(),
+                            ));
                         }
                     };
 
@@ -423,10 +378,9 @@ impl Index for BloomFilterIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::InvalidInput {
-            source: "BloomFilter is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "BloomFilter is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -480,10 +434,9 @@ impl ScalarIndex for BloomFilterIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::InvalidInput {
-            source: "BloomFilter does not support remap".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "BloomFilter does not support remap".into(),
+        ))
     }
 
     async fn update(
@@ -712,9 +665,8 @@ impl BloomFilterProcessor {
             .expected_items(params.number_of_items)
             .false_positive_probability(params.probability)
             .build()
-            .map_err(|e| Error::InvalidInput {
-                source: format!("Failed to build SBBF: {:?}", e).into(),
-                location: location!(),
+            .map_err(|e| {
+                Error::invalid_input_source(format!("Failed to build SBBF: {:?}", e).into())
             })
     }
 
@@ -788,10 +740,7 @@ impl ZoneProcessor for BloomFilterProcessor {
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
         let sbbf = self.sbbf.as_mut().ok_or_else(|| {
-            Error::invalid_input(
-                "BloomFilterProcessor did not initialize bloom filter",
-                location!(),
-            )
+            Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
 
         let has_null = match array.data_type() {
@@ -892,10 +841,9 @@ impl ZoneProcessor for BloomFilterProcessor {
                     Self::process_primitive_array(sbbf, typed_array)
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Unsupported Time32 unit: {:?}", time_unit).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Unsupported Time32 unit: {:?}", time_unit).into(),
+                    ));
                 }
             },
             // Date and time types (stored as i64 internally)
@@ -922,10 +870,9 @@ impl ZoneProcessor for BloomFilterProcessor {
                     Self::process_primitive_array(sbbf, typed_array)
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Unsupported Time64 unit: {:?}", time_unit).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Unsupported Time64 unit: {:?}", time_unit).into(),
+                    ));
                 }
             },
             DataType::Timestamp(time_unit, _) => match time_unit {
@@ -987,14 +934,13 @@ impl ZoneProcessor for BloomFilterProcessor {
                 Self::process_large_binary_array(sbbf, typed_array)
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: format!(
+                return Err(Error::invalid_input_source(
+                    format!(
                         "Bloom filter does not support data type: {:?}",
                         array.data_type()
                     )
                     .into(),
-                    location: location!(),
-                });
+                ));
             }
         };
 
@@ -1005,10 +951,7 @@ impl ZoneProcessor for BloomFilterProcessor {
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
-            Error::invalid_input(
-                "BloomFilterProcessor did not initialize bloom filter",
-                location!(),
-            )
+            Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
         Ok(BloomFilterStatistics {
             bound,
@@ -1054,10 +997,9 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A bloom filter index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A bloom filter index can only be created on a non-nested field.".into(),
+            ));
         }
 
         // Check if the data type is supported by bloom filter
@@ -1090,13 +1032,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                 // Type is supported, continue
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: format!(
-                        "Bloom filter index does not support data type: {:?}. Supported types: Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Utf8, LargeUtf8, Binary, LargeBinary, Date32, Date64, Time32, Time64, Timestamp",
-                        field.data_type()
-                    ).into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(format!(
+                    "Bloom filter index does not support data type: {:?}. Supported types: Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Utf8, LargeUtf8, Binary, LargeBinary, Date32, Date64, Time32, Time64, Timestamp",
+                    field.data_type()
+                ).into()));
             }
         }
 
@@ -1114,17 +1053,17 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "BloomFilter index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "BloomFilter index does not support fragment training".into(),
+            ));
         }
 
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
         Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
@@ -1203,27 +1142,27 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
-    use arrow_array::{record_batch, RecordBatch, UInt64Array};
+    use arrow_array::{RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
     use lance_core::{
+        ROW_ADDR,
         cache::LanceCache,
         utils::{mask::RowAddrTreeMap, tempfile::TempObjDir},
-        ROW_ADDR,
     };
     use lance_io::object_store::ObjectStore;
 
     use crate::scalar::{
+        BloomFilterQuery, ScalarIndex, SearchResult,
         bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
         lance_format::LanceIndexStore,
-        BloomFilterQuery, ScalarIndex, SearchResult,
     };
 
-    use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
 
     // Adds a _rowaddr column emulating each batch as a new fragment

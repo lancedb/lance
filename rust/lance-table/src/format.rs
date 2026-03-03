@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_buffer::ToByteSlice;
-use snafu::location;
 use uuid::Uuid;
 
 mod fragment;
@@ -17,8 +16,8 @@ pub use fragment::*;
 pub use index::IndexMetadata;
 
 pub use manifest::{
-    is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, DETACHED_VERSION_MASK,
+    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
+    WriterVersion, is_detached_version,
 };
 pub use transaction::Transaction;
 
@@ -54,7 +53,6 @@ impl TryFrom<&pb::Uuid> for Uuid {
         if p.uuid.len() != 16 {
             return Err(Error::invalid_input(
                 "Protobuf UUID is malformed".to_string(),
-                location!(),
             ));
         }
         let mut buf: [u8; 16] = [0; 16];

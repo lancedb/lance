@@ -357,11 +357,7 @@ impl BatchStore {
     #[inline]
     pub fn max_buffered_batch_position(&self) -> Option<usize> {
         let len = self.len();
-        if len == 0 {
-            None
-        } else {
-            Some(len - 1)
-        }
+        if len == 0 { None } else { Some(len - 1) }
     }
 
     /// Get total row count.
@@ -1088,8 +1084,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_read_write() {
-        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         use std::thread;
 
         let store = Arc::new(BatchStore::with_capacity(200));

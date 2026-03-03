@@ -41,9 +41,9 @@ use lance_namespace::models::{
     UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-use lance_core::{box_error, Error, Result};
+use lance_core::{Error, Result, box_error};
 
 use lance_namespace::LanceNamespace;
 
@@ -100,13 +100,13 @@ impl RestClient {
 
             const HEADERS_PREFIX: &str = "headers.";
             for (key, value) in context {
-                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX) {
-                    if let (Ok(header_name), Ok(header_value)) = (
+                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX)
+                    && let (Ok(header_name), Ok(header_value)) = (
                         HeaderName::from_str(header_name),
                         HeaderValue::from_str(&value),
-                    ) {
-                        request_headers.insert(header_name, header_value);
-                    }
+                    )
+                {
+                    request_headers.insert(header_name, header_value);
                 }
             }
         }
@@ -249,13 +249,9 @@ impl RestNamespaceBuilder {
     /// ```
     pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
         // Extract URI (required)
-        let uri = properties
-            .get("uri")
-            .cloned()
-            .ok_or_else(|| Error::Namespace {
-                source: "Missing required property 'uri' for REST namespace".into(),
-                location: snafu::location!(),
-            })?;
+        let uri = properties.get("uri").cloned().ok_or_else(|| {
+            Error::namespace_source("Missing required property 'uri' for REST namespace".into())
+        })?;
 
         // Extract delimiter (optional)
         let delimiter = properties
@@ -416,10 +412,7 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
     match id {
         Some(id_parts) if !id_parts.is_empty() => Ok(id_parts.join(delimiter)),
         Some(_) => Ok(delimiter.to_string()),
-        None => Err(Error::Namespace {
-            source: "Object ID is required".into(),
-            location: snafu::location!(),
-        }),
+        None => Err(Error::namespace_source("Object ID is required".into())),
     }
 }
 
@@ -462,21 +455,19 @@ impl RestNamespace {
         let mut client_builder = reqwest::Client::builder();
 
         // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file) {
-            if let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file)) {
-                if let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat()) {
-                    client_builder = client_builder.identity(identity);
-                }
-            }
+        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file)
+            && let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file))
+            && let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat())
+        {
+            client_builder = client_builder.identity(identity);
         }
 
         // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &builder.ssl_ca_cert {
-            if let Ok(ca_cert) = std::fs::read(ca_cert_file) {
-                if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert) {
-                    client_builder = client_builder.add_root_certificate(ca_cert);
-                }
-            }
+        if let Some(ca_cert_file) = &builder.ssl_ca_cert
+            && let Ok(ca_cert) = std::fs::read(ca_cert_file)
+            && let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert)
+        {
+            client_builder = client_builder.add_root_certificate(ca_cert);
         }
 
         // Configure hostname verification
@@ -515,27 +506,22 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
-        let content = resp.text().await.map_err(|e| Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        })?;
+        let content = resp
+            .text()
+            .await
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| Error::Namespace {
-                source: format!("Failed to parse response: {}", e).into(),
-                location: snafu::location!(),
+            serde_json::from_str(&content).map_err(|e| {
+                Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 
@@ -555,27 +541,22 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
-        let content = resp.text().await.map_err(|e| Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        })?;
+        let content = resp
+            .text()
+            .await
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| Error::Namespace {
-                source: format!("Failed to parse response: {}", e).into(),
-                location: snafu::location!(),
+            serde_json::from_str(&content).map_err(|e| {
+                Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 
@@ -595,23 +576,19 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
-            let content = resp.text().await.map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            let content = resp
+                .text()
+                .await
+                .map_err(|e| Error::io_source(box_error(e)))?;
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 
@@ -631,27 +608,22 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
-        let content = resp.text().await.map_err(|e| Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        })?;
+        let content = resp
+            .text()
+            .await
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| Error::Namespace {
-                source: format!("Failed to parse response: {}", e).into(),
-                location: snafu::location!(),
+            serde_json::from_str(&content).map_err(|e| {
+                Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 
@@ -672,26 +644,21 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.bytes().await.map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })
+            resp.bytes()
+                .await
+                .map_err(|e| Error::io_source(box_error(e)))
         } else {
-            let content = resp.text().await.map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            let content = resp
+                .text()
+                .await
+                .map_err(|e| Error::io_source(box_error(e)))?;
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 
@@ -921,9 +888,8 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
 
-        let on = request.on.as_deref().ok_or_else(|| Error::Namespace {
-            source: "'on' field is required for merge insert".into(),
-            location: snafu::location!(),
+        let on = request.on.as_deref().ok_or_else(|| {
+            Error::namespace_source("'on' field is required for merge insert".into())
         })?;
 
         let path = format!("/v1/table/{}/merge_insert", encoded_id);
@@ -1017,26 +983,21 @@ impl LanceNamespace for RestNamespace {
             .rest_client
             .execute(req_builder, "query_table", &id)
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::io_source(box_error(e)))?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.bytes().await.map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })
+            resp.bytes()
+                .await
+                .map_err(|e| Error::io_source(box_error(e)))
         } else {
-            let content = resp.text().await.map_err(|e| Error::IO {
-                source: box_error(e),
-                location: snafu::location!(),
-            })?;
-            Err(Error::Namespace {
-                source: format!("Response error: status={}, content={}", status, content).into(),
-                location: snafu::location!(),
-            })
+            let content = resp
+                .text()
+                .await
+                .map_err(|e| Error::io_source(box_error(e)))?;
+            Err(Error::namespace_source(
+                format!("Response error: status={}, content={}", status, content).into(),
+            ))
         }
     }
 

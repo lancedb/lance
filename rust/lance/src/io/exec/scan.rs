@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream};
-use futures::{stream, FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, stream};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -30,15 +30,14 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::location;
 use tracing::Instrument;
 
+use crate::dataset::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
     LEGACY_DEFAULT_FRAGMENT_READAHEAD,
 };
-use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
@@ -239,11 +238,10 @@ impl LanceStream {
                         .count_rows(None)
                         // count_rows should be a fast operation in v2 files
                         .now_or_never()
-                        .ok_or(Error::Internal {
-                            message: "Encountered fragment without row count metadata in v2 file"
+                        .ok_or(Error::internal(
+                            "Encountered fragment without row count metadata in v2 file"
                                 .to_string(),
-                            location: location!(),
-                        })??;
+                        ))??;
                     if rows_to_skip >= num_rows_in_frag as u64 {
                         rows_to_skip -= num_rows_in_frag as u64;
                     } else {

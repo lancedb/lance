@@ -9,15 +9,15 @@ use std::sync::Arc;
 
 use crate::Error;
 use arrow_array::types::{Float16Type, Float64Type, Int8Type};
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, cast::AsArray, types::Float32Type};
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::SIMD_SUPPORT;
-use num_traits::{real::Real, AsPrimitive, Num};
+use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
 
@@ -88,7 +88,7 @@ mod kernel {
 
     // These are the `dot_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
-    extern "C" {
+    unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]

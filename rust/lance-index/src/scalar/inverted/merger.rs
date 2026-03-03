@@ -2,17 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use fst::Streamer;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus, Error, Result};
-use snafu::location;
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};
 use std::sync::Arc;
 
 use crate::progress::IndexBuildProgress;
 use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
     InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
+    builder::{InnerBuilder, PositionRecorder, doc_file_path, posting_file_path, token_file_path},
 };
 
 pub trait Merger {
@@ -118,10 +117,9 @@ impl<'a> SizeBasedMerger<'a> {
         match self.with_position {
             Some(existing) => {
                 if existing != with_position {
-                    return Err(Error::Index {
-                        message: "partition position settings do not match".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "partition position settings do not match".to_string(),
+                    ));
                 }
             }
             None => {

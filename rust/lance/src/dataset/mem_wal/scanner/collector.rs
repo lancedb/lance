@@ -11,8 +11,8 @@ use lance_core::Result;
 use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, RegionSnapshot};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Reference to an active (in-memory) MemTable.
 #[derive(Clone)]

@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::vec;
 
+use crate::dataset::ROW_ID;
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
-use crate::dataset::ROW_ID;
 use crate::index::vector::VectorIndexParams;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
@@ -16,26 +16,26 @@ use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
+use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
 use arrow_array::{
+    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
     types::{Float32Type, Int32Type},
-    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
 };
-use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
 };
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::utils::tempfile::TempStrDir;
-use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_index::DatasetIndexExt;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::DatasetIndexExt;
-use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_linalg::distance::MetricType;
 
 use datafusion::common::{assert_contains, assert_not_contains};
@@ -393,11 +393,13 @@ async fn test_create_fts_index_with_empty_strings() {
         false,
     )]));
 
-    let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec!["", "", ""]))],
-    )
-    .unwrap()];
+    let batches: Vec<RecordBatch> = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["", "", ""]))],
+        )
+        .unwrap(),
+    ];
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     let mut dataset = Dataset::write(reader, &test_uri, None)
         .await
@@ -1797,7 +1799,7 @@ async fn prepare_json_dataset() -> (Dataset, String) {
     );
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
-            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
         ])
         .into(),
         vec![text_col.clone()],
@@ -2062,7 +2064,7 @@ async fn test_json_inverted_flat_match_query() {
     );
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
-            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
         ])
         .into(),
         vec![text_col.clone()],

@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
     CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableVersionRequest,
     DescribeTableVersionResponse, ListTableVersionsRequest, ListTableVersionsResponse,
 };
-use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
@@ -724,12 +724,11 @@ impl LanceNamespaceTrait for PyLanceNamespace {
     ) -> lance_core::Result<DescribeTableVersionResponse> {
         // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
         let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to serialize request: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -739,38 +738,36 @@ impl LanceNamespaceTrait for PyLanceNamespace {
 
                 match result {
                     Ok(response_py) => {
-                        let response_str: String =
-                            response_py.extract(py).map_err(|e| lance_core::Error::IO {
-                                source: Box::new(std::io::Error::other(format!(
-                                    "Failed to extract response string: {}",
-                                    e
-                                ))),
-                                location: snafu::location!(),
-                            })?;
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
                         Ok(response_str)
                     }
-                    Err(e) => Err(lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
                             "Failed to call describe_table_version_json: {}",
                             e
-                        ))),
-                        location: snafu::location!(),
-                    }),
+                        )),
+                    ))),
                 }
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
         })??;
 
-        serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to deserialize response: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })
     }
 
@@ -780,12 +777,11 @@ impl LanceNamespaceTrait for PyLanceNamespace {
     ) -> lance_core::Result<CreateTableVersionResponse> {
         // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
         let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to serialize request: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -795,38 +791,36 @@ impl LanceNamespaceTrait for PyLanceNamespace {
 
                 match result {
                     Ok(response_py) => {
-                        let response_str: String =
-                            response_py.extract(py).map_err(|e| lance_core::Error::IO {
-                                source: Box::new(std::io::Error::other(format!(
-                                    "Failed to extract response string: {}",
-                                    e
-                                ))),
-                                location: snafu::location!(),
-                            })?;
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
                         Ok(response_str)
                     }
-                    Err(e) => Err(lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
                             "Failed to call create_table_version_json: {}",
                             e
-                        ))),
-                        location: snafu::location!(),
-                    }),
+                        )),
+                    ))),
                 }
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
         })??;
 
-        serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to deserialize response: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })
     }
 
@@ -836,12 +830,11 @@ impl LanceNamespaceTrait for PyLanceNamespace {
     ) -> lance_core::Result<ListTableVersionsResponse> {
         // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
         let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to serialize request: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })?;
 
         let response_json = tokio::task::spawn_blocking(move || {
@@ -851,38 +844,36 @@ impl LanceNamespaceTrait for PyLanceNamespace {
 
                 match result {
                     Ok(response_py) => {
-                        let response_str: String =
-                            response_py.extract(py).map_err(|e| lance_core::Error::IO {
-                                source: Box::new(std::io::Error::other(format!(
-                                    "Failed to extract response string: {}",
-                                    e
-                                ))),
-                                location: snafu::location!(),
-                            })?;
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
                         Ok(response_str)
                     }
-                    Err(e) => Err(lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
                             "Failed to call list_table_versions_json: {}",
                             e
-                        ))),
-                        location: snafu::location!(),
-                    }),
+                        )),
+                    ))),
                 }
             })
         })
         .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!("Task join error: {}", e))),
-            location: snafu::location!(),
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
         })??;
 
-        serde_json::from_str(&response_json).map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to deserialize response: {}",
                 e
-            ))),
-            location: snafu::location!(),
+            ))))
         })
     }
 }
@@ -921,10 +912,10 @@ pub fn extract_namespace_arc(
             if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
                 return Ok(dir_ns.borrow().inner.clone());
             }
-        } else if type_name == "RestNamespace" {
-            if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
-                return Ok(rest_ns.borrow().inner.clone());
-            }
+        } else if type_name == "RestNamespace"
+            && let Ok(rest_ns) = inner.downcast::<PyRestNamespace>()
+        {
+            return Ok(rest_ns.borrow().inner.clone());
         }
     }
 

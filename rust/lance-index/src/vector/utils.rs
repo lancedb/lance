@@ -12,15 +12,14 @@ use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
-use snafu::location;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
 use crate::vector::flat::storage::FlatFloatStorage;
-use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::hnsw::HNSW;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::v3::subindex::IvfSubIndex;
 
 enum SimpleIndexStatus {
@@ -128,10 +127,10 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
             do_prefetch(array.values().as_ptr_range())
         }
         _ => {
-            return Err(Error::invalid_input(
-                format!("Unsupported data type for prefetch: {}", array.data_type()),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Unsupported data type for prefetch: {}",
+                array.data_type()
+            )));
         }
     }
 
@@ -149,7 +148,7 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
             const CACHE_LINE_SIZE: usize = 64;
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                 _mm_prefetch(current_ptr, _MM_HINT_T0);
             }
             current_ptr = current_ptr.add(CACHE_LINE_SIZE);
@@ -184,10 +183,10 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
             DataType::Float16 => Ok(Self::Float16),
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
-            _ => Err(Error::Index {
-                message: format!("pb tensor type not supported: {:?}", dt),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "pb tensor type not supported: {:?}",
+                dt
+            ))),
         }
     }
 }
@@ -218,10 +217,10 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
 
     fn try_from(tensor: &Tensor) -> Result<Self> {
         if tensor.shape.len() != 2 {
-            return Err(Error::Index {
-                message: format!("only accept 2-D tensor shape, got: {:?}", tensor.shape),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "only accept 2-D tensor shape, got: {:?}",
+                tensor.shape
+            )));
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
@@ -235,14 +234,11 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         )?;
 
         if flat_array.len() != dim * num_rows {
-            return Err(Error::Index {
-                message: format!(
-                    "Tensor shape {:?} does not match to data len: {}",
-                    tensor.shape,
-                    flat_array.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Tensor shape {:?} does not match to data len: {}",
+                tensor.shape,
+                flat_array.len()
+            )));
         }
 
         let field = Field::new("item", flat_array.data_type().clone(), true);

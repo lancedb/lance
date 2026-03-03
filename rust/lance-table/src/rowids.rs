@@ -27,13 +27,11 @@ use deepsize::DeepSizeOf;
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
 use lance_core::{
-    utils::mask::{RowAddrMask, RowAddrTreeMap},
     Error, Result,
+    utils::mask::{RowAddrMask, RowAddrTreeMap},
 };
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
-
-use snafu::location;
 
 use crate::utils::LanceIteratorExtension;
 use lance_core::utils::mask::RowSetOps;
@@ -127,14 +125,13 @@ impl RowIdSequence {
         // range.
         if let (Some(U64Segment::Range(range1)), Some(U64Segment::Range(range2))) =
             (self.0.last(), other.0.first())
+            && range1.end == range2.start
         {
-            if range1.end == range2.start {
-                let new_range = U64Segment::Range(range1.start..range2.end);
-                self.0.pop();
-                self.0.push(new_range);
-                self.0.extend(other.0.into_iter().skip(1));
-                return;
-            }
+            let new_range = U64Segment::Range(range1.start..range2.end);
+            self.0.pop();
+            self.0.push(new_range);
+            self.0.extend(other.0.into_iter().skip(1));
+            return;
         }
         // TODO: add other optimizations, such as combining two RangeWithHoles.
         self.0.extend(other.0);
@@ -219,10 +216,10 @@ impl RowIdSequence {
             // If we've cycled through all segments, we know the row id is not in the sequence.
             while i < self.0.len() {
                 let (segment_idx, segment) = segment_iter.next().unwrap();
-                if segment.range().is_some_and(|range| range.contains(&row_id)) {
-                    if let Some(offset) = segment.position(row_id) {
-                        segment_matches.get_mut(segment_idx).unwrap().push(offset);
-                    }
+                if segment.range().is_some_and(|range| range.contains(&row_id))
+                    && let Some(offset) = segment.position(row_id)
+                {
+                    segment_matches.get_mut(segment_idx).unwrap().push(offset);
                     // The row id was not found it the segment. It might be in a later segment.
                 }
                 i += 1;
@@ -590,23 +587,17 @@ pub fn rechunk_sequences(
         .peekable();
 
     let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
-        Error::invalid_input(
-            format!(
-                "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
-                chunk_index, expected_chunk_size, remaining
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
+            chunk_index, expected_chunk_size, remaining
+        ))
     };
 
     let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
-        Error::invalid_input(
-            format!(
-                "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
-                processed_chunks, total_chunk_sizes
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
+            processed_chunks, total_chunk_sizes
+        ))
     };
 
     let mut segment_offset = 0_u64;
@@ -682,14 +673,11 @@ pub fn select_row_ids<'a>(
     offsets: &'a ReadBatchParams,
 ) -> Result<Vec<u64>> {
     let out_of_bounds_err = |offset: u32| {
-        Error::invalid_input(
-            format!(
-                "Index out of bounds: {} for sequence of length {}",
-                offset,
-                sequence.len()
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Index out of bounds: {} for sequence of length {}",
+            offset,
+            sequence.len()
+        ))
     };
 
     match offsets {

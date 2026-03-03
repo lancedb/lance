@@ -9,13 +9,12 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray};
+use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     decoder::{
@@ -54,12 +53,9 @@ impl FieldEncoder for FixedSizeListStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let fsl_arr = array
-            .as_fixed_size_list_opt()
-            .ok_or_else(|| Error::Internal {
-                message: "FixedSizeList encoder used for non-fixed-size-list data".to_string(),
-                location: location!(),
-            })?;
+        let fsl_arr = array.as_fixed_size_list_opt().ok_or_else(|| {
+            Error::internal("FixedSizeList encoder used for non-fixed-size-list data".to_string())
+        })?;
 
         let dimension = fsl_arr.value_length() as usize;
         let values = fsl_arr.values().clone();
@@ -210,10 +206,9 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
         let dimension = match &self.data_type {
             DataType::FixedSizeList(_, d) => *d as u64,
             _ => {
-                return Err(Error::Internal {
-                    message: "FixedSizeListDecoder has non-FSL data type".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "FixedSizeListDecoder has non-FSL data type".to_string(),
+                ));
             }
         };
         let child_task = self.child.drain(num_rows * dimension)?;
@@ -268,10 +263,9 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
                     repdef,
                 })
             }
-            _ => Err(Error::Internal {
-                message: "FixedSizeList decoder did not have a fixed-size list field".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::internal(
+                "FixedSizeList decoder did not have a fixed-size list field".to_string(),
+            )),
         }
     }
 }
@@ -521,9 +515,9 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
+        Array, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
-        Array, FixedSizeListArray,
     };
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
@@ -534,7 +528,7 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{check_specific_random, TestCases},
+        testing::{TestCases, check_specific_random},
         version::LanceFileVersion,
     };
 

@@ -82,12 +82,13 @@ pub mod rest_adapter;
 // Re-export connect builder
 pub use connect::ConnectBuilder;
 pub use context::{DynamicContextProvider, OperationInfo};
-pub use dir::{manifest::ManifestNamespace, DirectoryNamespace, DirectoryNamespaceBuilder};
+pub use dir::{DirectoryNamespace, DirectoryNamespaceBuilder, manifest::ManifestNamespace};
 
 // Re-export credential vending
 pub use credentials::{
+    CredentialVendor, DEFAULT_CREDENTIAL_DURATION_MILLIS, VendedCredentials,
     create_credential_vendor_for_location, detect_provider_from_uri, has_credential_vendor_config,
-    redact_credential, CredentialVendor, VendedCredentials, DEFAULT_CREDENTIAL_DURATION_MILLIS,
+    redact_credential,
 };
 
 #[cfg(feature = "credential-vendor-aws")]

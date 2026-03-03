@@ -16,7 +16,6 @@
 //! FSST encoding is transparent.
 
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -27,8 +26,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb21::{self, CompressiveEncoding},
         ProtobufUtils21,
+        pb21::{self, CompressiveEncoding},
     },
 };
 
@@ -116,14 +115,13 @@ impl FsstCompressed {
                     ),
                 }
             }
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with FsstEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -380,7 +378,7 @@ mod tests {
     use lance_datagen::{ByteCount, RowCount};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

@@ -354,7 +354,7 @@ impl SpillSender {
         let (writer, batches_written) = match &mut self.state {
             SpillState::Buffering {
                 batches,
-                ref mut memory_accumulator,
+                memory_accumulator,
             } => {
                 memory_accumulator.record_batch(&batch);
 
@@ -531,7 +531,7 @@ impl AsyncStreamReader {
 mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field};
-    use futures::{poll, StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, poll};
     use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
 
     use super::*;

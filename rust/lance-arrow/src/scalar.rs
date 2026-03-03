@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{make_array, ArrayRef};
+use arrow_array::{ArrayRef, make_array};
 use arrow_buffer::Buffer;
-use arrow_data::{transform::MutableArrayData, ArrayDataBuilder};
+use arrow_data::{ArrayDataBuilder, transform::MutableArrayData};
 use arrow_schema::{ArrowError, DataType};
 
 use crate::DataTypeExt;
@@ -195,7 +195,7 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{cast::AsArray, BooleanArray, FixedSizeBinaryArray, Int32Array, StringArray};
+    use arrow_array::{BooleanArray, FixedSizeBinaryArray, Int32Array, StringArray, cast::AsArray};
 
     use super::*;
 

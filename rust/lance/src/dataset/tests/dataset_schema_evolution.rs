@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
 use crate::Dataset;
+use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
     StringArray, StructArray,
@@ -54,9 +54,11 @@ async fn test_add_sub_column_to_packed_struct_col(
         )
         .await
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("Column animal is packed struct and already exists in the dataset"));
+    assert!(
+        error
+            .to_string()
+            .contains("Column animal is packed struct and already exists in the dataset")
+    );
 }
 
 #[rstest]
@@ -86,9 +88,10 @@ async fn test_add_sub_column_to_struct_col_unsupported(
         )
         .await
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("is a struct col, add sub column is not supported in Lance file version"));
+    assert!(
+        err.to_string()
+            .contains("is a struct col, add sub column is not supported in Lance file version")
+    );
 }
 
 #[rstest]

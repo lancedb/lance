@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use jni::JNIEnv;
 use jni::objects::JObject;
 use jni::sys::jlong;
-use jni::JNIEnv;
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -17,7 +17,7 @@ use crate::ok_or_throw_with_return;
 ///
 /// The handle is a raw pointer to a Box<Arc<LanceSession>>, which allows
 /// the session to be shared between multiple datasets.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Session_createNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -60,7 +60,7 @@ fn create_session(
 }
 
 /// Returns the current size of the session in bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Session_sizeBytesNative(
     mut env: JNIEnv,
     obj: JObject,
@@ -80,7 +80,7 @@ fn size_bytes_native(env: &mut JNIEnv, obj: JObject) -> Result<jlong> {
 }
 
 /// Releases the native session handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Session_releaseNative(
     _env: JNIEnv,
     _obj: JObject,
@@ -127,7 +127,7 @@ pub fn handle_from_session(session: Arc<LanceSession>) -> jlong {
 /// Compares two session handles to see if they point to the same underlying session.
 /// This is needed because each call to handle_from_session creates a new Box,
 /// resulting in different pointer addresses even for the same session.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Session_isSameAsNative(
     _env: JNIEnv,
     _obj: JObject,
