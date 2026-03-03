@@ -50,13 +50,13 @@ fn install_panic_handler() {
         eprintln!("\n\x1b[31mPANIC{}: {}\x1b[0m", location, msg);
 
         // Print backtrace if available
-        if let Ok(var) = std::env::var("RUST_BACKTRACE")
-            && var != "0"
-        {
-            eprintln!(
-                "\nBacktrace:\n{:?}",
-                std::backtrace::Backtrace::force_capture()
-            );
+        if let Ok(var) = std::env::var("RUST_BACKTRACE") {
+            if var != "0" {
+                eprintln!(
+                    "\nBacktrace:\n{:?}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
         }
     }));
 }
