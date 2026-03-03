@@ -617,8 +617,7 @@ public class NamespaceIntegrationTest {
 
           // Verify declareTable was called
           int callCountAfter = namespace.getCreateCallCount();
-          assertEquals(
-              1, callCountAfter - callCountBefore, "declareTable should be called once");
+          assertEquals(1, callCountAfter - callCountBefore, "declareTable should be called once");
 
           // Verify dataset was created successfully
           assertEquals(2, dataset.countRows());
@@ -736,8 +735,7 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify counts after dataset is closed
-      assertEquals(
-          1, namespace.getCreateCallCount(), "declareTable should still be 1 after close");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1 after close");
       assertEquals(
           0,
           namespace.getDescribeCallCount(),

@@ -207,8 +207,7 @@ public class WriteDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describeTable() or
-   * declareTable().
+   * Sets whether to ignore storage options from the namespace's describeTable() or declareTable().
    *
    * @param ignoreNamespaceStorageOptions If true, storage options returned from namespace will be
    *     ignored
