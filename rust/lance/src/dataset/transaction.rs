@@ -1504,13 +1504,13 @@ impl Transaction {
     ) -> Result<DataStorageFormat> {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
-            if let Some(user_requested) = user_requested {
-                if user_requested != file_version {
-                    return Err(Error::invalid_input(format!(
-                        "User requested data storage version ({}) does not match version in data files ({})",
-                        user_requested, file_version
-                    )));
-                }
+            if let Some(user_requested) = user_requested
+                && user_requested != file_version
+            {
+                return Err(Error::invalid_input(format!(
+                    "User requested data storage version ({}) does not match version in data files ({})",
+                    user_requested, file_version
+                )));
             }
             Ok(DataStorageFormat::new(file_version))
         } else {
@@ -2312,20 +2312,20 @@ impl Transaction {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
 
-            if !index_covers_modified_field {
-                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    // check if all the original fragments contains the updating rows are covered
-                    // by the index(index fragment bitmap contains these frag ids).
-                    // if not, that means not all the updating rows are indexed, so we could not
-                    // index them.
-                    let index_covers_all_original_fragments = original_fragment_ids
-                        .iter()
-                        .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            if !index_covers_modified_field
+                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+            {
+                // check if all the original fragments contains the updating rows are covered
+                // by the index(index fragment bitmap contains these frag ids).
+                // if not, that means not all the updating rows are indexed, so we could not
+                // index them.
+                let index_covers_all_original_fragments = original_fragment_ids
+                    .iter()
+                    .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
 
-                    if index_covers_all_original_fragments {
-                        for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
-                            fragment_bitmap.insert(fragment_id);
-                        }
+                if index_covers_all_original_fragments {
+                    for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                        fragment_bitmap.insert(fragment_id);
                     }
                 }
             }
@@ -2351,11 +2351,10 @@ impl Transaction {
                 .fields
                 .iter()
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
-                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                        fragment_bitmap.remove(fragment_id);
-                    }
+                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
+                    fragment_bitmap.remove(fragment_id);
                 }
             }
         }
@@ -2445,10 +2444,10 @@ impl Transaction {
                     sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
                     // Keep only the first (oldest) if it's not a vector index
-                    if let Some(oldest) = sorted_indices.first() {
-                        if !Self::is_vector_index(oldest) {
-                            uuids_to_keep.insert(oldest.uuid);
-                        }
+                    if let Some(oldest) = sorted_indices.first()
+                        && !Self::is_vector_index(oldest)
+                    {
+                        uuids_to_keep.insert(oldest.uuid);
                     }
                 } else {
                     // At least one index has non-empty bitmap - keep all non-empty indices
@@ -3374,10 +3373,10 @@ fn schema_fragments_valid(
     schema: &Schema,
     fragments: &[Fragment],
 ) -> Result<()> {
-    if let Some(manifest) = manifest {
-        if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
-            return schema_fragments_legacy_valid(schema, fragments);
-        }
+    if let Some(manifest) = manifest
+        && manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy
+    {
+        return schema_fragments_legacy_valid(schema, fragments);
     }
     // validate that each data file at least contains one field.
     for fragment in fragments {

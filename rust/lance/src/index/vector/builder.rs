@@ -978,26 +978,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut loss = 0.0;
         // Skip if this partition doesn't exist in the reader
         // This can happen after a split creates a new partition
-        if let Some(reader) = reader {
-            if reader.partition_size(part_id)? > 0 {
-                let mut partition_data =
-                    reader
-                        .read_partition(part_id)
-                        .await?
-                        .ok_or(Error::invalid_input(format!(
-                            "partition {} is empty",
-                            part_id
-                        )))?;
-                while let Some(batch) = partition_data.try_next().await? {
-                    loss += batch
-                        .metadata()
-                        .get(LOSS_METADATA_KEY)
-                        .map(|s| s.parse::<f64>().unwrap_or(0.0))
-                        .unwrap_or(0.0);
-                    let batch = batch.drop_column(PART_ID_COLUMN)?;
-                    let batch = stable_sort_batch_by_row_id(&batch)?;
-                    batches.push(batch);
-                }
+        if let Some(reader) = reader
+            && reader.partition_size(part_id)? > 0
+        {
+            let mut partition_data =
+                reader
+                    .read_partition(part_id)
+                    .await?
+                    .ok_or(Error::invalid_input(format!(
+                        "partition {} is empty",
+                        part_id
+                    )))?;
+            while let Some(batch) = partition_data.try_next().await? {
+                loss += batch
+                    .metadata()
+                    .get(LOSS_METADATA_KEY)
+                    .map(|s| s.parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let batch = batch.drop_column(PART_ID_COLUMN)?;
+                let batch = stable_sort_batch_by_row_id(&batch)?;
+                batches.push(batch);
             }
         }
 
