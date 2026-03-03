@@ -550,14 +550,15 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-        let (batch_sender, mut batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
                 let batch = posting_list
                     .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
-                if batch_sender.send(batch).is_err() {
-                    // Consumer dropped early (e.g. write failed); stop producing.
-                    return Ok(());
+                if let Err(err) = tx.send(batch) {
+                    return Err(Error::execution(format!(
+                        "failed to send posting list batch to writer: {err}"
+                    )));
                 }
             }
             Ok(())
@@ -565,13 +566,14 @@ impl InnerBuilder {
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        let mut write_result: Result<()> = Ok(());
-        while let Some(batch) = batch_receiver.recv().await {
+        while let Some(batch) = rx.recv().await {
             num_posting_lists += 1;
             let start = std::time::Instant::now();
             if let Err(err) = writer.write_record_batch(batch).await {
-                write_result = Err(err);
-                break;
+                drop(rx);
+                // Wait for producer to stop; preserve the write error as the primary failure.
+                let _ = producer.await;
+                return Err(err);
             }
             write_duration += start.elapsed();
 
@@ -584,9 +586,8 @@ impl InnerBuilder {
                 );
             }
         }
-        drop(batch_receiver);
+        drop(rx);
         producer.await?;
-        write_result?;
 
         writer.finish().await?;
         Ok(())
