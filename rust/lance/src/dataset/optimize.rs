@@ -870,7 +870,17 @@ pub struct RewriteResult {
     pub original_fragments: Vec<Fragment>,
     /// Serialized RoaringTreemap of row addresses read from the original fragments.
     /// Some for address-style row IDs, None for stable row IDs.
+    #[serde(default)]
     pub row_addrs: Option<Vec<u8>>,
+    /// Legacy: A HashMap of original row IDs to new row IDs or None (deleted).
+    /// Kept for backwards compatibility with older serialized RewriteResults.
+    #[serde(default)]
+    pub row_id_map: Option<HashMap<u64, Option<u64>>>,
+    /// Legacy: the changed row addresses in the original fragment
+    /// in the form of serialized RoaringTreemap.
+    /// Kept for backwards compatibility with older serialized RewriteResults.
+    #[serde(default)]
+    pub changed_row_addrs: Option<Vec<u8>>,
 }
 
 async fn reserve_fragment_ids(
@@ -925,6 +935,8 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            row_id_map: None,
+            changed_row_addrs: None,
         });
     }
 
@@ -1101,6 +1113,8 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        row_id_map: None,
+        changed_row_addrs: None,
     })
 }
 
@@ -1285,13 +1299,19 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
-    // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // Single reserve_fragment_ids for all address-style tasks whose fragments
+    // don't already have allocated IDs (legacy results may have pre-allocated IDs).
+    let needs_id_reservation: Vec<bool> = completed_tasks
+        .iter()
+        .map(|t| t.row_addrs.is_some() && t.new_fragments.iter().any(|f| f.id == 0))
+        .collect();
+    let has_address_style = needs_id_reservation.iter().any(|r| *r);
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
-            .filter(|t| t.row_addrs.is_some())
-            .flat_map(|t| t.new_fragments.iter_mut())
+            .zip(needs_id_reservation.iter())
+            .filter(|(_, needs)| **needs)
+            .flat_map(|(t, _)| t.new_fragments.iter_mut())
             .collect();
         reserve_fragment_ids(dataset, frags.into_iter()).await?;
     }
@@ -1312,6 +1332,7 @@ pub async fn commit_compaction(
 
         if needs_remapping {
             if let Some(row_addrs_bytes) = task.row_addrs {
+                // New-style: transpose row_addrs to build the row_id_map
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
                 let transposed = remapping::transpose_row_addrs(
@@ -1320,14 +1341,31 @@ pub async fn commit_compaction(
                     &task.new_fragments,
                 );
                 row_id_map.extend(transposed);
+            } else if let Some(legacy_changed) = task.changed_row_addrs {
+                // Legacy: changed_row_addrs from older defer_index_remap path
+                let row_addrs =
+                    RoaringTreemap::deserialize_from(&mut Cursor::new(&legacy_changed))?;
+                let transposed = remapping::transpose_row_addrs(
+                    row_addrs,
+                    &task.original_fragments,
+                    &task.new_fragments,
+                );
+                row_id_map.extend(transposed);
+            } else if let Some(legacy_map) = task.row_id_map {
+                // Legacy: pre-computed row_id_map from older immediate remap path
+                row_id_map.extend(legacy_map);
             }
         } else if options.defer_index_remap {
-            let changed_row_addrs = task.row_addrs.unwrap_or_else(|| {
-                let empty = RoaringTreemap::new();
-                let mut bytes = Vec::with_capacity(empty.serialized_size());
-                empty.serialize_into(&mut bytes).unwrap();
-                bytes
-            });
+            // Prefer row_addrs, fall back to legacy changed_row_addrs
+            let changed_row_addrs =
+                task.row_addrs
+                    .or(task.changed_row_addrs)
+                    .unwrap_or_else(|| {
+                        let empty = RoaringTreemap::new();
+                        let mut bytes = Vec::with_capacity(empty.serialized_size());
+                        empty.serialize_into(&mut bytes).unwrap();
+                        bytes
+                    });
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
                 old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
@@ -1360,15 +1398,18 @@ pub async fn commit_compaction(
                 new_index_version: rewritten.index_version,
             })
             .collect()
-    } else if !options.defer_index_remap && !has_address_style {
+    } else if !options.defer_index_remap {
         // We need to reserve fragment ids here so that the fragment bitmap
-        // can be updated for each index. Only needed for stable row IDs
-        // since address-style IDs were already reserved above.
-        let new_fragments = rewrite_groups
+        // can be updated for each index. Skip fragments that already have
+        // allocated IDs (address-style reserved above, or legacy pre-allocated).
+        let new_fragments: Vec<&mut Fragment> = rewrite_groups
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
-            .collect::<Vec<_>>();
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
+            .filter(|f| f.id == 0)
+            .collect();
+        if !new_fragments.is_empty() {
+            reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
+        }
         Vec::new()
     } else {
         Vec::new()

@@ -431,6 +431,8 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             read_version,
             original_fragments,
             row_addrs,
+            row_id_map: None,
+            changed_row_addrs: None,
         })
     }
 }
