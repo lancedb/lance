@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::RT;
@@ -944,11 +943,13 @@ impl FieldExt for Field {
         }
 
         if self.logical_type != base_field.logical_type {
-            return Err(lance_core::Error::invalid_input_source(format!(
-                "Expecting logical type {} but got {} for field {}",
-                base_field.logical_type, self.logical_type, self.name
-            )
-            .into()));
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "Expecting logical type {} but got {} for field {}",
+                    base_field.logical_type, self.logical_type, self.name
+                )
+                .into(),
+            ));
         }
 
         if self.id < 0 {
