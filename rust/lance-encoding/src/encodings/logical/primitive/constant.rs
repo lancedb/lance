@@ -403,11 +403,11 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
             for _ in range.start..range.end {
                 let (level_range, visible) = self.take_row()?;
                 visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut()
-                    && last.end == level_range.start
-                {
-                    last.end = level_range.end;
-                    continue;
+                if let Some(last) = level_slices.last_mut() {
+                    if last.end == level_range.start {
+                        last.end = level_range.end;
+                        continue;
+                    }
                 }
                 level_slices.push(level_range);
             }
@@ -460,13 +460,13 @@ impl DecodeConstantTask {
             return Ok(new_empty_array(self.scalar.data_type()));
         }
 
-        if let DataType::Struct(fields) = self.scalar.data_type()
-            && fields.is_empty()
-        {
-            return Ok(Arc::new(arrow_array::StructArray::new_empty_fields(
-                num_values as usize,
-                None,
-            )) as ArrayRef);
+        if let DataType::Struct(fields) = self.scalar.data_type() {
+            if fields.is_empty() {
+                return Ok(Arc::new(arrow_array::StructArray::new_empty_fields(
+                    num_values as usize,
+                    None,
+                )) as ArrayRef);
+            }
         }
 
         let indices = arrow_array::UInt64Array::from(vec![0u64; num_values as usize]);
