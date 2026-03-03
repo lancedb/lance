@@ -8,24 +8,24 @@ use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
-    format::{is_detached_version, DataStorageFormat},
+    format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::location;
 
 use crate::{
+    Dataset, Error, Result,
     dataset::{
+        ManifestWriteConfig, ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
         refs::Refs,
         transaction::{Operation, Transaction},
-        ManifestWriteConfig, ReadParams,
     },
     session::Session,
-    Dataset, Error, Result,
 };
 
-use super::{resolve_commit_handler, WriteDestination};
+use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
@@ -291,13 +291,14 @@ impl<'a> CommitBuilder<'a> {
         };
 
         // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset() {
-            if let Some(storage_format) = self.storage_format {
-                let passed_storage_format = DataStorageFormat::new(storage_format);
-                if ds.manifest.data_storage_format != passed_storage_format
-                    && !matches!(transaction.operation, Operation::Overwrite { .. })
-                {
-                    return Err(Error::InvalidInput {
+        if let Some(ds) = dest.dataset()
+            && let Some(storage_format) = self.storage_format
+        {
+            let passed_storage_format = DataStorageFormat::new(storage_format);
+            if ds.manifest.data_storage_format != passed_storage_format
+                && !matches!(transaction.operation, Operation::Overwrite { .. })
+            {
+                return Err(Error::InvalidInput {
                         source: format!(
                             "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
                             ds.manifest.data_storage_format,
@@ -305,7 +306,6 @@ impl<'a> CommitBuilder<'a> {
                         ).into(),
                         location: location!(),
                     });
-                }
             }
         }
 

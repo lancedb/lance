@@ -15,7 +15,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -28,18 +28,18 @@ use tracing::instrument;
 use crate::vector::ivf::storage::IvfModel;
 use crate::vector::quantizer::QuantizationType;
 use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
-use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 use crate::{
+    Index, IndexType,
     vector::{
+        Query, VectorIndex,
         graph::NEIGHBORS_FIELD,
-        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        hnsw::{HNSW, HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
         storage::VectorStore,
-        Query, VectorIndex,
     },
-    Index, IndexType,
 };
+use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndexOptions {

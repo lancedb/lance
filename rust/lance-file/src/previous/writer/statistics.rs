@@ -8,26 +8,26 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{make_builder, ArrayBuilder, BooleanBuilder, PrimitiveBuilder},
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, StructArray,
+    builder::{ArrayBuilder, BooleanBuilder, PrimitiveBuilder, make_builder},
     builder::{GenericBinaryBuilder, GenericStringBuilder},
-    cast::{as_generic_binary_array, as_primitive_array, AsArray},
+    cast::{AsArray, as_generic_binary_array, as_primitive_array},
     types::{
         ArrowDictionaryKeyType, Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType,
         DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float32Type,
-        Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Time32MillisecondType,
+        Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Time32MillisecondType,
         Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
-        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
-        UInt32Type, UInt64Type, UInt8Type,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type,
+        UInt16Type, UInt32Type, UInt64Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion_common::ScalarValue;
-use lance_arrow::{as_fixed_size_binary_array, DataTypeExt};
-use lance_core::datatypes::{Field, Schema};
+use lance_arrow::{DataTypeExt, as_fixed_size_binary_array};
 use lance_core::Result;
-use num_traits::{bounds::Bounded, Float, Zero};
+use lance_core::datatypes::{Field, Schema};
+use num_traits::{Float, Zero, bounds::Bounded};
 use std::str;
 
 /// Max number of bytes that are included in statistics for binary columns.
@@ -930,14 +930,15 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array, BinaryArray,
-        BooleanArray, Date32Array, Date64Array, Datum, Decimal128Array, DictionaryArray,
-        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        BinaryArray, BooleanArray, Date32Array, Date64Array, Datum, Decimal128Array,
+        DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
+        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array, builder::StringDictionaryBuilder, make_array,
+        new_empty_array, new_null_array,
     };
     use arrow_select::interleave::interleave;
     use num_traits::One;
@@ -1385,213 +1386,206 @@ mod tests {
             stats: StatisticsRow,
         }
 
-        let cases: [TestCase; 13] =
-            [
-                // StringArray
-                // Whole strings are used if short enough
-                TestCase {
-                    source_arrays: vec![
-                        Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")])),
-                        Arc::new(StringArray::from(vec!["yee", "haw"])),
-                    ],
-                    stats: StatisticsRow {
-                        null_count: 1,
-                        min_value: ScalarValue::from("bar"),
-                        max_value: ScalarValue::from("yee"),
-                    },
+        let cases: [TestCase; 13] = [
+            // StringArray
+            // Whole strings are used if short enough
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")])),
+                    Arc::new(StringArray::from(vec!["yee", "haw"])),
+                ],
+                stats: StatisticsRow {
+                    null_count: 1,
+                    min_value: ScalarValue::from("bar"),
+                    max_value: ScalarValue::from("yee"),
                 },
-                // Prefixes are used if strings are too long. Multi-byte characters are
-                // not split.
-                TestCase {
-                    source_arrays: vec![Arc::new(StringArray::from(vec![
-                        format!("{}{}", filler, "bacteriologists🧑‍🔬"),
-                        format!("{}{}", filler, "terrestial planet"),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        // Bacteriologists is just 15 bytes, but the next character is multi-byte
-                        // so we truncate before.
-                        min_value: ScalarValue::from(
-                            format!("{}{}", filler, "bacteriologists").as_str(),
-                        ),
-                        // Increment the last character to make sure it's greater than max value
-                        max_value: ScalarValue::from(
-                            format!("{}{}", filler, "terrestial planf").as_str(),
-                        ),
-                    },
+            },
+            // Prefixes are used if strings are too long. Multi-byte characters are
+            // not split.
+            TestCase {
+                source_arrays: vec![Arc::new(StringArray::from(vec![
+                    format!("{}{}", filler, "bacteriologists🧑‍🔬"),
+                    format!("{}{}", filler, "terrestial planet"),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    // Bacteriologists is just 15 bytes, but the next character is multi-byte
+                    // so we truncate before.
+                    min_value: ScalarValue::from(
+                        format!("{}{}", filler, "bacteriologists").as_str(),
+                    ),
+                    // Increment the last character to make sure it's greater than max value
+                    max_value: ScalarValue::from(
+                        format!("{}{}", filler, "terrestial planf").as_str(),
+                    ),
                 },
-                // Sting is not incremented if it's exact length of the limit
-                TestCase {
-                    source_arrays: vec![Arc::new(StringArray::from(vec![format!(
+            },
+            // Sting is not incremented if it's exact length of the limit
+            TestCase {
+                source_arrays: vec![Arc::new(StringArray::from(vec![format!(
+                    "{}{}",
+                    filler, "terrestial planf"
+                )]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::from(
+                        format!("{}{}", filler, "terrestial planf").as_str(),
+                    ),
+                    max_value: ScalarValue::from(
+                        format!("{}{}", filler, "terrestial planf").as_str(),
+                    ),
+                },
+            },
+            // LargeStringArray
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(LargeStringArray::from(vec![Some("foo"), None, Some("bar")])),
+                    Arc::new(LargeStringArray::from(vec!["yee", "haw"])),
+                ],
+                stats: StatisticsRow {
+                    null_count: 1,
+                    min_value: ScalarValue::LargeUtf8(Some("bar".to_string())),
+                    max_value: ScalarValue::LargeUtf8(Some("yee".to_string())),
+                },
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(LargeStringArray::from(vec![
+                    format!("{}{}", filler, "bacteriologists🧑‍🔬"),
+                    format!("{}{}", filler, "terrestial planet"),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    // Bacteriologists is just 15 bytes, but the next character is multi-byte
+                    // so we truncate before.
+                    min_value: ScalarValue::LargeUtf8(Some(format!(
+                        "{}{}",
+                        filler, "bacteriologists"
+                    ))),
+                    // Increment the last character to make sure it's greater than max value
+                    max_value: ScalarValue::LargeUtf8(Some(format!(
                         "{}{}",
                         filler, "terrestial planf"
-                    )]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::from(
-                            format!("{}{}", filler, "terrestial planf").as_str(),
-                        ),
-                        max_value: ScalarValue::from(
-                            format!("{}{}", filler, "terrestial planf").as_str(),
-                        ),
-                    },
+                    ))),
                 },
-                // LargeStringArray
-                TestCase {
-                    source_arrays: vec![
-                        Arc::new(LargeStringArray::from(vec![Some("foo"), None, Some("bar")])),
-                        Arc::new(LargeStringArray::from(vec!["yee", "haw"])),
-                    ],
-                    stats: StatisticsRow {
-                        null_count: 1,
-                        min_value: ScalarValue::LargeUtf8(Some("bar".to_string())),
-                        max_value: ScalarValue::LargeUtf8(Some("yee".to_string())),
-                    },
-                },
-                TestCase {
-                    source_arrays: vec![Arc::new(LargeStringArray::from(vec![
-                        format!("{}{}", filler, "bacteriologists🧑‍🔬"),
-                        format!("{}{}", filler, "terrestial planet"),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        // Bacteriologists is just 15 bytes, but the next character is multi-byte
-                        // so we truncate before.
-                        min_value: ScalarValue::LargeUtf8(Some(format!(
-                            "{}{}",
-                            filler, "bacteriologists"
-                        ))),
-                        // Increment the last character to make sure it's greater than max value
-                        max_value: ScalarValue::LargeUtf8(Some(format!(
-                            "{}{}",
-                            filler, "terrestial planf"
-                        ))),
-                    },
-                },
-                // Sting is not incremented if it's exact length of the limit
-                TestCase {
-                    source_arrays: vec![Arc::new(LargeStringArray::from(vec![format!(
+            },
+            // Sting is not incremented if it's exact length of the limit
+            TestCase {
+                source_arrays: vec![Arc::new(LargeStringArray::from(vec![format!(
+                    "{}{}",
+                    filler, "terrestial planf"
+                )]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::LargeUtf8(Some(format!(
                         "{}{}",
                         filler, "terrestial planf"
-                    )]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::LargeUtf8(Some(format!(
-                            "{}{}",
-                            filler, "terrestial planf"
-                        ))),
-                        max_value: ScalarValue::LargeUtf8(Some(format!(
-                            "{}{}",
-                            filler, "terrestial planf"
-                        ))),
-                    },
+                    ))),
+                    max_value: ScalarValue::LargeUtf8(Some(format!(
+                        "{}{}",
+                        filler, "terrestial planf"
+                    ))),
                 },
-                // BinaryArray
-                // If not truncated max value exists (in the edge case where the value is
-                // 0xFF up until the limit), just return null as max.)
-                TestCase {
-                    source_arrays: vec![Arc::new(BinaryArray::from(vec![vec![
-                        0xFFu8;
-                        BINARY_PREFIX_LENGTH
-                            + 5
-                    ]
-                    .as_ref()]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        // We can truncate the minimum value, since the prefix is less than the full value
-                        min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
-                        // We can't truncate the max value, so we return None
-                        max_value: ScalarValue::Binary(None),
-                    },
+            },
+            // BinaryArray
+            // If not truncated max value exists (in the edge case where the value is
+            // 0xFF up until the limit), just return null as max.)
+            TestCase {
+                source_arrays: vec![Arc::new(BinaryArray::from(vec![
+                    vec![0xFFu8; BINARY_PREFIX_LENGTH + 5].as_ref(),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    // We can truncate the minimum value, since the prefix is less than the full value
+                    min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
+                    // We can't truncate the max value, so we return None
+                    max_value: ScalarValue::Binary(None),
                 },
-                TestCase {
-                    source_arrays: vec![Arc::new(BinaryArray::from(vec![
-                        vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
-                        max_value: ScalarValue::Binary(Some(min_binary_value.clone())),
-                    },
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(BinaryArray::from(vec![
+                    vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
+                    max_value: ScalarValue::Binary(Some(min_binary_value.clone())),
                 },
-                // LargeBinaryArray
-                // If not truncated max value exists (in the edge case where the value is
-                // 0xFF up until the limit), just return null as max.)
-                TestCase {
-                    source_arrays: vec![Arc::new(LargeBinaryArray::from(vec![vec![
-                        0xFFu8;
-                        BINARY_PREFIX_LENGTH
-                            + 5
-                    ]
-                    .as_ref()]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        // We can truncate the minimum value, since the prefix is less than the full value
-                        min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
-                        // We can't truncate the max value, so we return None
-                        max_value: ScalarValue::LargeBinary(None),
-                    },
+            },
+            // LargeBinaryArray
+            // If not truncated max value exists (in the edge case where the value is
+            // 0xFF up until the limit), just return null as max.)
+            TestCase {
+                source_arrays: vec![Arc::new(LargeBinaryArray::from(vec![
+                    vec![0xFFu8; BINARY_PREFIX_LENGTH + 5].as_ref(),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    // We can truncate the minimum value, since the prefix is less than the full value
+                    min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
+                    // We can't truncate the max value, so we return None
+                    max_value: ScalarValue::LargeBinary(None),
                 },
-                TestCase {
-                    source_arrays: vec![Arc::new(LargeBinaryArray::from(vec![
-                        vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        // We can truncate the minimum value, since the prefix is less than the full value
-                        min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
-                        max_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
-                    },
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(LargeBinaryArray::from(vec![
+                    vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    // We can truncate the minimum value, since the prefix is less than the full value
+                    min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
+                    max_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
                 },
-                // FixedSizeBinaryArray
-                TestCase {
-                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                        Some(vec![0, 1].as_slice()),
-                        Some(vec![2, 3].as_slice()),
-                        Some(vec![4, 5].as_slice()),
-                        Some(vec![6, 7].as_slice()),
-                        Some(vec![8, 9].as_slice()),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::FixedSizeBinary(2, Some(vec![0, 1])),
-                        max_value: ScalarValue::FixedSizeBinary(2, Some(vec![8, 9])),
-                    },
+            },
+            // FixedSizeBinaryArray
+            TestCase {
+                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                    Some(vec![0, 1].as_slice()),
+                    Some(vec![2, 3].as_slice()),
+                    Some(vec![4, 5].as_slice()),
+                    Some(vec![6, 7].as_slice()),
+                    Some(vec![8, 9].as_slice()),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::FixedSizeBinary(2, Some(vec![0, 1])),
+                    max_value: ScalarValue::FixedSizeBinary(2, Some(vec![8, 9])),
                 },
-                TestCase {
-                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                        min_binary_value.as_slice(),
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::FixedSizeBinary(
-                            BINARY_PREFIX_LENGTH.try_into().unwrap(),
-                            Some(min_binary_value.clone()),
-                        ),
-                        max_value: ScalarValue::FixedSizeBinary(
-                            BINARY_PREFIX_LENGTH.try_into().unwrap(),
-                            Some(min_binary_value),
-                        ),
-                    },
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                    min_binary_value.as_slice(),
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::FixedSizeBinary(
+                        BINARY_PREFIX_LENGTH.try_into().unwrap(),
+                        Some(min_binary_value.clone()),
+                    ),
+                    max_value: ScalarValue::FixedSizeBinary(
+                        BINARY_PREFIX_LENGTH.try_into().unwrap(),
+                        Some(min_binary_value),
+                    ),
                 },
-                TestCase {
-                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                        &[0xFFu8; BINARY_PREFIX_LENGTH + 7],
-                    ]))],
-                    stats: StatisticsRow {
-                        null_count: 0,
-                        min_value: ScalarValue::FixedSizeBinary(
-                            (BINARY_PREFIX_LENGTH + 7).try_into().unwrap(),
-                            Some(vec![0xFFu8; BINARY_PREFIX_LENGTH]),
-                        ),
-                        // We can't truncate the max value, so we return None
-                        max_value: ScalarValue::FixedSizeBinary(
-                            (BINARY_PREFIX_LENGTH).try_into().unwrap(),
-                            None,
-                        ),
-                    },
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                    &[0xFFu8; BINARY_PREFIX_LENGTH + 7],
+                ]))],
+                stats: StatisticsRow {
+                    null_count: 0,
+                    min_value: ScalarValue::FixedSizeBinary(
+                        (BINARY_PREFIX_LENGTH + 7).try_into().unwrap(),
+                        Some(vec![0xFFu8; BINARY_PREFIX_LENGTH]),
+                    ),
+                    // We can't truncate the max value, so we return None
+                    max_value: ScalarValue::FixedSizeBinary(
+                        (BINARY_PREFIX_LENGTH).try_into().unwrap(),
+                        None,
+                    ),
                 },
-            ];
+            },
+        ];
 
         for case in cases {
             let array_refs = case.source_arrays.iter().collect::<Vec<_>>();
@@ -2041,8 +2035,8 @@ mod tests {
 
     // Property 2: The min and max should always be less than / greater than
     // all values in the array respectively.
-    fn assert_min_max_ordering_float<F: ArrowPrimitiveType>(
-    ) -> std::result::Result<(), TestCaseError>
+    fn assert_min_max_ordering_float<F: ArrowPrimitiveType>()
+    -> std::result::Result<(), TestCaseError>
     where
         F::Native: Float,
     {

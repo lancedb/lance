@@ -6,8 +6,8 @@
 use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::stream::StreamExt;
 use futures::TryStreamExt;
+use futures::stream::StreamExt;
 use snafu::location;
 
 use lance::dataset::Dataset;

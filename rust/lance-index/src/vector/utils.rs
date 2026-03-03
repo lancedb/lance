@@ -19,8 +19,8 @@ use std::{ops::Range, sync::Arc};
 use super::pb;
 use crate::pb::Tensor;
 use crate::vector::flat::storage::FlatFloatStorage;
-use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::hnsw::HNSW;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::v3::subindex::IvfSubIndex;
 
 enum SimpleIndexStatus {
@@ -128,10 +128,10 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
             do_prefetch(array.values().as_ptr_range())
         }
         _ => {
-            return Err(Error::invalid_input(
-                format!("Unsupported data type for prefetch: {}", array.data_type()),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Unsupported data type for prefetch: {}",
+                array.data_type()
+            )));
         }
     }
 
@@ -149,7 +149,7 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
             const CACHE_LINE_SIZE: usize = 64;
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                 _mm_prefetch(current_ptr, _MM_HINT_T0);
             }
             current_ptr = current_ptr.add(CACHE_LINE_SIZE);

@@ -27,8 +27,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb21::{self, CompressiveEncoding},
         ProtobufUtils21,
+        pb21::{self, CompressiveEncoding},
     },
 };
 
@@ -380,7 +380,7 @@ mod tests {
     use lance_datagen::{ByteCount, RowCount};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

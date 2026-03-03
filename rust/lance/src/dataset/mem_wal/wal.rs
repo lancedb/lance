@@ -7,8 +7,8 @@
 //! WAL files use bit-reversed naming to distribute files evenly across S3 keyspace.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 
 use uuid::Uuid;
 
-use super::util::{region_wal_path, wal_entry_filename, WatchableOnceCell};
+use super::util::{WatchableOnceCell, region_wal_path, wal_entry_filename};
 
 use super::index::IndexStore;
 use super::memtable::batch_store::{BatchStore, StoredBatch};
@@ -65,7 +65,7 @@ impl BatchDurableWatcher {
             self.rx
                 .changed()
                 .await
-                .map_err(|_| Error::io("Durable watermark channel closed", location!()))?;
+                .map_err(|_| Error::io("Durable watermark channel closed"))?;
         }
     }
 
@@ -278,7 +278,7 @@ impl WalFlusher {
                 end_batch_position,
                 done,
             })
-            .map_err(|_| Error::io("WAL flush channel closed", location!()))?;
+            .map_err(|_| Error::io("WAL flush channel closed"))?;
         }
         Ok(())
     }
@@ -326,7 +326,7 @@ impl WalFlusher {
         let object_store = self
             .object_store
             .as_ref()
-            .ok_or_else(|| Error::io("Object store not set on WAL flusher", location!()))?;
+            .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
 
         let wal_entry_position = self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
         let final_path = self.wal_entry_path(wal_entry_position);
@@ -369,27 +369,18 @@ impl WalFlusher {
         {
             let mut writer =
                 StreamWriter::try_new(&mut buffer, &schema_with_epoch).map_err(|e| {
-                    Error::io(
-                        format!("Failed to create Arrow IPC stream writer: {}", e),
-                        location!(),
-                    )
+                    Error::io(format!("Failed to create Arrow IPC stream writer: {}", e))
                 })?;
 
             for stored in &stored_batches {
                 writer.write(&stored.data).map_err(|e| {
-                    Error::io(
-                        format!("Failed to write batch to Arrow IPC stream: {}", e),
-                        location!(),
-                    )
+                    Error::io(format!("Failed to write batch to Arrow IPC stream: {}", e))
                 })?;
             }
 
-            writer.finish().map_err(|e| {
-                Error::io(
-                    format!("Failed to finish Arrow IPC stream: {}", e),
-                    location!(),
-                )
-            })?;
+            writer
+                .finish()
+                .map_err(|e| Error::io(format!("Failed to finish Arrow IPC stream: {}", e)))?;
         }
 
         let wal_bytes = buffer.len();
@@ -407,9 +398,7 @@ impl WalFlusher {
                     .inner
                     .put(&wal_path, wal_data.into())
                     .await
-                    .map_err(|e| {
-                        Error::io(format!("Failed to write WAL file: {}", e), location!())
-                    })?;
+                    .map_err(|e| Error::io(format!("Failed to write WAL file: {}", e)))?;
                 Ok::<_, Error>(start.elapsed())
             };
 
@@ -434,9 +423,7 @@ impl WalFlusher {
                     .inner
                     .put(&wal_path, wal_data.into())
                     .await
-                    .map_err(|e| {
-                        Error::io(format!("Failed to write WAL file: {}", e), location!())
-                    })?;
+                    .map_err(|e| Error::io(format!("Failed to write WAL file: {}", e)))?;
                 Ok::<_, Error>(start.elapsed())
             };
 
@@ -521,19 +508,15 @@ impl WalEntryData {
             .inner
             .get(path)
             .await
-            .map_err(|e| Error::io(format!("Failed to read WAL file: {}", e), location!()))?
+            .map_err(|e| Error::io(format!("Failed to read WAL file: {}", e)))?
             .bytes()
             .await
-            .map_err(|e| Error::io(format!("Failed to get WAL file bytes: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to get WAL file bytes: {}", e)))?;
 
         // Parse as Arrow IPC stream
         let cursor = Cursor::new(data);
-        let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-            Error::io(
-                format!("Failed to open Arrow IPC stream reader: {}", e),
-                location!(),
-            )
-        })?;
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| Error::io(format!("Failed to open Arrow IPC stream reader: {}", e)))?;
 
         // Extract writer epoch from schema metadata (at start of stream)
         let schema = reader.schema();
@@ -547,10 +530,7 @@ impl WalEntryData {
         let mut batches = Vec::new();
         for batch_result in reader {
             let batch = batch_result.map_err(|e| {
-                Error::io(
-                    format!("Failed to read batch from Arrow IPC stream: {}", e),
-                    location!(),
-                )
+                Error::io(format!("Failed to read batch from Arrow IPC stream: {}", e))
             })?;
             batches.push(batch);
         }

@@ -14,34 +14,36 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
-        CreatedIndex, UpdateCriteria,
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
-use crate::{Index, IndexType};
 use arrow_arith::numeric::add;
-use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
+    union::UnionExec,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use deepsize::DeepSizeOf;
 use futures::{
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
+    Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
@@ -49,11 +51,10 @@ use lance_core::{
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result, ROW_ID,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
@@ -1502,10 +1503,11 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
-            )),
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::invalid_input(
+                    "full text search is not supported for BTree index, build a inverted index for it",
+                ));
+            }
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
 
@@ -1919,7 +1921,9 @@ async fn list_page_lookup_files(
         return Err(Error::Internal {
             message: format!(
                 "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-                index_dir, part_page_files.len(), part_lookup_files.len()
+                index_dir,
+                part_page_files.len(),
+                part_lookup_files.len()
             ),
             location: location!(),
         });
@@ -2609,21 +2613,21 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{record_batch, FixedSizeListArray};
+    use arrow_array::{FixedSizeListArray, record_batch};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
-        physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+        physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
-    use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
+    use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
     use deepsize::DeepSizeOf;
-    use futures::stream;
     use futures::TryStreamExt;
+    use futures::stream;
     use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
@@ -2631,15 +2635,15 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
-            lance_format::LanceIndexStore,
             IndexStore, SargableQuery, ScalarIndex, SearchResult,
+            btree::{BTREE_PAGES_NAME, BTreeIndex},
+            lance_format::LanceIndexStore,
         },
     };
 
     use super::{
-        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
-        DEFAULT_BTREE_BATCH_SIZE,
+        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
+        part_page_data_file_path, train_btree_index,
     };
     #[test]
     fn test_scalar_value_size() {

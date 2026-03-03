@@ -9,7 +9,9 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
-    std::env::set_var("PROTOC", protobuf_src::protoc());
+    unsafe {
+        std::env::set_var("PROTOC", protobuf_src::protoc());
+    }
 
     let mut prost_build = prost_build::Config::new();
     prost_build.protoc_arg("--experimental_allow_proto3_optional");

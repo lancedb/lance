@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::LanceOptionExt;
@@ -38,8 +38,8 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{utils::mask::RowAddrTreeMap, Error};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Error, utils::mask::RowAddrTreeMap};
+use lance_core::{ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -1339,25 +1339,25 @@ mod tests {
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
     };
     use datafusion_common::DataFusionError;
-    use futures::{stream, TryStreamExt};
+    use futures::{TryStreamExt, stream};
     use itertools::Itertools;
     use lance_core::{
+        ROW_ID,
         cache::LanceCache,
         utils::{mask::RowAddrTreeMap, tempfile::TempDir},
-        ROW_ID,
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use tantivy::tokenizer::TextAnalyzer;
 
     use crate::scalar::{
+        ScalarIndex, SearchResult, TextQuery,
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
-        ScalarIndex, SearchResult, TextQuery,
     };
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
-    use super::{ngram_to_token, tokenize_visitor, NGRAM_TOKENIZER};
+    use super::{NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);

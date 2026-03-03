@@ -8,10 +8,10 @@ use arrow_array::builder::{ArrayBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
 use arrow_array::{
-    make_array, new_null_array, Array, ArrayRef, DictionaryArray, StringArray, UInt8Array,
+    Array, ArrayRef, DictionaryArray, StringArray, UInt8Array, make_array, new_null_array,
 };
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 use snafu::location;
@@ -26,9 +26,9 @@ use crate::format::ProtobufUtils;
 use crate::previous::decoder::LogicalPageDecoder;
 use crate::previous::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
+    EncodingsIo,
     decoder::{PageScheduler, PrimitivePageDecoder},
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 #[derive(Debug)]
@@ -408,13 +408,13 @@ impl ArrayEncoder for DictionaryEncoder {
 pub mod tests {
 
     use arrow_array::{
-        builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, DictionaryArray, StringArray, UInt8Array,
+        builder::{LargeStringBuilder, StringBuilder},
     };
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     use super::encode_dict_indices_and_items;
 

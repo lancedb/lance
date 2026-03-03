@@ -13,7 +13,7 @@ pub mod levenshtein;
 pub mod traits;
 pub mod utils;
 
-pub use error::{box_error, ArrowResult, Error, Result};
+pub use error::{ArrowResult, Error, Result, box_error};
 
 /// Wildcard to indicate all non-system columns
 pub const WILDCARD: &str = "*";

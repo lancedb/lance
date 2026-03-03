@@ -64,8 +64,8 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
+use crate::format::pb21::CompressiveEncoding;
 use crate::statistics::{GetStat, Stat};
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use lance_core::Result;

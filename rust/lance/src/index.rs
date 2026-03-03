@@ -11,21 +11,22 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{stream, FutureExt};
+use futures::{FutureExt, stream};
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
-use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
-use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
+pub use lance_index::IndexParams;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
@@ -41,21 +42,19 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-pub use lance_index::IndexParams;
 use lance_index::{
-    is_system_index,
-    metrics::{MetricsCollector, NoOpMetricsCollector},
-    IndexCriteria,
+    DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, VECTOR_INDEX_VERSION,
 };
-use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
-    DatasetIndexExt, IndexDescription, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION,
+    IndexCriteria, is_system_index,
+    metrics::{MetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
-    read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
-    CachedFileSize,
+    CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
+    read_version,
 };
 use lance_table::format::IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
@@ -80,15 +79,15 @@ pub mod vector;
 use self::append::merge_indices;
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::optimize::RemappedIndex;
+use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
-use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
+use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
-use crate::{dataset::Dataset, Error, Result};
+use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 
 // Cache keys for different index types
@@ -191,12 +190,7 @@ impl CacheKey for MemWalCacheKey<'_> {
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
     static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
-    *LANCE_AUTO_MIGRATION.get_or_init(|| {
-        std::env::var("LANCE_AUTO_MIGRATION")
-            .ok()
-            .map(|s| str_is_truthy(&s))
-            .unwrap_or(true)
-    })
+    *LANCE_AUTO_MIGRATION.get_or_init(|| parse_env_as_bool("LANCE_AUTO_MIGRATION", true))
 }
 
 /// Derive a friendly (but not necessarily unique) type name from a type URL.
@@ -330,7 +324,8 @@ pub(crate) async fn remap_index(
                             location: location!(),
                         })?;
                     if inverted_index.is_legacy() {
-                        log::warn!("reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
+                        log::warn!(
+                            "reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
                             scalar_index.index_type(),
                             index_id,
                             field_path
@@ -826,29 +821,29 @@ impl DatasetIndexExt for Dataset {
             let has_multiple = indices.len() > 1;
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
-                if let Some(field) = field {
-                    if index_matches_criteria(
+                if let Some(field) = field
+                    && index_matches_criteria(
                         idx,
                         &criteria,
                         &[field],
                         has_multiple,
                         self.schema(),
-                    )? {
-                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
-                        });
-                        let is_fts_index = if let Some(details) = &idx.index_details {
-                            IndexDetails(details.clone()).supports_fts()
-                        } else {
-                            false
-                        };
-                        // FTS indices must always be returned even if empty, because FTS queries
-                        // require an index to exist. The query execution will handle the empty
-                        // bitmap appropriately and fall back to scanning unindexed data.
-                        // Other index types can be skipped if empty since they're optional optimizations.
-                        if non_empty || is_fts_index {
-                            return Ok(Some(idx.clone()));
-                        }
+                    )?
+                {
+                    let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                        bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                    });
+                    let is_fts_index = if let Some(details) = &idx.index_details {
+                        IndexDetails(details.clone()).supports_fts()
+                    } else {
+                        false
+                    };
+                    // FTS indices must always be returned even if empty, because FTS queries
+                    // require an index to exist. The query execution will handle the empty
+                    // bitmap appropriately and fall back to scanning unindexed data.
+                    // Other index types can be skipped if empty since they're optional optimizations.
+                    if non_empty || is_fts_index {
+                        return Ok(Some(idx.clone()));
                     }
                 }
             }
@@ -1129,14 +1124,13 @@ async fn collect_regular_indices_statistics(
         }
 
         let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-        if let Ok(plugin) = index_details_wrapper.get_plugin() {
-            if let Some(stats) = plugin
+        if let Ok(plugin) = index_details_wrapper.get_plugin()
+            && let Some(stats) = plugin
                 .load_statistics(index_store.clone(), index_details.as_ref())
                 .await?
-            {
-                indices_stats.push(stats);
-                continue;
-            }
+        {
+            indices_stats.push(stats);
+            continue;
         }
 
         let index = ds
@@ -1754,19 +1748,19 @@ impl DatasetIndexInternalExt for Dataset {
         for indexed_field in indexed_fields {
             // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
             // but the rust compiler does not.
-            let mut parser = Some(indexed_field.1 .1);
+            let mut parser = Some(indexed_field.1.1);
             let parser = &mut parser;
             index_info_map
                 .entry(indexed_field.0)
                 .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
                     // If there are two indices on the same column, they must have the same type
-                    debug_assert_eq!(existing.0, indexed_field.1 .0);
+                    debug_assert_eq!(existing.0, indexed_field.1.0);
 
                     existing.1.add(parser.take().unwrap());
                 })
                 .or_insert_with(|| {
                     (
-                        indexed_field.1 .0,
+                        indexed_field.1.0,
                         Box::new(MultiQueryParser::single(parser.take().unwrap())),
                     )
                 });
@@ -1976,11 +1970,11 @@ fn is_vector_field(data_type: DataType) -> bool {
 mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::Int32Array;
@@ -1992,7 +1986,7 @@ mod tests {
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
-    use lance_datagen::{array, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -2022,14 +2016,16 @@ mod tests {
             ),
         ]));
         let data = generate_random_array(2048 * DIM as usize);
-        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap()),
-                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
-            ],
-        )
-        .unwrap()];
+        let batches: Vec<RecordBatch> = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap()),
+                    Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
+                ],
+            )
+            .unwrap(),
+        ];
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -2053,16 +2049,18 @@ mod tests {
             .unwrap();
 
         // Can not overwrite an index on different columns.
-        assert!(dataset
-            .create_index(
-                &["v"],
-                IndexType::Vector,
-                Some("o_idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .is_err());
+        assert!(
+            dataset
+                .create_index(
+                    &["v"],
+                    IndexType::Vector,
+                    Some("o_idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3207,7 +3205,7 @@ mod tests {
         #[case] index_type: IndexType,
         #[case] params: Box<dyn IndexParams>,
     ) {
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with scalar and text columns (no vector column needed)
         let reader = lance_datagen::gen_batch()
@@ -3319,7 +3317,7 @@ mod tests {
         #[case] index_type: IndexType,
         #[case] params: Box<dyn IndexParams>,
     ) {
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with initial data
         let reader = lance_datagen::gen_batch()
@@ -3522,7 +3520,7 @@ mod tests {
         #[case] params: Box<dyn IndexParams>,
     ) {
         use crate::dataset::UpdateBuilder;
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with initial data
         let reader = lance_datagen::gen_batch()
@@ -3936,12 +3934,14 @@ mod tests {
             assert!(
                 vector_index_dir.exists(),
                 "Round {}: New vector index directory should exist in cloned dataset location: {:?}",
-                round, vector_index_dir
+                round,
+                vector_index_dir
             );
             assert!(
                 category_index_dir.exists(),
                 "Round {}: New category index directory should exist in cloned dataset location: {:?}",
-                round, category_index_dir
+                round,
+                category_index_dir
             );
 
             // Verify base id
@@ -4110,7 +4110,7 @@ mod tests {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use std::collections::HashSet;
@@ -4260,7 +4260,7 @@ mod tests {
         use crate::dataset::Dataset;
         use arrow_array::types::Int32Type;
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::ScalarIndexParams;
 
         // Test that initialize_indices handles missing fields gracefully
@@ -4302,10 +4302,12 @@ mod tests {
 
         // Should fail when field is missing
         assert!(result.is_err(), "Should error when field is missing");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in target dataset"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in target dataset")
+        );
     }
 
     #[tokio::test]
@@ -4314,7 +4316,7 @@ mod tests {
         use crate::index::vector::VectorIndexParams;
         use arrow_array::types::{Float32Type, Int32Type};
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::ScalarIndexParams;
         use lance_linalg::distance::MetricType;
 
@@ -4407,10 +4409,12 @@ mod tests {
             .initialize_index(&source_dataset, "non_existent")
             .await;
         assert!(result.is_err(), "Should error for non-existent index");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in source dataset"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in source dataset")
+        );
     }
 
     #[tokio::test]
@@ -5077,7 +5081,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_index_column() {
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
 
         // Create a test dataset with a vector column
         let test_dir = tempfile::tempdir().unwrap();
@@ -5130,15 +5134,17 @@ mod tests {
         // Test 3: Pass a non-existent column name (should fail)
         let result = resolve_index_column(dataset.schema(), index_meta, "nonexistent");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not exist in the schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist in the schema")
+        );
     }
 
     #[tokio::test]
     async fn test_resolve_index_column_error_cases() {
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
 
         // Create a test dataset
         let test_dir = tempfile::tempdir().unwrap();

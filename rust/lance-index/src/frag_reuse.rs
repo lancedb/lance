@@ -11,7 +11,7 @@ use itertools::Itertools;
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::format::{pb, ExternalFile, Fragment};
+use lance_table::format::{ExternalFile, Fragment, pb};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -328,10 +328,10 @@ impl FragReuseIndex {
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    group.old_frags),
-                            location!()));
+                        return Err(Error::invalid_input(format!(
+                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                            group.old_frags
+                        )));
                     }
 
                     for new_frag in group.new_frags.iter() {

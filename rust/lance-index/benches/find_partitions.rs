@@ -4,10 +4,10 @@
 mod sq;
 
 use arrow_array::Float32Array;
-use arrow_array::{types::Float32Type, FixedSizeListArray};
+use arrow_array::{FixedSizeListArray, types::Float32Type};
 use lance_arrow::FixedSizeListArrayExt;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 

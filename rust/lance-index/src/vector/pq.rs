@@ -7,19 +7,19 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{self, ArrowPrimitiveType};
-use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, FixedSizeListArray, UInt8Array, cast::AsArray};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
-use lance_core::{assume_eq, Error, Result};
+use lance_core::{Error, Result, assume_eq};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
 use snafu::location;
-use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADATA_KEY};
+use storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage};
 use tracing::instrument;
 
 pub mod builder;
@@ -33,7 +33,7 @@ pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
-use super::{pb, PQ_CODE_COLUMN};
+use super::{PQ_CODE_COLUMN, pb};
 use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;

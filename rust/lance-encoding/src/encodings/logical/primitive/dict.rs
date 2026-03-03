@@ -9,17 +9,17 @@ pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
 pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
 
 use arrow_array::{
+    Array, DictionaryArray, PrimitiveArray, UInt64Array,
     cast::AsArray,
     types::{
-        ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-        UInt64Type, UInt8Type,
+        ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+        UInt32Type, UInt64Type,
     },
-    Array, DictionaryArray, PrimitiveArray, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
-use lance_core::{error::LanceOptionExt, utils::hash::U8SliceKey, Error, Result};
+use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
 use snafu::location;
 
 use crate::{

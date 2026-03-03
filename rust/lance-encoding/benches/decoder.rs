@@ -5,15 +5,15 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::{
     decoder::{
-        create_decode_stream, DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression,
+        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression, create_decode_stream,
     },
-    encoder::{default_encoding_strategy, encode_batch, EncodingOptions},
+    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
     version::LanceFileVersion,
 };
 use tokio::sync::mpsc::unbounded_channel;

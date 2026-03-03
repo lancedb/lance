@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::DatasetIndexExt;
-use lance_index::{scalar::ScalarIndexParams, IndexType};
+use lance_index::{IndexType, scalar::ScalarIndexParams};
 
 #[tokio::test]
 async fn concurrent_create() {
@@ -260,10 +260,12 @@ async fn test_add_bases() {
 
     let result = updated_dataset.add_bases(conflicting_bases, None).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Conflict detected"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected")
+    );
 
     // Test conflict detection - try to add a base with the same path
     let conflicting_bases = vec![BasePath::new(
@@ -275,10 +277,12 @@ async fn test_add_bases() {
 
     let result = updated_dataset.add_bases(conflicting_bases, None).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Conflict detected"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected")
+    );
 }
 
 #[tokio::test]
@@ -397,10 +401,12 @@ async fn test_concurrent_add_bases_name_conflict() {
 
     let result = dataset_clone.add_bases(new_bases2, None).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("incompatible with concurrent transaction"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible with concurrent transaction")
+    );
 }
 
 #[tokio::test]
@@ -451,10 +457,12 @@ async fn test_concurrent_add_bases_path_conflict() {
 
     let result = dataset_clone.add_bases(new_bases2, None).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("incompatible with concurrent transaction"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible with concurrent transaction")
+    );
 }
 
 #[tokio::test]
@@ -513,11 +521,13 @@ async fn test_concurrent_add_bases_with_data_write() {
 
     // Should have the new base
     assert_eq!(final_dataset.manifest.base_paths.len(), 1);
-    assert!(final_dataset
-        .manifest
-        .base_paths
-        .values()
-        .any(|bp| bp.name == Some("base1".to_string())));
+    assert!(
+        final_dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base1".to_string()))
+    );
 
     // Should have both data writes (10 rows total)
     assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);

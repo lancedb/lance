@@ -5641,6 +5641,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    allow_external_blob_outside_bases: bool = False,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -5735,6 +5736,9 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to the dataset root or a registered
+        base path. If True, external blob URIs outside registered bases are allowed.
     namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -5897,6 +5901,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
     }
 
     # Add storage_options_provider if created from namespace

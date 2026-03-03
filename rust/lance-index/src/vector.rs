@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
-use lance_core::{Result, ROW_ID_FIELD};
+use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use quantizer::{QuantizationType, Quantizer};
@@ -40,7 +40,7 @@ pub mod v3;
 
 use super::pb;
 use crate::metrics::MetricsCollector;
-use crate::{prefilter::PreFilter, Index};
+use crate::{Index, prefilter::PreFilter};
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const DIST_COL: &str = "_distance";

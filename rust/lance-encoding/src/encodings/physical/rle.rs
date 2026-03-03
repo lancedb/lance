@@ -63,11 +63,11 @@ use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompress
 use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
-    MAX_MINIBLOCK_VALUES,
+    MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
+    MiniBlockCompressor,
 };
-use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
+use crate::format::pb21::CompressiveEncoding;
 
 use lance_core::{Error, Result};
 
@@ -753,10 +753,12 @@ mod tests {
             10,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("expects exactly 2 buffers"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expects exactly 2 buffers")
+        );
     }
 
     #[test]
@@ -766,10 +768,12 @@ mod tests {
         let lengths = LanceBuffer::from(vec![5, 10]); // 2 lengths - mismatch!
         let result = MiniBlockDecompressor::decompress(&decompressor, vec![values, lengths], 15);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Inconsistent RLE buffers"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Inconsistent RLE buffers")
+        );
     }
 
     #[test]
@@ -1051,7 +1055,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_rle_encoding_verification() {
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
         use crate::version::LanceFileVersion;
         use arrow_array::{Array, Int32Array};
         use lance_datagen::{ArrayGenerator, RowCount};
@@ -1162,10 +1166,12 @@ mod tests {
         data.extend_from_slice(&u64::MAX.to_le_bytes());
         let result = BlockDecompressor::decompress(&decompressor, LanceBuffer::from(data), 1);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid RLE values buffer size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid RLE values buffer size")
+        );
     }
 
     #[test]
@@ -1174,10 +1180,12 @@ mod tests {
         let result =
             BlockDecompressor::decompress(&decompressor, LanceBuffer::from(vec![1, 2, 3]), 10);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Insufficient data size: 3"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient data size: 3")
+        );
     }
 
     #[test]

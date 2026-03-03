@@ -3,15 +3,15 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
+use arrow_array::FixedSizeListArray;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::FixedSizeListArray;
 use arrow_schema::DataType;
 use half::{bf16, f16};
-#[cfg(feature = "fp16kernels")]
-use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::SIMD_SUPPORT;
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
@@ -26,7 +26,7 @@ mod kernel {
 
     // These are the `norm_l2_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
-    extern "C" {
+    unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]

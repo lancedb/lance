@@ -9,16 +9,16 @@ use std::sync::{Arc, LazyLock};
 use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
+    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
 };
 use arrow_schema::DataType;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
-use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
@@ -26,16 +26,16 @@ use lance_index::pbold::{
 };
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::IndexStore;
-use lance_index::scalar::{
-    bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
-    ScalarIndex, ScalarIndexParams,
-};
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
+use lance_index::scalar::{
+    ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
+    lance_format::LanceIndexStore,
+};
 use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
@@ -412,10 +412,10 @@ pub fn index_matches_criteria(
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
-    if let Some(name) = &criteria.has_name {
-        if &index.name != name {
-            return Ok(false);
-        }
+    if let Some(name) = &criteria.has_name
+        && &index.name != name
+    {
+        return Ok(false);
     }
 
     if let Some(for_column) = criteria.for_column {
@@ -554,7 +554,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::{optimize::OptimizeOptions, IndexType};
+    use lance_index::{IndexType, optimize::OptimizeOptions};
     use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
     use lance_table::format::pb::VectorIndexDetails;
 
@@ -770,10 +770,10 @@ mod tests {
     async fn test_initialize_scalar_index_btree() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_index::DatasetIndexExt;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -876,10 +876,10 @@ mod tests {
     async fn test_optimize_scalar_index_btree() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_index::DatasetIndexExt;
 
         let test_dir = TempStrDir::default();
         let uri = format!("{}/source", test_dir.as_str());
@@ -994,9 +994,9 @@ mod tests {
     async fn test_initialize_scalar_index_bitmap() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
-        use lance_index::scalar::ScalarIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::DatasetIndexExt;
+        use lance_index::scalar::ScalarIndexParams;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1073,10 +1073,10 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_inverted() {
         use crate::dataset::Dataset;
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-        use lance_index::DatasetIndexExt;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1213,11 +1213,11 @@ mod tests {
     async fn test_initialize_scalar_index_zonemap() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
-        use lance_index::metrics::NoOpMetricsCollector;
-        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
-        use lance_index::scalar::ScalarIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::DatasetIndexExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1366,7 +1366,11 @@ mod tests {
             }
 
             for (before, expected) in result_before.iter().zip(expected.iter()) {
-                assert_eq!(before, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}'", del_pred);
+                assert_eq!(
+                    before, expected,
+                    "Zonemap index with deletions returned wrong results for deletion predicate '{}'",
+                    del_pred
+                );
             }
 
             // Now recreate the indexes for the next iteration
@@ -1385,7 +1389,11 @@ mod tests {
             }
 
             for (after, expected) in result_after.iter().zip(expected.iter()) {
-                assert_eq!(after, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index", del_pred);
+                assert_eq!(
+                    after, expected,
+                    "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index",
+                    del_pred
+                );
             }
         }
     }
@@ -1394,8 +1402,8 @@ mod tests {
     async fn test_zonemap_deletion_then_index() {
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows in two fragments: alternating boolean values
         // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
@@ -1471,8 +1479,8 @@ mod tests {
         // Verifies that zonemap index properly handles deletions that occur after index creation
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating boolean values
         // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
@@ -1599,8 +1607,8 @@ mod tests {
         // After deleting rows and creating a bloom filter index, queries return fewer results than expected
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating string values "apple" and "banana"
         // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
@@ -1686,8 +1694,8 @@ mod tests {
         // Verifies that bloom filter index properly handles deletions that occur after index creation
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating string values "apple" and "banana"
         // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"

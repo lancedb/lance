@@ -8,8 +8,8 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     RecordBatch,
+    types::{Float16Type, Float32Type, Float64Type},
 };
 use arrow_schema::{DataType, Field};
 use snafu::location;
@@ -72,7 +72,7 @@ impl Transformer for SQTransformer {
                 return Err(Error::Index {
                     message: format!("unsupported data type: {}", fsl.value_type()),
                     location: location!(),
-                })
+                });
             }
         };
 

@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use datafusion::{execution::TaskContext, logical_expr::Expr};
 use datafusion_physical_plan::{
-    filter::FilterExec, metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan,
-    PlanProperties, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    Statistics, filter::FilterExec, metrics::MetricsSet,
 };
-use lance_core::{error::DataFusionResult, Result};
+use lance_core::{Result, error::DataFusionResult};
 use lance_datafusion::planner::Planner;
 
 #[derive(Debug)]

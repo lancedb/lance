@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::AsArray;
-use arrow::compute::{concat_batches, TakeOptions};
+use arrow::compute::{TakeOptions, concat_batches};
 use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
@@ -21,8 +21,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use futures::FutureExt;
+use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
@@ -32,9 +32,9 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tracing::error;
 
+use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
@@ -640,7 +640,7 @@ mod tests {
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{datatypes::OnMissing, ROW_ID};
+    use lance_core::{ROW_ID, datatypes::OnMissing};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
     use rstest::rstest;

@@ -37,12 +37,12 @@ use lance_namespace::models::{
     NamespaceExistsRequest, TableExistsRequest, TableVersion,
 };
 
-use lance_core::{box_error, Error, Result};
-use lance_namespace::schema::arrow_schema_to_json;
+use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
+use lance_namespace::schema::arrow_schema_to_json;
 
 use crate::credentials::{
-    create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
+    CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
 
 /// Result of checking table status atomically.
@@ -627,10 +627,10 @@ impl DirectoryNamespace {
         }
 
         // Apply limit
-        if let Some(limit) = limit {
-            if limit >= 0 {
-                names.truncate(limit as usize);
-            }
+        if let Some(limit) = limit
+            && limit >= 0
+        {
+            names.truncate(limit as usize);
         }
     }
 
@@ -671,16 +671,16 @@ impl DirectoryNamespace {
 
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
-        if let Some(id) = id {
-            if !id.is_empty() {
-                return Err(Error::Namespace {
+        if let Some(id) = id
+            && !id.is_empty()
+        {
+            return Err(Error::Namespace {
                     source: format!(
                         "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
                         id
                     ).into(),
                     location: snafu::location!(),
                 });
-            }
         }
         Ok(())
     }
@@ -1025,10 +1025,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            if !self.dir_listing_enabled {
-                return manifest_ns.list_tables(request).await;
-            }
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !self.dir_listing_enabled
+        {
+            return manifest_ns.list_tables(request).await;
         }
 
         // When both manifest and directory listing are enabled, we need to merge and deduplicate
@@ -2009,10 +2009,12 @@ mod tests {
 
         let result = namespace.create_table(request, bytes::Bytes::new()).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Arrow IPC stream) is required"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Arrow IPC stream) is required")
+        );
     }
 
     #[tokio::test]
@@ -2152,10 +2154,12 @@ mod tests {
 
         let result = namespace.describe_table(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Table does not exist")
+        );
     }
 
     #[tokio::test]
@@ -2184,10 +2188,12 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Table does not exist")
+        );
     }
 
     #[tokio::test]
@@ -2269,10 +2275,12 @@ mod tests {
         request.id = Some(vec![]);
         let result = namespace.drop_namespace(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be dropped"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be dropped")
+        );
     }
 
     #[tokio::test]
@@ -2581,10 +2589,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.version, Some(1));
-        assert!(response
-            .location
-            .unwrap()
-            .contains("test_table_with_data.lance"));
+        assert!(
+            response
+                .location
+                .unwrap()
+                .contains("test_table_with_data.lance")
+        );
 
         // Verify table exists
         let mut exists_request = TableExistsRequest::new();
@@ -2648,10 +2658,12 @@ mod tests {
 
         let result = namespace.create_empty_table(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be at location"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be at location")
+        );
     }
 
     #[tokio::test]
@@ -3405,10 +3417,12 @@ mod tests {
         register_req.id = Some(vec!["test_table".to_string()]);
         let result = namespace.register_table(register_req).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("manifest mode is enabled"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("manifest mode is enabled")
+        );
 
         // Note: deregister_table now works in V1 mode via .lance-deregistered marker files
         // See test_deregister_table_v1_mode for that test case
@@ -3773,10 +3787,12 @@ mod tests {
         // Try to deregister again - should fail
         let result = namespace.deregister_table(deregister_req).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already deregistered"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already deregistered")
+        );
     }
 
     // ============================================================
@@ -4808,9 +4824,9 @@ mod tests {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
             use arrow::record_batch::RecordBatch;
+            use lance::Dataset;
             use lance::dataset::builder::DatasetBuilder;
             use lance::dataset::{WriteMode, WriteParams};
-            use lance::Dataset;
             use lance_namespace::models::CreateNamespaceRequest;
 
             let temp_dir = TempStdDir::default();

@@ -996,6 +996,21 @@ public class Dataset implements Closeable {
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
 
+  /**
+   * Drop an index by name.
+   *
+   * @param name the index name to drop
+   */
+  public void dropIndex(String name) {
+    Preconditions.checkArgument(name != null && !name.isEmpty(), "name cannot be null or empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropIndex(name);
+    }
+  }
+
+  private native void nativeDropIndex(String name);
+
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
     innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);

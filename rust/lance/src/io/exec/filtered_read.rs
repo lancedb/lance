@@ -3,8 +3,8 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
@@ -18,25 +18,25 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    execution_plan::{Boundedness, EmissionType},
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
-use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
-use futures::{future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::{
-    bitmap_to_ranges, ranges_to_bitmap, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
+    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Projection, Error, Result};
+use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
@@ -50,14 +50,14 @@ use lance_table::utils::stream::ReadBatchFut;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
-use tracing::{instrument, Instrument};
+use tracing::{Instrument, instrument};
 
+use crate::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
-    get_default_batch_size, BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD,
+    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
 };
-use crate::Dataset;
 
 use super::utils::IoMetrics;
 
@@ -537,10 +537,10 @@ impl FilteredReadStream {
             deletion_vector,
         } in fragments.iter()
         {
-            if let Some(range_before_filter) = &options.scan_range_before_filter {
-                if range_offset >= range_before_filter.end {
-                    break;
-                }
+            if let Some(range_before_filter) = &options.scan_range_before_filter
+                && range_offset >= range_before_filter.end
+            {
+                break;
             }
 
             let mut to_read: Vec<Range<u64>> =
@@ -1774,27 +1774,53 @@ impl DisplayAs for FilteredReadExec {
                     "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}",
                     self.dataset.data_dir(),
                     columns,
-                    self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
+                    self.options
+                        .fragments
+                        .as_ref()
+                        .map(|f| f.len())
+                        .unwrap_or(self.dataset.fragments().len()),
                     self.options.scan_range_before_filter,
                     self.options.scan_range_after_filter,
                     self.options.projection.with_row_id,
                     self.options.projection.with_row_addr,
-                    self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
-                    self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
+                    self.options
+                        .full_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("--".to_string()),
+                    self.options
+                        .refine_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("--".to_string()),
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
-                self.dataset.data_dir(),
-                columns,
-                self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
-                self.options.scan_range_before_filter,
-                self.options.scan_range_after_filter,
-                self.options.projection.with_row_id,
-                self.options.projection.with_row_addr,
-                self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-                self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-            )
+                write!(
+                    f,
+                    "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.options
+                        .fragments
+                        .as_ref()
+                        .map(|f| f.len())
+                        .unwrap_or(self.dataset.fragments().len()),
+                    self.options.scan_range_before_filter,
+                    self.options.scan_range_after_filter,
+                    self.options.projection.with_row_id,
+                    self.options.projection.with_row_addr,
+                    self.options
+                        .full_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("true".to_string()),
+                    self.options
+                        .refine_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("true".to_string()),
+                )
             }
         }
     }
@@ -2052,16 +2078,16 @@ mod tests {
         datatypes::{Float32Type, UInt32Type, UInt64Type},
     };
     use arrow_array::{
-        cast::AsArray, Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray,
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
-        optimize::OptimizeOptions,
-        scalar::{expression::PlannerIndexExt, ScalarIndexParams},
         DatasetIndexExt, IndexType,
+        optimize::OptimizeOptions,
+        scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
 
     use crate::{

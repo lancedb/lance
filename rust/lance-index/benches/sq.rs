@@ -5,14 +5,14 @@
 
 use std::{iter::repeat_with, ops::Range, sync::Arc, time::Duration};
 
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::ROW_ID;
 use lance_index::vector::storage::DistCalculator;
 use lance_index::vector::{
-    sq::storage::ScalarQuantizationStorage, storage::VectorStore, SQ_CODE_COLUMN,
+    SQ_CODE_COLUMN, sq::storage::ScalarQuantizationStorage, storage::VectorStore,
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;

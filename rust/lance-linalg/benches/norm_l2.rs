@@ -4,15 +4,15 @@
 use std::iter::repeat_with;
 
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     Float16Array, Float32Array, Float64Array,
+    types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use half::{bf16, f16};
 use num_traits::Float;
 use rand::Rng;
 
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray};
+use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
 use lance_linalg::distance::{norm_l2, norm_l2_impl};
 use lance_testing::datagen::generate_random_array_with_seed;
 

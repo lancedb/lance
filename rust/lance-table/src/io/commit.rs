@@ -24,23 +24,23 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
-use futures::future::Either;
 use futures::Stream;
+use futures::future::Either;
 use futures::{
+    StreamExt, TryStreamExt,
     future::{self, BoxFuture},
     stream::BoxStream,
-    StreamExt, TryStreamExt,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{get_etag, ObjectWriter, WriteResult};
+use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::PutOptions;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use snafu::location;
 use tracing::info;
 use url::Url;
@@ -53,14 +53,14 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
-use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
+use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-    aws_credential_types::provider::error::CredentialsError,
     aws_credential_types::provider::ProvideCredentials,
-    lance_io::object_store::{providers::aws::build_aws_credential, StorageOptions},
+    aws_credential_types::provider::error::CredentialsError,
+    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -260,10 +260,10 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
-            return Ok(location);
-        }
+    if object_store.is_local()
+        && let Ok(Some(location)) = current_manifest_local(base)
+    {
+        return Ok(location);
     }
 
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
@@ -652,8 +652,8 @@ async fn build_dynamodb_external_store(
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{
-        config::{retry::RetryConfig, IdentityCache, Region},
         Client,
+        config::{IdentityCache, Region, retry::RetryConfig},
     };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()

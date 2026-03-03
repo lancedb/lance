@@ -6,33 +6,33 @@ use std::ops::Range;
 use arrow::datatypes::Float64Type;
 use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
+    ArrayRef, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
-    types::{Float32Type, UInt64Type, UInt8Type},
-    ArrayRef, RecordBatch, UInt64Array, UInt8Array,
+    types::{Float32Type, UInt8Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
+use lance_linalg::distance::{DistanceType, dot_distance, l2_distance_uint_scalar};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::sync::Arc;
 
-use super::{scale_to_u8, ScalarQuantizer};
+use super::{ScalarQuantizer, scale_to_u8};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
+        SQ_CODE_COLUMN,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
         transform::Transformer,
-        SQ_CODE_COLUMN,
     },
-    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
@@ -494,7 +494,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                 // Loop over the sq_code to prefetch each cache line
                 for offset in (0..dim).step_by(CACHE_LINE_SIZE) {
                     {
-                        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                         _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
                     }
                 }

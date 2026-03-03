@@ -103,7 +103,7 @@ mod tests {
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{stream, TryStreamExt};
+    use futures::{TryStreamExt, stream};
     use serde_json::Value;
     use std::sync::Arc;
 

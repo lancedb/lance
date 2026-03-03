@@ -30,8 +30,8 @@ use std::str::FromStr;
 use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
-    pb21::{self, CompressiveEncoding},
     ProtobufUtils21,
+    pb21::{self, CompressiveEncoding},
 };
 use crate::{
     buffer::LanceBuffer,
@@ -76,10 +76,10 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
         match scheme {
             CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
             CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -91,10 +91,10 @@ impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
         match scheme {
             pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
             pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -120,10 +120,10 @@ impl FromStr for CompressionScheme {
             "fsst" => Ok(Self::Fsst),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
-            _ => Err(Error::invalid_input(
-                format!("Unknown compression scheme: {}", s),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unknown compression scheme: {}",
+                s
+            ))),
         }
     }
 }
@@ -141,7 +141,7 @@ mod zstd {
 
     use super::*;
 
-    use ::zstd::bulk::{decompress_to_buffer, Compressor};
+    use ::zstd::bulk::{Compressor, decompress_to_buffer};
     use ::zstd::stream::copy_decode;
 
     /// A zstd buffer compressor that lazily creates and reuses compression contexts.
@@ -637,7 +637,7 @@ impl BlockCompressor for CompressedBufferEncoder {
                 return Err(Error::InvalidInput {
                     source: "Unsupported data block type".into(),
                     location: location!(),
-                })
+                });
             }
         };
 
@@ -787,7 +787,7 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY,
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
-            testing::{check_round_trip_encoding_generated, FnArrayGeneratorProvider, TestCases},
+            testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
             version::LanceFileVersion,
         };
 

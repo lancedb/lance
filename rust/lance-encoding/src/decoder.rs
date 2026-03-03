@@ -213,20 +213,21 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
-use std::sync::{LazyLock, Once};
+use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::future::{maybe_done, BoxFuture, MaybeDone};
+use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
+use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -261,6 +262,13 @@ use crate::{BufferScheduler, EncodingsIo};
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
+const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
+
+fn default_cache_repetition_index() -> bool {
+    static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
+    *DEFAULT_CACHE_REPETITION_INDEX
+        .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
+}
 
 /// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
@@ -430,7 +438,6 @@ impl<'a> ColumnInfoIter<'a> {
         self.next().ok_or_else(|| {
             Error::invalid_input(
                 "there were more fields in the schema than provided column indices / infos",
-                location!(),
             )
         })
     }
@@ -517,13 +524,10 @@ impl CoreFieldDecoderStrategy {
             .column_encoding
             .as_ref()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "the column at index {} was missing a ColumnEncoding",
-                        column_info.index
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "the column at index {} was missing a ColumnEncoding",
+                    column_info.index
+                ))
             })?;
         if matches!(
             column_encoding,
@@ -531,7 +535,10 @@ impl CoreFieldDecoderStrategy {
         ) {
             Ok(())
         } else {
-            Err(Error::invalid_input(format!("the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it", column_info.index, field_name, column_encoding), location!()))
+            Err(Error::invalid_input(format!(
+                "the column at index {} mapping to the input field {} has column encoding {:?} and no decoder is registered to handle it",
+                column_info.index, field_name, column_encoding
+            )))
         }
     }
 
@@ -1415,9 +1422,7 @@ impl BatchDecodeStream {
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1427,7 +1432,10 @@ impl BatchDecodeStream {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1625,9 +1633,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     fn next_batch_task(&mut self) -> Result<Option<RecordBatch>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1637,7 +1643,10 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1764,9 +1773,7 @@ impl StructuralBatchDecodeStream {
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining,
-            self.rows_drained,
-            self.rows_scheduled,
+            self.rows_remaining, self.rows_drained, self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -1776,7 +1783,10 @@ impl StructuralBatchDecodeStream {
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
+        trace!(
+            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
+            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
+        );
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
             trace!(
@@ -1862,12 +1872,26 @@ impl RequestedRows {
 }
 
 /// Configuration for decoder behavior
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DecoderConfig {
-    /// Whether to cache repetition indices for better performance
+    /// Whether to cache repetition indices for better performance.
+    ///
+    /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
+    /// when present and is enabled by default. Set the env var to a non-truthy
+    /// value (for example `0` or `false`) to disable it. The env var is read
+    /// once per process.
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            cache_repetition_index: default_cache_repetition_index(),
+            validate_on_decode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

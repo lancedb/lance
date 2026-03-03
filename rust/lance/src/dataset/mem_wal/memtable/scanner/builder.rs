@@ -12,11 +12,10 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
-use snafu::location;
 
 use super::exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -355,14 +354,13 @@ impl MemTableScanner {
     /// Set a filter expression using SQL-like syntax.
     pub fn filter(&mut self, filter_expr: &str) -> Result<&mut Self> {
         let ctx = SessionContext::new();
-        let df_schema = self.schema.clone().to_dfschema().map_err(|e| {
-            Error::invalid_input(format!("Failed to create DFSchema: {}", e), location!())
-        })?;
+        let df_schema = self
+            .schema
+            .clone()
+            .to_dfschema()
+            .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
         let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to parse filter expression: {}", e),
-                location!(),
-            )
+            Error::invalid_input(format!("Failed to parse filter expression: {}", e))
         })?;
         self.filter = Some(expr);
         Ok(self)
@@ -630,7 +628,7 @@ impl MemTableScanner {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         plan.execute(0, task_ctx)
-            .map_err(|e| Error::io(format!("Failed to execute plan: {}", e), location!()))
+            .map_err(|e| Error::io(format!("Failed to execute plan: {}", e)))
     }
 
     /// Execute the scan and collect all results into a single RecordBatch.
@@ -639,14 +637,14 @@ impl MemTableScanner {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| Error::io(format!("Failed to collect batches: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(self.output_schema()));
         }
 
         arrow_select::concat::concat_batches(&self.output_schema(), &batches)
-            .map_err(|e| Error::io(format!("Failed to concatenate batches: {}", e), location!()))
+            .map_err(|e| Error::io(format!("Failed to concatenate batches: {}", e)))
     }
 
     /// Count the number of rows that match the query.
@@ -655,7 +653,7 @@ impl MemTableScanner {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| Error::io(format!("Failed to count rows: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))?;
 
         Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
     }
@@ -723,12 +721,11 @@ impl MemTableScanner {
         }
 
         // Check if we can use a BTree index for the filter
-        if self.use_index {
-            if let Some(predicate) = self.extract_btree_predicate() {
-                if self.has_btree_index(predicate.column()) {
-                    return self.plan_btree_query(&predicate).await;
-                }
-            }
+        if self.use_index
+            && let Some(predicate) = self.extract_btree_predicate()
+            && self.has_btree_index(predicate.column())
+        {
+            return self.plan_btree_query(&predicate).await;
         }
 
         // Fall back to full scan
@@ -881,10 +878,7 @@ impl MemTableScanner {
                         .column_with_name(name)
                         .map(|(idx, _)| idx)
                         .ok_or_else(|| {
-                            Error::invalid_input(
-                                format!("Column '{}' not found in schema", name),
-                                location!(),
-                            )
+                            Error::invalid_input(format!("Column '{}' not found in schema", name))
                         })
                 })
                 .collect();
