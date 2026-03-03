@@ -2898,9 +2898,8 @@ def test_fts_filter_vector_search(tmp_path):
         filter=PhraseQuery("text", "text"),
     )
 
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [299, 300] == ids_result
+    with pytest.raises(ValueError):
+        scanner.to_table()
 
     # Case 6: search with prefilter=false, search_filter=phrase("text")
     scanner = dataset.scanner(
@@ -2912,6 +2911,5 @@ def test_fts_filter_vector_search(tmp_path):
         },
     )
 
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300] == ids_result
+    with pytest.raises(ValueError):
+        scanner.to_table()

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{
     cmp::{Reverse, min},
@@ -2444,6 +2445,9 @@ const FLAT_ROW_ID_COL_IDX: usize = 0;
 const FLAT_ALL_TOKENS_COL_IDX: usize = 1;
 const FLAT_QUERY_TOKEN_COUNTS_COL_IDX: usize = 2;
 
+/// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
+const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
+
 /// Consumes a stream of record batches and produces token counts
 ///
 /// The resulting batch will have three columns:
@@ -2476,12 +2480,16 @@ async fn tokenize_and_count(
         ),
     ]));
     let output_schema_clone = output_schema.clone();
+    let bytes_accumulated = Arc::new(AtomicU64::new(0));
+    let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
     let batches = input
         .map(move |batch| {
             let mut tokenizer = tokenizer.box_clone();
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
+            let bytes_accumulated = bytes_accumulated.clone();
+            let bytes_warning_emitted = bytes_warning_emitted.clone();
             spawn_cpu(move || {
                 let batch = batch?;
                 let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
@@ -2522,14 +2530,21 @@ async fn tokenize_and_count(
                 let row_ids = batch[ROW_ID].clone();
                 let all_token_counts = all_token_counts.finish();
                 let query_token_counts = query_token_counts.finish();
-                DataFusionResult::Ok(RecordBatch::try_new(
+                let result_batch = RecordBatch::try_new(
+
                     output_schema,
                     vec![
                         row_ids,
                         Arc::new(all_token_counts) as ArrayRef,
                         Arc::new(query_token_counts) as ArrayRef,
                     ],
-                )?)
+                )?;
+                let bytes_accumulated = bytes_accumulated.fetch_add(result_batch.get_array_memory_size() as u64, Ordering::Relaxed);
+                if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD && !bytes_warning_emitted.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
+                }
+
+                DataFusionResult::Ok(result_batch)
             })
         })
         .buffered(get_num_compute_intensive_cpus())

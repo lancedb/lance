@@ -379,7 +379,7 @@ impl FlatMatchFilterExec {
 
         if let Some(index_meta) = index_meta {
             let uuid = index_meta.uuid.to_string();
-            let index = dataset.open_generic_index(&column, &uuid, metrics).await?;
+            let index = dataset.open_generic_index(column, &uuid, metrics).await?;
             if let Some(index) = index.as_any().downcast_ref::<InvertedIndex>() {
                 return Ok(index.tokenizer());
             } else {
@@ -422,7 +422,7 @@ impl FlatMatchFilterExec {
         let mut predicate = BooleanBuilder::with_capacity(text_col.len());
         for idx in 0..text_col.len() {
             let value = text_col.value(idx);
-            predicate.append_value(has_query_token(value, tokenizer, &query_tokens));
+            predicate.append_value(has_query_token(value, tokenizer, query_tokens));
         }
         predicate.finish()
     }
