@@ -54,10 +54,9 @@ impl FieldRef<'_> {
                 Ok(id)
             }
             FieldRef::ByPath(path) => {
-                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
-                    source: format!("Field '{}' not found in schema", path).into(),
-                    location: location!(),
-                })?;
+                let field = schema
+                    .field(path)
+                    .ok_or_else(|| Error::field_not_found(path, schema.field_paths()))?;
                 Ok(field.id)
             }
         }
@@ -267,10 +266,7 @@ impl Schema {
                     }
                 }
             } else if err_on_missing {
-                return Err(Error::Schema {
-                    message: format!("Column {} does not exist", col.as_ref()),
-                    location: location!(),
-                });
+                return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
             }
         }
 
@@ -382,6 +378,27 @@ impl Schema {
     /// before its children
     pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
         SchemaFieldIterPreOrder::new(self)
+    }
+
+    /// Get all field paths in the schema as a list of strings.
+    ///
+    /// This returns all field paths in the schema, including nested fields.
+    /// For example, if there's a struct field "user" with a field "name",
+    /// this will return "user.name" as one of the paths.
+    pub fn field_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for field in self.fields_pre_order() {
+            let ancestry = self.field_ancestry_by_id(field.id);
+            if let Some(ancestry) = ancestry {
+                let path = ancestry
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                paths.push(path);
+            }
+        }
+        paths
     }
 
     /// Returns a new schema that only contains the fields in `column_ids`.
@@ -743,40 +760,9 @@ impl Schema {
                 location: location!(),
             })
     }
-}
 
-impl PartialEq for Schema {
-    fn eq(&self, other: &Self) -> bool {
-        self.fields == other.fields
-    }
-}
-
-impl fmt::Display for Schema {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for field in self.fields.iter() {
-            writeln!(f, "{field}")?
-        }
-        Ok(())
-    }
-}
-
-/// Convert `arrow2::datatype::Schema` to Lance
-impl TryFrom<&ArrowSchema> for Schema {
-    type Error = Error;
-
-    fn try_from(schema: &ArrowSchema) -> Result<Self> {
-        let mut schema = Self {
-            fields: schema
-                .fields
-                .iter()
-                .map(|f| Field::try_from(f.as_ref()))
-                .collect::<Result<_>>()?,
-            metadata: schema.metadata.clone(),
-        };
-        schema.set_field_id(None);
-        schema.validate()?;
-
-        let pk = schema.unenforced_primary_key();
+    pub fn verify_primary_key(&self) -> Result<()> {
+        let pk = self.unenforced_primary_key();
         for pk_col in pk.into_iter() {
             if !pk_col.is_leaf() {
                 return Err(Error::Schema {
@@ -785,7 +771,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 });
             }
 
-            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
+            if let Some(ancestors) = self.field_ancestry_by_id(pk_col.id) {
                 for ancestor in ancestors {
                     if ancestor.nullable {
                         return Err(Error::Schema {
@@ -819,6 +805,42 @@ impl TryFrom<&ArrowSchema> for Schema {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl PartialEq for Schema {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+    }
+}
+
+impl fmt::Display for Schema {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for field in self.fields.iter() {
+            writeln!(f, "{field}")?
+        }
+        Ok(())
+    }
+}
+
+/// Convert `arrow2::datatype::Schema` to Lance
+impl TryFrom<&ArrowSchema> for Schema {
+    type Error = Error;
+
+    fn try_from(schema: &ArrowSchema) -> Result<Self> {
+        let mut schema = Self {
+            fields: schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
+            metadata: schema.metadata.clone(),
+        };
+        schema.set_field_id(None);
+        schema.validate()?;
+
+        schema.verify_primary_key()?;
 
         Ok(schema)
     }
@@ -2771,5 +2793,58 @@ mod tests {
         assert_eq!(pk_fields[0].name, "f");
         assert_eq!(pk_fields[1].name, "e");
         assert_eq!(pk_fields[2].name, "g");
+    }
+
+    #[test]
+    fn test_project_with_suggestion() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("vector", ArrowDataType::Float32, false),
+            ArrowField::new("label", ArrowDataType::Utf8, true),
+            ArrowField::new("score", ArrowDataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // Typo: "vectr" is close to "vector" → should get suggestion
+        let err = schema.project(&["vectr"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Did you mean 'vector'?"),
+            "Expected suggestion for 'vectr', got: {}",
+            msg
+        );
+        // Should also list available fields
+        assert!(
+            msg.contains("Available fields:"),
+            "Expected available fields list, got: {}",
+            msg
+        );
+
+        // Completely wrong name → no suggestion but still lists fields
+        let err = schema.project(&["nonexistent_column"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Did you mean"),
+            "Should not suggest for completely different name, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Available fields:"),
+            "Expected available fields list even without suggestion, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_field_paths() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("vector", ArrowDataType::Float32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let paths = schema.field_paths();
+        assert!(paths.contains(&"id".to_string()));
+        assert!(paths.contains(&"vector".to_string()));
+        assert!(paths.contains(&"name".to_string()));
     }
 }

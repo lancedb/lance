@@ -314,6 +314,21 @@ pub async fn maybe_sample_training_data(
     }
 }
 
+/// Filter out non-finite vectors from sampled training data.
+///
+/// This is a no-op when all rows are finite, avoiding an unnecessary copy.
+pub fn filter_finite_training_data(
+    training_data: FixedSizeListArray,
+) -> Result<FixedSizeListArray> {
+    let finite_mask = lance_index::vector::utils::is_finite(&training_data);
+    if finite_mask.true_count() == training_data.len() {
+        Ok(training_data)
+    } else {
+        let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
+        Ok(filtered.as_fixed_size_list().clone())
+    }
+}
+
 #[derive(Debug)]
 pub struct PartitionLoadLock {
     partition_locks: Vec<Arc<Mutex<()>>>,
@@ -761,7 +776,8 @@ fn random_ranges(
 mod tests {
     use super::*;
 
-    use arrow_array::types::Float32Type;
+    use arrow_array::{types::Float32Type, Float32Array};
+    use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
 
@@ -931,6 +947,25 @@ mod tests {
             unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, 4 * dim) };
         let expected: Vec<f32> = (12..28).map(|i| i as f32).collect();
         assert_eq!(result, &expected[..]);
+    }
+
+    #[test]
+    fn test_filter_finite_training_data() {
+        let values = Float32Array::from_iter_values([
+            1.0,
+            2.0, // finite
+            f32::NAN,
+            0.0, // non-finite
+            3.0,
+            4.0, // finite
+        ]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let training_data = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        let filtered = filter_finite_training_data(training_data).unwrap();
+        assert_eq!(filtered.len(), 2);
+        let vals = filtered.values().as_primitive::<Float32Type>();
+        assert_eq!(vals.values(), &[1.0, 2.0, 3.0, 4.0]);
     }
 
     #[tokio::test]

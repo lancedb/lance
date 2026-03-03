@@ -529,10 +529,13 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err
-            .to_string()
-            .contains("Field 'non_existent_field' not found in schema"));
+        assert!(matches!(err, Error::FieldNotFound { .. }));
+        assert!(
+            err.to_string()
+                .contains("Field 'non_existent_field' not found"),
+            "Expected error message to contain field name, got: {}",
+            err
+        );
     }
 
     #[tokio::test]

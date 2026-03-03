@@ -24,9 +24,10 @@ use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -337,7 +338,8 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 }
 
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
-    let expanded = tilde(str_path.as_ref()).to_string();
+    let str_path = str_path.as_ref();
+    let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
@@ -351,6 +353,22 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     }
 
     Ok(expanded_path)
+}
+
+fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
+    let home_dir = std::env::home_dir()?;
+    if path == "~" {
+        return Some(home_dir);
+    }
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return Some(home_dir.join(stripped));
+    }
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix("~\\") {
+        return Some(home_dir.join(stripped));
+    }
+
+    None
 }
 
 fn local_path_to_url(str_path: &str) -> Result<Url> {
@@ -878,6 +896,42 @@ impl StorageOptions {
         self.0.get(key)
     }
 
+    /// Build [`ClientOptions`] with default headers extracted from `headers.*` keys.
+    ///
+    /// Keys prefixed with `headers.` are parsed into HTTP headers. For example,
+    /// `headers.x-ms-version = 2023-11-03` results in a default header
+    /// `x-ms-version: 2023-11-03`.
+    ///
+    /// Returns an error if any `headers.*` key has an invalid header name or value.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    pub fn client_options(&self) -> Result<ClientOptions> {
+        let mut headers = HeaderMap::new();
+        for (key, value) in &self.0 {
+            if let Some(header_name) = key.strip_prefix("headers.") {
+                let name = header_name
+                    .parse::<http::header::HeaderName>()
+                    .map_err(|e| {
+                        Error::invalid_input(
+                            format!("invalid header name '{header_name}': {e}"),
+                            location!(),
+                        )
+                    })?;
+                let val = HeaderValue::from_str(value).map_err(|e| {
+                    Error::invalid_input(
+                        format!("invalid header value for '{header_name}': {e}"),
+                        location!(),
+                    )
+                })?;
+                headers.insert(name, val);
+            }
+        }
+        let mut client_options = ClientOptions::default();
+        if !headers.is_empty() {
+            client_options = client_options.with_default_headers(headers);
+        }
+        Ok(client_options)
+    }
+
     /// Get the expiration time in milliseconds since epoch, if present
     pub fn expires_at_millis(&self) -> Option<u64> {
         self.0
@@ -967,8 +1021,7 @@ mod tests {
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
-        let expanded = tilde(path_str).to_string();
-        let path = StdPath::new(&expanded);
+        let path = expand_path(path_str).map_err(std::io::Error::other)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
     }
@@ -1364,5 +1417,67 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_extracts_headers() {
+        let opts = StorageOptions(HashMap::from([
+            ("headers.x-custom-foo".to_string(), "bar".to_string()),
+            ("headers.x-ms-version".to_string(), "2023-11-03".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]));
+        let client_options = opts.client_options().unwrap();
+
+        // Verify non-header keys are not consumed as headers by creating
+        // another StorageOptions with no headers.* keys.
+        let opts_no_headers = StorageOptions(HashMap::from([(
+            "region".to_string(),
+            "us-west-2".to_string(),
+        )]));
+        opts_no_headers.client_options().unwrap();
+
+        // Smoke test: the client_options with headers should be usable
+        // in a builder (we can't inspect the headers directly, but building
+        // should not fail).
+        #[cfg(feature = "gcp")]
+        {
+            use object_store::gcp::GoogleCloudStorageBuilder;
+            let _builder = GoogleCloudStorageBuilder::new()
+                .with_client_options(client_options)
+                .with_url("gs://test-bucket");
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_rejects_invalid_header_name() {
+        let opts = StorageOptions(HashMap::from([(
+            "headers.bad header".to_string(),
+            "value".to_string(),
+        )]));
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header name"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_rejects_invalid_header_value() {
+        let opts = StorageOptions(HashMap::from([(
+            "headers.x-good-name".to_string(),
+            "bad\x01value".to_string(),
+        )]));
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header value"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_empty_when_no_header_keys() {
+        let opts = StorageOptions(HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("access_key_id".to_string(), "AKID".to_string()),
+        ]));
+        opts.client_options().unwrap();
     }
 }

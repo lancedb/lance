@@ -20,7 +20,17 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Objects;
 
-/** Schema related base operation. */
+/**
+ * Schema related base operation.
+ *
+ * <p>Each field will be assigned a field id when transaction commits, in the following order:
+ *
+ * <ol>
+ *   <li>Parse from field metadata with key {@code lance:field_id}.
+ *   <li>Otherwise, set field id from txn read version dataset's schema field (with the same name).
+ *   <li>Otherwise, allocate based on the max field id of the dataset.
+ * </ol>
+ */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;
   private ArrowSchema cSchema;

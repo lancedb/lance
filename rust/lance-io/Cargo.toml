@@ -36,11 +36,11 @@ bytes.workspace = true
 chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
+http.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 serde.workspace = true
-shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -55,6 +55,7 @@ test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
+tracing-mock = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true

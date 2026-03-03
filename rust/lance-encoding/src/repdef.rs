@@ -1278,7 +1278,7 @@ impl RepDefUnraveler {
         // This is the highest def level that is still visible.  Once we hit a list then
         // we stop looking because any null / empty list (or list masked by a higher level
         // null) will not be visible
-        let mut max_level = null_level.max(empty_level);
+        let mut max_level = null_level.max(empty_level).max(valid_level);
         // Anything higher than this (but less than max_level) is a null struct masking our
         // list.  We will materialize this is a null list.
         let upper_null = max_level;
@@ -2690,6 +2690,40 @@ mod tests {
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
+    }
+
+    #[test]
+    fn test_repdef_null_struct_valid_list() {
+        // This regresses a bug
+
+        let rep = vec![1, 0, 0, 0];
+        let def = vec![2, 0, 2, 2];
+        // AllValidList<NullableStruct<NullableItem>>
+        let def_meaning = vec![
+            DefinitionInterpretation::NullableItem,
+            DefinitionInterpretation::NullableItem,
+            DefinitionInterpretation::AllValidList,
+        ];
+        let num_items = 4;
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep),
+            Some(def),
+            def_meaning.into(),
+            num_items,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(4),
+            Some(validity(&[false, true, false, false]))
+        );
+        assert_eq!(
+            unraveler.unravel_validity(4),
+            Some(validity(&[false, true, false, false]))
+        );
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 4]).inner());
+        assert_eq!(val, None);
     }
 
     #[test]

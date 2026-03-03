@@ -81,7 +81,8 @@ impl AzureBlobStoreProvider {
 
         let mut builder = MicrosoftAzureBuilder::new()
             .with_url(base_path.as_ref())
-            .with_retry(retry_config);
+            .with_retry(retry_config)
+            .with_client_options(storage_options.client_options()?);
         for (key, value) in storage_options.as_azure_options() {
             builder = builder.with_config(key, value);
         }

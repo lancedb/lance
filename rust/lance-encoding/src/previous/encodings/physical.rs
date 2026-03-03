@@ -47,14 +47,12 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
 /// Convert a protobuf buffer encoding into a physical page scheduler
 fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn PageScheduler> {
     let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
-    let compression_config: CompressionConfig = if encoding.compression.is_none() {
-        CompressionConfig::new(CompressionScheme::None, None)
-    } else {
-        let compression = encoding.compression.as_ref().unwrap();
-        CompressionConfig::new(
+    let compression_config: CompressionConfig = match encoding.compression.as_ref() {
+        None => CompressionConfig::new(CompressionScheme::None, None),
+        Some(compression) => CompressionConfig::new(
             compression.scheme.as_str().parse().unwrap(),
             compression.level,
-        )
+        ),
     };
     match encoding.bits_per_value {
         1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),

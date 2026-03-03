@@ -287,7 +287,11 @@ fn bench_ivf_pq_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("ivf_pq_throughput");
     group.throughput(Throughput::Elements(NUM_QUERIES as u64));
 
-    for &version in &[LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+    for &version in &[
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ] {
         // Get or create cached dataset
         let cached_dataset = get_or_create_dataset(&rt, version);
 

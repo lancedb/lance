@@ -213,7 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
-use std::sync::{LazyLock, Once};
+use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -227,6 +227,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -259,6 +260,15 @@ use crate::{BufferScheduler, EncodingsIo};
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
+const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
+    "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
+const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
+
+fn default_cache_repetition_index() -> bool {
+    static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
+    *DEFAULT_CACHE_REPETITION_INDEX
+        .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
+}
 
 /// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
@@ -1689,6 +1699,14 @@ pub struct StructuralBatchDecodeStream {
     rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
+    // Decode scheduling policy selected at planning time.
+    //
+    // Performance tradeoff:
+    // - true: spawn `into_batch` onto Tokio, which improves scan throughput by allowing
+    //   more decode parallelism.
+    // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
+    //   typically better for point lookups / small takes.
+    spawn_batch_decode_tasks: bool,
 }
 
 impl StructuralBatchDecodeStream {
@@ -1706,6 +1724,7 @@ impl StructuralBatchDecodeStream {
         rows_per_batch: u32,
         num_rows: u64,
         root_decoder: StructuralStructDecoder,
+        spawn_batch_decode_tasks: bool,
     ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
@@ -1716,6 +1735,7 @@ impl StructuralBatchDecodeStream {
             rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
+            spawn_batch_decode_tasks,
         }
     }
 
@@ -1793,9 +1813,23 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                // Capture the per-stream policy once so every emitted batch task follows the
+                // same throughput-vs-overhead choice made by the scheduler.
+                let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
                 let task = async move {
                     let next_task = next_task?;
-                    async move { next_task.into_batch(emitted_batch_size_warning) }.await
+                    if spawn_batch_decode_tasks {
+                        tokio::spawn(
+                            async move { next_task.into_batch(emitted_batch_size_warning) },
+                        )
+                        .await
+                        .map_err(|err| Error::Wrapped {
+                            error: err.into(),
+                            location: location!(),
+                        })?
+                    } else {
+                        next_task.into_batch(emitted_batch_size_warning)
+                    }
                 };
                 (task, num_rows)
             });
@@ -1836,12 +1870,26 @@ impl RequestedRows {
 }
 
 /// Configuration for decoder behavior
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DecoderConfig {
-    /// Whether to cache repetition indices for better performance
+    /// Whether to cache repetition indices for better performance.
+    ///
+    /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
+    /// when present and is enabled by default. Set the env var to a non-truthy
+    /// value (for example `0` or `false`) to disable it. The env var is read
+    /// once per process.
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            cache_repetition_index: default_cache_repetition_index(),
+            validate_on_decode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1880,6 +1928,7 @@ pub fn create_decode_stream(
     batch_size: u32,
     is_structural: bool,
     should_validate: bool,
+    spawn_structural_batch_decode_tasks: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
@@ -1889,10 +1938,14 @@ pub fn create_decode_stream(
             should_validate,
             /*is_root=*/ true,
         )?;
-        Ok(
-            StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder)
-                .into_stream(),
+        Ok(StructuralBatchDecodeStream::new(
+            rx,
+            batch_size,
+            num_rows,
+            structural_decoder,
+            spawn_structural_batch_decode_tasks,
         )
+        .into_stream())
     } else {
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
@@ -1948,6 +2001,12 @@ fn create_scheduler_decoder(
     let num_rows = requested_rows.num_rows();
 
     let is_structural = column_infos[0].is_structural();
+    let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
+    let spawn_structural_batch_decode_tasks = match mode.ok().as_deref() {
+        Some("always") => true,
+        Some("never") => false,
+        _ => matches!(requested_rows, RequestedRows::Ranges(_)),
+    };
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -1957,6 +2016,7 @@ fn create_scheduler_decoder(
         config.batch_size,
         is_structural,
         config.decoder_config.validate_on_decode,
+        spawn_structural_batch_decode_tasks,
         rx,
     )?;
 
@@ -2656,12 +2716,15 @@ pub async fn decode_batch(
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
     let is_structural = version >= LanceFileVersion::V2_1;
+    let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
+    let spawn_structural_batch_decode_tasks = !matches!(mode.ok().as_deref(), Some("never"));
     let mut decode_stream = create_decode_stream(
         &batch.schema,
         batch.num_rows,
         batch.num_rows as u32,
         is_structural,
         should_validate,
+        spawn_structural_batch_decode_tasks,
         rx,
     )?;
     decode_stream.next().await.unwrap().task.await

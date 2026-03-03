@@ -9,7 +9,6 @@ use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -264,10 +263,7 @@ impl<S> InstrumentedRecordBatchStreamAdapter<S> {
         let batch_count = Count::new();
         MetricBuilder::new(metrics)
             .with_partition(partition)
-            .build(MetricValue::Count {
-                name: Cow::Borrowed("output_batches"),
-                count: batch_count.clone(),
-            });
+            .build(MetricValue::OutputBatches(batch_count.clone()));
         Self {
             schema,
             stream,

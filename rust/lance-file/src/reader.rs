@@ -1774,7 +1774,8 @@ pub mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_projection(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
     ) {
         let fs = FsFixture::default();
 
@@ -2026,7 +2027,8 @@ pub mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_blocking_take(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
     ) {
         let fs = FsFixture::default();
         let WrittenFile { data, schema, .. } = create_some_file(&fs, version).await;

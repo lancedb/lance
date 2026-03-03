@@ -9,6 +9,7 @@ pub mod cache;
 pub mod container;
 pub mod datatypes;
 pub mod error;
+pub mod levenshtein;
 pub mod traits;
 pub mod utils;
 

@@ -52,7 +52,7 @@ mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
-pub use delete::DeleteBuilder;
+pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
@@ -1391,6 +1391,7 @@ mod tests {
             LanceFileVersion::Legacy,
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Stable,
             LanceFileVersion::Next,
         ];

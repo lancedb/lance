@@ -4564,7 +4564,6 @@ def test_file_reader_options(tmp_path: Path):
     # direct dataset read
     assert iops_scanner <= iops_without_cache
 
-
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset

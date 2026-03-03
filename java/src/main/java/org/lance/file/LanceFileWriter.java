@@ -14,7 +14,6 @@
 package org.lance.file;
 
 import org.lance.JniLoader;
-import org.lance.WriteParams;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -87,19 +86,18 @@ public class LanceFileWriter implements AutoCloseable {
    * @param path the URI of the file to write to
    * @param allocator the BufferAllocator to use for the writer
    * @param dictionaryProvider the DictionaryProvider to use for the writer
-   * @param dataStorageVersion the version of the data storage format to use
+   * @param dataStorageVersion the version of the data storage format to use (e.g., "legacy",
+   *     "stable", "2.0")
    * @return a new LanceFileWriter
    */
   public static LanceFileWriter open(
       String path,
       BufferAllocator allocator,
       DictionaryProvider dictionaryProvider,
-      Optional<WriteParams.LanceFileVersion> dataStorageVersion,
+      Optional<String> dataStorageVersion,
       Map<String, String> storageOptions)
       throws IOException {
-    Optional<String> dataStorageVersionStr =
-        dataStorageVersion.map(WriteParams.LanceFileVersion::getVersionString);
-    LanceFileWriter writer = openNative(path, dataStorageVersionStr, storageOptions);
+    LanceFileWriter writer = openNative(path, dataStorageVersion, storageOptions);
     writer.allocator = allocator;
     writer.dictionaryProvider = dictionaryProvider;
     return writer;

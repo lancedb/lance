@@ -82,12 +82,14 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
+use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -95,6 +97,7 @@ use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -483,7 +486,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace=None, table_id=None))]
     fn new(
         py: Python,
         uri: String,
@@ -499,6 +502,8 @@ impl Dataset {
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -528,22 +533,24 @@ impl Dataset {
 
         // Handle read_params dict
         if let Some(read_params_dict) = read_params {
-            let cache_repetition_index = read_params_dict
+            let mut decoder_config = DecoderConfig::default();
+
+            if let Some(cache_repetition_index) = read_params_dict
                 .get_item("cache_repetition_index")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.cache_repetition_index = cache_repetition_index;
+            }
 
-            let validate_on_decode = read_params_dict
+            if let Some(validate_on_decode) = read_params_dict
                 .get_item("validate_on_decode")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.validate_on_decode = validate_on_decode;
+            }
 
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode,
-            };
             let file_reader_options = FileReaderOptions {
                 decoder_config,
                 ..Default::default()
@@ -591,6 +598,16 @@ impl Dataset {
             use crate::storage_options::py_object_to_storage_options_provider;
             let provider = py_object_to_storage_options_provider(provider_obj)?;
             builder = builder.with_storage_options_provider(provider);
+        }
+
+        // Set up namespace commit handler if namespace and table_id are provided
+        if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            let ns_arc = extract_namespace_arc(py, ns)?;
+            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
@@ -1331,10 +1348,11 @@ impl Dataset {
     #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
     fn delete(
         &mut self,
+        py: Python<'_>,
         predicate: String,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<PyAny>> {
         let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
 
         if let Some(retries) = conflict_retries {
@@ -1345,11 +1363,13 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        let new_dataset = rt()
+        let result = rt()
             .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = new_dataset;
-        Ok(())
+        self.ds = result.new_dataset;
+        let dict = PyDict::new(py);
+        dict.set_item("num_deleted_rows", result.num_deleted_rows)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
@@ -2116,7 +2136,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2129,6 +2149,8 @@ impl Dataset {
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2149,13 +2171,15 @@ impl Dataset {
             detached,
             max_retries,
             enable_stable_row_ids,
+            namespace,
+            table_id,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2166,6 +2190,8 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2181,14 +2207,25 @@ impl Dataset {
             None
         };
 
-        let commit_handler = commit_lock
-            .as_ref()
-            .map(|commit_lock| {
-                commit_lock
-                    .into_py_any(commit_lock.py())
-                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-            })
-            .transpose()?;
+        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        let commit_handler: Option<Arc<dyn CommitHandler>> =
+            if let Some(commit_lock) = commit_lock.as_ref() {
+                // User provided a commit_lock
+                Some(
+                    commit_lock
+                        .into_py_any(commit_lock.py())
+                        .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
+                )
+            } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
+                // Create ExternalManifestCommitHandler from namespace and table_id
+                let ns_arc = extract_namespace_arc(ns.py(), ns)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            } else {
+                None
+            };
 
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
@@ -3130,6 +3167,23 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 new_props.insert(key, value);
             }
             p.transaction_properties = Some(Arc::new(new_props));
+        }
+
+        // Handle namespace and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user
+        if p.commit_handler.is_none() {
+            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
+            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
+                let ns_arc = extract_namespace_arc(options.py(), &ns)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                p.commit_handler = Some(commit_handler);
+            }
         }
 
         Some(p)

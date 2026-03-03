@@ -216,6 +216,7 @@ async fn test_decode(
         batch_size,
         is_structural_encoding,
         /*should_validate=*/ true,
+        /*spawn_structural_batch_decode_tasks=*/ is_structural_encoding,
         rx,
     )
     .unwrap();

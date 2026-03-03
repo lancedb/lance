@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
@@ -29,6 +30,8 @@ import java.nio.file.Path;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OverwriteTest extends OperationTestBase {
 
@@ -43,33 +46,34 @@ public class OverwriteTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
-          dataset
-              .newTransactionBuilder()
+      try (Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
                       .schema(testDataset.getSchema())
                       .build())
-              .build();
-      try (Dataset dataset = transaction.commit()) {
-        assertEquals(2, dataset.version());
-        assertEquals(2, dataset.latestVersion());
-        assertEquals(rowCount, dataset.countRows());
-        Fragment fragment = dataset.getFragments().get(0);
+              .build()) {
+        try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
+          assertEquals(2, dataset.version());
+          assertEquals(2, dataset.latestVersion());
+          assertEquals(rowCount, dataset.countRows());
+          Fragment fragment = dataset.getFragments().get(0);
 
-        try (LanceScanner scanner = fragment.newScan()) {
-          Schema schemaRes = scanner.schema();
-          assertEquals(testDataset.getSchema(), schemaRes);
+          try (LanceScanner scanner = fragment.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertEquals(testDataset.getSchema(), schemaRes);
+          }
         }
       }
 
-      // Commit fragment again
+      // Try to commit from stale version (v1) - should fail with retryable error
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
-      transaction =
-          dataset
-              .newTransactionBuilder()
+      try (Transaction staleTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
@@ -77,21 +81,43 @@ public class OverwriteTest extends OperationTestBase {
                       .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
-              .build();
-      assertEquals(
-          "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
-      try (Dataset dataset = transaction.commit()) {
-        assertEquals(3, dataset.version());
-        assertEquals(3, dataset.latestVersion());
-        assertEquals(rowCount, dataset.countRows());
-        assertEquals("config_value", dataset.getConfig().get("config_key"));
-        Fragment fragment = dataset.getFragments().get(0);
+              .build()) {
+        assertEquals("value", staleTxn.transactionProperties().map(m -> m.get("key")).orElse(null));
 
-        try (LanceScanner scanner = fragment.newScan()) {
-          Schema schemaRes = scanner.schema();
-          assertEquals(testDataset.getSchema(), schemaRes);
+        RuntimeException ex =
+            assertThrows(
+                RuntimeException.class, () -> new CommitBuilder(dataset).execute(staleTxn).close());
+        assertTrue(
+            ex.getMessage().contains("Retryable commit conflict"),
+            "Expected retryable commit conflict error, got: " + ex.getMessage());
+      }
+
+      // Checkout latest and retry - should succeed
+      dataset.checkoutLatest();
+      try (Transaction retryTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(testDataset.getSchema())
+                      .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
+                      .build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
+              .build()) {
+        try (Dataset dataset = new CommitBuilder(this.dataset).execute(retryTxn)) {
+          assertEquals(3, dataset.version());
+          assertEquals(3, dataset.latestVersion());
+          assertEquals(rowCount, dataset.countRows());
+          assertEquals("config_value", dataset.getConfig().get("config_key"));
+          Fragment fragment = dataset.getFragments().get(0);
+
+          try (LanceScanner scanner = fragment.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertEquals(testDataset.getSchema(), schemaRes);
+          }
+          assertEquals(retryTxn, dataset.readTransaction().orElse(null));
         }
-        assertEquals(transaction, dataset.readTransaction().orElse(null));
       }
     }
   }

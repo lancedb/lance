@@ -75,7 +75,12 @@ impl RestAdapter {
             .route("/v1/table/:id/deregister", post(deregister_table))
             .route("/v1/table/:id/rename", post(rename_table))
             .route("/v1/table/:id/restore", post(restore_table))
-            .route("/v1/table/:id/version/list", get(list_table_versions))
+            .route("/v1/table/:id/version/list", post(list_table_versions))
+            .route("/v1/table/:id/version/create", post(create_table_version))
+            .route(
+                "/v1/table/:id/version/describe",
+                post(describe_table_version),
+            )
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -237,6 +242,7 @@ struct PaginationQuery {
     delimiter: Option<String>,
     page_token: Option<String>,
     limit: Option<i32>,
+    descending: Option<bool>,
 }
 
 // ============================================================================
@@ -743,11 +749,56 @@ async fn list_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        descending: params.descending,
         identity: extract_identity(&headers),
         ..Default::default()
     };
 
     match backend.list_table_versions(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_table_version(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(body): Json<CreateTableVersionRequest>,
+) -> Response {
+    let request = CreateTableVersionRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        identity: extract_identity(&headers),
+        version: body.version,
+        manifest_path: body.manifest_path,
+        manifest_size: body.manifest_size,
+        e_tag: body.e_tag,
+        metadata: body.metadata,
+        ..Default::default()
+    };
+
+    match backend.create_table_version(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn describe_table_version(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<DelimiterQuery>,
+    Json(body): Json<DescribeTableVersionRequest>,
+) -> Response {
+    let request = DescribeTableVersionRequest {
+        id: Some(parse_id(&id, query.delimiter.as_deref())),
+        version: body.version,
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
+
+    match backend.describe_table_version(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -2870,8 +2921,7 @@ mod tests {
                     "test_table".to_string(),
                 ]),
                 mode: Some("create".to_string()),
-                identity: None,
-                context: None,
+                ..Default::default()
             };
             let result = namespace.create_table(create_table_req, table_data).await;
             assert!(result.is_ok(), "Failed to create table: {:?}", result);
@@ -2894,6 +2944,162 @@ mod tests {
 
             // Cleanup
             server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_list_table_versions_with_descending() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["version_test_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "version_test_ns".to_string(),
+                    "version_table".to_string(),
+                ]),
+                mode: Some("create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // List table versions (ascending by default)
+            let list_req = ListTableVersionsRequest {
+                id: Some(vec![
+                    "version_test_ns".to_string(),
+                    "version_table".to_string(),
+                ]),
+                descending: None,
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_versions(list_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to list table versions: {:?}",
+                result
+            );
+            let versions = result.unwrap();
+            assert!(
+                !versions.versions.is_empty(),
+                "Should have at least one version"
+            );
+
+            // List table versions with descending=true
+            let list_req = ListTableVersionsRequest {
+                id: Some(vec![
+                    "version_test_ns".to_string(),
+                    "version_table".to_string(),
+                ]),
+                descending: Some(true),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_versions(list_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to list table versions with descending: {:?}",
+                result
+            );
+
+            // List table versions with descending=false
+            let list_req = ListTableVersionsRequest {
+                id: Some(vec![
+                    "version_test_ns".to_string(),
+                    "version_table".to_string(),
+                ]),
+                descending: Some(false),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_versions(list_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to list table versions with ascending: {:?}",
+                result
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_describe_table_version() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["describe_version_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "describe_version_ns".to_string(),
+                    "describe_version_table".to_string(),
+                ]),
+                mode: Some("create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Describe table version with specific version number
+            let describe_req = DescribeTableVersionRequest {
+                id: Some(vec![
+                    "describe_version_ns".to_string(),
+                    "describe_version_table".to_string(),
+                ]),
+                version: Some(1),
+                ..Default::default()
+            };
+            let result = fixture.namespace.describe_table_version(describe_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to describe table version 1: {:?}",
+                result
+            );
+            let version_info = result.unwrap();
+            assert_eq!(version_info.version.version, 1);
+
+            // Describe table version with None (latest)
+            let describe_req = DescribeTableVersionRequest {
+                id: Some(vec![
+                    "describe_version_ns".to_string(),
+                    "describe_version_table".to_string(),
+                ]),
+                version: None,
+                ..Default::default()
+            };
+            let result = fixture.namespace.describe_table_version(describe_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to describe latest table version: {:?}",
+                result
+            );
+            let version_info = result.unwrap();
+            assert_eq!(
+                version_info.version.version, 1,
+                "Latest version should be 1"
+            );
         }
     }
 }

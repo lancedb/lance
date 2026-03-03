@@ -457,7 +457,7 @@ impl<'a> CleanupTask<'a> {
             }
             Some("blob") => {
                 // Blob v2 sidecar files are keyed by the data file stem:
-                //   data/{data_file_key}/{blob_id:08x}.blob
+                //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
                 // These files are not referenced directly by the manifest.  Instead, treat them
                 // as referenced if their parent data file is referenced.
@@ -474,7 +474,10 @@ impl<'a> CleanupTask<'a> {
                 let data_file_key = parts.next();
                 let blob_file = parts.next();
                 // Be conservative: only handle the expected 3-part layout.
-                if data_dir.is_none() || data_file_key.is_none() || blob_file.is_none() {
+                if !matches!(data_dir, Some(dir) if dir.as_ref() == "data")
+                    || data_file_key.is_none()
+                    || blob_file.is_none()
+                {
                     debug!(
                         path = relative_path.as_ref(),
                         "Will not garbage collect blob file because it does not follow convention"

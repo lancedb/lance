@@ -3,6 +3,9 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::namespace::{
+    create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+};
 use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
@@ -35,11 +38,13 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::version::LanceFileVersion;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::DatasetIndexExt;
@@ -47,6 +52,9 @@ use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
+use lance_namespace::LanceNamespace;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::io::commit::CommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -124,6 +132,10 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    pub fn new(dataset: Dataset) -> Self {
+        Self { inner: dataset }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
@@ -135,6 +147,8 @@ impl BlockingDataset {
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
+        namespace: Option<Arc<dyn LanceNamespace>>,
+        table_id: Option<Vec<String>>,
     ) -> Result<Self> {
         // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
@@ -174,6 +188,15 @@ impl BlockingDataset {
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
+
+        // Set up namespace commit handler if namespace and table_id are provided
+        if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -307,20 +330,35 @@ impl BlockingDataset {
         Ok(indexes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
         store_params: ObjectStoreParams,
         detached: bool,
         enable_v2_manifest_paths: bool,
+        use_stable_row_ids: Option<bool>,
+        storage_format: Option<LanceFileVersion>,
+        max_retries: u32,
+        skip_auto_cleanup: bool,
     ) -> Result<Self> {
-        let new_dataset = RT.block_on(
-            CommitBuilder::new(Arc::new(self.clone().inner))
-                .with_store_params(store_params)
-                .with_detached(detached)
-                .enable_v2_manifest_paths(enable_v2_manifest_paths)
-                .execute(transaction),
-        )?;
+        let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
+            .with_store_params(store_params)
+            .with_detached(detached)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+        if let Some(use_stable) = use_stable_row_ids {
+            builder = builder.use_stable_row_ids(use_stable);
+        }
+        if let Some(format) = storage_format {
+            builder = builder.with_storage_format(format);
+        }
+        if max_retries > 0 {
+            builder = builder.with_max_retries(max_retries);
+        }
+        if skip_auto_cleanup {
+            builder = builder.with_skip_auto_cleanup(true);
+        }
+        let new_dataset = RT.block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
     }
 
@@ -421,6 +459,7 @@ fn inner_create_with_ffi_schema<'local>(
         initial_bases,
         target_bases,
         reader,
+        None, // No namespace for schema-only creation
     )
 }
 
@@ -484,17 +523,20 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
-            enable_v2_manifest_paths,
             data_storage_version,
+            enable_v2_manifest_paths,
             storage_options_obj,
             JObject::null(),
             initial_bases,
-            target_bases
+            target_bases,
+            JObject::null(), // No namespace
+            JObject::null(), // No table_id
         )
     )
 }
 
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -511,6 +553,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     initial_bases: JObject,                // Optional<List<BasePath>>
     target_bases: JObject,                 // Optional<List<String>>
+    namespace_obj: JObject,                // LanceNamespace (can be null)
+    table_id_obj: JObject,                 // List<String> (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -528,7 +572,9 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
             storage_options_obj,
             storage_options_provider_obj,
             initial_bases,
-            target_bases
+            target_bases,
+            namespace_obj,
+            table_id_obj,
         )
     )
 }
@@ -549,9 +595,15 @@ fn inner_create_with_ffi_stream<'local>(
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     initial_bases: JObject,                // Optional<List<BasePath>>
     target_bases: JObject,                 // Optional<List<String>>
+    namespace_obj: JObject,                // LanceNamespace (can be null)
+    table_id_obj: JObject,                 // List<String> (can be null)
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+
+    // Create the namespace wrapper for commit handling (if provided)
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+
     create_dataset(
         env,
         path,
@@ -567,6 +619,7 @@ fn inner_create_with_ffi_stream<'local>(
         initial_bases,
         target_bases,
         reader,
+        namespace_info,
     )
 }
 
@@ -586,10 +639,11 @@ fn create_dataset<'local>(
     initial_bases: JObject,
     target_bases: JObject,
     reader: impl RecordBatchReader + Send + 'static,
+    namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
-    let write_params = extract_write_params(
+    let mut write_params = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -603,6 +657,15 @@ fn create_dataset<'local>(
         &initial_bases,
         &target_bases,
     )?;
+
+    // Set up namespace commit handler if provided
+    if let Some((namespace, table_id)) = namespace_info {
+        let external_store = LanceNamespaceExternalManifestStore::new(namespace, table_id);
+        let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        write_params.commit_handler = Some(commit_handler);
+    }
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
     dataset.into_java(env)
@@ -927,6 +990,23 @@ fn inner_create_index<'local>(
     (&index_metadata).into_java(env)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeDropIndex(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    name: JString,
+) {
+    ok_or_throw_without_return!(env, inner_drop_index(&mut env, java_dataset, name))
+}
+
+fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> Result<()> {
+    let name = name.extract(env)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_index(&name))?;
+    Ok(())
+}
+
 fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
     match index_type {
         IndexType::BTree => {
@@ -1050,6 +1130,8 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
+    namespace_obj: JObject,                // LanceNamespace object, null if no namespace
+    table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1064,6 +1146,8 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             serialized_manifest,
             storage_options_provider_obj,
             session_handle,
+            namespace_obj,
+            table_id_obj,
         )
     )
 }
@@ -1080,6 +1164,8 @@ fn inner_open_native<'local>(
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     session_handle: jlong,                 // Session handle, 0 means no session
+    namespace_obj: JObject,                // LanceNamespace object, null if no namespace
+    table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
@@ -1096,6 +1182,13 @@ fn inner_open_native<'local>(
     let storage_options_provider_arc =
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
+    // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let (namespace, table_id) = match namespace_info {
+        Some((ns, tid)) => (Some(ns), Some(tid)),
+        None => (None, None),
+    };
+
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
 
     // Convert session handle to Arc<LanceSession> if provided
@@ -1111,8 +1204,68 @@ fn inner_open_native<'local>(
         serialized_manifest,
         storage_options_provider_arc,
         session,
+        namespace,
+        table_id,
     )?;
     dataset.into_java(env)
+}
+
+/// Check if the Java object is an instance of DirectoryNamespace.
+fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+    let class = env
+        .find_class("org/lance/namespace/DirectoryNamespace")
+        .map_err(|e| {
+            Error::runtime_error(format!("Failed to find DirectoryNamespace class: {}", e))
+        })?;
+    env.is_instance_of(namespace_obj, class)
+        .map_err(|e| Error::runtime_error(format!("Failed to check instanceof: {}", e)))
+}
+
+/// Check if the Java object is an instance of RestNamespace.
+fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+    let class = env
+        .find_class("org/lance/namespace/RestNamespace")
+        .map_err(|e| Error::runtime_error(format!("Failed to find RestNamespace class: {}", e)))?;
+    env.is_instance_of(namespace_obj, class)
+        .map_err(|e| Error::runtime_error(format!("Failed to check instanceof: {}", e)))
+}
+
+/// Get the native handle from a Java LanceNamespace object.
+fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
+    env.call_method(namespace_obj, "getNativeHandle", "()J", &[])
+        .map_err(|e| Error::runtime_error(format!("Failed to call getNativeHandle: {}", e)))?
+        .j()
+        .map_err(|e| Error::runtime_error(format!("getNativeHandle did not return a long: {}", e)))
+}
+
+/// Extract namespace and table_id from Java objects into Rust types.
+///
+/// Returns `None` if `namespace_obj` is null, otherwise returns the namespace
+/// and table_id pair.
+#[allow(clippy::type_complexity)]
+pub(crate) fn extract_namespace_info(
+    env: &mut JNIEnv,
+    namespace_obj: &JObject,
+    table_id_obj: &JObject,
+) -> Result<Option<(Arc<dyn LanceNamespace>, Vec<String>)>> {
+    if namespace_obj.is_null() {
+        return Ok(None);
+    }
+
+    let namespace: Arc<dyn LanceNamespace> = if is_directory_namespace(env, namespace_obj)? {
+        let native_handle = get_native_namespace_handle(env, namespace_obj)?;
+        let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
+        ns.inner.clone()
+    } else if is_rest_namespace(env, namespace_obj)? {
+        let native_handle = get_native_namespace_handle(env, namespace_obj)?;
+        let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
+        ns.inner.clone()
+    } else {
+        create_java_lance_namespace(env, namespace_obj)?
+    };
+
+    let table_id = env.get_strings(table_id_obj)?;
+    Ok(Some((namespace, table_id)))
 }
 
 #[no_mangle]
@@ -1614,6 +1767,38 @@ fn inner_get_config<'local>(
     }
 
     Ok(java_hashmap)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_lance_file_format_version(&mut env, java_dataset),
+        JObject::null().into()
+    )
+}
+
+fn inner_get_lance_file_format_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JString<'local>> {
+    let version_string = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let version = dataset_guard
+            .inner
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
+        version.to_string()
+    };
+
+    Ok(env
+        .new_string(&version_string)
+        .expect("Failed to create Java String"))
 }
 
 #[no_mangle]

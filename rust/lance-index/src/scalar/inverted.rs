@@ -28,6 +28,7 @@ use lance_core::Error;
 use snafu::location;
 
 use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -48,6 +49,7 @@ impl InvertedIndexPlugin {
         index_store: &dyn IndexStore,
         params: InvertedIndexParams,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
             if !frag_ids.is_empty() {
@@ -62,7 +64,8 @@ impl InvertedIndexPlugin {
 
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
-            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask);
+            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
+                .with_progress(progress);
         inverted_index.update(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -173,6 +176,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
@@ -180,8 +184,14 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 source: "must provide training request created by new_training_request".into(),
                 location: location!(),
             })?;
-        Self::train_inverted_index(data, index_store, request.parameters.clone(), fragment_ids)
-            .await
+        Self::train_inverted_index(
+            data,
+            index_store,
+            request.parameters.clone(),
+            fragment_ids,
+            progress,
+        )
+        .await
     }
 
     /// Load an index from storage

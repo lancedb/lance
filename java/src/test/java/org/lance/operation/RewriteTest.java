@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
 import org.lance.TestUtils;
@@ -44,47 +45,45 @@ public class RewriteTest extends OperationTestBase {
       FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
       FragmentMetadata fragmentMeta2 = testDataset.createNewFragment(rowCount);
 
-      Transaction appendTx =
-          dataset
-              .newTransactionBuilder()
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Arrays.asList(fragmentMeta1, fragmentMeta2)).build())
-              .build();
+              .build()) {
+        try (Dataset datasetWithData = new CommitBuilder(dataset).execute(appendTxn)) {
+          assertEquals(2, datasetWithData.version());
+          assertEquals(rowCount * 2, datasetWithData.countRows());
 
-      try (Dataset datasetWithData = appendTx.commit()) {
-        assertEquals(2, datasetWithData.version());
-        assertEquals(rowCount * 2, datasetWithData.countRows());
+          // Now create a rewrite operation
+          List<RewriteGroup> groups = new ArrayList<>();
 
-        // Now create a rewrite operation
-        List<RewriteGroup> groups = new ArrayList<>();
+          // Create a rewrite group with old fragments and new fragments
+          List<FragmentMetadata> oldFragments = new ArrayList<>();
+          oldFragments.add(fragmentMeta1);
 
-        // Create a rewrite group with old fragments and new fragments
-        List<FragmentMetadata> oldFragments = new ArrayList<>();
-        oldFragments.add(fragmentMeta1);
+          List<FragmentMetadata> newFragments = new ArrayList<>();
+          FragmentMetadata newFragmentMeta = testDataset.createNewFragment(rowCount);
+          newFragments.add(newFragmentMeta);
 
-        List<FragmentMetadata> newFragments = new ArrayList<>();
-        FragmentMetadata newFragmentMeta = testDataset.createNewFragment(rowCount);
-        newFragments.add(newFragmentMeta);
+          RewriteGroup group =
+              RewriteGroup.builder().oldFragments(oldFragments).newFragments(newFragments).build();
 
-        RewriteGroup group =
-            RewriteGroup.builder().oldFragments(oldFragments).newFragments(newFragments).build();
+          groups.add(group);
 
-        groups.add(group);
-
-        // Create and commit the rewrite transaction
-        Transaction rewriteTx =
-            datasetWithData
-                .newTransactionBuilder()
-                .operation(Rewrite.builder().groups(groups).build())
-                .build();
-
-        try (Dataset rewrittenDataset = rewriteTx.commit()) {
-          assertEquals(3, rewrittenDataset.version());
-          // The row count should remain the same since we're just rewriting
-          assertEquals(rowCount * 2, rewrittenDataset.countRows());
-
-          // Verify that the transaction was recorded
-          assertEquals(rewriteTx, rewrittenDataset.readTransaction().orElse(null));
+          // Create and commit the rewrite transaction
+          try (Transaction rewriteTxn =
+              new Transaction.Builder()
+                  .readVersion(datasetWithData.version())
+                  .operation(Rewrite.builder().groups(groups).build())
+                  .build()) {
+            try (Dataset rewrittenDataset =
+                new CommitBuilder(datasetWithData).execute(rewriteTxn)) {
+              assertEquals(3, rewrittenDataset.version());
+              // The row count should remain the same since we're just rewriting
+              assertEquals(rowCount * 2, rewrittenDataset.countRows());
+            }
+          }
         }
       }
     }

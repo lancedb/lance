@@ -25,7 +25,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{noop_progress, IndexBuildProgress};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
@@ -169,8 +169,22 @@ impl VectorIndexParams {
     }
 
     pub fn ivf_rq(num_partitions: usize, num_bits: u8, distance_type: DistanceType) -> Self {
+        Self::ivf_rq_with_rotation(
+            num_partitions,
+            num_bits,
+            distance_type,
+            RQRotationType::default(),
+        )
+    }
+
+    pub fn ivf_rq_with_rotation(
+        num_partitions: usize,
+        num_bits: u8,
+        distance_type: DistanceType,
+        rotation_type: RQRotationType,
+    ) -> Self {
         let ivf = IvfBuildParams::new(num_partitions);
-        let rq = RQBuildParams { num_bits };
+        let rq = RQBuildParams::with_rotation_type(num_bits, rotation_type);
         let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
         Self {
             stages,
@@ -1671,6 +1685,7 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
 fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
+        rotation_type: rabit_quantizer.rotation_type(),
     }
 }
 

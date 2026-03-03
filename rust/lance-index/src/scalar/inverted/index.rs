@@ -624,6 +624,7 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 

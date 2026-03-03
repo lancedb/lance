@@ -565,6 +565,7 @@ impl ScalarIndex for ZoneMapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         // Train new zones for the incoming data stream
         let schema = new_data.schema();
@@ -899,6 +900,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {
@@ -1111,7 +1113,7 @@ mod tests {
         // Directly pass the stream with proper row addresses instead of using MockTrainingSource
         // which would regenerate row addresses starting from 0
         index
-            .update(new_data_stream, test_store.as_ref())
+            .update(new_data_stream, test_store.as_ref(), None)
             .await
             .unwrap();
 

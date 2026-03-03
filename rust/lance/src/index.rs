@@ -17,7 +17,7 @@ use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
@@ -191,12 +191,7 @@ impl CacheKey for MemWalCacheKey<'_> {
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
     static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
-    *LANCE_AUTO_MIGRATION.get_or_init(|| {
-        std::env::var("LANCE_AUTO_MIGRATION")
-            .ok()
-            .map(|s| str_is_truthy(&s))
-            .unwrap_or(true)
-    })
+    *LANCE_AUTO_MIGRATION.get_or_init(|| parse_env_as_bool("LANCE_AUTO_MIGRATION", true))
 }
 
 /// Derive a friendly (but not necessarily unique) type name from a type URL.
@@ -292,9 +287,22 @@ pub(crate) async fn remap_index(
 
     let new_id = Uuid::new_v4();
 
-    let generic = dataset
+    let generic = match dataset
         .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
-        .await?;
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!(
+                "Cannot open index '{}' on '{}': {}. \
+                 Index will be dropped during compaction.",
+                index_id,
+                field_path,
+                e
+            );
+            return Ok(RemapResult::Drop);
+        }
+    };
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
@@ -336,6 +344,7 @@ pub(crate) async fn remap_index(
                             &new_store,
                             inverted_index.params().clone(),
                             None,
+                            Arc::new(NoopIndexBuildProgress),
                         )
                         .await?
                     } else {
@@ -1021,7 +1030,7 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
         "Detecting out-dated fragment metadata, migrating dataset. \
                         To disable migration, set LANCE_AUTO_MIGRATION=false"
     );
-    ds.delete("false").await.map_err(|err| Error::Execution {
+    ds.delete("false").await.map(|_| ()).map_err(|err| Error::Execution {
         message: format!(
             "Failed to migrate dataset while calculating index statistics. \
                             To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
@@ -1717,7 +1726,19 @@ impl DatasetIndexInternalExt for Dataset {
                 continue;
             }
 
-            let plugin = index_details.get_plugin()?;
+            let plugin = match index_details.get_plugin() {
+                Ok(plugin) => plugin,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping index '{}' on column '{}': {}. \
+                         Queries on this column will fall back to a full scan.",
+                        index.name,
+                        field_path,
+                        e
+                    );
+                    continue;
+                }
+            };
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {

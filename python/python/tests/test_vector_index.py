@@ -184,6 +184,28 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):
+    # Keep this before other distributed vector merge tests so the process-level
+    # lazy window size initialization reads this override.
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT", "2")
+
+    data = create_table(nvec=3000, ndim=128)
+    q = np.random.randn(128).astype(np.float32)
+    assert_distributed_vector_consistency(
+        data,
+        "vector",
+        index_type="IVF_PQ",
+        index_params={"num_partitions": 10, "num_sub_vectors": 16},
+        queries=[q],
+        topk=10,
+        world=2,
+        tmp_path=tmp_path,
+        similarity_metric="recall",
+        similarity_threshold=0.80,
+    )
+
+
 @pytest.mark.parametrize(
     "fixture_name,index_type,index_params,similarity_threshold",
     [
@@ -841,6 +863,24 @@ def test_create_ivf_rq_index():
     assert res.num_rows == 10
     assert res["_distance"].to_numpy().min() == 0.0
     assert res["_distance"].to_numpy().max() == 0.0
+
+
+def test_create_ivf_rq_requires_dim_divisible_by_8():
+    vectors = np.zeros((1000, 30), dtype=np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(vectors, type=pa.list_(pa.float32(), 30))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+
+    with pytest.raises(
+        ValueError, match="vector dimension must be divisible by 8 for IVF_RQ"
+    ):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+        )
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):

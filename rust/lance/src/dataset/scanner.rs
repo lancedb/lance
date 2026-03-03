@@ -87,9 +87,9 @@ use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
-    knn::new_knn_exec, project, AddRowAddrExec, FilterPlan as ExprFilterPlan,
-    KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource,
-    ScanConfig, TakeExec,
+    knn::{new_knn_exec, KNN_INDEX_SCHEMA},
+    project, AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec,
+    LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
@@ -417,8 +417,9 @@ impl ExprFilter {
                 let filter = planner.parse_filter(sql)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
-                let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
-                if ret_type != DataType::Boolean {
+                let ret_field = filter.to_field(&df_schema)?.1;
+                let ret_type = ret_field.data_type();
+                if ret_type != &DataType::Boolean {
                     return Err(Error::InvalidInput {
                         source: format!("The filter {} does not return a boolean", filter).into(),
                         location: location!(),
@@ -2042,33 +2043,39 @@ impl Scanner {
     }
 
     fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
-        use datafusion::logical_expr::{expr::AggregateFunction, Expr, TypeSignature};
+        use datafusion::logical_expr::expr::AggregateFunction;
+        use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
+        use datafusion::logical_expr::Expr;
 
         match expr {
             Expr::AggregateFunction(agg_func) => {
                 let func = &agg_func.func;
                 let args = &agg_func.params.args;
 
-                // Only UserDefined signature functions need explicit coercion
-                if !matches!(func.signature().type_signature, TypeSignature::UserDefined) {
-                    return Ok(expr.clone());
-                }
-
                 if args.is_empty() {
                     return Ok(expr.clone());
                 }
 
-                let current_types: Vec<arrow_schema::DataType> = args
+                let current_fields: Vec<arrow_schema::FieldRef> = args
                     .iter()
-                    .map(|e| e.get_type(schema))
-                    .collect::<std::result::Result<_, _>>()?;
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let dt = e.get_type(schema)?;
+                        Ok(Arc::new(arrow_schema::Field::new(
+                            format!("arg_{i}"),
+                            dt,
+                            true,
+                        )))
+                    })
+                    .collect::<std::result::Result<_, datafusion::common::DataFusionError>>()?;
 
-                let coerced_types = func.coerce_types(&current_types)?;
+                let coerced_fields = fields_with_udf(&current_fields, func.as_ref())?;
                 let coerced_args: Vec<Expr> = args
                     .iter()
-                    .zip(coerced_types.iter())
-                    .map(|(arg, target_type)| {
+                    .zip(coerced_fields.iter())
+                    .map(|(arg, target_field)| {
                         let arg_type = arg.get_type(schema)?;
+                        let target_type = target_field.data_type();
                         if arg_type == *target_type {
                             Ok(arg.clone())
                         } else {
@@ -2461,7 +2468,15 @@ impl Scanner {
                     .union_columns(&required_columns, OnMissing::Error)?
             };
             plan = self.take(plan, agg_projection)?;
-            return self.apply_aggregate(plan, agg).await;
+            plan = self.apply_aggregate(plan, agg).await?;
+
+            let optimizer = get_physical_optimizer();
+            let options = Default::default();
+            for rule in optimizer.rules {
+                plan = rule.optimize(plan, &options)?;
+            }
+
+            return Ok(plan);
         }
 
         // Sort
@@ -3334,13 +3349,14 @@ impl Scanner {
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
                 // Get unindexed fragments and filter to target fragments
-                let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-                let target_bitmap =
-                    RoaringBitmap::from_iter(target_fragments.iter().map(|f| f.id as u32));
-                unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+                let unindexed_fragments = self
+                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
                 // If all target fragments are unindexed, skip index entirely
                 if unindexed_fragments.len() == target_fragments.len() {
+                    if self.fast_search {
+                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                    }
                     let flat_match_plan = self
                         .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
                         .await?;
@@ -3355,7 +3371,7 @@ impl Scanner {
                     prefilter_source.clone(),
                 ));
 
-                if unindexed_fragments.is_empty() {
+                if self.fast_search || unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
                     let flat_match_plan = self
@@ -3365,9 +3381,12 @@ impl Scanner {
                 }
             }
             None => {
+                if self.fast_search {
+                    return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -3558,6 +3577,9 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.fast_search {
+                return Ok(Arc::new(EmptyExec::new(KNN_INDEX_SCHEMA.clone())));
+            }
             // Resolve metric type for flat search (use default if not specified)
             let metric = q
                 .metric_type
@@ -3605,11 +3627,8 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Get unindexed fragments and filter to target fragments
-        let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        if let Some(target_frags) = &self.fragments {
-            let target_bitmap = RoaringBitmap::from_iter(target_frags.iter().map(|f| f.id as u32));
-            unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
-        }
+        let unindexed_fragments =
+            self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
         if !unindexed_fragments.is_empty() {
             // need to set the metric type to be the same as the index
@@ -4168,6 +4187,16 @@ impl Scanner {
         }
     }
 
+    /// Retain only fragments that are in the user-specified fragment list.
+    /// If no fragment list is specified, returns the fragments unchanged.
+    fn retain_target_fragments(&self, mut fragments: Vec<Fragment>) -> Vec<Fragment> {
+        if let Some(target) = &self.fragments {
+            let bitmap = RoaringBitmap::from_iter(target.iter().map(|f| f.id as u32));
+            fragments.retain(|f| bitmap.contains(f.id as u32));
+        }
+        fragments
+    }
+
     fn get_indexed_frags(&self, index: &[IndexMetadata]) -> RoaringBitmap {
         let all_fragments = self.get_fragments_as_bitmap();
 
@@ -4309,20 +4338,23 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
-        if filter_plan.is_empty() {
+        if filter_plan.is_empty() && self.fragments.is_none() {
             log::trace!("no filter plan, no prefilter");
             return Ok(PreFilterSource::None);
         }
 
-        let fragments = Arc::new(
-            self.dataset
-                .manifest
-                .fragments
-                .iter()
-                .filter(|f| required_frags.contains(f.id as u32))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        // get fragments covered by index
+        let fragments: Vec<Fragment> = self
+            .dataset
+            .manifest
+            .fragments
+            .iter()
+            .filter(|f| required_frags.contains(f.id as u32))
+            .cloned()
+            .collect();
+
+        // If explicitly specified fragments with .with_fragments(), intersect with those
+        let fragments = Arc::new(self.retain_target_fragments(fragments));
 
         // Can only use ScalarIndexExec when the scalar index is exact and we are not scanning
         // a subset of the fragments.
@@ -8484,6 +8516,25 @@ mod test {
         )
         .await?;
 
+        log::info!("Test case: Full text search with unindexed rows and fast_search");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      MatchQuery: column=s, query=hello"#;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                let scan = scan
+                    .project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))?;
+                scan.fast_search();
+                Ok(scan)
+            },
+            expected,
+        )
+        .await?;
+
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
@@ -8599,6 +8650,25 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_without_vector_index_returns_empty() {
+        let dataset = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap().fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 10);
+        assert_eq!(fast_rows, 0);
     }
 
     #[rstest]
@@ -8937,6 +9007,40 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_fts_fast_search_excludes_unindexed_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Append rows after index build so they stay unindexed.
+        test_ds.append_data_with_range(10, 20).await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap()
+            .fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 2);
+        assert_eq!(fast_rows, 1);
     }
 
     async fn test_row_offset_read_helper(
@@ -9486,7 +9590,7 @@ mod test {
         );
     }
 
-    // Common test function for fragment list filtering
+    // Common test function for fragment list filtering (unindexed + indexed fragments)
     async fn test_fragment_list_filtering(
         test_ds: &TestVectorDataset,
         fragments: &[Fragment],
@@ -9517,9 +9621,9 @@ mod test {
             .unwrap();
         assert_values_in_range(i_array, 400..410, "Should only get results from fragment 2");
 
-        // Test 3: Query only indexed fragments (fragments 0 and 1)
+        // Test 3: Query a single indexed fragment (fragment 0 only)
         let mut scanner = build_scanner(&test_ds.dataset);
-        scanner.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
+        scanner.with_fragments(vec![fragments[0].clone()]);
         let batch = scanner.try_into_batch().await.unwrap();
         let i_array = batch
             .column_by_name("i")
@@ -9527,11 +9631,7 @@ mod test {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_values_in_range(
-            i_array,
-            0..400,
-            "Should only get results from indexed fragments",
-        );
+        assert_values_in_range(i_array, 0..200, "Should only get results from fragment 0");
 
         // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
         let mut scanner = build_scanner(&test_ds.dataset);
@@ -9552,11 +9652,33 @@ mod test {
             0..410,
             "Should get results from fragments 0, 1, and 2, excluding fragment 3",
         );
+
+        // Test 5: One indexed fragment (0) + one unindexed fragment (2), skipping indexed fragment 1 and unindexed fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[0].clone(), fragments[2].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(
+            i_array
+                .iter()
+                .all(|v| v.is_some_and(|val| (0..200).contains(&val) || (400..410).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (400..410).contains(&val))),
+            "Should only get results from fragment 0 (indexed) and fragment 2 (unindexed)"
+        );
     }
 
     #[tokio::test]
     async fn test_vector_search_respects_fragment_list() {
-        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9564,20 +9686,16 @@ mod test {
         // Create index on first 2 fragments
         test_ds.make_vector_index().await.unwrap();
 
-        // Append two more fragments after indexing (these will be unindexed)
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+
+        // Append two more unindexed fragments
         test_ds.append_data_with_range(400, 410).await.unwrap();
         test_ds.append_data_with_range(410, 420).await.unwrap();
 
-        // Now we have 4 fragments:
-        // Fragment 0: i=0..200 (indexed)
-        // Fragment 1: i=200..400 (indexed)
-        // Fragment 2: i=400..410 (unindexed)
-        // Fragment 3: i=410..420 (unindexed)
-
+        // Fragment 0: i=0..200 (indexed), Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed), Fragment 3: i=410..420 (unindexed)
         let fragments = test_ds.dataset.fragments();
         assert_eq!(fragments.len(), 4);
-
-        let query: Float32Array = (0..32).map(|v| v as f32).collect();
 
         test_fragment_list_filtering(&test_ds, fragments, |dataset| {
             let mut scanner = dataset.scan();
@@ -9589,7 +9707,6 @@ mod test {
 
     #[tokio::test]
     async fn test_fts_respects_fragment_list() {
-        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9597,20 +9714,16 @@ mod test {
         // Create FTS index on first 2 fragments
         test_ds.make_fts_index().await.unwrap();
 
-        // Append two more fragments after indexing (these will be unindexed)
+        // Append two more unindexed fragments
         test_ds.append_data_with_range(400, 410).await.unwrap();
         test_ds.append_data_with_range(410, 420).await.unwrap();
 
-        // Now we have 4 fragments:
-        // Fragment 0: i=0..200 (indexed)
-        // Fragment 1: i=200..400 (indexed)
-        // Fragment 2: i=400..410 (unindexed)
-        // Fragment 3: i=410..420 (unindexed)
-
+        // Fragment 0: i=0..200 (indexed), Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed), Fragment 3: i=410..420 (unindexed)
         let fragments = test_ds.dataset.fragments();
         assert_eq!(fragments.len(), 4);
 
-        // "s-5" matches: s-5, s-50-59, s-150-159 (frag 0), s-250-259, s-350-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
+        // "s-5" matches: s-5, s-50..s-59, s-150..s-159 (frag 0), s-250..s-259, s-350..s-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
         test_fragment_list_filtering(&test_ds, fragments, |dataset| {
             let mut scanner = dataset.scan();
             scanner

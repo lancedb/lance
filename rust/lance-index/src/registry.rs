@@ -5,13 +5,14 @@ use std::{collections::HashMap, sync::Arc};
 use lance_core::{Error, Result};
 use snafu::location;
 
+#[cfg(feature = "geo")]
+use crate::scalar::rtree::RTreeIndexPlugin;
 use crate::{
     pb, pbold,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, rtree::RTreeIndexPlugin,
-        zonemap::ZoneMapIndexPlugin,
+        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -62,6 +63,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+        #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
         let registry = Arc::new(registry);
@@ -77,9 +79,17 @@ impl IndexPluginRegistry {
         self.plugins
             .get(name)
             .map(|plugin| plugin.as_ref())
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("No scalar index plugin found for name {}", name).into(),
-                location: location!(),
+            .ok_or_else(|| {
+                let hint = if name == "rtree" {
+                    ". The 'rtree' index requires the `geo` feature. \
+                     Rebuild with `--features geo` to enable geospatial support"
+                } else {
+                    ""
+                };
+                Error::InvalidInput {
+                    source: format!("No scalar index plugin found for name '{name}'{hint}").into(),
+                    location: location!(),
+                }
             })
     }
 

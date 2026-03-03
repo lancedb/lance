@@ -8,9 +8,12 @@ use crate::dataset::optimize::{compact_files, CompactionOptions};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::WriteDestination;
 use crate::dataset::ROW_ID;
-use crate::dataset::{AutoCleanupParams, ProjectionRequest};
+use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest};
 use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::{DatasetIndexExt, IndexType};
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
@@ -25,12 +28,14 @@ use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
+use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::DataFile;
 
+use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use futures::TryStreamExt;
 use lance_datafusion::datagen::DatafusionDatagenExt;
 use object_store::path::Path;
@@ -1489,4 +1494,214 @@ async fn test_issue_4429_nested_struct_encoding_v2_1_with_over_65k_structs() {
 
     dataset.validate().await.unwrap();
     assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+}
+
+/// Regression test for https://github.com/lancedb/lance/issues/5321
+///
+/// merge_insert with reordered columns triggers the RewriteColumns path,
+/// which prunes the index bitmap. After compact + optimize_indices, the old
+/// stale B-tree data was being merged back in, causing "non-existent fragment"
+/// errors on subsequent queries.
+#[tokio::test]
+async fn test_merge_insert_with_reordered_columns_and_index() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with one row {id: 1, value: "a"}
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec!["x", "a"])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_5321",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force multiple fragments for testing
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create BTree index on 'id'
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Step 3: merge_insert with reversed column order (value, id)
+    // This triggers the RewriteColumns path, which prunes the index bitmap
+    let reversed_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("value", DataType::Utf8, true),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        reversed_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["b", "c"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch)],
+        reversed_schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = dataset.as_ref().clone();
+
+    // Step 4: compact_files
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    // Step 5: optimize_indices
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Step 6: Another merge_insert should NOT error
+    let source_batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["d"])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job2 = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader2 = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch2)],
+        schema.clone(),
+    ));
+    let (final_dataset, _) = merge_job2.execute(reader_to_stream(reader2)).await.unwrap();
+    final_dataset.validate().await.unwrap();
+}
+
+/// DataReplacement should invalidate index fragment bitmaps for replaced fields.
+#[tokio::test]
+async fn test_data_replacement_invalidates_index_bitmap() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+    ]));
+
+    // Create dataset with 2 columns
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://test_replacement_idx", None)
+        .await
+        .unwrap();
+
+    // Create scalar index on column 'a'
+    dataset
+        .create_index(
+            &["a"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Verify fragment 0 is in the index bitmap
+    let indices = dataset.load_indices().await.unwrap();
+    let a_index = indices.iter().find(|idx| idx.name == "a_idx").unwrap();
+    assert!(a_index.fragment_bitmap.as_ref().unwrap().contains(0));
+
+    // Write a replacement data file for column 'a'
+    let single_col_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "a",
+        DataType::Int32,
+        true,
+    )]));
+    let replacement_batch = RecordBatch::try_new(
+        single_col_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )
+    .unwrap();
+
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/replacement.lance"))
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        single_col_schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    // Build replacement DataFile matching the existing data file for column 'a'
+    let frag = dataset.get_fragment(0).unwrap();
+    let data_file = frag.data_file_for_field(0).unwrap();
+    let mut new_data_file = data_file.clone();
+    new_data_file.path = "replacement.lance".to_string();
+
+    // Commit DataReplacement
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // The index bitmap for 'a' should no longer contain fragment 0
+    let indices = dataset.load_indices().await.unwrap();
+    let a_index = indices.iter().find(|idx| idx.name == "a_idx").unwrap();
+    let effective = a_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert!(
+        !effective.contains(0),
+        "Fragment 0 should be removed from index bitmap after DataReplacement on indexed column"
+    );
 }
