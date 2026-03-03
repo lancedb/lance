@@ -491,7 +491,7 @@ pub struct ExecutionSummaryCounts {
     pub all_counts: HashMap<String, usize>,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
@@ -521,7 +521,7 @@ fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
         }
     }
     for child in node.children() {
-        visit_node(child.as_ref(), counts);
+        collect_execution_metrics(child.as_ref(), counts);
     }
 }
 
@@ -531,7 +531,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
-    visit_node(plan, &mut counts);
+    collect_execution_metrics(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
         r#type = EXECUTION_PLAN_RUN,
