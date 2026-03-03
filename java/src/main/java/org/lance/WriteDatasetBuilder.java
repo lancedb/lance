@@ -16,8 +16,6 @@ package org.lance;
 import org.lance.io.StorageOptionsProvider;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
-import org.lance.namespace.model.CreateEmptyTableRequest;
-import org.lance.namespace.model.CreateEmptyTableResponse;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
@@ -210,7 +208,7 @@ public class WriteDatasetBuilder {
 
   /**
    * Sets whether to ignore storage options from the namespace's describeTable() or
-   * createEmptyTable().
+   * declareTable().
    *
    * @param ignoreNamespaceStorageOptions If true, storage options returned from namespace will be
    *     ignored
@@ -368,36 +366,18 @@ public class WriteDatasetBuilder {
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
-      // Try declareTable first, fall back to deprecated createEmptyTable
-      // for backward compatibility with older namespace implementations.
-      // createEmptyTable support will be removed in 3.0.0.
-      String location;
-      Map<String, String> responseStorageOptions;
+      DeclareTableRequest declareRequest = new DeclareTableRequest();
+      declareRequest.setId(tableId);
+      DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
 
-      try {
-        DeclareTableRequest declareRequest = new DeclareTableRequest();
-        declareRequest.setId(tableId);
-        DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
-        location = declareResponse.getLocation();
-        responseStorageOptions = declareResponse.getStorageOptions();
-        managedVersioning = Boolean.TRUE.equals(declareResponse.getManagedVersioning());
-      } catch (UnsupportedOperationException e) {
-        // Fall back to deprecated createEmptyTable
-        // Note: createEmptyTable doesn't support managedVersioning
-        CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
-        fallbackRequest.setId(tableId);
-        CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
-        location = fallbackResponse.getLocation();
-        responseStorageOptions = fallbackResponse.getStorageOptions();
-        managedVersioning = false;
-      }
-
-      tableUri = location;
+      tableUri = declareResponse.getLocation();
       if (tableUri == null || tableUri.isEmpty()) {
         throw new IllegalArgumentException("Namespace did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : responseStorageOptions;
+      managedVersioning = Boolean.TRUE.equals(declareResponse.getManagedVersioning());
+      namespaceStorageOptions =
+          ignoreNamespaceStorageOptions ? null : declareResponse.getStorageOptions();
     } else {
       // For APPEND/OVERWRITE modes, call namespace.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();

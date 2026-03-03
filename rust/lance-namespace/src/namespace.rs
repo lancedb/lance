@@ -12,12 +12,12 @@ use lance_namespace_reqwest_client::models::{
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
-    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
-    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
@@ -169,22 +169,6 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// Declare a table (metadata only operation).
     async fn declare_table(&self, _request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         Err(Error::not_supported("declare_table not implemented"))
-    }
-
-    /// Create an empty table (metadata only operation).
-    ///
-    /// # Deprecated
-    ///
-    /// Use [`declare_table`](Self::declare_table) instead. Support will be removed in 3.0.0.
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use declare_table instead. Support will be removed in 3.0.0."
-    )]
-    async fn create_empty_table(
-        &self,
-        _request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        Err(Error::not_supported("create_empty_table not implemented"))
     }
 
     /// Insert data into a table.

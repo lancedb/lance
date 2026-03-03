@@ -838,18 +838,6 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/create-empty", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "create_empty_table", &id)
-            .await
-    }
-
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);

@@ -26,15 +26,15 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateEmptyTableRequest,
-    CreateEmptyTableResponse, CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
-    DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceExistsRequest, TableExistsRequest, TableVersion,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
+    ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
+    TableExistsRequest, TableVersion,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -1366,69 +1366,6 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            #[allow(deprecated)]
-            let mut response = manifest_ns.create_empty_table(request.clone()).await?;
-            // Only apply identity-based credential vending when explicitly requested
-            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                if let Some(ref location) = response.location {
-                    let identity = request.identity.as_deref();
-                    response.storage_options = self
-                        .get_storage_options_for_table(location, identity)
-                        .await?;
-                }
-            } else if request.vend_credentials == Some(false) {
-                response.storage_options = None;
-            }
-            return Ok(response);
-        }
-
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
-
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_uri {
-                return Err(Error::namespace_source(
-                    format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_uri
-                    )
-                    .into(),
-                ));
-            }
-        }
-
-        // Atomically create the .lance-reserved file to mark the table as existing.
-        // This uses put_if_not_exists semantics to avoid race conditions.
-        let reserved_file_path = self.table_reserved_file_path(&table_name);
-
-        self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
-            .await
-            .map_err(|e| Error::namespace_source(e.into()))?;
-
-        // For backwards compatibility, only skip vending credentials when explicitly set to false
-        let vend_credentials = request.vend_credentials.unwrap_or(true);
-        let identity = request.identity.as_deref();
-        let storage_options = if vend_credentials {
-            self.get_storage_options_for_table(&table_uri, identity)
-                .await?
-        } else {
-            None
-        };
-
-        Ok(CreateEmptyTableResponse {
-            location: Some(table_uri),
-            storage_options,
-            ..Default::default()
-        })
-    }
-
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
@@ -2566,105 +2503,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table() {
-        let (namespace, temp_dir) = create_test_namespace().await;
-
-        let mut request = CreateEmptyTableRequest::new();
-        request.id = Some(vec!["empty_table".to_string()]);
-
-        let response = namespace.create_empty_table(request).await.unwrap();
-
-        assert!(response.location.is_some());
-        assert!(response.location.unwrap().ends_with("empty_table.lance"));
-
-        // Verify the .lance-reserved file was created in the correct location
-        let table_dir = temp_dir.join("empty_table.lance");
-        assert!(table_dir.exists());
-        assert!(table_dir.is_dir());
-
-        let reserved_file = table_dir.join(".lance-reserved");
-        assert!(reserved_file.exists());
-        assert!(reserved_file.is_file());
-
-        // Verify file is empty
-        let metadata = std::fs::metadata(&reserved_file).unwrap();
-        assert_eq!(metadata.len(), 0);
-
-        // Verify table exists by checking for .lance-reserved file
-        let mut exists_request = TableExistsRequest::new();
-        exists_request.id = Some(vec!["empty_table".to_string()]);
-        namespace.table_exists(exists_request).await.unwrap();
-
-        // List tables should include the empty table
-        let mut list_request = ListTablesRequest::new();
-        list_request.id = Some(vec![]);
-        let list_response = namespace.list_tables(list_request).await.unwrap();
-        assert!(list_response.tables.contains(&"empty_table".to_string()));
-
-        // Verify describe table works for empty table
-        let mut describe_request = DescribeTableRequest::new();
-        describe_request.id = Some(vec!["empty_table".to_string()]);
-        let describe_response = namespace.describe_table(describe_request).await.unwrap();
-        assert!(describe_response.location.is_some());
-        assert!(describe_response.location.unwrap().contains("empty_table"));
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table_with_wrong_location() {
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut request = CreateEmptyTableRequest::new();
-        request.id = Some(vec!["test_table".to_string()]);
-        request.location = Some("/wrong/path/table.lance".to_string());
-
-        let result = namespace.create_empty_table(request).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("must be at location")
-        );
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table_then_drop() {
-        let (namespace, temp_dir) = create_test_namespace().await;
-
-        // Create an empty table
-        let mut create_request = CreateEmptyTableRequest::new();
-        create_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-
-        let create_response = namespace.create_empty_table(create_request).await.unwrap();
-        assert!(create_response.location.is_some());
-
-        // Verify it exists
-        let table_dir = temp_dir.join("empty_table_to_drop.lance");
-        assert!(table_dir.exists());
-        let reserved_file = table_dir.join(".lance-reserved");
-        assert!(reserved_file.exists());
-
-        // Drop the table
-        let mut drop_request = DropTableRequest::new();
-        drop_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-        let drop_response = namespace.drop_table(drop_request).await.unwrap();
-        assert!(drop_response.location.is_some());
-
-        // Verify table directory was removed
-        assert!(!table_dir.exists());
-        assert!(!reserved_file.exists());
-
-        // Verify table no longer exists
-        let mut exists_request = TableExistsRequest::new();
-        exists_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-        let exists_result = namespace.table_exists(exists_request).await;
-        assert!(exists_result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_child_namespace_create_and_list() {
         let (namespace, _temp_dir) = create_test_namespace().await;
 
@@ -2842,32 +2680,6 @@ mod tests {
         exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
         let result = namespace.table_exists(exists_req).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_empty_table_in_child_namespace() {
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        // Create child namespace
-        let mut create_ns_req = CreateNamespaceRequest::new();
-        create_ns_req.id = Some(vec!["test_ns".to_string()]);
-        namespace.create_namespace(create_ns_req).await.unwrap();
-
-        // Create empty table
-        let mut create_empty_req = CreateEmptyTableRequest::new();
-        create_empty_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
-        let result = namespace.create_empty_table(create_empty_req).await;
-        assert!(
-            result.is_ok(),
-            "Failed to create empty table in child namespace"
-        );
-
-        // Verify table exists
-        let mut exists_req = TableExistsRequest::new();
-        exists_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
-        let result = namespace.table_exists(exists_req).await;
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -4683,14 +4495,6 @@ mod tests {
                 request_data: Bytes,
             ) -> Result<CreateTableResponse> {
                 self.inner.create_table(request, request_data).await
-            }
-
-            #[allow(deprecated)]
-            async fn create_empty_table(
-                &self,
-                request: CreateEmptyTableRequest,
-            ) -> Result<CreateEmptyTableResponse> {
-                self.inner.create_empty_table(request).await
             }
 
             async fn declare_table(

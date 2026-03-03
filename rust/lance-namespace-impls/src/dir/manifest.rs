@@ -27,9 +27,8 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
-    DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
+    DeclareTableRequest, DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
     DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
     DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
@@ -1721,111 +1720,6 @@ impl LanceNamespace for ManifestNamespace {
                 format!("Namespace '{}' not found", object_id).into(),
             ))
         }
-    }
-
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        let table_id = request
-            .id
-            .as_ref()
-            .ok_or_else(|| Error::invalid_input_source("Table ID is required".into()))?;
-
-        if table_id.is_empty() {
-            return Err(Error::invalid_input_source(
-                "Table ID cannot be empty".into(),
-            ));
-        }
-
-        let (namespace, table_name) = Self::split_object_id(table_id);
-        let object_id = Self::build_object_id(&namespace, &table_name);
-
-        // Check if table already exists in manifest
-        let existing = self.query_manifest_for_table(&object_id).await?;
-        if existing.is_some() {
-            return Err(Error::namespace_source(
-                format!("Table '{}' already exists", table_name).into(),
-            ));
-        }
-
-        // Create table location path with hash-based naming
-        // When dir_listing_enabled is true and it's a root table, use directory-style naming: {table_name}.lance
-        // Otherwise, use hash-based naming: {hash}_{object_id}
-        let dir_name = if namespace.is_empty() && self.dir_listing_enabled {
-            // Root table with directory listing enabled: use {table_name}.lance
-            format!("{}.lance", table_name)
-        } else {
-            // Child namespace table or dir listing disabled: use hash-based naming
-            Self::generate_dir_name(&object_id)
-        };
-        let table_path = self.base_path.child(dir_name.as_str());
-        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
-
-        // Validate location if provided
-        if let Some(req_location) = &request.location {
-            let req_location = req_location.trim_end_matches('/');
-            if req_location != table_uri {
-                return Err(Error::namespace_source(
-                    format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, req_location, table_uri
-                    )
-                    .into(),
-                ));
-            }
-        }
-
-        // Create the .lance-reserved file to mark the table as existing
-        let reserved_file_path = table_path.child(".lance-reserved");
-
-        self.object_store
-            .create(&reserved_file_path)
-            .await
-            .map_err(|e| {
-                Error::namespace_source(
-                    format!(
-                        "Failed to create .lance-reserved file for table {}: {}",
-                        table_name, e
-                    )
-                    .into(),
-                )
-            })?
-            .shutdown()
-            .await
-            .map_err(|e| {
-                Error::namespace_source(
-                    format!(
-                        "Failed to finalize .lance-reserved file for table {}: {}",
-                        table_name, e
-                    )
-                    .into(),
-                )
-            })?;
-
-        // Add entry to manifest marking this as an empty table (store dir_name, not full path)
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
-            .await?;
-
-        log::info!(
-            "Created empty table '{}' in manifest at {}",
-            table_name,
-            table_uri
-        );
-
-        // For backwards compatibility, only skip vending credentials when explicitly set to false
-        let vend_credentials = request.vend_credentials.unwrap_or(true);
-        let storage_options = if vend_credentials {
-            self.storage_options.clone()
-        } else {
-            None
-        };
-
-        Ok(CreateEmptyTableResponse {
-            location: Some(table_uri),
-            storage_options,
-            ..Default::default()
-        })
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {

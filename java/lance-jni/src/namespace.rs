@@ -1094,20 +1094,6 @@ impl LanceNamespaceTrait for JavaLanceNamespace {
         .await
     }
 
-    #[allow(deprecated)]
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> lance_core::Result<CreateEmptyTableResponse> {
-        self.call_json_method(
-            "createEmptyTable",
-            &format!("{}/CreateEmptyTableRequest", MODEL_PKG),
-            &format!("{}/CreateEmptyTableResponse", MODEL_PKG),
-            request,
-        )
-        .await
-    }
-
     async fn insert_into_table(
         &self,
         request: InsertIntoTableRequest,
@@ -1835,24 +1821,6 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableNa
 }
 
 #[unsafe(no_mangle)]
-#[allow(deprecated)]
-pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createEmptyTableNative(
-    mut env: JNIEnv,
-    _obj: JObject,
-    handle: jlong,
-    request_json: JString,
-) -> jstring {
-    ok_or_throw_with_return!(
-        env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_empty_table(req))
-        }),
-        std::ptr::null_mut()
-    )
-    .into_raw()
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_declareTableNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -2420,24 +2388,6 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableNative(
             request_data,
             |ns, req, data| { RT.block_on(ns.inner.create_table(req, data)) }
         ),
-        std::ptr::null_mut()
-    )
-    .into_raw()
-}
-
-#[unsafe(no_mangle)]
-#[allow(deprecated)]
-pub extern "system" fn Java_org_lance_namespace_RestNamespace_createEmptyTableNative(
-    mut env: JNIEnv,
-    _obj: JObject,
-    handle: jlong,
-    request_json: JString,
-) -> jstring {
-    ok_or_throw_with_return!(
-        env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_empty_table(req))
-        }),
         std::ptr::null_mut()
     )
     .into_raw()

@@ -112,9 +112,7 @@ use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_namespace::models::{
-    CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
-};
+use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
@@ -747,7 +745,7 @@ impl Dataset {
 
     /// Write into a namespace-managed table with automatic credential vending.
     ///
-    /// For CREATE mode, calls create_empty_table() to initialize the table.
+    /// For CREATE mode, calls declare_table() to initialize the table.
     /// For other modes, calls describe_table() and opens dataset with namespace credentials.
     ///
     /// # Arguments
@@ -770,33 +768,10 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                // Try declare_table first, fall back to deprecated create_empty_table
-                // for backward compatibility with older namespace implementations.
-                // create_empty_table support will be removed in 3.0.0.
-                #[allow(deprecated)]
-                let response = match namespace.declare_table(declare_request).await {
-                    Ok(resp) => resp,
-                    Err(Error::NotSupported { .. }) => {
-                        let fallback_request = CreateEmptyTableRequest {
-                            id: Some(table_id.clone()),
-                            ..Default::default()
-                        };
-                        let fallback_resp = namespace
-                            .create_empty_table(fallback_request)
-                            .await
-                            .map_err(|e| Error::namespace_source(Box::new(e)))?;
-                        DeclareTableResponse {
-                            transaction_id: fallback_resp.transaction_id,
-                            location: fallback_resp.location,
-                            storage_options: fallback_resp.storage_options,
-                            properties: fallback_resp.properties,
-                            managed_versioning: None,
-                        }
-                    }
-                    Err(e) => {
-                        return Err(Error::namespace_source(Box::new(e)));
-                    }
-                };
+                let response = namespace
+                    .declare_table(declare_request)
+                    .await
+                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
                 let uri = response.location.ok_or_else(|| {
                     Error::namespace_source(Box::new(std::io::Error::other(
