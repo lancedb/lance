@@ -15,7 +15,7 @@ use azure_identity::DefaultAzureCredential;
 use azure_storage::prelude::*;
 use azure_storage::shared_access_signature::service_sas::{BlobSharedAccessSignature, SasKey};
 use azure_storage_blobs::prelude::*;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
 use lance_namespace::models::Identity;
@@ -23,8 +23,8 @@ use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
 
 use super::{
-    redact_credential, CredentialVendor, VendedCredentials, VendedPermission,
-    DEFAULT_CREDENTIAL_DURATION_MILLIS,
+    CredentialVendor, DEFAULT_CREDENTIAL_DURATION_MILLIS, VendedCredentials, VendedPermission,
+    redact_credential,
 };
 
 /// Configuration for Azure credential vending.
@@ -702,7 +702,12 @@ impl AzureCredentialVendor {
 
         info!(
             "Azure credentials vended (web identity): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-            account, container, path, self.config.permission, expires_at_millis, redact_credential(&sas_token)
+            account,
+            container,
+            path,
+            self.config.permission,
+            expires_at_millis,
+            redact_credential(&sas_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -771,7 +776,12 @@ impl AzureCredentialVendor {
 
         info!(
             "Azure credentials vended (api_key): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-            account, container, path, permission, expires_at_millis, redact_credential(&sas_token)
+            account,
+            container,
+            path,
+            permission,
+            expires_at_millis,
+            redact_credential(&sas_token)
         );
 
         Ok(VendedCredentials::new(storage_options, expires_at_millis))
@@ -887,7 +897,12 @@ impl CredentialVendor for AzureCredentialVendor {
 
                 info!(
                     "Azure credentials vended (static): account={}, container={}, path={}, permission={}, expires_at={}, sas_token={}",
-                    account, container, path, self.config.permission, expires_at_millis, redact_credential(&sas_token)
+                    account,
+                    container,
+                    path,
+                    self.config.permission,
+                    expires_at_millis,
+                    redact_credential(&sas_token)
                 );
 
                 Ok(VendedCredentials::new(storage_options, expires_at_millis))

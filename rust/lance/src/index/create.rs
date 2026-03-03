@@ -2,28 +2,29 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::{
+    Error, Result,
     dataset::{
-        transaction::{Operation, Transaction},
         Dataset,
+        transaction::{Operation, Transaction},
     },
     index::{
+        DatasetIndexExt, DatasetIndexInternalExt,
         scalar::build_scalar_index,
         vector::{
-            build_distributed_vector_index, build_empty_vector_index, build_vector_index,
-            VectorIndexParams, LANCE_VECTOR_INDEX,
+            LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
+            build_empty_vector_index, build_vector_index,
         },
-        vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
+        vector_index_details,
     },
-    Error, Result,
 };
 use futures::future::BoxFuture;
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::{IndexParams, IndexType, VECTOR_INDEX_VERSION, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
-    scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
+    scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::IndexMetadata;
 use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
@@ -163,7 +164,7 @@ impl<'a> CreateIndexBuilder<'a> {
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-                                 // Find unique name by appending numeric suffix if needed
+            // Find unique name by appending numeric suffix if needed
             while indices
                 .iter()
                 .any(|idx| idx.name == candidate && idx.fields != [field.id])
@@ -408,7 +409,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     message: "Fragment reuse index can only be created through compaction"
                         .to_string(),
                     location: location!(),
-                })
+                });
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -954,13 +955,17 @@ mod tests {
                 && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
         );
         assert_eq!(vector_indices.len(), 2);
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(
+            vector_indices
+                .iter()
+                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+        );
+        assert!(
+            vector_indices
+                .iter()
+                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+        );
     }
 }

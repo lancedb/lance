@@ -41,9 +41,9 @@ use lance_namespace::models::{
     UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-use lance_core::{box_error, Error, Result};
+use lance_core::{Error, Result, box_error};
 
 use lance_namespace::LanceNamespace;
 
@@ -100,13 +100,13 @@ impl RestClient {
 
             const HEADERS_PREFIX: &str = "headers.";
             for (key, value) in context {
-                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX) {
-                    if let (Ok(header_name), Ok(header_value)) = (
+                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX)
+                    && let (Ok(header_name), Ok(header_value)) = (
                         HeaderName::from_str(header_name),
                         HeaderValue::from_str(&value),
-                    ) {
-                        request_headers.insert(header_name, header_value);
-                    }
+                    )
+                {
+                    request_headers.insert(header_name, header_value);
                 }
             }
         }
@@ -462,21 +462,19 @@ impl RestNamespace {
         let mut client_builder = reqwest::Client::builder();
 
         // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file) {
-            if let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file)) {
-                if let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat()) {
-                    client_builder = client_builder.identity(identity);
-                }
-            }
+        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file)
+            && let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file))
+            && let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat())
+        {
+            client_builder = client_builder.identity(identity);
         }
 
         // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &builder.ssl_ca_cert {
-            if let Ok(ca_cert) = std::fs::read(ca_cert_file) {
-                if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert) {
-                    client_builder = client_builder.add_root_certificate(ca_cert);
-                }
-            }
+        if let Some(ca_cert_file) = &builder.ssl_ca_cert
+            && let Ok(ca_cert) = std::fs::read(ca_cert_file)
+            && let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert)
+        {
+            client_builder = client_builder.add_root_certificate(ca_cert);
         }
 
         // Configure hostname verification

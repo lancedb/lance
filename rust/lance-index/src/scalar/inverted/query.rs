@@ -6,7 +6,6 @@ use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -84,10 +83,7 @@ impl TryFrom<&str> for Operator {
         match value.to_ascii_uppercase().as_str() {
             "AND" => Ok(Self::And),
             "OR" => Ok(Self::Or),
-            _ => Err(Error::invalid_input(
-                format!("Invalid operator: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!("Invalid operator: {}", value))),
         }
     }
 }
@@ -514,7 +510,6 @@ impl MultiMatchQuery {
         if columns.is_empty() {
             return Err(Error::invalid_input(
                 "Cannot create MultiMatchQuery with no columns".to_string(),
-                location!(),
             ));
         }
 
@@ -529,7 +524,6 @@ impl MultiMatchQuery {
         if boosts.len() != self.match_queries.len() {
             return Err(Error::invalid_input(
                 "The number of boosts must match the number of queries".to_string(),
-                location!(),
             ));
         }
 
@@ -570,10 +564,10 @@ impl TryFrom<&str> for Occur {
             "SHOULD" => Ok(Self::Should),
             "MUST" => Ok(Self::Must),
             "MUST_NOT" => Ok(Self::MustNot),
-            _ => Err(Error::invalid_input(
-                format!("Invalid occur value: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid occur value: {}",
+                value
+            ))),
         }
     }
 }
@@ -789,10 +783,10 @@ pub fn collect_query_tokens(
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
+        if let Some(inclusive) = inclusive
+            && !inclusive.contains(&token.text)
+        {
+            continue;
         }
         tokens.push(token.text.clone());
     }
@@ -808,10 +802,10 @@ pub fn collect_doc_tokens(
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
+        if let Some(inclusive) = inclusive
+            && !inclusive.contains(&token.text)
+        {
+            continue;
         }
         tokens.push(token.text.clone());
     }
@@ -830,10 +824,7 @@ pub fn fill_fts_query_column(
         FtsQuery::Match(match_query) => {
             match columns.len() {
                 0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
                 }
                 1 => {
                     let column = columns[0].clone();
@@ -851,10 +842,7 @@ pub fn fill_fts_query_column(
         FtsQuery::Phrase(phrase_query) => {
             match columns.len() {
                 0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
                 }
                 1 => {
                     let column = columns[0].clone();
@@ -862,10 +850,7 @@ pub fn fill_fts_query_column(
                     Ok(FtsQuery::Phrase(query))
                 }
                 _ => {
-                    Err(Error::invalid_input(
-                        "the column must be specified in the query".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("the column must be specified in the query".to_string()))
                 }
             }
         }

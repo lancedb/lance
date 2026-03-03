@@ -9,18 +9,18 @@ use std::sync::Arc;
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, cast::AsArray, types::Float32Type};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
-use lance_linalg::distance::{Dot, Normalize, L2};
+use lance_linalg::distance::{Dot, L2, Normalize};
 use snafu::location;
 
-use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::vector::kmeans::{train_kmeans, KMeansParams};
+use super::utils::divide_to_subvectors;
+use crate::vector::kmeans::{KMeansParams, train_kmeans};
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]

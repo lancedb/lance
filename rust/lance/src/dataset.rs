@@ -7,7 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
-use chrono::{prelude::*, Duration};
+use chrono::{Duration, prelude::*};
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -18,6 +18,7 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
+use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
@@ -25,7 +26,6 @@ use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
@@ -38,12 +38,12 @@ use lance_io::object_store::{
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
 };
 use lance_table::io::commit::{
-    external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
-    write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler, CommitLock,
-    ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
+    CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
+    VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
+    write_manifest_file_to_path,
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -106,18 +106,18 @@ use crate::io::commit::{
     detect_overlapping_fragments,
 };
 use crate::session::Session;
-use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
+use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
-use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
 };
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
-use lance_table::io::deletion::{relative_deletion_file_path, DELETIONS_DIR};
+use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -131,8 +131,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder,
-    WriteDestination, WriteMode, WriteParams,
+    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder, WriteDestination,
+    WriteMode, WriteParams, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -646,52 +646,48 @@ impl Dataset {
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(index_offset) = manifest.index_section {
-            if manifest_size - index_offset <= last_block.len() {
-                let offset_in_block = last_block.len() - (manifest_size - index_offset);
-                let message_len =
-                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
-                        as usize;
-                let message_data =
-                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-                let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let mut indices: Vec<IndexMetadata> = section
-                    .indices
-                    .into_iter()
-                    .map(IndexMetadata::try_from)
-                    .collect::<Result<Vec<_>>>()?;
-                retain_supported_indices(&mut indices);
-                let ds_index_cache = session.index_cache.for_dataset(uri);
-                let metadata_key = crate::session::index_caches::IndexMetadataKey {
-                    version: manifest_location.version,
-                };
-                ds_index_cache
-                    .insert_with_key(&metadata_key, Arc::new(indices))
-                    .await;
-            }
+        if let Some(index_offset) = manifest.index_section
+            && manifest_size - index_offset <= last_block.len()
+        {
+            let offset_in_block = last_block.len() - (manifest_size - index_offset);
+            let message_len =
+                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
+            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            let section = lance_table::format::pb::IndexSection::decode(message_data)?;
+            let mut indices: Vec<IndexMetadata> = section
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?;
+            retain_supported_indices(&mut indices);
+            let ds_index_cache = session.index_cache.for_dataset(uri);
+            let metadata_key = crate::session::index_caches::IndexMetadataKey {
+                version: manifest_location.version,
+            };
+            ds_index_cache
+                .insert_with_key(&metadata_key, Arc::new(indices))
+                .await;
         }
 
         // If transaction is also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(transaction_offset) = manifest.transaction_section {
-            if manifest_size - transaction_offset <= last_block.len() {
-                let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
-                let message_len =
-                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
-                        as usize;
-                let message_data =
-                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-                let transaction: Transaction =
-                    lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+        if let Some(transaction_offset) = manifest.transaction_section
+            && manifest_size - transaction_offset <= last_block.len()
+        {
+            let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
+            let message_len =
+                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
+            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            let transaction: Transaction =
+                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
 
-                let metadata_cache = session.metadata_cache.for_dataset(uri);
-                let metadata_key = TransactionKey {
-                    version: manifest_location.version,
-                };
-                metadata_cache
-                    .insert_with_key(&metadata_key, Arc::new(transaction))
-                    .await;
-            }
+            let metadata_cache = session.metadata_cache.for_dataset(uri);
+            let metadata_key = TransactionKey {
+                version: manifest_location.version,
+            };
+            metadata_cache
+                .insert_with_key(&metadata_key, Arc::new(transaction))
+                .await;
         }
 
         if manifest.should_use_legacy_format() {
@@ -935,10 +931,10 @@ impl Dataset {
                 // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
                 // assumes no dataset exists and converts the mode to CREATE.
                 let mut builder = DatasetBuilder::from_uri(uri.as_str());
-                if let Some(ref store_params) = write_params.store_params {
-                    if let Some(accessor) = &store_params.storage_options_accessor {
-                        builder = builder.with_storage_options_accessor(accessor.clone());
-                    }
+                if let Some(ref store_params) = write_params.store_params
+                    && let Some(accessor) = &store_params.storage_options_accessor
+                {
+                    builder = builder.with_storage_options_accessor(accessor.clone());
                 }
                 let dataset = Arc::new(builder.load().await?);
 
@@ -1254,7 +1250,6 @@ impl Dataset {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
                 _ => Err(Error::invalid_input(
                     "read_version must be specified for this operation",
-                    location!(),
                 )),
             },
             Ok,
@@ -1710,13 +1705,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for data_file {}",
-                            base_id, data_file.path
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for data_file {}",
+                        base_id, data_file.path
+                    ))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
@@ -1732,10 +1724,7 @@ impl Dataset {
     /// Get the ObjectStore for a specific path based on base_id
     pub(crate) async fn object_store_for_base(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
-            Error::invalid_input(
-                format!("Dataset base path with ID {} not found", base_id),
-                Default::default(),
-            )
+            Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
 
         let (store, _) = ObjectStore::from_uri_and_params(
@@ -1753,13 +1742,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for deletion_file {:?}",
-                            base_id, deletion_file
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for deletion_file {:?}",
+                        base_id, deletion_file
+                    ))
                 })?;
 
                 if !base_path.is_dataset_root {
@@ -1783,13 +1769,10 @@ impl Dataset {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "base_path id {} not found for index {}",
-                            base_id, index.uuid
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "base_path id {} not found for index {}",
+                        base_id, index.uuid
+                    ))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
@@ -2676,20 +2659,17 @@ impl Dataset {
     ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
-            return Err(Error::invalid_input(
-                format!("Column {} does not exist in the left side dataset", left_on),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side dataset",
+                left_on
+            )));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side dataset",
-                    right_on
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side dataset",
+                right_on
+            )));
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
@@ -2698,13 +2678,10 @@ impl Dataset {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} exists in both sides of the dataset",
-                        field.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} exists in both sides of the dataset",
+                    field.name()
+                )));
             }
         }
 

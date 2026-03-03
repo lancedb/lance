@@ -11,23 +11,23 @@ use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use itertools::Itertools;
+use lance_core::Result;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowAddrMask;
-use lance_core::Result;
 
 use crate::metrics::MetricsCollector;
 
 use super::{
+    CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
     query::FtsSearchParams,
     scorer::Scorer,
-    CompressedPostingList, DocSet, PostingList, RawDocInfo,
 };
-use super::{builder::BLOCK_SIZE, DocInfo};
+use super::{DocInfo, builder::BLOCK_SIZE};
 use super::{
     query::Operator,
-    scorer::{idf, K1},
+    scorer::{K1, idf},
 };
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
@@ -401,10 +401,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
-            if let Some(cur_doc) = self.cur_doc {
-                if cur_doc.doc_id() >= doc.doc_id() {
-                    continue;
-                }
+            if let Some(cur_doc) = self.cur_doc
+                && cur_doc.doc_id() >= doc.doc_id()
+            {
+                continue;
             }
             self.cur_doc = Some(doc);
             num_comparisons += 1;
@@ -437,12 +437,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
@@ -499,11 +499,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 pivot += 1;
             }
 
-            if let Some(least_id) = self.postings[0].block_first_doc() {
-                if least_id > doc_id {
-                    current_doc = least_id;
-                    continue;
-                }
+            if let Some(least_id) = self.postings[0].block_first_doc()
+                && least_id > doc_id
+            {
+                current_doc = least_id;
+                continue;
             }
             let mut max_pivot = 0;
             while max_pivot + 1 < self.postings.len() {
@@ -563,12 +563,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -899,7 +899,7 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, CompressedPostingList, PlainPostingList,
+            CompressedPostingList, PlainPostingList, encoding::compress_posting_list,
         },
     };
 

@@ -4,18 +4,18 @@
 use std::sync::Arc;
 use std::vec;
 
-use crate::dataset::tests::dataset_transactions::execute_sql;
 use crate::Dataset;
+use crate::dataset::tests::dataset_transactions::execute_sql;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::Float64Type;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float64Type;
 use datafusion::common::{assert_contains, assert_not_contains};
-use geo_types::{coord, line_string, Rect};
+use geo_types::{Rect, coord, line_string};
 use geoarrow_array::{
-    builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
     GeoArrowArray,
+    builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_core::utils::tempfile::TempStrDir;

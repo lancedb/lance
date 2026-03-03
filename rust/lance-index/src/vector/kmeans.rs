@@ -18,9 +18,9 @@ use std::vec;
 use std::{collections::HashMap, ops::MulAssign};
 
 use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt8Type},
-    Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
 };
 use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
@@ -29,7 +29,7 @@ use bitvec::prelude::*;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Normalize};
+use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
 use num_traits::One;
@@ -39,8 +39,8 @@ use rayon::prelude::*;
 use snafu::location;
 use {
     lance_linalg::distance::{
-        l2::{l2_distance_batch, L2},
         Dot,
+        l2::{L2, l2_distance_batch},
     },
     lance_linalg::kernels::argmin_value,
 };
@@ -443,13 +443,20 @@ where
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             if data.len() / dimension < k * 256 {
-                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                warn!(
+                    "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
                 is too small to have a meaningful index ({} < {}) or has many duplicate vectors.",
-                empty_clusters, k, data.len() / dimension, k * 256);
+                    empty_clusters,
+                    k,
+                    data.len() / dimension,
+                    k * 256
+                );
             } else {
-                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                warn!(
+                    "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
                 has many duplicate vectors.",
-                empty_clusters, k);
+                    empty_clusters, k
+                );
             }
         }
 
@@ -730,7 +737,12 @@ impl KMeans {
                 if (loss - last_loss).abs() < params.tolerance * last_loss {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
-                        i, params.max_iters, redo, loss, last_loss, (loss - last_loss).abs() / last_loss
+                        i,
+                        params.max_iters,
+                        redo,
+                        loss,
+                        last_loss,
+                        (loss - last_loss).abs() / last_loss
                     );
                     break;
                 }
@@ -856,10 +868,10 @@ impl KMeans {
         for i in 0..initial_k {
             let mut cluster_indices = Vec::new();
             for (idx, &cluster_id) in membership.iter().enumerate() {
-                if let Some(cid) = cluster_id {
-                    if cid as usize == i {
-                        cluster_indices.push(idx);
-                    }
+                if let Some(cid) = cluster_id
+                    && cid as usize == i
+                {
+                    cluster_indices.push(idx);
                 }
             }
 
@@ -887,14 +899,22 @@ impl KMeans {
 
             // If this cluster is already finalized, no further split is possible; stop splitting
             if largest_cluster.finalized {
-                log::warn!("Cluster {} is already finalized, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                log::warn!(
+                    "Cluster {} is already finalized, no further split is possible, finish with {} clusters",
+                    largest_cluster.id,
+                    heap.len() + 1
+                );
                 heap.push(largest_cluster);
                 break;
             }
 
             // Because the clusters are sorted by size, if the cluster has only 1 point, no further split is possible; stop splitting
             if largest_cluster.indices.len() <= 1 {
-                log::warn!("Cluster {} has only 1 point, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                log::warn!(
+                    "Cluster {} has only 1 point, no further split is possible, finish with {} clusters",
+                    largest_cluster.id,
+                    heap.len() + 1
+                );
                 heap.push(largest_cluster);
                 break;
             }
@@ -1038,12 +1058,10 @@ impl KMeans {
     ) -> arrow::error::Result<Self> {
         let n = data.len();
         if n < k {
-            return Err(ArrowError::InvalidArgumentError(
-                format!(
-                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
-                    n, k
-                )
-            ));
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
+                n, k
+            )));
         }
 
         // use hierarchical clustering if k > 256 and hierarchical_k > 1
@@ -1401,8 +1419,8 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 mod tests {
     use std::iter::repeat_n;
 
-    use arrow_array::types::Float16Type;
     use arrow_array::Float16Array;
+    use arrow_array::types::Float16Type;
     use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;

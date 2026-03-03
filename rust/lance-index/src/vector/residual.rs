@@ -5,12 +5,12 @@ use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::{iter, ops::MulAssign};
 
-use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
+use crate::vector::kmeans::{KMeansAlgoFloat, compute_partitions};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, UInt32Type},
-    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
@@ -20,7 +20,7 @@ use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;
 use tracing::instrument;
 
-use super::{transform::Transformer, PQ_CODE_COLUMN};
+use super::{PQ_CODE_COLUMN, transform::Transformer};
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
@@ -131,13 +131,12 @@ pub(crate) fn compute_residual(
         (DataType::Float64, DataType::Float64) => {
             do_compute_residual::<Float64Type>(centroids, vectors, distance_type, partitions)
         }
-        (DataType::Float32, DataType::Int8) => {
-            do_compute_residual::<Float32Type>(
-                centroids,
-                &vectors.convert_to_floating_point()?,
-                distance_type,
-                partitions)
-        }
+        (DataType::Float32, DataType::Int8) => do_compute_residual::<Float32Type>(
+            centroids,
+            &vectors.convert_to_floating_point()?,
+            distance_type,
+            partitions,
+        ),
         _ => Err(Error::Index {
             message: format!(
                 "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
@@ -145,7 +144,7 @@ pub(crate) fn compute_residual(
                 vectors.value_type(),
             ),
             location: location!(),
-        })
+        }),
     }
 }
 

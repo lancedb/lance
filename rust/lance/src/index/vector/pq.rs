@@ -7,8 +7,8 @@ use std::{any::Any, collections::HashMap};
 use arrow::compute::concat;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    cast::{as_primitive_array, AsArray},
-    Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
+    Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
+    cast::{AsArray, as_primitive_array},
 };
 use arrow_array::{ArrayRef, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
@@ -25,12 +25,12 @@ use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
+use lance_index::vector::pq::storage::{ProductQuantizationStorage, transpose};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
-    vector::{pq::ProductQuantizer, Query},
     Index, IndexType,
+    vector::{Query, pq::ProductQuantizer},
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -38,16 +38,16 @@ use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::location;
-use tracing::{instrument, span, Level};
+use tracing::{Level, instrument, span};
 // Re-export
 pub use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::kernels::normalize_fsl_owned;
 
 use super::VectorIndex;
+use crate::Dataset;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::io::exec::knn::KNN_INDEX_SCHEMA;
-use crate::Dataset;
 use crate::{Error, Result};
 
 /// Product Quantization Index.

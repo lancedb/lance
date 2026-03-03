@@ -11,19 +11,20 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream::StreamExt, FutureExt};
-use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::{builder::DatasetBuilder, ReadParams, WriteParams};
+use futures::{FutureExt, stream::StreamExt};
+use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{ReadParams, WriteParams, builder::DatasetBuilder};
 use lance::session::Session;
-use lance::{dataset::scanner::Scanner, Dataset};
-use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
-use lance_core::{box_error, Error, Result};
+use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::{Error, Result, box_error};
+use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::traits::DatasetIndexExt;
-use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -36,7 +37,6 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_namespace::LanceNamespace;
 use object_store::path::Path;
 use snafu::location;
 use std::io::Cursor;
@@ -78,10 +78,7 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
-            _ => Err(Error::io(
-                format!("Invalid object type: {}", s),
-                location!(),
-            )),
+            _ => Err(Error::io(format!("Invalid object type: {}", s))),
         }
     }
 }
@@ -503,7 +500,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created BTREE index '{}' on object_id for __manifest table",
@@ -529,7 +529,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created Bitmap index '{}' on object_type for __manifest table",
@@ -555,7 +558,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created LabelList index '{}' on base_objects for __manifest table",
@@ -577,7 +583,10 @@ impl ManifestNamespace {
                 }
             }
             Err(e) => {
-                log::warn!("Failed to compact files for __manifest table: {:?}. Continuing with optimization.", e);
+                log::warn!(
+                    "Failed to compact files for __manifest table: {:?}. Continuing with optimization.",
+                    e
+                );
             }
         }
 
@@ -655,16 +664,11 @@ impl ManifestNamespace {
     fn get_string_column<'a>(batch: &'a RecordBatch, column_name: &str) -> Result<&'a StringArray> {
         let column = batch
             .column_by_name(column_name)
-            .ok_or_else(|| Error::io(format!("Column '{}' not found", column_name), location!()))?;
+            .ok_or_else(|| Error::io(format!("Column '{}' not found", column_name)))?;
         column
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                Error::io(
-                    format!("Column '{}' is not a string array", column_name),
-                    location!(),
-                )
-            })
+            .ok_or_else(|| Error::io(format!("Column '{}' is not a string array", column_name)))
     }
 
     /// Check if the manifest contains an object with the given ID
@@ -724,13 +728,10 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
-                        "Expected exactly 1 table with id '{}', found {}",
-                        object_id, total_rows
-                    ),
-                    location!(),
-                ));
+                return Err(Error::io(format!(
+                    "Expected exactly 1 table with id '{}', found {}",
+                    object_id, total_rows
+                )));
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -844,12 +845,7 @@ impl ManifestNamespace {
                 Arc::new(base_objects_array),
             ],
         )
-        .map_err(|e| {
-            Error::io(
-                format!("Failed to create manifest entry: {}", e),
-                location!(),
-            )
-        })?;
+        .map_err(|e| Error::io(format!("Failed to create manifest entry: {}", e)))?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
@@ -947,10 +943,7 @@ impl ManifestNamespace {
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", name),
-                location!(),
-            ));
+            return Err(Error::io(format!("Table '{}' already exists", name)));
         }
 
         self.insert_into_manifest(object_id, ObjectType::Table, Some(location))
@@ -998,13 +991,10 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
-                        "Expected exactly 1 namespace with id '{}', found {}",
-                        object_id, total_rows
-                    ),
-                    location!(),
-                ));
+                return Err(Error::io(format!(
+                    "Expected exactly 1 namespace with id '{}', found {}",
+                    object_id, total_rows
+                )));
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -1016,13 +1006,10 @@ impl ManifestNamespace {
                 match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
                     Ok(map) => Some(map),
                     Err(e) => {
-                        return Err(Error::io(
-                            format!(
-                                "Failed to deserialize metadata for namespace '{}': {}",
-                                object_id, e
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::io(format!(
+                            "Failed to deserialize metadata for namespace '{}': {}",
+                            object_id, e
+                        )));
                     }
                 }
             } else {
@@ -1217,7 +1204,9 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = namespace_id.join(DELIMITER);
             format!(
                 "object_type = 'table' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
@@ -1393,10 +1382,7 @@ impl LanceNamespace for ManifestNamespace {
 
         // Check if table already exists in manifest
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", table_name),
-                location!(),
-            ));
+            return Err(Error::io(format!("Table '{}' already exists", table_name)));
         }
 
         // Create the physical table location with hash-based naming
@@ -1422,18 +1408,15 @@ impl LanceNamespace for ManifestNamespace {
         // Write the data using Lance Dataset
         let cursor = Cursor::new(data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| Error::io(format!("Failed to read IPC stream: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to read IPC stream: {}", e)))?;
 
         let batches: Vec<RecordBatch> =
             stream_reader
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::io(format!("Failed to collect batches: {}", e), location!()))?;
+                .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
-            return Err(Error::io(
-                "No data provided for table creation",
-                location!(),
-            ));
+            return Err(Error::io("No data provided for table creation"));
         }
 
         let schema = batches[0].schema();
@@ -1547,7 +1530,9 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = parent_namespace.join(DELIMITER);
             format!(
                 "object_type = 'namespace' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
@@ -2085,11 +2070,11 @@ mod tests {
     use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
+    use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
         ListTablesRequest, TableExistsRequest,
     };
-    use lance_namespace::LanceNamespace;
     use rstest::rstest;
 
     fn create_test_ipc_data() -> Vec<u8> {

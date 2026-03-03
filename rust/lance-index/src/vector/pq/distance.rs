@@ -6,9 +6,9 @@ use std::cmp::{max, min};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 use lance_core::assume_eq;
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::distance::{Dot, L2, dot_distance_batch, l2_distance_batch};
 use lance_linalg::simd::u8::u8x16;
-use lance_linalg::simd::{Shuffle, SIMD};
+use lance_linalg::simd::{SIMD, Shuffle};
 
 // for quantizing the distance table, we need to know the max possible distance,
 // so we perform a flat search on the first `FLAT_NUM_4BIT_PQ` rows.

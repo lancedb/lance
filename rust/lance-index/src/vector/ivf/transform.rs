@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    Array, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray, types::UInt32Type,
 };
 use lance_table::utils::LanceIteratorExtension;
 use snafu::location;

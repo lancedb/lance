@@ -9,15 +9,15 @@ use std::{iter::repeat_with, ops::Range};
 
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
-    Float32Array, Int32Array, Int8Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
+    Float32Array, Int8Array, Int32Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
     RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
-use num_traits::{real::Real, FromPrimitive};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, fixed_size_list_type};
+use num_traits::{FromPrimitive, real::Real};
 use rand::distr::uniform::SampleUniform;
 use rand::{
-    distr::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
+    Rng, SeedableRng, distr::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom,
 };
 
 pub trait ArrayGenerator {
@@ -165,13 +165,17 @@ impl BatchGenerator {
         RecordBatch::try_new(schema, arrays).unwrap()
     }
 
-    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
+    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader + use<> {
         let batch = self.gen_batch(num_rows as u32);
         let schema = batch.schema();
         RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
     }
 
-    pub fn batches(&mut self, num_batches: u32, rows_per_batch: u32) -> impl RecordBatchReader {
+    pub fn batches(
+        &mut self,
+        num_batches: u32,
+        rows_per_batch: u32,
+    ) -> impl RecordBatchReader + use<> {
         let batches = (0..num_batches)
             .map(|_| self.gen_batch(rows_per_batch))
             .collect::<Vec<_>>();

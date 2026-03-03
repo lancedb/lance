@@ -12,37 +12,37 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion_substrait::substrait::proto::{
+    AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot,
+    SortField, Version,
     aggregate_function::AggregationInvocation,
     aggregate_rel::{Grouping, Measure},
     expression::{
+        FieldReference, ReferenceSegment, RexType,
         field_reference::{ReferenceType, RootReference, RootType},
         reference_segment::{self, StructField},
-        FieldReference, ReferenceSegment, RexType,
     },
     extensions::{
-        simple_extension_declaration::{ExtensionFunction, MappingType},
         SimpleExtensionDeclaration, SimpleExtensionUri,
+        simple_extension_declaration::{ExtensionFunction, MappingType},
     },
     function_argument::ArgType,
     rel::RelType,
     sort_field::SortKind,
-    AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot,
-    SortField, Version,
 };
 use futures::TryStreamExt;
-use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
 use lance_datagen::{array, gen_batch};
 use lance_table::format::Fragment;
 use prost::Message;
 use tempfile::tempdir;
 
+use crate::Dataset;
 use crate::dataset::scanner::AggregateExpr;
 use crate::index::vector::VectorIndexParams;
-use crate::utils::test::{assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount};
-use crate::Dataset;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_plan_node_equals};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
@@ -711,7 +711,7 @@ async fn test_aggregate_with_filter() {
 
     // Filter x >= 50 matches rows 50..99 (50 rows)
     assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 50); // COUNT
-                                                                          // SUM(50..99) = (50+99)*50/2 = 3725
+    // SUM(50..99) = (50+99)*50/2 = 3725
     assert_eq!(batch.column(1).as_primitive::<Int64Type>().value(0), 3725); // SUM
     assert_eq!(batch.column(2).as_primitive::<Int64Type>().value(0), 50); // MIN
     assert_eq!(batch.column(3).as_primitive::<Int64Type>().value(0), 99); // MAX

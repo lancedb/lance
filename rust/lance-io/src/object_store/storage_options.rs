@@ -21,8 +21,8 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use lance_namespace::models::DescribeTableRequest;
 use lance_namespace::LanceNamespace;
+use lance_namespace::models::DescribeTableRequest;
 use snafu::location;
 use tokio::sync::RwLock;
 
@@ -309,10 +309,10 @@ impl StorageOptionsAccessor {
         // Check if we have valid cached options with read lock
         {
             let cached = self.cache.read().await;
-            if !self.needs_refresh(&cached) {
-                if let Some(cached_opts) = &*cached {
-                    return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-                }
+            if !self.needs_refresh(&cached)
+                && let Some(cached_opts) = &*cached
+            {
+                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
             }
         }
 
@@ -335,10 +335,10 @@ impl StorageOptionsAccessor {
 
         // Double-check if options are still stale after acquiring write lock
         // (another thread might have refreshed them)
-        if !self.needs_refresh(&cache) {
-            if let Some(cached_opts) = &*cache {
-                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-            }
+        if !self.needs_refresh(&cache)
+            && let Some(cached_opts) = &*cache
+        {
+            return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
         }
 
         log::debug!(
@@ -593,7 +593,7 @@ mod tests {
         MockClock::set_system_time(Duration::from_secs(100_000));
 
         let mock_provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000))); // 10 min expiry
-                                                                                      // Use with_initial_and_provider to set custom refresh_offset_millis (5 min = 300000ms)
+        // Use with_initial_and_provider to set custom refresh_offset_millis (5 min = 300000ms)
         let now_ms = MockClock::system_time().as_millis() as u64;
         let expires_at = now_ms + 600_000; // 10 minutes from now
         let initial = HashMap::from([

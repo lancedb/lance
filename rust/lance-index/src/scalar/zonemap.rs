@@ -12,6 +12,7 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -20,14 +21,13 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
 };
-use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -44,7 +44,7 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
@@ -367,78 +367,53 @@ impl ZoneMapIndex {
         rows_per_zone: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
-        let min_col = data.column_by_name("min").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'min' column", location!())
-        })?;
-        let max_col = data.column_by_name("max").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'max' column", location!())
-        })?;
+        let min_col = data
+            .column_by_name("min")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
+        let max_col = data
+            .column_by_name("max")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
         let null_count_col = data
             .column_by_name("null_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'null_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'null_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32")
             })?;
         let nan_count_col = data
             .column_by_name("nan_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'nan_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'nan_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32")
             })?;
         let zone_length = data
             .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_length' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
             })?;
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'fragment_id' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
             })?;
 
         let zone_start_col = data
             .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_start' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_start' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
         let data_type = min_col.data_type().clone();
@@ -937,37 +912,37 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 #[cfg(test)]
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
-    use crate::scalar::{zonemap::ROWS_PER_ZONE_DEFAULT, IndexStore};
+    use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
     use arrow::datatypes::Float32Type;
-    use arrow_array::{record_batch, Array, RecordBatch, UInt64Array};
+    use arrow_array::{Array, RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::utils::mask::NullableRowAddrSet;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap, ROW_ADDR};
+    use lance_core::{ROW_ADDR, cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
 
     use crate::scalar::{
+        SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
-            ZoneMapIndex, ZoneMapIndexBuilderParams, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
+            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
         },
-        SargableQuery, ScalarIndex, SearchResult,
     };
 
     // Add missing imports for the tests
-    use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
 

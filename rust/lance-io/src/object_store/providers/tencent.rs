@@ -5,13 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use object_store_opendal::OpendalStore;
-use opendal::{services::Cos, Operator};
-use snafu::location;
+use opendal::{Operator, services::Cos};
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -26,9 +25,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
 
         let bucket = base_path
             .host_str()
-            .ok_or_else(|| {
-                Error::invalid_input("Tencent Cos URL must contain bucket name", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("Tencent Cos URL must contain bucket name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -79,17 +76,11 @@ impl ObjectStoreProvider for TencentStoreProvider {
         if !config_map.contains_key("endpoint") {
             return Err(Error::invalid_input(
                 "COS endpoint is required. Please provide 'cos_endpoint' in storage options or set COS_ENDPOINT environment variable",
-                location!(),
             ));
         }
 
         let operator = Operator::from_iter::<Cos>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create COS operator: {:?}", e),
-                    location!(),
-                )
-            })?
+            .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?
             .finish();
 
         let opendal_store = Arc::new(OpendalStore::new(operator));

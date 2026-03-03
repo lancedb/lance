@@ -29,8 +29,8 @@ use lance_table::format::Fragment;
 use prost::Message;
 use snafu::location;
 
-use crate::dataset::builder::DatasetBuilder;
 use crate::Dataset;
+use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
@@ -551,9 +551,9 @@ fn schema_to_bytes(schema: &ArrowSchema) -> Result<Vec<u8>> {
                 message: format!("Failed to create IPC write options: {}", e),
                 location: location!(),
             })?;
-    let gen = arrow_ipc::writer::IpcDataGenerator::default();
+    let generator = arrow_ipc::writer::IpcDataGenerator::default();
     let mut tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-    let encoded = gen.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
+    let encoded = generator.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
     Ok(encoded.ipc_message.to_vec())
 }
 

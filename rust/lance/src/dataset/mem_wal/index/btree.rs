@@ -13,7 +13,6 @@ use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::scalar::btree::OrderableScalarValue;
-use snafu::location;
 
 use super::RowPosition;
 
@@ -80,10 +79,7 @@ impl BTreeMemIndex {
             .column_with_name(&self.column_name)
             .map(|(idx, _)| idx)
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!("Column '{}' not found in batch", self.column_name),
-                    location!(),
-                )
+                Error::invalid_input(format!("Column '{}' not found in batch", self.column_name))
             })?;
 
         let column = batch.column(col_idx);
@@ -224,11 +220,11 @@ impl BTreeMemIndex {
 
         for entry in self.lookup.iter() {
             let key = entry.key();
-            if let Some(last) = result.last_mut() {
-                if last.0 == key.value {
-                    last.1.push(key.row_position);
-                    continue;
-                }
+            if let Some(last) = result.last_mut()
+                && last.0 == key.value
+            {
+                last.1.push(key.row_position);
+                continue;
             }
             result.push((key.value.clone(), vec![key.row_position]));
         }
@@ -373,12 +369,8 @@ impl BTreeMemIndex {
         // Create row_id array
         let row_id_array = Arc::new(UInt64Array::from(row_ids.to_vec()));
 
-        RecordBatch::try_new(schema.clone(), vec![value_array, row_id_array]).map_err(|e| {
-            Error::io(
-                format!("Failed to create training batch: {}", e),
-                location!(),
-            )
-        })
+        RecordBatch::try_new(schema.clone(), vec![value_array, row_id_array])
+            .map_err(|e| Error::io(format!("Failed to create training batch: {}", e)))
     }
 }
 
@@ -583,8 +575,8 @@ mod tests {
         assert_eq!(snapshot.len(), 3);
 
         // Snapshot should be in sorted order
-        assert_eq!(snapshot[0].0 .0, ScalarValue::Int32(Some(0)));
-        assert_eq!(snapshot[1].0 .0, ScalarValue::Int32(Some(1)));
-        assert_eq!(snapshot[2].0 .0, ScalarValue::Int32(Some(2)));
+        assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
+        assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
+        assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
     }
 }

@@ -6,20 +6,19 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Fields};
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
 use crate::format::ProtobufUtils;
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{DataBlock, FixedWidthDataBlock, StructDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 #[derive(Debug)]
@@ -212,23 +211,23 @@ impl ArrayEncoder for PackedStructEncoder {
                     let flattened = fixed_size_list.try_into_flat().ok_or_else(|| {
                         Error::invalid_input(
                             "Packed struct encoder cannot pack nullable fixed-width data blocks",
-                            location!(),
                         )
                     })?;
                     Ok(flattened)
                 }
                 _ => Err(Error::invalid_input(
                     "Packed struct encoder currently only implemented for fixed-width data blocks",
-                    location!(),
                 )),
             })
             .collect::<Result<Vec<_>>>()?;
         let total_bits_per_value = fixed_fields.iter().map(|f| f.bits_per_value).sum::<u64>();
 
         let num_values = fixed_fields[0].num_values;
-        debug_assert!(fixed_fields
-            .iter()
-            .all(|field| field.num_values == num_values));
+        debug_assert!(
+            fixed_fields
+                .iter()
+                .all(|field| field.num_values == num_values)
+        );
 
         let zipped_input = fixed_fields
             .into_iter()
@@ -259,11 +258,11 @@ impl ArrayEncoder for PackedStructEncoder {
 #[cfg(test)]
 pub mod tests {
 
-    use arrow_array::{ArrayRef, Int32Array, StructArray, UInt64Array, UInt8Array};
+    use arrow_array::{ArrayRef, Int32Array, StructArray, UInt8Array, UInt64Array};
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
     async fn test_random_packed_struct() {

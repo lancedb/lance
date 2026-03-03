@@ -6,7 +6,7 @@ use std::sync::Arc;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_index::{vector::VectorIndex, IndexParams, IndexType};
+use lance_index::{IndexParams, IndexType, vector::VectorIndex};
 
 use crate::Dataset;
 
@@ -62,7 +62,7 @@ mod test {
     use std::{
         any::Any,
         collections::HashMap,
-        sync::{atomic::AtomicBool, Arc},
+        sync::{Arc, atomic::AtomicBool},
     };
 
     use arrow_array::{Float32Array, RecordBatch, UInt32Array};
@@ -75,15 +75,15 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
+        DatasetIndexExt, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata,
+        IndexType,
+        vector::{Query, hnsw::VECTOR_ID_FIELD},
+    };
+    use lance_index::{
         metrics::MetricsCollector,
         vector::quantizer::{QuantizationType, Quantizer},
     };
     use lance_index::{metrics::NoOpMetricsCollector, vector::ivf::storage::IvfModel};
-    use lance_index::{
-        vector::{hnsw::VECTOR_ID_FIELD, Query},
-        DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
-        INDEX_METADATA_SCHEMA_KEY,
-    };
     use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
     use lance_table::io::manifest::ManifestDescribing;
@@ -348,12 +348,16 @@ mod test {
             .unwrap();
 
         // neither has been called
-        assert!(!idx_ext
-            .create_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(!idx_ext
-            .load_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !idx_ext
+                .create_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !idx_ext
+                .load_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
 
         let mut ds_with_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
             .with_session(Arc::new(session))
@@ -368,12 +372,16 @@ mod test {
             .unwrap();
 
         // create index should have been called
-        assert!(idx_ext
-            .create_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(!idx_ext
-            .load_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            idx_ext
+                .create_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !idx_ext
+                .load_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
 
         // check that the index was created
         let ds_without_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
@@ -386,12 +394,14 @@ mod test {
         let index_uuid = idx.first().unwrap().uuid.to_string();
 
         // trying to open the index should fail as there is no extension loader
-        assert!(ds_without_extension
-            .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported index type: TEST"));
+        assert!(
+            ds_without_extension
+                .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported index type: TEST")
+        );
 
         // trying to open the index should succeed with the extension loader
         let vector_index = ds_with_extension
@@ -400,12 +410,16 @@ mod test {
             .unwrap();
 
         // load index should have been called
-        assert!(idx_ext
-            .create_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(idx_ext
-            .load_index_called
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            idx_ext
+                .create_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            idx_ext
+                .load_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
 
         // should be able to downcast to the mock index
         let _downcasted = vector_index.as_any().downcast_ref::<MockIndex>().unwrap();

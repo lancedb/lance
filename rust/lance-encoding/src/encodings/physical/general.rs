@@ -4,6 +4,7 @@
 use log::trace;
 
 use crate::{
+    Result,
     buffer::LanceBuffer,
     compression::MiniBlockDecompressor,
     data::DataBlock,
@@ -11,8 +12,7 @@ use crate::{
         logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
         physical::block::{CompressionConfig, GeneralBufferCompressor},
     },
-    format::{pb21::CompressiveEncoding, ProtobufUtils21},
-    Result,
+    format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
 
 /// A miniblock compressor that wraps another miniblock compressor and applies

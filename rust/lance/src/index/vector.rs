@@ -23,7 +23,7 @@ use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::{noop_progress, IndexBuildProgress};
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -38,17 +38,17 @@ use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
+    VectorIndex,
     hnsw::{
         builder::HnswBuildParams,
         index::{HNSWIndex, HNSWIndexOptions},
     },
     ivf::IvfBuildParams,
     pq::PQBuildParams,
-    sq::{builder::SQBuildParams, ScalarQuantizer},
-    VectorIndex,
+    sq::{ScalarQuantizer, builder::SQBuildParams},
 };
 use lance_index::{
-    DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+    DatasetIndexExt, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType,
     VECTOR_INDEX_VERSION,
 };
 use lance_io::traits::Reader;
@@ -60,9 +60,9 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{pb, vector_index_details, DatasetIndexInternalExt, IndexParams};
+use super::{DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
+use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
@@ -355,15 +355,15 @@ for concurrent distributed create_index"
     }
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message:
-                    "Build Distributed Vector Index: multivector type supports only cosine distance"
-                        .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message:
+                "Build Distributed Vector Index: multivector type supports only cosine distance"
+                    .to_string(),
+            location: location!(),
+        });
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -741,14 +741,14 @@ pub(crate) async fn build_vector_index(
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message: "Build Vector Index: multivector type supports only cosine distance"
-                    .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message: "Build Vector Index: multivector type supports only cosine distance"
+                .to_string(),
+            location: location!(),
+        });
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -1012,14 +1012,14 @@ pub(crate) async fn build_vector_index_incremental(
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    if let DataType::List(_) = vector_type {
-        if params.metric_type != DistanceType::Cosine {
-            return Err(Error::Index {
-                message: "Build Vector Index: multivector type supports only cosine distance"
-                    .to_string(),
-                location: location!(),
-            });
-        }
+    if let DataType::List(_) = vector_type
+        && params.metric_type != DistanceType::Cosine
+    {
+        return Err(Error::Index {
+            message: "Build Vector Index: multivector type supports only cosine distance"
+                .to_string(),
+            location: location!(),
+        });
     }
 
     // Extract IVF model and quantizer from existing index
@@ -1741,15 +1741,15 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
 mod tests {
     use super::*;
     use crate::dataset::Dataset;
-    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::Array;
     use arrow_array::RecordBatch;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
-    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::DatasetIndexExt;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
 
     #[tokio::test]

@@ -4,15 +4,15 @@
 //! Utilities for remapping row ids. Necessary before stable row ids.
 //!
 
+use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
-use crate::Result;
-use crate::{index, Dataset};
+use crate::{Dataset, index};
 use async_trait::async_trait;
-use lance_core::utils::address::RowAddress;
 use lance_core::Error;
-use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
+use lance_core::utils::address::RowAddress;
 use lance_index::DatasetIndexExt;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
@@ -253,9 +253,10 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                             // and we always reindex either the entire group or nothing.
                             // We use invalid input to be consistent with
                             // dataset::transaction::recalculate_fragment_bitmap
-                            return Err(Error::invalid_input(
-                                format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags),
-                                location!()));
+                            return Err(Error::invalid_input(format!(
+                                "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                group.old_frags
+                            )));
                         }
                         index_frag_bitmap
                             .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));

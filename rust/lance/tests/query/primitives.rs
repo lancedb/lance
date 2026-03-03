@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use lance::Dataset;
 
-use lance_datagen::{array, gen_batch, ArrayGeneratorExt, RowCount};
+use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
 
 use super::{test_filter, test_scan, test_take};

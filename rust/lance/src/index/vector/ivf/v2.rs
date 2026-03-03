@@ -6,10 +6,10 @@
 use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use crate::index::vector::{builder::index_type_string, IndexFileVersion};
+use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{
-    vector::{utils::PartitionLoadLock, VectorIndex},
     PreFilter,
+    vector::{VectorIndex, utils::PartitionLoadLock},
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
@@ -23,11 +23,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -36,21 +37,19 @@ use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::{
-    pb,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
-        v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY,
+        DISTANCE_TYPE_KEY, Query, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
+        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
-    Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
-use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 use lance_io::local::to_local_path;
 use lance_io::scheduler::SchedulerConfig;
 use lance_io::utils::CachedFileSize;
 use lance_io::{
-    object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
+    ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
 use object_store::path::Path;
@@ -59,7 +58,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
+use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
 
 #[derive(Debug, DeepSizeOf)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
@@ -449,7 +448,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         _pre_filter: Arc<dyn PreFilter>,
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
+        unimplemented!(
+            "IVFIndex not currently used as sub-index and top-level indices do partition-aware search"
+        )
     }
 
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
@@ -615,7 +616,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_le, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
@@ -626,53 +627,53 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
-        storage::RabitQuantizationMetadata, RQBuildParams, RQRotationType,
+        RQBuildParams, RQRotationType, storage::RabitQuantizationMetadata,
     };
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::finalize_distributed_merge;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
-        dataset::optimize::{compact_files, CompactionOptions},
-        index::vector::IndexFileVersion,
+        Dataset,
+        index::vector::{VectorIndex, VectorIndexParams},
     };
     use crate::{
-        index::vector::{VectorIndex, VectorIndexParams},
-        Dataset,
+        dataset::optimize::{CompactionOptions, compact_files},
+        index::vector::IndexFileVersion,
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{Result, ROW_ID};
+    use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
+    use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::kmeans::{train_kmeans, KMeansParams};
+    use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::DIST_COL;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
     };
-    use lance_linalg::distance::{multivec_distance, DistanceType};
+    use lance_linalg::distance::{DistanceType, multivec_distance};
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -3024,9 +3025,11 @@ mod tests {
             .max()
             .expect("expected at least one partition count");
         assert!(base_partition_count >= 2);
-        assert!(partitions_before
-            .iter()
-            .all(|count| *count == base_partition_count));
+        assert!(
+            partitions_before
+                .iter()
+                .all(|count| *count == base_partition_count)
+        );
 
         let indices_meta = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(indices_meta.len(), 2);

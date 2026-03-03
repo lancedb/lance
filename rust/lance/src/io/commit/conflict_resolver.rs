@@ -5,20 +5,20 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
-    dataset::transaction::{Operation, Transaction},
     Dataset,
+    dataset::transaction::{Operation, Transaction},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
     Error, Result,
+    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::{MergedGeneration, MEM_WAL_INDEX_NAME};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
-use snafu::{location, Location};
+use snafu::{Location, location};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -1517,11 +1517,10 @@ impl<'a> TransactionRebase<'a> {
                         .initial_fragments
                         .get(fragment_id)
                         .and_then(|(fragment, _)| fragment.physical_rows)
+                        && dv.len() == physical_rows
                     {
-                        if dv.len() == physical_rows {
-                            new_deleted_frag_ids.push(*fragment_id);
-                            continue;
-                        }
+                        new_deleted_frag_ids.push(*fragment_id);
+                        continue;
                     }
 
                     let new_deletion_file = write_deletion_file(
@@ -1838,12 +1837,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+
+        InsertBuilder::new("memory://")
             .with_params(&write_params)
             .execute(vec![data])
             .await
-            .unwrap();
-        dataset
+            .unwrap()
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -2282,7 +2281,7 @@ mod tests {
 
     #[test]
     fn test_conflicts() {
-        use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
+        use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
 
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -3161,7 +3160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conflicts_data_replacement() {
-        use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
+        use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
 
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

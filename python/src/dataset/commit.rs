@@ -38,7 +38,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
             return CommitError::OtherError(Error::Internal {
                 message: format!("Error importing from pylance {}", import_error),
                 location: location!(),
-            })
+            });
         }
     };
 

@@ -22,11 +22,11 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_VALUES,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb21::compressive_encoding::Compression;
 use crate::format::pb21::CompressiveEncoding;
-use crate::format::{pb21, ProtobufUtils21};
+use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::{ProtobufUtils21, pb21};
 
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
@@ -411,8 +411,10 @@ impl BlockCompressor for VariableEncoder {
                         Ok(LanceBuffer::from(output))
                     }
                     _ => {
-                        panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
-                variable_width_data.bits_per_offset);
+                        panic!(
+                            "BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
+                            variable_width_data.bits_per_offset
+                        );
                     }
                 }
             }
@@ -529,8 +531,8 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 #[cfg(test)]
 pub mod tests {
     use arrow_array::{
-        builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, StringArray,
+        builder::{LargeStringBuilder, StringBuilder},
     };
     use arrow_schema::{DataType, Field};
 
@@ -546,8 +548,8 @@ pub mod tests {
 
     use crate::{
         testing::{
-            check_basic_random, check_round_trip_encoding_of_data, FnArrayGeneratorProvider,
-            TestCases,
+            FnArrayGeneratorProvider, TestCases, check_basic_random,
+            check_round_trip_encoding_of_data,
         },
         version::LanceFileVersion,
     };

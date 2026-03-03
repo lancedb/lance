@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
@@ -27,12 +27,12 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
-use lance_core::{Result, ROW_ID};
+use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
 
-use crate::index::prefilter::DatasetPreFilter;
 use crate::Dataset;
+use crate::index::prefilter::DatasetPreFilter;
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
@@ -431,20 +431,20 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{types::UInt32Type, RecordBatchReader};
+    use arrow_array::{RecordBatchReader, types::UInt32Type};
     use arrow_schema::SortOptions;
     use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
         physical_plan::{
-            joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter, ExecutionPlan,
+            ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, TryStreamExt};
     use lance_core::utils::futures::Capacity;
     use lance_datafusion::exec::OneShotExec;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
 
     use super::ReplayExec;
 

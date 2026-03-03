@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
     CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableVersionRequest,
     DescribeTableVersionResponse, ListTableVersionsRequest, ListTableVersionsResponse,
 };
-use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
@@ -921,10 +921,10 @@ pub fn extract_namespace_arc(
             if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
                 return Ok(dir_ns.borrow().inner.clone());
             }
-        } else if type_name == "RestNamespace" {
-            if let Ok(rest_ns) = inner.downcast::<PyRestNamespace>() {
-                return Ok(rest_ns.borrow().inner.clone());
-            }
+        } else if type_name == "RestNamespace"
+            && let Ok(rest_ns) = inner.downcast::<PyRestNamespace>()
+        {
+            return Ok(rest_ns.borrow().inner.clone());
         }
     }
 

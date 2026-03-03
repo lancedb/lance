@@ -81,9 +81,11 @@ impl TryFrom<pb::MergedGeneration> for MergedGeneration {
     type Error = Error;
 
     fn try_from(mg: pb::MergedGeneration) -> lance_core::Result<Self> {
-        let region_id = mg.region_id.as_ref().map(Uuid::try_from).ok_or_else(|| {
-            Error::invalid_input("Missing region_id in MergedGeneration", location!())
-        })??;
+        let region_id = mg
+            .region_id
+            .as_ref()
+            .map(Uuid::try_from)
+            .ok_or_else(|| Error::invalid_input("Missing region_id in MergedGeneration"))??;
         Ok(Self {
             region_id,
             generation: mg.generation,
@@ -187,9 +189,11 @@ impl TryFrom<pb::RegionManifest> for RegionManifest {
     type Error = Error;
 
     fn try_from(rm: pb::RegionManifest) -> lance_core::Result<Self> {
-        let region_id = rm.region_id.as_ref().map(Uuid::try_from).ok_or_else(|| {
-            Error::invalid_input("Missing region_id in RegionManifest", location!())
-        })??;
+        let region_id = rm
+            .region_id
+            .as_ref()
+            .map(Uuid::try_from)
+            .ok_or_else(|| Error::invalid_input("Missing region_id in RegionManifest"))??;
         Ok(Self {
             region_id,
             version: rm.version,
@@ -363,7 +367,7 @@ impl MemWalIndex {
         let caught_up_gen = self.index_caught_up_generation(index_name, region_id);
 
         // If not tracked in index_catchup, assumed fully caught up
-        caught_up_gen.is_none_or(|gen| gen >= merged_gen)
+        caught_up_gen.is_none_or(|generation| generation >= merged_gen)
     }
 }
 

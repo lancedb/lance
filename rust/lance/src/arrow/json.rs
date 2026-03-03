@@ -104,7 +104,7 @@ impl TryFrom<&DataType> for JsonDataType {
                 return Err(Error::Arrow {
                     message: format!("Json conversion: Unsupported type: {dt}"),
                     location: location!(),
-                })
+                });
             }
         };
 
@@ -310,7 +310,7 @@ mod test {
     use super::*;
 
     use arrow_schema::TimeUnit;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn assert_type_json_str(dt: DataType, val: Value) {
         assert_eq!(
