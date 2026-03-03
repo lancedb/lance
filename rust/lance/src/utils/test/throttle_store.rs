@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use lance_io::object_store::WrappingObjectStore;
 use object_store::{
-    throttle::{ThrottleConfig, ThrottledStore},
     ObjectStore,
+    throttle::{ThrottleConfig, ThrottledStore},
 };
 
 #[derive(Debug, Clone, Default)]

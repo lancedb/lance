@@ -10,7 +10,7 @@ use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
@@ -23,13 +23,13 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
-        ivf::storage::{IvfModel, IVF_METADATA_KEY},
+        ivf::storage::{IVF_METADATA_KEY, IvfModel},
         quantizer::Quantization,
     },
 };
 
-use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::DISTANCE_TYPE_KEY;
+use super::quantizer::{Quantizer, QuantizerMetadata};
 
 /// <section class="warning">
 ///  Internal API

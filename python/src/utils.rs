@@ -19,17 +19,17 @@ use crate::rt;
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array, cast::AsArray};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance::datatypes::Schema;
 use lance::Result;
+use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::scalar::IndexWriter;
-use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
+use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::kmeans::{
-    compute_partitions, KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams,
+    KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams, compute_partitions,
 };
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
@@ -37,10 +37,10 @@ use lance_table::io::manifest::ManifestDescribing;
 use pyo3::intern;
 use pyo3::types::PyNone;
 use pyo3::{
+    IntoPyObjectExt,
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyIterator,
-    IntoPyObjectExt,
 };
 
 /// A wrapper around a JSON string that converts to a Python object

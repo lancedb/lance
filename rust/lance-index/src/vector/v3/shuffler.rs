@@ -12,9 +12,9 @@ use arrow_schema::Schema;
 use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::{
+    Error, Result,
     cache::LanceCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
-    Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};

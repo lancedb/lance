@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
-use arrow_array::{cast::AsArray, Array, ArrayRef, FixedSizeListArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::StreamExt;
 use lance_arrow::DataTypeExt;
@@ -154,10 +154,15 @@ pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize>
 }
 
 fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) -> Result<usize> {
-    match (data_type,in_list) {
-        (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
-        (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
-        _ => Err(Error::invalid_input(format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type), location!()))
+    match (data_type, in_list) {
+        (arrow::datatypes::DataType::FixedSizeList(_, dim), _) => Ok(*dim as usize),
+        (arrow::datatypes::DataType::List(inner), false) => {
+            infer_vector_dim_impl(inner.data_type(), true)
+        }
+        _ => Err(Error::invalid_input(format!(
+            "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+            data_type
+        ))),
     }
 }
 
@@ -208,13 +213,10 @@ pub fn validate_distance_type_for(
     if supported {
         Ok(())
     } else {
-        Err(Error::invalid_input(
-            format!(
-                "Distance type {} does not support {} vectors",
-                distance_type, element_type
-            ),
-            location!(),
-        ))
+        Err(Error::invalid_input(format!(
+            "Distance type {} does not support {} vectors",
+            distance_type, element_type
+        )))
     }
 }
 
@@ -252,13 +254,10 @@ fn infer_vector_element_type_impl(
         (arrow::datatypes::DataType::List(inner), false) => {
             infer_vector_element_type_impl(inner.data_type(), true)
         }
-        _ => Err(Error::invalid_input(
-            format!(
+        _ => Err(Error::invalid_input(format!(
             "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
             data_type
-        ),
-            location!(),
-        )),
+        ))),
     }
 }
 
@@ -468,7 +467,7 @@ fn fsl_values_to_array(
             return Err(Error::Index {
                 message: format!("Expected FixedSizeList, got {:?}", other),
                 location: location!(),
-            })
+            });
         }
     };
 
@@ -748,16 +747,18 @@ fn random_ranges(
             .cloned()
             .collect::<std::collections::HashSet<_>>();
 
-        let additional = std::iter::from_fn(move || loop {
-            if seen.len() >= num_bins {
-                break None;
-            }
-            let next = (0..num_bins).choose(&mut rng).unwrap();
-            if seen.contains(&next) {
-                continue;
-            } else {
-                seen.insert(next);
-                return Some(next);
+        let additional = std::iter::from_fn(move || {
+            loop {
+                if seen.len() >= num_bins {
+                    break None;
+                }
+                let next = (0..num_bins).choose(&mut rng).unwrap();
+                if seen.contains(&next) {
+                    continue;
+                } else {
+                    seen.insert(next);
+                    return Some(next);
+                }
             }
         });
 
@@ -776,10 +777,10 @@ fn random_ranges(
 mod tests {
     use super::*;
 
-    use arrow_array::{types::Float32Type, Float32Array};
+    use arrow_array::{Float32Array, types::Float32Type};
     use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
 
     use crate::dataset::InsertBuilder;
 

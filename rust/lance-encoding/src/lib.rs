@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 
 use lance_core::Result;
 

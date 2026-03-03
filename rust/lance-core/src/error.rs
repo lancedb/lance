@@ -4,7 +4,7 @@
 use std::fmt;
 
 use arrow_schema::ArrowError;
-use snafu::{Location, Snafu};
+use snafu::{IntoError as _, Location, Snafu, location};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -57,6 +57,7 @@ pub enum Error {
     #[snafu(display("Invalid user input: {source}, {location}"))]
     InvalidInput {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
@@ -82,6 +83,7 @@ pub enum Error {
     #[snafu(display("Not supported: {source}, {location}"))]
     NotSupported {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
@@ -103,8 +105,14 @@ pub enum Error {
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention { message: String, location: Location },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"))]
-    Internal { message: String, location: Location },
+    #[snafu(display(
+        "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"
+    ))]
+    Internal {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
     #[snafu(display("Unprocessable: {message}, {location}"))]
@@ -160,6 +168,7 @@ pub enum Error {
     #[snafu(display("Namespace error: {source}, {location}"))]
     Namespace {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     /// External error passed through from user code.
@@ -189,19 +198,17 @@ impl Error {
         }
     }
 
-    pub fn invalid_input(message: impl Into<String>, location: Location) -> Self {
-        let message: String = message.into();
-        Self::InvalidInput {
-            source: message.into(),
-            location,
-        }
+    #[track_caller]
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        InvalidInputSnafu.into_error(message.into().into())
     }
 
-    pub fn io(message: impl Into<String>, location: Location) -> Self {
+    #[track_caller]
+    pub fn io(message: impl Into<String>) -> Self {
         let message: String = message.into();
         Self::IO {
             source: message.into(),
-            location,
+            location: location!(),
         }
     }
 
@@ -223,21 +230,40 @@ impl Error {
     pub fn not_found(uri: impl Into<String>) -> Self {
         Self::NotFound {
             uri: uri.into(),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 
-    pub fn schema(message: impl Into<String>, location: Location) -> Self {
+    #[track_caller]
+    pub fn schema(message: impl Into<String>) -> Self {
         let message: String = message.into();
-        Self::Schema { message, location }
+        Self::Schema {
+            message,
+            location: location!(),
+        }
     }
 
-    pub fn not_supported(message: impl Into<String>, location: Location) -> Self {
-        let message: String = message.into();
-        Self::NotSupported {
-            source: message.into(),
-            location,
+    #[track_caller]
+    pub fn not_supported(message: impl Into<String>) -> Self {
+        NotSupportedSnafu.into_error(message.into().into())
+    }
+
+    #[track_caller]
+    pub fn internal(message: impl Into<String>) -> Self {
+        InternalSnafu {
+            message: message.into(),
         }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn namespace(message: impl Into<String>) -> Self {
+        NamespaceSnafu.into_error(message.into().into())
+    }
+
+    #[track_caller]
+    pub fn namespace_source(source: Box<dyn std::error::Error + Send + Sync + 'static>) -> Self {
+        NamespaceSnafu.into_error(source)
     }
 
     /// Create an External error from a boxed error source.
@@ -286,21 +312,11 @@ pub trait LanceOptionExt<T> {
 impl<T> LanceOptionExt<T> for Option<T> {
     #[track_caller]
     fn expect_ok(self) -> Result<T> {
-        let location = std::panic::Location::caller().to_snafu_location();
+        let location = location!();
         self.ok_or_else(|| Error::Internal {
             message: "Expected option to have value".to_string(),
             location,
         })
-    }
-}
-
-pub trait ToSnafuLocation {
-    fn to_snafu_location(&'static self) -> snafu::Location;
-}
-
-impl ToSnafuLocation for std::panic::Location<'static> {
-    fn to_snafu_location(&'static self) -> snafu::Location {
-        snafu::Location::new(self.file(), self.line(), self.column())
     }
 }
 
@@ -322,7 +338,7 @@ impl From<ArrowError> for Error {
             }
             other => Self::Arrow {
                 message: other.to_string(),
-                location: std::panic::Location::caller().to_snafu_location(),
+                location: location!(),
             },
         }
     }
@@ -333,7 +349,7 @@ impl From<&ArrowError> for Error {
     fn from(e: &ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -343,7 +359,7 @@ impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -353,7 +369,7 @@ impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -363,7 +379,7 @@ impl From<prost::DecodeError> for Error {
     fn from(e: prost::DecodeError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -373,7 +389,7 @@ impl From<prost::EncodeError> for Error {
     fn from(e: prost::EncodeError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -383,7 +399,7 @@ impl From<prost::UnknownEnumValue> for Error {
     fn from(e: prost::UnknownEnumValue) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -393,7 +409,7 @@ impl From<tokio::task::JoinError> for Error {
     fn from(e: tokio::task::JoinError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -403,7 +419,7 @@ impl From<object_store::path::Error> for Error {
     fn from(e: object_store::path::Error) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -413,7 +429,7 @@ impl From<url::ParseError> for Error {
     fn from(e: url::ParseError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -423,7 +439,7 @@ impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Arrow {
             message: e.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -447,7 +463,7 @@ impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -458,7 +474,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
             source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         }
     }
 }
@@ -475,7 +491,7 @@ impl From<Error> for datafusion_common::DataFusionError {
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
-        let location = std::panic::Location::caller().to_snafu_location();
+        let location = location!();
         match e {
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
@@ -540,7 +556,7 @@ impl Clone for CloneableError {
     fn clone(&self) -> Self {
         Self(Error::Cloned {
             message: self.0.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location: location!(),
         })
     }
 }
@@ -574,7 +590,7 @@ mod test {
         match f().unwrap_err() {
             Error::IO { location, .. } => {
                 // +4 is the beginning of object_store::Error::Generic...
-                assert_eq!(location.line, current_fn.line() + 4, "{}", location)
+                assert_eq!(location.line(), current_fn.line() + 4, "{}", location)
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
@@ -626,7 +642,7 @@ mod test {
         assert_eq!(recovered.code, 123);
 
         // Test that non-External variants return None
-        let io_err = Error::io("test", snafu::Location::new("test", 1, 1));
+        let io_err = Error::io("test");
         assert!(io_err.external_source().is_none());
     }
 
@@ -647,7 +663,7 @@ mod test {
         }
 
         // Test that non-External variants return Err(self)
-        let io_err = Error::io("test", snafu::Location::new("test", 1, 1));
+        let io_err = Error::io("test");
         match io_err.into_external() {
             Err(Error::IO { .. }) => {}
             _ => panic!("Expected Err with IO variant"),
@@ -737,10 +753,7 @@ mod test {
     /// (e.g., via RecordBatchIterator) before being converted back.
     #[test]
     fn test_lance_error_roundtrip_through_arrow() {
-        let original = Error::invalid_input(
-            "test validation error",
-            snafu::Location::new("test.rs", 10, 1),
-        );
+        let original = Error::invalid_input("test validation error");
 
         // Simulate what happens when using ? in an Arrow context
         let arrow_err: ArrowError = original.into();
@@ -765,10 +778,7 @@ mod test {
     #[cfg(feature = "datafusion")]
     #[test]
     fn test_lance_error_roundtrip_through_datafusion() {
-        let original = Error::invalid_input(
-            "test validation error",
-            snafu::Location::new("test.rs", 10, 1),
-        );
+        let original = Error::invalid_input("test validation error");
 
         // Simulate what happens when using ? in a DataFusion context
         let df_err: datafusion_common::DataFusionError = original.into();

@@ -13,11 +13,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
-use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::spawn_cpu;
@@ -26,14 +26,14 @@ use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
-use tracing::instrument;
 use tracing::Instrument;
+use tracing::instrument;
 
+use crate::Dataset;
+use crate::Result;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::utils::future::SharedPrerequisite;
-use crate::Dataset;
-use crate::Result;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
@@ -319,10 +319,12 @@ mod test {
 
         dataset.delete("x >= 3").await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
-        assert!(dataset.get_fragments()[0]
-            .metadata()
-            .deletion_file
-            .is_none());
+        assert!(
+            dataset.get_fragments()[0]
+                .metadata()
+                .deletion_file
+                .is_none()
+        );
         let only_missing_frags = Arc::new(dataset.clone());
 
         TestDatasets {

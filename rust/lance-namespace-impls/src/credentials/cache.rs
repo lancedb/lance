@@ -190,15 +190,16 @@ impl CredentialVendor for CachingCredentialVendor {
         // Try to get from cache first
         {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(&cache_key) {
-                if !entry.is_stale() && !entry.credentials.is_expired() {
-                    debug!(
-                        "Credential cache hit for location={}, provider={}",
-                        table_location,
-                        self.inner.provider_name()
-                    );
-                    return Ok(entry.credentials.clone());
-                }
+            if let Some(entry) = cache.get(&cache_key)
+                && !entry.is_stale()
+                && !entry.credentials.is_expired()
+            {
+                debug!(
+                    "Credential cache hit for location={}, provider={}",
+                    table_location,
+                    self.inner.provider_name()
+                );
+                return Ok(entry.credentials.clone());
             }
         }
 

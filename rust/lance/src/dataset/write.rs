@@ -3,8 +3,8 @@
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{
@@ -13,9 +13,9 @@ use lance_core::datatypes::{
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
+use lance_datafusion::spill::{SpillReceiver, SpillSender, create_replay_spill};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::{
     FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
@@ -24,25 +24,24 @@ use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
-use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
+use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::location;
 use std::collections::HashMap;
 use std::num::NonZero;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
-use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
-use crate::session::Session;
 use crate::Dataset;
+use crate::dataset::blob::{BlobPreprocessor, preprocess_blob_batches};
+use crate::session::Session;
 
+use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
-use super::DATA_DIR;
 
 mod commit;
 pub mod delete;
@@ -123,10 +122,10 @@ impl TryFrom<&str> for WriteMode {
             "create" => Ok(Self::Create),
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
-            _ => Err(Error::invalid_input(
-                format!("Invalid write mode: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid write mode: {}",
+                value
+            ))),
         }
     }
 }
@@ -450,19 +449,15 @@ pub async fn validate_and_resolve_target_bases(
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
     // Step 1: Validations
     if !matches!(params.mode, WriteMode::Create) && params.initial_bases.is_some() {
-        return Err(Error::invalid_input(
-            format!(
-                "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
-                params.mode
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
+            params.mode
+        )));
     }
 
     if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
         return Err(Error::invalid_input(
             "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
-            location!(),
         ));
     }
 
@@ -493,10 +488,10 @@ pub async fn validate_and_resolve_target_bases(
                 })
                 .map(|(&id, _)| id)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!("Base reference '{}' not found in available bases", ref_str),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "Base reference '{}' not found in available bases",
+                        ref_str
+                    ))
                 })?;
 
             resolved_ids.push(id);
@@ -519,13 +514,10 @@ pub async fn validate_and_resolve_target_bases(
 
         for &target_base_id in target_bases {
             let base_path = all_bases.get(&target_base_id).ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Target base ID {} not found in available bases",
-                        target_base_id
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Target base ID {} not found in available bases",
+                    target_base_id
+                ))
             })?;
 
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
@@ -633,14 +625,10 @@ pub async fn write_fragments_internal(
     };
 
     if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "Blob v2 requires file version >= 2.2 (got {:?})",
-                storage_version
-            )
-            .into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input(format!(
+            "Blob v2 requires file version >= 2.2 (got {:?})",
+            storage_version
+        )));
     }
 
     if storage_version >= LanceFileVersion::V2_2
@@ -649,13 +637,9 @@ pub async fn write_fragments_internal(
             .iter()
             .any(|f| f.metadata.contains_key(BLOB_META_KEY))
     {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
-            )
-            .into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input(format!(
+            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
+        )));
     }
 
     let fragments = do_write_fragments(
@@ -944,17 +928,17 @@ async fn resolve_commit_handler(
                 .map(|opts| opts.object_store.is_some())
                 .unwrap_or_default()
             {
-                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: Default::default() });
+                return Err(Error::invalid_input(
+                    "when creating a dataset with a custom object store the commit_handler must also be specified",
+                ));
             }
             commit_handler_from_url(uri, store_options).await
         }
         Some(commit_handler) => {
             if uri.starts_with("s3+ddb") {
-                Err(Error::InvalidInput {
-                    source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                        .into(),
-                    location: Default::default(),
-                })
+                Err(Error::invalid_input(
+                    "`s3+ddb://` scheme and custom commit handler are mutually exclusive",
+                ))
             } else {
                 Ok(commit_handler)
             }
@@ -1017,10 +1001,8 @@ impl SpillStreamIter {
         memory_limit: usize,
     ) -> Result<Self> {
         let tmp_dir = tokio::task::spawn_blocking(|| {
-            TempDir::try_new().map_err(|e| Error::InvalidInput {
-                source: format!("Failed to create temp dir: {}", e).into(),
-                location: location!(),
-            })
+            TempDir::try_new()
+                .map_err(|e| Error::invalid_input(format!("Failed to create temp dir: {}", e)))
         })
         .await
         .ok()
@@ -1077,7 +1059,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_io::traits::Reader;
 
@@ -1745,34 +1727,27 @@ mod tests {
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
         // Replicate the validation logic from the main write function
-        if matches!(params.mode, WriteMode::Create) {
-            if let Some(target_bases) = &params.target_bases {
-                if target_bases.len() != 1 {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "target_bases with {} elements is not supported",
-                            target_bases.len()
-                        ),
-                        Default::default(),
-                    ));
+        if matches!(params.mode, WriteMode::Create)
+            && let Some(target_bases) = &params.target_bases
+        {
+            if target_bases.len() != 1 {
+                return Err(Error::invalid_input(format!(
+                    "target_bases with {} elements is not supported",
+                    target_bases.len()
+                )));
+            }
+            let target_base_id = target_bases[0];
+            if let Some(initial_bases) = &params.initial_bases {
+                if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
+                    return Err(Error::invalid_input(format!(
+                        "target_base_id {} must be one of the initial_bases in CREATE mode",
+                        target_base_id
+                    )));
                 }
-                let target_base_id = target_bases[0];
-                if let Some(initial_bases) = &params.initial_bases {
-                    if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
-                        return Err(Error::invalid_input(
-                            format!(
-                                "target_base_id {} must be one of the initial_bases in CREATE mode",
-                                target_base_id
-                            ),
-                            Default::default(),
-                        ));
-                    }
-                } else {
-                    return Err(Error::invalid_input(
-                        "initial_bases must be provided when target_bases is specified in CREATE mode",
-                        Default::default(),
-                    ));
-                }
+            } else {
+                return Err(Error::invalid_input(
+                    "initial_bases must be provided when target_bases is specified in CREATE mode",
+                ));
             }
         }
         Ok(())
@@ -1822,26 +1797,32 @@ mod tests {
 
         // Verify base_paths are registered in manifest
         assert_eq!(dataset.manifest.base_paths.len(), 2);
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base1".to_string())));
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base2".to_string())));
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base1".to_string()))
+        );
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base2".to_string()))
+        );
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
         assert!(!fragments.is_empty());
         for fragment in fragments {
-            assert!(fragment
-                .metadata
-                .files
-                .iter()
-                .any(|file| file.base_id == Some(1)));
+            assert!(
+                fragment
+                    .metadata
+                    .files
+                    .iter()
+                    .any(|file| file.base_id == Some(1))
+            );
         }
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
@@ -1867,10 +1848,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot specify both target_base_names_or_paths and target_bases"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot specify both target_base_names_or_paths and target_bases")
+        );
     }
 
     #[tokio::test]
@@ -1938,24 +1921,28 @@ mod tests {
 
         // Verify base_paths were inherited (still base1 and base2)
         assert_eq!(dataset.manifest.base_paths.len(), 2);
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base1".to_string())));
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base2".to_string())));
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base1".to_string()))
+        );
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base2".to_string()))
+        );
 
         // Verify data was written to base2 (ID 2)
         let fragments = dataset.get_fragments();
-        assert!(fragments.iter().all(|f| f
-            .metadata
-            .files
-            .iter()
-            .all(|file| file.base_id == Some(2))));
+        assert!(
+            fragments
+                .iter()
+                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
+        );
 
         // Test validation: cannot specify initial_bases in OVERWRITE mode
         let mut data_gen3 =
@@ -1979,10 +1966,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot register new bases in Overwrite mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot register new bases in Overwrite mode")
+        );
     }
 
     #[tokio::test]
@@ -2100,10 +2089,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot register new bases in Append mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot register new bases in Append mode")
+        );
     }
 
     #[tokio::test]
@@ -2302,11 +2293,11 @@ mod tests {
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
-        assert!(fragments.iter().all(|f| f
-            .metadata
-            .files
-            .iter()
-            .all(|file| file.base_id == Some(1))));
+        assert!(
+            fragments
+                .iter()
+                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(1)))
+        );
 
         // Now append using the path URI instead of name
         let mut data_gen2 =

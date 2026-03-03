@@ -22,7 +22,6 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
-use snafu::location;
 
 use super::super::builder::ScalarPredicate;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -87,10 +86,10 @@ impl BTreeIndexExec {
         // Verify the index exists for this column
         let column = predicate.column().to_string();
         if indexes.get_btree_by_column(&column).is_none() {
-            return Err(Error::invalid_input(
-                format!("No BTree index found for column '{}'", column),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "No BTree index found for column '{}'",
+                column
+            )));
         }
 
         let properties = PlanProperties::new(

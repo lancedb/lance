@@ -5,8 +5,8 @@ use crate::Result;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::Result as DFResult;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
@@ -16,8 +16,8 @@ use lance_core::ROW_ID;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
@@ -213,8 +213,8 @@ impl SchemaAdapter {
         &self,
         stream: SendableRecordBatchStream,
     ) -> SendableRecordBatchStream {
-        use lance_arrow::json::ARROW_JSON_EXT_NAME;
         use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
 
         if !Self::requires_logical_conversion(&stream.schema()) {
             return stream;

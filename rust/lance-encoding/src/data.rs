@@ -20,10 +20,10 @@ use std::{
 };
 
 use arrow_array::{
+    Array, ArrayRef, OffsetSizeTrait, UInt64Array,
     cast::AsArray,
     new_empty_array, new_null_array,
-    types::{ArrowDictionaryKeyType, UInt16Type, UInt32Type, UInt64Type, UInt8Type},
-    Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+    types::{ArrowDictionaryKeyType, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
@@ -1633,15 +1633,14 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        make_array, new_null_array,
-        types::{Int32Type, Int8Type},
-        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt16Array,
-        UInt8Array,
+        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
+        UInt16Array, make_array, new_null_array,
+        types::{Int8Type, Int32Type},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
     use arrow_schema::{DataType, Field, Fields};
-    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
 
     use crate::buffer::LanceBuffer;

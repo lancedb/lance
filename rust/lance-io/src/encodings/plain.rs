@@ -11,16 +11,16 @@ use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use crate::{
-    traits::{Reader, Writer},
     ReadBatchParams,
+    traits::{Reader, Writer},
 };
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array, Array, ArrayRef,
-    BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt8Array,
+    UInt32Array, builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array,
 };
-use arrow_buffer::{bit_util, Buffer};
-use arrow_data::{layout, ArrayDataBuilder, BufferSpec};
+use arrow_buffer::{Buffer, bit_util};
+use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
@@ -241,13 +241,10 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::invalid_input(
-                format!(
-                    "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
-                    start, end, self.length
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                start, end, self.length
+            )));
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {

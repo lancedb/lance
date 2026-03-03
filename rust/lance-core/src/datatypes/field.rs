@@ -4,34 +4,34 @@
 //! Lance Schema Field
 
 use std::{
-    cmp::{max, Ordering},
+    cmp::{Ordering, max},
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
 };
 
 use arrow_array::{
+    ArrayRef,
     cast::AsArray,
     types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     },
-    ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
-    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
 use super::{
-    schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
+    schema::{compare_fields, explain_fields_difference},
 };
 use crate::{
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
     Error, Result,
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -1057,7 +1057,7 @@ impl TryFrom<&ArrowField> for Field {
         let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
             Some(val) => val
                 .parse::<i32>()
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .map_err(|e| Error::invalid_input(e.to_string()))?
                 .max(-1),
             None => -1,
         };

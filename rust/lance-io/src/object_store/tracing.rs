@@ -7,15 +7,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
     PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use tracing::{instrument, Instrument, Span};
+use tracing::{Instrument, Span, instrument};
 
 #[derive(Debug)]
 pub struct TracedMultipartUpload {
@@ -217,9 +217,9 @@ mod tests {
     use super::*;
 
     use bytes::Bytes;
+    use object_store::PutPayload;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::PutPayload;
     use tracing_mock::{expect, subscriber};
 
     fn payload(data: &[u8]) -> PutPayload {

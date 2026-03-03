@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use fst::Streamer;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus, Error, Result};
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};
 use snafu::location;
 use std::sync::Arc;
 
@@ -11,8 +11,8 @@ use crate::progress::IndexBuildProgress;
 use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
     InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
+    builder::{InnerBuilder, PositionRecorder, doc_file_path, posting_file_path, token_file_path},
 };
 
 pub trait Merger {

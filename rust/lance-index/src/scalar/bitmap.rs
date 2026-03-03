@@ -10,46 +10,46 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
+    Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::{NullableRowAddrSet, RowAddrTreeMap},
         tokio::get_num_compute_intensive_cpus,
     },
-    Error, Result, ROW_ID,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
 
-use super::{
-    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
-};
 use super::{AnyQuery, IndexStore, ScalarIndex};
+use super::{
+    BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
+};
 use crate::pbold;
+use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
             DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
             TrainingRequest, VALUE_COLUMN_NAME,
         },
-        CreatedIndex, UpdateCriteria,
     },
 };
-use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
+use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -855,7 +855,7 @@ pub mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{record_batch, RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
@@ -1003,9 +1003,9 @@ pub mod tests {
     async fn test_big_bitmap_index() {
         // WARNING: This test allocates a huge state to force overflow over int32 on BinaryArray
         // You must run it only on a machine with enough resources (or skip it normally).
-        use super::{BitmapIndex, BITMAP_LOOKUP_NAME};
-        use crate::scalar::lance_format::LanceIndexStore;
+        use super::{BITMAP_LOOKUP_NAME, BitmapIndex};
         use crate::scalar::IndexStore;
+        use crate::scalar::lance_format::LanceIndexStore;
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
@@ -1194,27 +1194,35 @@ pub mod tests {
             value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string()))),
         };
 
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_red)
-            .await
-            .is_none());
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_blue)
-            .await
-            .is_none());
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_red)
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_blue)
+                .await
+                .is_none()
+        );
 
         // Call prewarm
         index.prewarm().await.unwrap();
 
         // Verify all bitmaps are now cached
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_red)
-            .await
-            .is_some());
-        assert!(cache
-            .get_with_key::<BitmapKey>(&cache_key_blue)
-            .await
-            .is_some());
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_red)
+                .await
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_with_key::<BitmapKey>(&cache_key_blue)
+                .await
+                .is_some()
+        );
 
         // Verify cached bitmaps have correct content
         let cached_red = cache

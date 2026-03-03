@@ -13,7 +13,6 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result};
-use snafu::location;
 use uuid::Uuid;
 
 use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
@@ -115,14 +114,11 @@ impl LsmScanner {
         let ctx = SessionContext::new();
         let lance_schema = self.base_table.schema();
         let arrow_schema: arrow_schema::Schema = lance_schema.into();
-        let df_schema = arrow_schema.to_dfschema().map_err(|e| {
-            Error::invalid_input(format!("Failed to create DFSchema: {}", e), location!())
-        })?;
+        let df_schema = arrow_schema
+            .to_dfschema()
+            .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
         let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to parse filter expression: {}", e),
-                location!(),
-            )
+            Error::invalid_input(format!("Failed to parse filter expression: {}", e))
         })?;
         self.filter = Some(expr);
         Ok(self)
@@ -192,7 +188,7 @@ impl LsmScanner {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         plan.execute(0, task_ctx)
-            .map_err(|e| Error::io(format!("Failed to execute plan: {}", e), location!()))
+            .map_err(|e| Error::io(format!("Failed to execute plan: {}", e)))
     }
 
     /// Execute the scan and collect all results into a single RecordBatch.
@@ -201,7 +197,7 @@ impl LsmScanner {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| Error::io(format!("Failed to collect batches: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
             let schema = self.schema();
@@ -210,7 +206,7 @@ impl LsmScanner {
 
         let schema = batches[0].schema();
         arrow_select::concat::concat_batches(&schema, &batches)
-            .map_err(|e| Error::io(format!("Failed to concatenate batches: {}", e), location!()))
+            .map_err(|e| Error::io(format!("Failed to concatenate batches: {}", e)))
     }
 
     /// Count the number of rows that match the query.
@@ -219,7 +215,7 @@ impl LsmScanner {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| Error::io(format!("Failed to count rows: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))?;
 
         Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
     }

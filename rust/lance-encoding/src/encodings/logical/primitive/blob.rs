@@ -8,22 +8,22 @@
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, make_array, Array, UInt64Array};
+use arrow_array::{Array, UInt64Array, cast::AsArray, make_array};
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use snafu::location;
 
 use lance_core::{
-    cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt, Error, Result,
+    Error, Result, cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt,
 };
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
     encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
     repdef::{DefinitionInterpretation, RepDefUnraveler},
-    EncodingsIo,
 };
 
 /// How many bytes to target in each unloaded / loaded shard.  A larger value means

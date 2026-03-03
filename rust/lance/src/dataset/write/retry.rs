@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use either::Either;
-use futures::future::FutureExt;
 use futures::TryFutureExt;
+use futures::future::FutureExt;
 use lance_core::utils::backoff::SlotBackoff;
 use lance_core::{Error, Result};
 use snafu::location;

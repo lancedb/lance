@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use lance::dataset::statistics::{DataStatistics, FieldStatistics};
-use pyo3::{intern, types::PyAnyMethods, Bound, IntoPyObject, PyAny, PyErr, Python};
+use pyo3::{Bound, IntoPyObject, PyAny, PyErr, Python, intern, types::PyAnyMethods};
 
-use crate::utils::{export_vec, PyLance};
+use crate::utils::{PyLance, export_vec};
 
 impl<'py> IntoPyObject<'py> for PyLance<&FieldStatistics> {
     type Target = PyAny;

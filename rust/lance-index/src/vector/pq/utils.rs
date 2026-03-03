@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{
-    cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray, PrimitiveArray,
+    Array, FixedSizeListArray, PrimitiveArray, cast::AsArray, types::ArrowPrimitiveType,
 };
-use lance_core::{assume, Error, Result};
-use snafu::location;
+use lance_core::{Error, Result, assume};
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
@@ -20,13 +19,10 @@ where
 {
     let dim = fsl.value_length() as usize;
     if !dim.is_multiple_of(m) {
-        return Err(Error::invalid_input(
-            format!(
-                "num_sub_vectors must divide vector dimension {}, but got {}",
-                dim, m
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "num_sub_vectors must divide vector dimension {}, but got {}",
+            dim, m
+        )));
     };
 
     let sub_vector_length = dim / m;
@@ -78,7 +74,7 @@ pub fn get_sub_vector_centroids<const NUM_BITS: u32, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, types::Float32Type};
     use lance_arrow::FixedSizeListArrayExt;
 
     #[test]

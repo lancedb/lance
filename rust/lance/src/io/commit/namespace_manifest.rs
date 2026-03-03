@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
+use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
 };
-use lance_namespace::LanceNamespace;
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use object_store::path::Path;
 use object_store::ObjectStore as OSObjectStore;
+use object_store::path::Path;
 
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {

@@ -5,8 +5,8 @@ use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use lance_io::encodings::plain::PlainDecoder;
 use lance_io::encodings::Decoder;
+use lance_io::encodings::plain::PlainDecoder;
 use snafu::location;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
@@ -114,13 +114,10 @@ impl PageTable {
 
         let observed_min = *self.pages.keys().min().unwrap();
         if min_field_id > *self.pages.keys().min().unwrap() {
-            return Err(Error::invalid_input(
-                format!(
-                    "field_id_offset {} is greater than the minimum field_id {}",
-                    min_field_id, observed_min
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "field_id_offset {} is greater than the minimum field_id {}",
+                min_field_id, observed_min
+            )));
         }
         let max_field_id = *self.pages.keys().max().unwrap();
         let field_ids = min_field_id..=max_field_id;

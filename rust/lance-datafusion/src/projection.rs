@@ -15,13 +15,13 @@ use std::{
 use tracing::instrument;
 
 use lance_core::{
+    Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+    Result, WILDCARD,
     datatypes::{OnMissing, Projectable, Projection, Schema},
-    Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
-    ROW_OFFSET, WILDCARD,
 };
 
 use crate::{
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{LanceExecutionOptions, OneShotExec, execute_plan},
     planner::Planner,
 };
 
@@ -64,10 +64,10 @@ impl ProjectionBuilder {
 
     fn check_duplicate_column(&self, name: &str) -> Result<()> {
         if self.output.contains_key(name) {
-            return Err(Error::invalid_input(
-                format!("Duplicate column name: {}", name),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Duplicate column name: {}",
+                name
+            )));
         }
         Ok(())
     }
@@ -273,10 +273,10 @@ impl ProjectionPlan {
             } else {
                 // Regular data column - validate it exists in base schema
                 if base.schema().field(&field.name).is_none() {
-                    return Err(Error::invalid_input(
-                        format!("Column '{}' not found in schema", field.name),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Column '{}' not found in schema",
+                        field.name
+                    )));
                 }
                 data_fields.push(field.clone());
             }

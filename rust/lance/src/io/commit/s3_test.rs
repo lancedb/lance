@@ -6,14 +6,14 @@ use arrow::datatypes::Int32Type;
 
 use crate::{
     dataset::{
-        builder::DatasetBuilder, CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams,
+        CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
     },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
-use aws_sdk_s3::{config::Credentials, Client as S3Client};
+use aws_sdk_s3::{Client as S3Client, config::Credentials};
 use futures::future::try_join_all;
-use lance_datagen::{array, gen_batch, RowCount};
+use lance_datagen::{RowCount, array, gen_batch};
 use lance_io::assert_io_eq;
 use lance_io::utils::tracking_store::IOTracker;
 

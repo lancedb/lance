@@ -4,23 +4,23 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    types::{UInt32Type, UInt64Type},
     RecordBatchReader,
+    types::{UInt32Type, UInt64Type},
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
-use lance::{io::ObjectStore, Dataset};
+use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
 use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::scalar::{
-    btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
+    IndexStore, SargableQuery, ScalarIndex, SearchResult,
+    btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     lance_format::LanceIndexStore,
     registry::ScalarIndexPlugin,
-    IndexStore, SargableQuery, ScalarIndex, SearchResult,
 };
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 #[cfg(target_os = "linux")]

@@ -15,13 +15,13 @@ use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use snafu::location;
 use tracing::info;
 
 use super::{
-    current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
-    ManifestNamingScheme, MANIFEST_EXTENSION,
+    MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
+    default_resolve_version, make_staging_manifest_path,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};

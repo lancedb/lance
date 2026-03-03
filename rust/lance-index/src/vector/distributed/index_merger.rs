@@ -4,7 +4,7 @@
 //! Index merging mechanisms for distributed vector index building
 
 use crate::vector::shared::partition_merger::{
-    write_unified_ivf_and_index_metadata, SupportedIvfIndexType,
+    SupportedIvfIndexType, write_unified_ivf_and_index_metadata,
 };
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
@@ -13,20 +13,20 @@ use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ID_FIELD, Result};
 use snafu::location;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::flat::index::FlatMetadata;
-use crate::vector::ivf::storage::{IvfModel as IvfStorageModel, IVF_METADATA_KEY};
-use crate::vector::pq::storage::{transpose, ProductQuantizationMetadata, PQ_METADATA_KEY};
+use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
+use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
 use crate::vector::quantizer::QuantizerMetadata;
-use crate::vector::sq::storage::{ScalarQuantizationMetadata, SQ_METADATA_KEY};
+use crate::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
-use crate::IndexMetadata as IndexMetaSchema;
 use crate::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -738,17 +738,16 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut aux_paths: Vec<object_store::path::Path> = Vec::new();
     let mut stream = object_store.list(Some(index_dir.clone()));
     while let Some(item) = stream.next().await {
-        if let Ok(meta) = item {
-            if let Some(fname) = meta.location.filename() {
-                if fname == INDEX_AUXILIARY_FILE_NAME {
-                    // Check parent dir name starts with partial_
-                    let parts: Vec<_> = meta.location.parts().collect();
-                    if parts.len() >= 2 {
-                        let pname = parts[parts.len() - 2].as_ref();
-                        if pname.starts_with("partial_") {
-                            aux_paths.push(meta.location.clone());
-                        }
-                    }
+        if let Ok(meta) = item
+            && let Some(fname) = meta.location.filename()
+            && fname == INDEX_AUXILIARY_FILE_NAME
+        {
+            // Check parent dir name starts with partial_
+            let parts: Vec<_> = meta.location.parts().collect();
+            if parts.len() >= 2 {
+                let pname = parts[parts.len() - 2].as_ref();
+                if pname.starts_with("partial_") {
+                    aux_paths.push(meta.location.clone());
                 }
             }
         }
@@ -1007,13 +1006,13 @@ pub async fn merge_partial_vector_auxiliary_files(
 
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
 
                 if sq_meta.is_none() {
@@ -1082,13 +1081,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1127,7 +1126,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                                 location: location!(),
                             });
                         } else {
-                            log::warn!("PQ codebook differs within tolerance; proceeding with first shard codebook");
+                            log::warn!(
+                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
+                            );
                         }
                     }
                 }
@@ -1158,13 +1159,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     _ => 0,
                 };
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1223,13 +1224,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     }
                 };
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1290,13 +1291,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 let d0 = pm.dimension;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1335,7 +1336,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                                 location: location!(),
                             });
                         } else {
-                            log::warn!("PQ codebook differs within tolerance; proceeding with first shard codebook");
+                            log::warn!(
+                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
+                            );
                         }
                     }
                 }
@@ -1396,13 +1399,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                     })?;
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
-                if let Some(dprev) = dim {
-                    if dprev != d0 {
-                        return Err(Error::Index {
-                            message: "Dimension mismatch across shards".to_string(),
-                            location: location!(),
-                        });
-                    }
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::Index {
+                        message: "Dimension mismatch across shards".to_string(),
+                        location: location!(),
+                    });
                 }
                 if sq_meta.is_none() {
                     sq_meta = Some(sq_meta_parsed.clone());
@@ -1536,13 +1539,13 @@ pub async fn merge_partial_vector_auxiliary_files(
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
     use futures::StreamExt;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID_FIELD;
+    use lance_core::utils::address::RowAddress;
     use lance_file::writer::FileWriterOptions as V2WriterOptions;
     use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};

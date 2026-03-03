@@ -10,10 +10,9 @@ use datafusion_expr::{Expr, TableType};
 use datafusion_physical_plan::ExecutionPlan;
 use lance_arrow::SchemaExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
-use lance_index::scalar::inverted::parser::from_json;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::parser::from_json;
 use serde_json::Value;
-use snafu::location;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -219,7 +218,7 @@ impl TableFunctionImpl for FtsQueryUDTF {
 
 fn parse_query_options(options: &str) -> datafusion::common::Result<(bool, bool, bool)> {
     let value: Value = serde_json::from_str(options)
-        .map_err(|e| Error::invalid_input(format!("invalid json options: {}", e), location!()))?;
+        .map_err(|e| Error::invalid_input(format!("invalid json options: {}", e)))?;
     let with_row_id = value
         .get("with_row_id")
         .is_some_and(|v| v.as_bool().unwrap_or(false));
@@ -258,8 +257,8 @@ impl FtsQueryUDTFBuilder {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::dataset::udtf::FtsQueryUDTFBuilder;
     use crate::Dataset;
+    use crate::dataset::udtf::FtsQueryUDTFBuilder;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };

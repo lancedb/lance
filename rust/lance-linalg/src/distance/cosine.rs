@@ -10,22 +10,22 @@
 use std::sync::Arc;
 
 use arrow_array::{
+    Array, FixedSizeListArray, Float32Array,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
-    Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::SIMD_SUPPORT;
 
-use super::{dot::dot, Normalize};
-use super::{norm_l2::norm_l2, Dot};
+use super::{Dot, norm_l2::norm_l2};
+use super::{Normalize, dot::dot};
 use crate::simd::{
-    f32::{f32x16, f32x8},
     FloatSimd, SIMD,
+    f32::{f32x8, f32x16},
 };
 use crate::{Error, Result};
 
@@ -75,7 +75,7 @@ mod kernel {
 
     // These are the `cosine_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
-    extern "C" {
+    unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]

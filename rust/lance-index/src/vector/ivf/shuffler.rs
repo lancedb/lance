@@ -15,40 +15,40 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayBuilder, FixedSizeListBuilder, StructBuilder, UInt32Builder, UInt64Builder, UInt8Builder,
+    ArrayBuilder, FixedSizeListBuilder, StructBuilder, UInt8Builder, UInt32Builder, UInt64Builder,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::UInt32Type;
-use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
 use arrow_array::{FixedSizeListArray, UInt8Array};
 use arrow_array::{ListArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::writer::FileWriterOptions;
+use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
-use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
 use snafu::location;
 
+use crate::vector::PART_ID_COLUMN;
 use crate::vector::ivf::IvfTransformer;
 use crate::vector::transform::Transformer;
-use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
@@ -461,7 +461,7 @@ impl IvfShuffler {
                 return Err(Error::InvalidInput {
                     source: "data must not be empty".into(),
                     location: location!(),
-                })
+                });
             }
         };
 
@@ -469,11 +469,10 @@ impl IvfShuffler {
         // we need to have row ID and partition ID column
         schema
             .column_with_name(ROW_ID)
-            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
-        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
-            "partition ID column not found".to_owned(),
-            location!(),
-        ))?;
+            .ok_or(Error::io("row ID column not found".to_owned()))?;
+        schema
+            .column_with_name(PART_ID_COLUMN)
+            .ok_or(Error::io("partition ID column not found".to_owned()))?;
 
         info!("Writing unsorted data to disk at {}", path);
         info!("with schema: {:?}", schema);
@@ -818,7 +817,7 @@ impl IvfShuffler {
     pub async fn load_partitioned_shuffles(
         basedir: &Path,
         files: Vec<String>,
-    ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
+    ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>> + use<>>> {
         // impl RecordBatchStream
         let mut streams = vec![];
 
@@ -871,8 +870,8 @@ impl IvfShuffler {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{UInt32Type, UInt8Type},
-        FixedSizeListArray, UInt64Array, UInt8Array,
+        FixedSizeListArray, UInt8Array, UInt64Array,
+        types::{UInt8Type, UInt32Type},
     };
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;

@@ -227,7 +227,9 @@ impl IoQueueState {
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
             tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
-            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            log::debug!(
+                "Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind"
+            );
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
         }
@@ -790,7 +792,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
 
         self.do_submit_request(reader, request, tx, priority, io_queue);
@@ -812,7 +814,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
             .into_iter()
@@ -846,7 +848,7 @@ impl ScanScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => futures::future::Either::Left(
                 self.submit_request_standard(reader, request, priority, io_queue),
@@ -918,7 +920,7 @@ impl FileScheduler {
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
@@ -1057,7 +1059,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
 
-    use object_store::{memory::InMemory, GetRange, ObjectStore as OSObjectStore};
+    use object_store::{GetRange, ObjectStore as OSObjectStore, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 

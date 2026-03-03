@@ -5,7 +5,7 @@
 
 use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
-use datafusion::logical_expr::{create_udf, ScalarUDF, Volatility};
+use datafusion::logical_expr::{ScalarUDF, Volatility, create_udf};
 use datafusion::prelude::SessionContext;
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::{Arc, LazyLock};

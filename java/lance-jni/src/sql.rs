@@ -6,14 +6,14 @@ use crate::error::Result;
 use crate::traits::FromJString;
 use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jboolean, jlong, JNI_TRUE};
 use jni::JNIEnv;
+use jni::objects::{JClass, JObject, JString};
+use jni::sys::{JNI_TRUE, jboolean, jlong};
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance::dataset::sql::SqlQueryBuilder;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
     mut env: JNIEnv,
     _class: JClass,

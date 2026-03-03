@@ -24,12 +24,12 @@ members = [
 ]
 exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
-resolver = "2"
+resolver = "3"
 
 
 [workspace.package]
 version = "4.0.0-beta.5"
-edition = "2021"
+edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
@@ -178,7 +178,7 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
 slatedb = "0.3"
-snafu = "0.8"
+snafu = "0.9"
 strum = "0.26"
 tantivy = { version = "0.24.1", features = ["stopwords"] }
 lindera = { version = "0.44.0" }
@@ -223,6 +223,7 @@ incremental = false
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unsafe_op_in_unsafe_fn = "allow"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

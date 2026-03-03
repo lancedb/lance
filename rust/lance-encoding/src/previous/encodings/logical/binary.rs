@@ -4,13 +4,13 @@
 use std::sync::Arc;
 
 use arrow_array::{
+    Array, ArrayRef, GenericByteArray, GenericListArray,
     cast::AsArray,
     types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, UInt8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, GenericListArray,
 };
 
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
 use log::trace;
 

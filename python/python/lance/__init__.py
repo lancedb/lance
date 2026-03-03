@@ -153,7 +153,8 @@ def dataset(
     read_params : optional, dict
         Dictionary of read parameters. Currently supports:
         - cache_repetition_index (bool): Whether to cache repetition indices for
-          large string/binary columns
+          large string/binary columns. This is enabled by default. You can disable
+          it globally by setting LANCE_READ_CACHE_REPETITION_INDEX=false.
         - validate_on_decode (bool): Whether to validate data during decoding
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the

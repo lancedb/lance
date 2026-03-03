@@ -13,15 +13,15 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::UInt8Type;
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::{
-    types::{Float32Type, UInt64Type},
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
+    types::{Float32Type, UInt64Type},
 };
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::hamming::hamming;
 use snafu::location;
 
 pub const FLAT_COLUMN: &str = "flat";

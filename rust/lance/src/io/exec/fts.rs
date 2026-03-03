@@ -20,24 +20,24 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
+use lance_core::{ROW_ID, utils::tracing::StreamTracingExt};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
-use crate::{index::DatasetIndexInternalExt, Dataset};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
+use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
-    collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+    BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, collect_query_tokens,
 };
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
+    FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
 };
-use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, IndexCriteria};
+use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
@@ -1169,7 +1169,7 @@ pub mod tests {
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery,
     };
-    use lance_index::scalar::inverted::{InvertedIndex, FTS_SCHEMA};
+    use lance_index::scalar::inverted::{FTS_SCHEMA, InvertedIndex};
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
 

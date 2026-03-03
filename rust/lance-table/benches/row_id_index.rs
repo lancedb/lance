@@ -20,15 +20,15 @@ use std::{collections::HashMap, io::Write, ops::Range, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_io::ReadBatchParams;
 use lance_table::rowids::FragmentRowIdIndex;
 use lance_table::{
-    rowids::{write_row_ids, RowIdIndex, RowIdSequence},
-    utils::stream::{apply_row_id_and_deletes, RowIdAndDeletesConfig},
+    rowids::{RowIdIndex, RowIdSequence, write_row_ids},
+    utils::stream::{RowIdAndDeletesConfig, apply_row_id_and_deletes},
 };
 
 fn make_sequence(row_id_range: Range<u64>, deletions: usize) -> RowIdSequence {

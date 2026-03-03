@@ -19,11 +19,11 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
+use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
-use lance::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
@@ -37,11 +37,11 @@ use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 use snafu::location;
 
-use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
+use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
-use crate::schema::{logical_schema_from_lance, LanceSchema};
-use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{rt, Dataset, Scanner};
+use crate::schema::{LanceSchema, logical_schema_from_lance};
+use crate::utils::{PyLance, export_vec, extract_vec};
+use crate::{Dataset, Scanner, rt};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -264,7 +264,7 @@ impl FileFragment {
                     other => {
                         return Err(PyValueError::new_err(format!(
                             "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
-                        )))
+                        )));
                     }
                 }
             } else {
@@ -508,7 +508,7 @@ impl PyDeletionFile {
                 return Err(PyValueError::new_err(format!(
                     "file_type must be either 'array' or 'bitmap', got '{}'",
                     file_type
-                )))
+                )));
             }
         };
         Ok(Self(DeletionFile {

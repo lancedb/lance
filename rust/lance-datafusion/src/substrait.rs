@@ -8,18 +8,19 @@ use crate::aggregate::Aggregate;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    from_substrait_agg_func, from_substrait_rex, from_substrait_sorts, DefaultSubstraitConsumer,
+    DefaultSubstraitConsumer, from_substrait_agg_func, from_substrait_rex, from_substrait_sorts,
 };
 use datafusion_substrait::substrait::proto::{
+    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
     expression::{
+        RexType,
         field_reference::{ReferenceType, RootType},
-        reference_segment, RexType,
+        reference_segment,
     },
     expression_reference::ExprType,
     function_argument::ArgType,
-    r#type::{Kind, Struct},
     rel::RelType,
-    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
+    r#type::{Kind, Struct},
 };
 use lance_core::{Error, Result};
 use prost::Message;
@@ -166,10 +167,9 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         // Complex operators not supported in filters
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",
-            location!(),
         )),
         // Pass through operators, nested children may have field references
-        RexType::ScalarFunction(ref mut func) => {
+        RexType::ScalarFunction(func) => {
             #[allow(deprecated)]
             for arg in &mut func.args {
                 remap_expr_references(arg, mapping)?;
@@ -182,7 +182,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::IfThen(ref mut ifthen) => {
+        RexType::IfThen(ifthen) => {
             for clause in ifthen.ifs.iter_mut() {
                 remap_expr_references(clause.r#if.as_mut().unwrap(), mapping)?;
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
@@ -190,21 +190,21 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             remap_expr_references(ifthen.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SwitchExpression(ref mut switch) => {
+        RexType::SwitchExpression(switch) => {
             for clause in switch.ifs.iter_mut() {
                 remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
             }
             remap_expr_references(switch.r#else.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::SingularOrList(ref mut orlist) => {
+        RexType::SingularOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 remap_expr_references(opt, mapping)?;
             }
             remap_expr_references(orlist.value.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::MultiOrList(ref mut orlist) => {
+        RexType::MultiOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 for field in opt.fields.iter_mut() {
                     remap_expr_references(field, mapping)?;
@@ -215,11 +215,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             }
             Ok(())
         }
-        RexType::Cast(ref mut cast) => {
+        RexType::Cast(cast) => {
             remap_expr_references(cast.input.as_mut().unwrap(), mapping)?;
             Ok(())
         }
-        RexType::Selection(ref mut sel) => {
+        RexType::Selection(sel) => {
             // Finally, the selection, which might actually have field references
             let root_type = sel.root_type.as_mut().unwrap();
             // These types of references do not reference input fields so no remap needed
@@ -235,19 +235,19 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                         reference_segment::ReferenceType::ListElement(_)
                         | reference_segment::ReferenceType::MapKey(_) => Err(Error::invalid_input(
                             "map/list nested references not supported in pushdown filters",
-                            location!(),
                         )),
                         reference_segment::ReferenceType::StructField(field) => {
                             if field.child.is_some() {
                                 Err(Error::invalid_input(
                                     "nested references in pushdown filters not yet supported",
-                                    location!(),
                                 ))
                             } else {
                                 if let Some(new_index) = mapping.get(&(field.field as usize)) {
                                     field.field = *new_index as i32;
                                 } else {
-                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion", location!()));
+                                    return Err(Error::invalid_input(
+                                        "pushdown filter referenced a field that is not yet supported by Substrait conversion",
+                                    ));
                                 }
                                 Ok(())
                             }
@@ -256,7 +256,6 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                 }
                 ReferenceType::MaskedReference(_) => Err(Error::invalid_input(
                     "masked references not yet supported in filter expressions",
-                    location!(),
                 )),
             }
         }
@@ -345,14 +344,12 @@ pub async fn parse_substrait(
     if expr_container.exprs.is_empty() {
         return Err(Error::invalid_input(
             "Substrait expression did not contain any expressions",
-            location!(),
         ));
     }
 
     if expr_container.exprs.len() > 1 {
         return Err(Error::invalid_input(
             "Substrait expression contained multiple expressions",
-            location!(),
         ));
     }
 
@@ -394,10 +391,7 @@ pub async fn parse_substrait_aggregate(
 
 fn extract_aggregate_from_plan(plan: &Plan) -> Result<(Box<AggregateRel>, Vec<String>)> {
     if plan.relations.is_empty() {
-        return Err(Error::invalid_input(
-            "Substrait Plan has no relations",
-            location!(),
-        ));
+        return Err(Error::invalid_input("Substrait Plan has no relations"));
     }
 
     let plan_rel = &plan.relations[0];
@@ -411,21 +405,15 @@ fn extract_aggregate_from_plan(plan: &Plan) -> Result<(Box<AggregateRel>, Vec<St
         None => (None, vec![]),
     };
 
-    let rel = rel.ok_or_else(|| Error::invalid_input("Plan relation has no input", location!()))?;
+    let rel = rel.ok_or_else(|| Error::invalid_input("Plan relation has no input"))?;
 
     match &rel.rel_type {
         Some(RelType::Aggregate(agg)) => Ok((agg.clone(), output_names)),
-        Some(other) => Err(Error::invalid_input(
-            format!(
-                "Expected Substrait AggregateRel, got {:?}",
-                std::mem::discriminant(other)
-            ),
-            location!(),
-        )),
-        None => Err(Error::invalid_input(
-            "Substrait Rel has no rel_type",
-            location!(),
-        )),
+        Some(other) => Err(Error::invalid_input(format!(
+            "Expected Substrait AggregateRel, got {:?}",
+            std::mem::discriminant(other)
+        ))),
+        None => Err(Error::invalid_input("Substrait Rel has no rel_type")),
     }
 }
 
@@ -467,23 +455,17 @@ async fn parse_groupings(
             for expr_ref in &grouping.expression_references {
                 let idx = *expr_ref as usize;
                 if idx >= agg_rel.grouping_expressions.len() {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Grouping expression reference {} out of bounds (max: {})",
-                            idx,
-                            agg_rel.grouping_expressions.len()
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Grouping expression reference {} out of bounds (max: {})",
+                        idx,
+                        agg_rel.grouping_expressions.len()
+                    )));
                 }
                 let expr = &agg_rel.grouping_expressions[idx];
                 let df_expr = from_substrait_rex(consumer, expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse grouping expression: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse grouping expression: {}", e))
                     })?;
                 group_exprs.push(df_expr);
             }
@@ -496,10 +478,7 @@ async fn parse_groupings(
                 let df_expr = from_substrait_rex(consumer, expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse grouping expression: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse grouping expression: {}", e))
                     })?;
                 group_exprs.push(df_expr);
             }
@@ -523,10 +502,7 @@ async fn parse_measures(
                 let df_filter = from_substrait_rex(consumer, filter_expr, schema)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse measure filter: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse measure filter: {}", e))
                     })?;
                 Some(Box::new(df_filter))
             } else {
@@ -537,10 +513,7 @@ async fn parse_measures(
             let order_by = from_substrait_sorts(consumer, &agg_func.sorts, schema)
                 .await
                 .map_err(|e| {
-                    Error::invalid_input(
-                        format!("Failed to parse aggregate sorts: {}", e),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("Failed to parse aggregate sorts: {}", e))
                 })?;
 
             // Check for DISTINCT invocation
@@ -554,10 +527,7 @@ async fn parse_measures(
                 from_substrait_agg_func(consumer, agg_func, schema, filter, order_by, distinct)
                     .await
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("Failed to parse aggregate function: {}", e),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("Failed to parse aggregate function: {}", e))
                     })?;
 
             aggregates.push(df_expr.as_ref().clone());
@@ -579,21 +549,21 @@ mod tests {
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
+        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
+        Version,
         expression::{
+            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
             field_reference::{ReferenceType, RootReference, RootType},
             literal::LiteralType,
             reference_segment::{self, StructField},
-            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
         },
         expression_reference::ExprType,
         extensions::{
-            simple_extension_declaration::{ExtensionFunction, MappingType},
             SimpleExtensionDeclaration, SimpleExtensionUri, SimpleExtensionUrn,
+            simple_extension_declaration::{ExtensionFunction, MappingType},
         },
         function_argument::ArgType,
-        r#type::{Boolean, Kind, Nullability, Struct, I32},
-        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
-        Version,
+        r#type::{Boolean, I32, Kind, Nullability, Struct},
     };
     use prost::Message;
 
@@ -892,10 +862,10 @@ mod tests {
     // ==================== Aggregate parsing tests ====================
 
     use datafusion_substrait::substrait::proto::{
+        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
         aggregate_function::AggregationInvocation,
         aggregate_rel::{Grouping, Measure},
         rel::RelType,
-        AggregateFunction, AggregateRel, Plan, PlanRel, Rel, RelRoot,
     };
 
     /// Helper to create a field reference expression for a column index
