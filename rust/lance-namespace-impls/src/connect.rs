@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! Connect functionality for Lance Namespace implementations.
 
 use std::collections::HashMap;

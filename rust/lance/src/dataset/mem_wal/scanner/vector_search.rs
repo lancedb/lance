@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! Vector search planner for LSM scanner.
 //!
 //! Provides KNN (K-Nearest Neighbors) search across LSM levels with staleness detection.

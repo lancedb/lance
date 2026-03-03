@@ -2297,13 +2297,13 @@ mod tests {
             );
         let mut left_keys = keyvals
             .clone()
-            .filter(|(_, &val)| val == 1)
+            .filter(|&(_, &val)| val == 1)
             .map(|(key, _)| key)
             .copied()
             .collect::<Vec<_>>();
         let mut right_keys = keyvals
             .clone()
-            .filter(|(_, &val)| val == 2)
+            .filter(|&(_, &val)| val == 2)
             .map(|(key, _)| key)
             .copied()
             .collect::<Vec<_>>();

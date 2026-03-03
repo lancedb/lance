@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! REST server adapter for Lance Namespace
 //!
 //! This module provides a REST API server that wraps any `LanceNamespace` implementation,

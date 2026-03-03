@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! AWS credential vending using STS AssumeRole.
 //!
 //! This module provides credential vending for AWS S3 storage by assuming

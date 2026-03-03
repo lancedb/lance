@@ -4715,17 +4715,23 @@ mod test {
         // Test that invalid environment variable values don't panic
 
         // Test invalid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None for invalid batch size");
 
         // Test valid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, Some(2048), "Should parse valid batch size");
 
         // Test unset LANCE_DEFAULT_BATCH_SIZE
-        std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        unsafe {
+            std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None when env var is not set");
     }
@@ -4738,43 +4744,61 @@ mod test {
         let test_var = "LANCE_TEST_PARSE_ENV_VAR_USIZE";
 
         // Test valid usize parsing
-        std::env::set_var(test_var, "12345");
+        unsafe {
+            std::env::set_var(test_var, "12345");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, Some(12345));
 
         // Test invalid usize parsing (triggers warning log)
-        std::env::set_var(test_var, "not_a_number");
+        unsafe {
+            std::env::set_var(test_var, "not_a_number");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test unset env var
-        std::env::remove_var(test_var);
+        unsafe {
+            std::env::remove_var(test_var);
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test with u32 type
         let test_var_u32 = "LANCE_TEST_PARSE_ENV_VAR_U32";
-        std::env::set_var(test_var_u32, "42");
+        unsafe {
+            std::env::set_var(test_var_u32, "42");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, Some(42));
 
-        std::env::set_var(test_var_u32, "invalid");
+        unsafe {
+            std::env::set_var(test_var_u32, "invalid");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u32);
+        unsafe {
+            std::env::remove_var(test_var_u32);
+        }
 
         // Test with u64 type
         let test_var_u64 = "LANCE_TEST_PARSE_ENV_VAR_U64";
-        std::env::set_var(test_var_u64, "9999999999");
+        unsafe {
+            std::env::set_var(test_var_u64, "9999999999");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, Some(9999999999));
 
-        std::env::set_var(test_var_u64, "-1");
+        unsafe {
+            std::env::set_var(test_var_u64, "-1");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u64);
+        unsafe {
+            std::env::remove_var(test_var_u64);
+        }
     }
 
     async fn make_binary_vector_dataset() -> Result<(TempStrDir, Dataset)> {

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::disallowed_macros)]
+
 use std::fmt::Write as _;
 use std::sync::Arc;
 

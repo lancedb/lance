@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! GCP credential vending using downscoped OAuth2 tokens.
 //!
 //! This module provides credential vending for GCP Cloud Storage by obtaining

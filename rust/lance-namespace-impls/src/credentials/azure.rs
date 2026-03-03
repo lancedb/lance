@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! Azure credential vending using SAS tokens.
 //!
 //! This module provides credential vending for Azure Blob Storage by generating

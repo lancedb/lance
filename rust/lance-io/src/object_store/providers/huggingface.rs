@@ -77,10 +77,10 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             config_map.insert("revision".to_string(), rev);
         }
 
-        if let Some(root) = storage_options.get("hf_root").cloned() {
-            if !root.is_empty() {
-                config_map.insert("root".to_string(), root);
-            }
+        if let Some(root) = storage_options.get("hf_root").cloned()
+            && !root.is_empty()
+        {
+            config_map.insert("root".to_string(), root);
         }
 
         if let Some(token) = storage_options

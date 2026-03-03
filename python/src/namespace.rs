@@ -3,6 +3,8 @@
 
 //! Python bindings for Lance Namespace implementations
 
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

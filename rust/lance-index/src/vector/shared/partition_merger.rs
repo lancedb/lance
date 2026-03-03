@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::disallowed_macros)]
+
 //! Shared helpers for IVF partition merging and metadata writing.
 //!
 //! The helpers here are used by both the distributed index merger
