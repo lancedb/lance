@@ -14,7 +14,6 @@ use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use snafu::location;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -229,10 +228,10 @@ pub async fn init_writer_for_pq(
         FileWriterOptions::default(),
     )?;
     let mut pm_init = pm.clone();
-    let cb = pm_init.codebook.as_ref().ok_or_else(|| Error::Index {
-        message: "PQ codebook missing".to_string(),
-        location: snafu::location!(),
-    })?;
+    let cb = pm_init
+        .codebook
+        .as_ref()
+        .ok_or_else(|| Error::index("PQ codebook missing".to_string()))?;
     let codebook_tensor: pb::Tensor = pb::Tensor::try_from(cb)?;
     let buf = Bytes::from(codebook_tensor.encode_to_vec());
     let pos = w.add_global_buffer(buf).await?;
@@ -308,22 +307,19 @@ async fn write_partition_rows_pq_transposed(
         return Ok(());
     }
 
-    let pq_col = batch
-        .column_by_name(PQ_CODE_COLUMN)
-        .ok_or_else(|| Error::Index {
-            message: format!("PQ column {} missing in auxiliary shard", PQ_CODE_COLUMN),
-            location: location!(),
-        })?;
-    let pq_fsl = pq_col
-        .as_fixed_size_list_opt()
-        .ok_or_else(|| Error::Index {
-            message: format!(
-                "PQ column {} is not a FixedSizeList in auxiliary shard, got {}",
-                PQ_CODE_COLUMN,
-                pq_col.data_type(),
-            ),
-            location: location!(),
-        })?;
+    let pq_col = batch.column_by_name(PQ_CODE_COLUMN).ok_or_else(|| {
+        Error::index(format!(
+            "PQ column {} missing in auxiliary shard",
+            PQ_CODE_COLUMN
+        ))
+    })?;
+    let pq_fsl = pq_col.as_fixed_size_list_opt().ok_or_else(|| {
+        Error::index(format!(
+            "PQ column {} is not a FixedSizeList in auxiliary shard, got {}",
+            PQ_CODE_COLUMN,
+            pq_col.data_type(),
+        ))
+    })?;
     let num_bytes = pq_fsl.value_length() as usize;
     let values = pq_fsl.values().as_primitive::<UInt8Type>();
     let transposed_codes = transpose(values, num_rows, num_bytes);
@@ -398,10 +394,7 @@ async fn compute_shard_content_key(
         .fields
         .iter()
         .position(|f| f.name() == ROW_ID_FIELD.name())
-        .ok_or_else(|| Error::Index {
-            message: "ROW_ID_FIELD missing in auxiliary shard".to_string(),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::index("ROW_ID_FIELD missing in auxiliary shard".to_string()))?;
 
     // Read IVF lengths from the global buffer.
     let ivf_idx: u32 = reader
@@ -409,15 +402,9 @@ async fn compute_shard_content_key(
         .file_schema
         .metadata
         .get(IVF_METADATA_KEY)
-        .ok_or_else(|| Error::Index {
-            message: "IVF meta missing".to_string(),
-            location: location!(),
-        })?
+        .ok_or_else(|| Error::index("IVF meta missing".to_string()))?
         .parse()
-        .map_err(|_| Error::Index {
-            message: "IVF index parse error".to_string(),
-            location: location!(),
-        })?;
+        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
     let bytes = reader.read_global_buffer(ivf_idx).await?;
     let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
     let lengths = pb_ivf.lengths;
@@ -442,10 +429,11 @@ async fn compute_shard_content_key(
                         .column(row_id_idx)
                         .as_any()
                         .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::Index {
-                            message: "ROW_ID_FIELD must be a UInt64 column in auxiliary shard"
-                                .to_string(),
-                            location: location!(),
+                        .ok_or_else(|| {
+                            Error::index(
+                                "ROW_ID_FIELD must be a UInt64 column in auxiliary shard"
+                                    .to_string(),
+                            )
                         })?;
                     let row_id_val = arr.value(0);
                     let frag_id = decode_fragment_id_from_row_id(row_id_val);
@@ -689,13 +677,10 @@ async fn read_shard_window_partitions(
             }
 
             if rel_partition >= window_len {
-                return Err(Error::Index {
-                    message: format!(
-                        "Shard has more rows than declared lengths in partition window [{}, {})",
-                        window_start, window_end
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Shard has more rows than declared lengths in partition window [{}, {})",
+                    window_start, window_end
+                )));
             }
 
             let to_take = std::cmp::min(remaining, rb.num_rows() - consumed);
@@ -713,13 +698,10 @@ async fn read_shard_window_partitions(
     }
 
     if rel_partition != window_len {
-        return Err(Error::Index {
-            message: format!(
-                "Shard has fewer rows than declared lengths in partition window [{}, {})",
-                window_start, window_end
-            ),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Shard has fewer rows than declared lengths in partition window [{}, {})",
+            window_start, window_end
+        )));
     }
 
     Ok(per_partition_batches)
@@ -834,18 +816,14 @@ pub async fn merge_partial_vector_auxiliary_files(
             .file_schema
             .metadata
             .get(DISTANCE_TYPE_KEY)
-            .ok_or_else(|| Error::Index {
-                message: format!("Missing {} in shard", DISTANCE_TYPE_KEY),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::index(format!("Missing {} in shard", DISTANCE_TYPE_KEY)))?;
         let dt: DistanceType = DistanceType::try_from(dt.as_str())?;
         if distance_type.is_none() {
             distance_type = Some(dt);
         } else if distance_type.as_ref().map(|v| *v != dt).unwrap_or(false) {
-            return Err(Error::Index {
-                message: "Distance type mismatch across shards".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Distance type mismatch across shards".to_string(),
+            ));
         }
 
         // Detect index type (first iteration only)
@@ -892,13 +870,10 @@ pub async fn merge_partial_vector_auxiliary_files(
                         "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                         "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
                         other => {
-                            return Err(Error::Index {
-                                message: format!(
-                                    "Unsupported index type in shard index.idx: {}",
-                                    other
-                                ),
-                                location: location!(),
-                            });
+                            return Err(Error::index(format!(
+                                "Unsupported index type in shard index.idx: {}",
+                                other
+                            )));
                         }
                     });
                 }
@@ -916,15 +891,9 @@ pub async fn merge_partial_vector_auxiliary_files(
             .file_schema
             .metadata
             .get(IVF_METADATA_KEY)
-            .ok_or_else(|| Error::Index {
-                message: "IVF meta missing".to_string(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?
             .parse()
-            .map_err(|_| Error::Index {
-                message: "IVF index parse error".to_string(),
-                location: location!(),
-            })?;
+            .map_err(|_| Error::index("IVF index parse error".to_string()))?;
         let bytes = reader.read_global_buffer(ivf_idx).await?;
         let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
         let lengths = pb_ivf.lengths.clone();
@@ -943,17 +912,14 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
             }
         } else if nlist_opt.as_ref().map(|v| *v != nlist).unwrap_or(false) {
-            return Err(Error::Index {
-                message: "IVF partition count mismatch across shards".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "IVF partition count mismatch across shards".to_string(),
+            ));
         }
 
         // Handle logic based on detected index type
-        let idx_type = detected_index_type.ok_or_else(|| Error::Index {
-            message: "Unable to detect index type".to_string(),
-            location: location!(),
-        })?;
+        let idx_type = detected_index_type
+            .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -969,9 +935,8 @@ pub async fn merge_partial_vector_auxiliary_files(
                 {
                     // Try to extract SQ metadata from storage metadata
                     let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
-                        .map_err(|e| Error::Index {
-                            message: format!("Failed to parse storage metadata: {}", e),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::index(format!("Failed to parse storage metadata: {}", e))
                         })?;
                     if let Some(first_meta) = storage_metadata_vec.first() {
                         // Check if this is SQ metadata by trying to parse it
@@ -980,39 +945,28 @@ pub async fn merge_partial_vector_auxiliary_files(
                         {
                             first_meta.clone()
                         } else {
-                            return Err(Error::Index {
-                                message: "SQ metadata missing in storage metadata".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "SQ metadata missing in storage metadata".to_string(),
+                            ));
                         }
                     } else {
-                        return Err(Error::Index {
-                            message: "SQ metadata missing in storage metadata".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::index(
+                            "SQ metadata missing in storage metadata".to_string(),
+                        ));
                     }
                 } else {
-                    return Err(Error::Index {
-                        message: "SQ metadata missing".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("SQ metadata missing".to_string()));
                 };
 
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
-                    .map_err(|e| Error::Index {
-                        message: format!("SQ metadata parse error: {}", e),
-                        location: location!(),
-                    })?;
+                    .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
 
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
 
                 if sq_meta.is_none() {
@@ -1038,9 +992,8 @@ pub async fn merge_partial_vector_auxiliary_files(
                 {
                     // Try to extract PQ metadata from storage metadata
                     let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
-                        .map_err(|e| Error::Index {
-                            message: format!("Failed to parse storage metadata: {}", e),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::index(format!("Failed to parse storage metadata: {}", e))
                         })?;
                     if let Some(first_meta) = storage_metadata_vec.first() {
                         // Check if this is PQ metadata by trying to parse it
@@ -1049,28 +1002,20 @@ pub async fn merge_partial_vector_auxiliary_files(
                         {
                             first_meta.clone()
                         } else {
-                            return Err(Error::Index {
-                                message: "PQ metadata missing in storage metadata".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "PQ metadata missing in storage metadata".to_string(),
+                            ));
                         }
                     } else {
-                        return Err(Error::Index {
-                            message: "PQ metadata missing in storage metadata".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::index(
+                            "PQ metadata missing in storage metadata".to_string(),
+                        ));
                     }
                 } else {
-                    return Err(Error::Index {
-                        message: "PQ metadata missing".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("PQ metadata missing".to_string()));
                 };
-                let mut pm: ProductQuantizationMetadata =
-                    serde_json::from_str(&pm_json).map_err(|e| Error::Index {
-                        message: format!("PQ metadata parse error: {}", e),
-                        location: location!(),
-                    })?;
+                let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
+                    .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
@@ -1084,10 +1029,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1095,36 +1037,30 @@ pub async fn merge_partial_vector_auxiliary_files(
                         || existing_pm.nbits != pm.nbits
                         || existing_pm.dimension != pm.dimension
                     {
-                        return Err(Error::Index {
-                            message: format!(
-                                "Distributed PQ merge: structural mismatch across shards; first(dim={}, m={}, nbits={}), current(dim={}, m={}, nbits={})",
-                                existing_pm.dimension,
-                                existing_pm.num_sub_vectors,
-                                existing_pm.nbits,
-                                pm.dimension,
-                                pm.num_sub_vectors,
-                                pm.nbits
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::index(format!(
+                            "Distributed PQ merge: structural mismatch across shards; first(dim={}, m={}, nbits={}), current(dim={}, m={}, nbits={})",
+                            existing_pm.dimension,
+                            existing_pm.num_sub_vectors,
+                            existing_pm.nbits,
+                            pm.dimension,
+                            pm.num_sub_vectors,
+                            pm.nbits
+                        )));
                     }
                     // Enforce codebook equality with tolerance for minor serialization diffs
-                    let existing_cb =
-                        existing_pm.codebook.as_ref().ok_or_else(|| Error::Index {
-                            message: "PQ codebook missing in first shard".to_string(),
-                            location: location!(),
-                        })?;
-                    let current_cb = pm.codebook.as_ref().ok_or_else(|| Error::Index {
-                        message: "PQ codebook missing in shard".to_string(),
-                        location: location!(),
+                    let existing_cb = existing_pm.codebook.as_ref().ok_or_else(|| {
+                        Error::index("PQ codebook missing in first shard".to_string())
                     })?;
+                    let current_cb = pm
+                        .codebook
+                        .as_ref()
+                        .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
                     if !fixed_size_list_equal(existing_cb, current_cb) {
                         const TOL: f32 = 1e-5;
                         if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::Index {
-                                message: "PQ codebook content mismatch across shards".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "PQ codebook content mismatch across shards".to_string(),
+                            ));
                         } else {
                             log::warn!(
                                 "PQ codebook differs within tolerance; proceeding with first shard codebook"
@@ -1150,10 +1086,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                     .fields
                     .iter()
                     .find(|f| f.name() == crate::vector::flat::storage::FLAT_COLUMN)
-                    .ok_or_else(|| Error::Index {
-                        message: "FLAT column missing".to_string(),
-                        location: location!(),
-                    })?;
+                    .ok_or_else(|| Error::index("FLAT column missing".to_string()))?;
                 let d0 = match flat_field.data_type() {
                     DataType::FixedSizeList(_, sz) => *sz as usize,
                     _ => 0,
@@ -1162,10 +1095,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1195,42 +1125,34 @@ pub async fn merge_partial_vector_auxiliary_files(
                         .get(STORAGE_METADATA_KEY)
                     {
                         let storage_metadata_vec: Vec<String> =
-                            serde_json::from_str(storage_meta_json).map_err(|e| Error::Index {
-                                message: format!("Failed to parse storage metadata: {}", e),
-                                location: location!(),
+                            serde_json::from_str(storage_meta_json).map_err(|e| {
+                                Error::index(format!("Failed to parse storage metadata: {}", e))
                             })?;
                         if let Some(first_meta) = storage_metadata_vec.first() {
                             if let Ok(flat_meta) = serde_json::from_str::<FlatMetadata>(first_meta)
                             {
                                 flat_meta.dim
                             } else {
-                                return Err(Error::Index {
-                                    message: "FLAT metadata missing in storage metadata"
-                                        .to_string(),
-                                    location: location!(),
-                                });
+                                return Err(Error::index(
+                                    "FLAT metadata missing in storage metadata".to_string(),
+                                ));
                             }
                         } else {
-                            return Err(Error::Index {
-                                message: "FLAT metadata missing in storage metadata".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "FLAT metadata missing in storage metadata".to_string(),
+                            ));
                         }
                     } else {
-                        return Err(Error::Index {
-                            message: "FLAT column missing and no storage metadata".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::index(
+                            "FLAT column missing and no storage metadata".to_string(),
+                        ));
                     }
                 };
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt).await?;
@@ -1250,9 +1172,8 @@ pub async fn merge_partial_vector_auxiliary_files(
                     .get(STORAGE_METADATA_KEY)
                 {
                     let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
-                        .map_err(|e| Error::Index {
-                            message: format!("Failed to parse storage metadata: {}", e),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::index(format!("Failed to parse storage metadata: {}", e))
                         })?;
                     if let Some(first_meta) = storage_metadata_vec.first() {
                         if let Ok(_pq_meta) =
@@ -1260,28 +1181,20 @@ pub async fn merge_partial_vector_auxiliary_files(
                         {
                             first_meta.clone()
                         } else {
-                            return Err(Error::Index {
-                                message: "PQ metadata missing in storage metadata".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "PQ metadata missing in storage metadata".to_string(),
+                            ));
                         }
                     } else {
-                        return Err(Error::Index {
-                            message: "PQ metadata missing in storage metadata".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::index(
+                            "PQ metadata missing in storage metadata".to_string(),
+                        ));
                     }
                 } else {
-                    return Err(Error::Index {
-                        message: "PQ metadata missing".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("PQ metadata missing".to_string()));
                 };
-                let mut pm: ProductQuantizationMetadata =
-                    serde_json::from_str(&pm_json).map_err(|e| Error::Index {
-                        message: format!("PQ metadata parse error: {}", e),
-                        location: location!(),
-                    })?;
+                let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
+                    .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
                         .read_global_buffer(pm.codebook_position as u32)
@@ -1294,10 +1207,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if let Some(existing_pm) = pq_meta.as_ref() {
                     // Enforce structural equality
@@ -1305,36 +1215,30 @@ pub async fn merge_partial_vector_auxiliary_files(
                         || existing_pm.nbits != pm.nbits
                         || existing_pm.dimension != pm.dimension
                     {
-                        return Err(Error::Index {
-                            message: format!(
-                                "Distributed PQ merge (HNSW_PQ): structural mismatch across shards; first(dim={}, m={}, nbits={}), current(dim={}, m={}, nbits={})",
-                                existing_pm.dimension,
-                                existing_pm.num_sub_vectors,
-                                existing_pm.nbits,
-                                pm.dimension,
-                                pm.num_sub_vectors,
-                                pm.nbits
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::index(format!(
+                            "Distributed PQ merge (HNSW_PQ): structural mismatch across shards; first(dim={}, m={}, nbits={}), current(dim={}, m={}, nbits={})",
+                            existing_pm.dimension,
+                            existing_pm.num_sub_vectors,
+                            existing_pm.nbits,
+                            pm.dimension,
+                            pm.num_sub_vectors,
+                            pm.nbits
+                        )));
                     }
                     // Enforce codebook equality with tolerance for minor serialization diffs
-                    let existing_cb =
-                        existing_pm.codebook.as_ref().ok_or_else(|| Error::Index {
-                            message: "PQ codebook missing in first shard".to_string(),
-                            location: location!(),
-                        })?;
-                    let current_cb = pm.codebook.as_ref().ok_or_else(|| Error::Index {
-                        message: "PQ codebook missing in shard".to_string(),
-                        location: location!(),
+                    let existing_cb = existing_pm.codebook.as_ref().ok_or_else(|| {
+                        Error::index("PQ codebook missing in first shard".to_string())
                     })?;
+                    let current_cb = pm
+                        .codebook
+                        .as_ref()
+                        .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
                     if !fixed_size_list_equal(existing_cb, current_cb) {
                         const TOL: f32 = 1e-5;
                         if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::Index {
-                                message: "PQ codebook content mismatch across shards".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "PQ codebook content mismatch across shards".to_string(),
+                            ));
                         } else {
                             log::warn!(
                                 "PQ codebook differs within tolerance; proceeding with first shard codebook"
@@ -1365,9 +1269,8 @@ pub async fn merge_partial_vector_auxiliary_files(
                     .get(STORAGE_METADATA_KEY)
                 {
                     let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
-                        .map_err(|e| Error::Index {
-                            message: format!("Failed to parse storage metadata: {}", e),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::index(format!("Failed to parse storage metadata: {}", e))
                         })?;
                     if let Some(first_meta) = storage_metadata_vec.first() {
                         if let Ok(_sq_meta) =
@@ -1375,37 +1278,26 @@ pub async fn merge_partial_vector_auxiliary_files(
                         {
                             first_meta.clone()
                         } else {
-                            return Err(Error::Index {
-                                message: "SQ metadata missing in storage metadata".to_string(),
-                                location: location!(),
-                            });
+                            return Err(Error::index(
+                                "SQ metadata missing in storage metadata".to_string(),
+                            ));
                         }
                     } else {
-                        return Err(Error::Index {
-                            message: "SQ metadata missing in storage metadata".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::index(
+                            "SQ metadata missing in storage metadata".to_string(),
+                        ));
                     }
                 } else {
-                    return Err(Error::Index {
-                        message: "SQ metadata missing".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("SQ metadata missing".to_string()));
                 };
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
-                    .map_err(|e| Error::Index {
-                        message: format!("SQ metadata parse error: {}", e),
-                        location: location!(),
-                    })?;
+                    .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
                     && dprev != d0
                 {
-                    return Err(Error::Index {
-                        message: "Dimension mismatch across shards".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if sq_meta.is_none() {
                     sq_meta = Some(sq_meta_parsed.clone());
@@ -1447,19 +1339,13 @@ pub async fn merge_partial_vector_auxiliary_files(
     // Write rows grouped by partition across all shards to ensure contiguous ranges per partition
 
     if v2w_opt.is_none() {
-        return Err(Error::Index {
-            message: "Failed to initialize unified writer".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Failed to initialize unified writer".to_string(),
+        ));
     }
-    let nlist = nlist_opt.ok_or_else(|| Error::Index {
-        message: "Missing IVF partition count".to_string(),
-        location: location!(),
-    })?;
-    let idx_type_final = detected_index_type.ok_or_else(|| Error::Index {
-        message: "Unable to detect index type".to_string(),
-        location: location!(),
-    })?;
+    let nlist = nlist_opt.ok_or_else(|| Error::index("Missing IVF partition count".to_string()))?;
+    let idx_type_final = detected_index_type
+        .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
 
     match idx_type_final {
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
@@ -1479,10 +1365,10 @@ pub async fn merge_partial_vector_auxiliary_files(
                     continue;
                 }
                 if batches.is_empty() {
-                    return Err(Error::Index {
-                        message: format!("No merged batches found for non-empty partition {}", pid),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "No merged batches found for non-empty partition {}",
+                        pid
+                    )));
                 }
 
                 let schema = batches[0].schema();
@@ -1519,17 +1405,13 @@ pub async fn merge_partial_vector_auxiliary_files(
         for len in accumulated_lengths.iter() {
             ivf_model.add_partition(*len);
         }
-        let dt2 = distance_type.ok_or_else(|| Error::Index {
-            message: "Distance type missing".to_string(),
-            location: location!(),
-        })?;
+        let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
         w.finish().await?;
     } else {
-        return Err(Error::Index {
-            message: "Failed to initialize unified writer".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Failed to initialize unified writer".to_string(),
+        ));
     }
 
     Ok(())

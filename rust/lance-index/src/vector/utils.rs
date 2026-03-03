@@ -12,7 +12,6 @@ use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
-use snafu::location;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
@@ -184,10 +183,10 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
             DataType::Float16 => Ok(Self::Float16),
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
-            _ => Err(Error::Index {
-                message: format!("pb tensor type not supported: {:?}", dt),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "pb tensor type not supported: {:?}",
+                dt
+            ))),
         }
     }
 }
@@ -218,10 +217,10 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
 
     fn try_from(tensor: &Tensor) -> Result<Self> {
         if tensor.shape.len() != 2 {
-            return Err(Error::Index {
-                message: format!("only accept 2-D tensor shape, got: {:?}", tensor.shape),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "only accept 2-D tensor shape, got: {:?}",
+                tensor.shape
+            )));
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
@@ -235,14 +234,11 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         )?;
 
         if flat_array.len() != dim * num_rows {
-            return Err(Error::Index {
-                message: format!(
-                    "Tensor shape {:?} does not match to data len: {}",
-                    tensor.shape,
-                    flat_array.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Tensor shape {:?} does not match to data len: {}",
+                tensor.shape,
+                flat_array.len()
+            )));
         }
 
         let field = Field::new("item", flat_array.data_type().clone(), true);

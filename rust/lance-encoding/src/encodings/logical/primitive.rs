@@ -37,7 +37,6 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use log::trace;
-use snafu::location;
 
 use crate::{
     compression::{
@@ -607,13 +606,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 instructions.preamble_action,
             );
             if item_range.end - item_range.start > chunk.items_in_chunk {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Item range {:?} is greater than chunk items in chunk {:?}",
-                        item_range, chunk.items_in_chunk
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Item range {:?} is greater than chunk items in chunk {:?}",
+                    item_range, chunk.items_in_chunk
+                )));
             }
 
             // Now we append the data to the output buffers
@@ -631,13 +627,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
             let DataBlock::FixedWidth(indices) = data else {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
-                        data
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
+                    data
+                )));
             };
             data = DataBlock::Dictionary(DictionaryDataBlock::from_parts(
                 indices,
@@ -851,35 +844,26 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                 match decompressed {
                     DataBlock::FixedWidth(block) => {
                         if block.num_values != num_values {
-                            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "Unexpected {} level count after decompression: expected {}, got {}",
-                                    level_type, num_values, block.num_values
-                                )
-                                .into(),
-                                location: location!(),
-                            });
+                            return Err(Error::invalid_input_source(format!(
+                                "Unexpected {} level count after decompression: expected {}, got {}",
+                                level_type, num_values, block.num_values
+                            )
+                            .into()));
                         }
                         if block.bits_per_value != 16 {
-                            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "Unexpected {} level bit width after decompression: expected 16, got {}",
-                                    level_type, block.bits_per_value
-                                )
-                                .into(),
-                                location: location!(),
-                            });
+                            return Err(Error::invalid_input_source(format!(
+                                "Unexpected {} level bit width after decompression: expected 16, got {}",
+                                level_type, block.bits_per_value
+                            )
+                            .into()));
                         }
                         Ok(block.data.borrow_to_typed_slice::<u16>())
                     }
-                    _ => Err(Error::InvalidInput {
-                        source: format!(
-                            "Expected fixed-width data block for {} levels",
-                            level_type
-                        )
-                        .into(),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::invalid_input_source(format!(
+                        "Expected fixed-width data block for {} levels",
+                        level_type
+                    )
+                    .into())),
                 }
             };
 
@@ -1367,14 +1351,13 @@ impl MiniBlockScheduler {
                     crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!(
+                    return Err(Error::invalid_input_source(
+                        format!(
                             "Unsupported mini-block dictionary encoding: {:?}",
                             dictionary_encoding.compression.as_ref().unwrap()
                         )
                         .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
             };
             Some(MiniBlockSchedulerDictionary {
@@ -2034,13 +2017,10 @@ impl FullZipReadSource {
                                 || range.start < base_offset
                                 || range.end > page_end
                             {
-                                return Err(Error::Internal {
-                                    message: format!(
-                                        "Requested range {:?} is outside page range {}..{}",
-                                        range, base_offset, page_end
-                                    ),
-                                    location: location!(),
-                                });
+                                return Err(Error::internal(format!(
+                                    "Requested range {:?} is outside page range {}..{}",
+                                    range, base_offset, page_end
+                                )));
                             }
                             let start = (range.start - base_offset) as usize;
                             let len = (range.end - range.start) as usize;
@@ -2208,20 +2188,15 @@ impl FullZipScheduler {
             PerValueDecompressor::Fixed(decompressor) => {
                 let bits_per_value = decompressor.bits_per_value();
                 if bits_per_value % 8 != 0 {
-                    return Err(lance_core::Error::NotSupported {
-                        source: "Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into(),
-                        location: location!(),
-                    });
+                    return Err(lance_core::Error::not_supported_source("Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into()));
                 }
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
                 if total_bytes_per_value == 0 {
-                    return Err(lance_core::Error::Internal {
-                        message: "Invalid encoding: per-row byte width must be greater than 0"
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(lance_core::Error::internal(
+                        "Invalid encoding: per-row byte width must be greater than 0",
+                    ));
                 }
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
@@ -2717,50 +2692,38 @@ impl VariableFullZipDecoder {
         let offsets_slice = offsets.borrow_to_typed_slice::<T>();
         let offsets_slice = offsets_slice.as_ref();
         if offsets_slice.is_empty() {
-            return Err(Error::Internal {
-                message: "Variable offsets cannot be empty".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Variable offsets cannot be empty".to_string(),
+            ));
         }
 
         let base = offsets_slice[0];
         let end = *offsets_slice.last().unwrap();
         if end < base {
-            return Err(Error::Internal {
-                message: format!(
-                    "Invalid variable offsets: end ({end}) is less than base ({base})"
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Invalid variable offsets: end ({end}) is less than base ({base})"
+            )));
         }
 
-        let data_start = base.try_into().map_err(|_| Error::Internal {
-            message: format!("Variable offset ({base}) does not fit into usize"),
-            location: location!(),
+        let data_start = base.try_into().map_err(|_| {
+            Error::internal(format!("Variable offset ({base}) does not fit into usize"))
         })?;
-        let data_end = end.try_into().map_err(|_| Error::Internal {
-            message: format!("Variable offset ({end}) does not fit into usize"),
-            location: location!(),
+        let data_end = end.try_into().map_err(|_| {
+            Error::internal(format!("Variable offset ({end}) does not fit into usize"))
         })?;
         if data_end > data.len() {
-            return Err(Error::Internal {
-                message: format!(
-                    "Invalid variable offsets: end ({data_end}) exceeds data len ({})",
-                    data.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Invalid variable offsets: end ({data_end}) exceeds data len ({})",
+                data.len()
+            )));
         }
 
         let mut rebased_offsets = Vec::with_capacity(offsets_slice.len());
         for &offset in offsets_slice {
             if offset < base {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Invalid variable offsets: offset ({offset}) is less than base ({base})"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Invalid variable offsets: offset ({offset}) is less than base ({base})"
+                )));
             }
             rebased_offsets.push(offset - base);
         }
@@ -2780,10 +2743,9 @@ impl VariableFullZipDecoder {
         match bits_per_offset {
             32 => Self::slice_batch_data_and_rebase_offsets_typed::<u32>(data, offsets),
             64 => Self::slice_batch_data_and_rebase_offsets_typed::<u64>(data, offsets),
-            _ => Err(Error::Internal {
-                message: format!("Unsupported bits_per_offset={bits_per_offset}"),
-                location: location!(),
-            }),
+            _ => Err(Error::internal(format!(
+                "Unsupported bits_per_offset={bits_per_offset}"
+            ))),
         }
     }
 
@@ -5055,7 +5017,7 @@ impl PrimitiveStructuralEncoder {
                 && fields.is_empty()
             {
                 if has_repdef_info {
-                    return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
+                    return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
                 }
                 // This is maybe a little confusing but the reader should never look at this anyways and it
                 // seems like overkill to invent a new layout just for "empty structs".
@@ -5187,7 +5149,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                     )
                 } else {
-                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                    Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
                 }
             }
         })

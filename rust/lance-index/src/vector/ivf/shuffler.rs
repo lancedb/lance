@@ -44,7 +44,6 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::location;
 
 use crate::vector::PART_ID_COLUMN;
 use crate::vector::ivf::IvfTransformer;
@@ -56,10 +55,8 @@ const SHUFFLE_BATCH_SIZE: usize = 1024;
 fn get_temp_dir() -> Result<Path> {
     // Note: using keep here means we will not delete this TempDir automatically
     let dir = tempfile::TempDir::new()?.keep();
-    let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
-        source: Box::new(e),
-        location: location!(),
-    })?;
+    let tmp_dir_path =
+        Path::from_filesystem_path(dir).map_err(|e| Error::io_source(Box::new(e)))?;
     Ok(tmp_dir_path)
 }
 
@@ -282,10 +279,9 @@ pub async fn shuffle_dataset(
                     let mut batch = b?;
 
                     if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-                            message: "column does not exist".to_string(),
-                            location: location!(),
-                        })?;
+                        let row_ids = batch
+                            .column_by_name(ROW_ID)
+                            .ok_or(Error::index("column does not exist".to_string()))?;
                         let part_ids = UInt32Array::from_iter(
                             row_ids
                                 .as_primitive::<UInt64Type>()
@@ -323,10 +319,7 @@ pub async fn shuffle_dataset(
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(join_err) => Err(Error::Execution {
-                    message: join_err.to_string(),
-                    location: location!(),
-                }),
+                Err(join_err) => Err(Error::execution(join_err.to_string())),
             })
             .boxed();
 
@@ -458,10 +451,7 @@ impl IvfShuffler {
                 return Err(std::mem::replace(err, Error::Stop));
             }
             None => {
-                return Err(Error::InvalidInput {
-                    source: "data must not be empty".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source("data must not be empty".into()));
             }
         };
 

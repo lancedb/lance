@@ -24,7 +24,6 @@ use datafusion_substrait::substrait::proto::{
 };
 use lance_core::{Error, Result};
 use prost::Message;
-use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -104,10 +103,7 @@ fn remove_extension_types(
 ) -> Result<(NamedStruct, Arc<ArrowSchema>, HashMap<usize, usize>)> {
     let fields = substrait_schema.r#struct.as_ref().unwrap();
     if fields.types.len() != arrow_schema.fields.len() {
-        return Err(Error::InvalidInput {
-            source: "the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source("the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into()));
     }
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
@@ -272,31 +268,27 @@ pub async fn parse_substrait(
 ) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
-        return Err(Error::InvalidInput {
-            source: "the provided substrait expression is empty (contains no expressions)".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            "the provided substrait expression is empty (contains no expressions)".into(),
+        ));
     }
     if envelope.referred_expr.len() > 1 {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "the provided substrait expression had {} expressions when only 1 was expected",
                 envelope.referred_expr.len()
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
     let mut expr = match &envelope.referred_expr[0].expr_type {
-        None => Err(Error::InvalidInput {
-            source: "the provided substrait had an expression but was missing an expr_type".into(),
-            location: location!(),
-        }),
+        None => Err(Error::invalid_input_source(
+            "the provided substrait had an expression but was missing an expr_type".into(),
+        )),
         Some(ExprType::Expression(expr)) => Ok(expr.clone()),
-        _ => Err(Error::InvalidInput {
-            source: "the provided substrait was not a scalar expression".into(),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input_source(
+            "the provided substrait was not a scalar expression".into(),
+        )),
     }?;
 
     // The Substrait may have come from a producer that uses extension types that DF doesn't support (e.g.

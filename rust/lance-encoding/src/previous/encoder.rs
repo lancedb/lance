@@ -6,7 +6,6 @@ use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 use arrow_array::{ArrayRef, UInt8Array, cast::AsArray};
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -257,7 +256,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         // but would be a significant amount of work
                         //
                         // An easier fallback implementation would be to decode-on-write and encode-on-read
-                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into(), location: location!() })
+                        Err(Error::not_supported_source(format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into()))
                     }
                 }
                 _ => todo!("Implement encoding for field {}", field),

@@ -679,7 +679,6 @@ fn verify_page_encoding(
 ) -> Result<()> {
     use crate::decoder::PageEncoding;
     use lance_core::Error;
-    use snafu::location;
 
     let mut actual_chain = Vec::new();
 
@@ -707,14 +706,13 @@ fn verify_page_encoding(
     // Check that all expected encodings appear in the actual chain
     for expected in expected_chain {
         if !actual_chain.iter().any(|actual| actual.contains(expected)) {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Column {} expected encoding chain {:?} but got {:?}",
                     col_idx, expected_chain, actual_chain
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
     }
     Ok(())

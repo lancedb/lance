@@ -17,7 +17,6 @@ use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -201,10 +200,9 @@ pub fn transpose_row_ids_from_digest(
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let indices = dataset.load_indices().await.unwrap();
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-        None => Err(Error::NotSupported {
-            source: "Fragment reuse index not found, cannot remap an index post compaction".into(),
-            location: location!(),
-        }),
+        None => Err(Error::not_supported_source(
+            "Fragment reuse index not found, cannot remap an index post compaction".into(),
+        )),
         Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
     }?;
 
@@ -327,38 +325,33 @@ pub async fn remap_column_index(
     name: Option<String>,
 ) -> Result<()> {
     if columns.len() != 1 {
-        return Err(Error::Index {
-            message: "Only support remapping index on 1 column at the moment".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Only support remapping index on 1 column at the moment".to_string(),
+        ));
     }
 
     let column = columns[0];
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::Index {
-            message: format!("RemapIndex: column '{column}' does not exist"),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "RemapIndex: column '{column}' does not exist"
+        )));
     };
 
     let indices = dataset.load_indices().await?;
     let index_name = name.unwrap_or(format!("{column}_idx"));
     let index = match indices.iter().find(|i| i.name == index_name) {
         None => {
-            return Err(Error::Index {
-                message: format!("Index with name {} not found", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index with name {} not found",
+                index_name
+            )));
         }
         Some(index) => {
             if index.fields != [field.id] {
-                Err(Error::Index {
-                    message: format!(
-                        "Index name {} already exists with different fields",
-                        index_name
-                    ),
-                    location: location!(),
-                })
+                Err(Error::index(format!(
+                    "Index name {} already exists with different fields",
+                    index_name
+                )))
             } else {
                 Ok(index)
             }

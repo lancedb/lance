@@ -28,7 +28,6 @@ use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
@@ -374,9 +373,8 @@ fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
 fn local_path_to_url(str_path: &str) -> Result<Url> {
     let expanded_path = expand_path(str_path)?;
 
-    Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
-        source: format!("Invalid table location: '{}'", str_path).into(),
-        location: location!(),
+    Url::from_directory_path(expanded_path).map_err(|_| {
+        Error::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
     })
 }
 
@@ -821,10 +819,9 @@ impl FromStr for LanceConfigKey {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "download_retry_count" => Ok(Self::DownloadRetryCount),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid LanceConfigKey: {}", s).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid LanceConfigKey: {}", s).into(),
+            )),
         }
     }
 }

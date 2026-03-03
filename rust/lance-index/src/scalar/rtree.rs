@@ -41,7 +41,6 @@ pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use sort::hilbert_sort::HilbertSorter;
 use std::any::Any;
 use std::collections::HashMap;
@@ -157,9 +156,11 @@ pub fn extract_bounding_boxes(
     geometry_array: &dyn Array,
     geometry_field: &ArrowField,
 ) -> Result<RectArray> {
-    let geo_array = from_arrow_array(geometry_array, geometry_field).map_err(|e| Error::Index {
-        message: format!("Construct GeoArrowArray from an Arrow Array failed: {}", e),
-        location: location!(),
+    let geo_array = from_arrow_array(geometry_array, geometry_field).map_err(|e| {
+        Error::index(format!(
+            "Construct GeoArrowArray from an Arrow Array failed: {}",
+            e
+        ))
     })?;
     let rect_array = bounding_box(geo_array.as_ref())?;
 
@@ -394,17 +395,14 @@ impl Index for RTreeIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "RTreeIndex is not vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "RTreeIndex is not vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(self.metadata.clone()).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
-            location: location!(),
-        })
+        serde_json::to_value(self.metadata.clone())
+            .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -501,10 +499,9 @@ impl ScalarIndex for RTreeIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::InvalidInput {
-            source: "RTree does not support remap".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "RTree does not support remap".into(),
+        ))
     }
 
     async fn update(
@@ -612,18 +609,16 @@ pub struct RTreeIndexPlugin;
 impl RTreeIndexPlugin {
     fn validate_schema(schema: &ArrowSchema) -> Result<()> {
         if schema.fields().len() != 2 {
-            return Err(Error::InvalidInput {
-                source: "RTree index schema must have exactly two fields".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "RTree index schema must have exactly two fields".into(),
+            ));
         }
 
         let row_id_field = schema.field_with_name(ROW_ID)?;
         if *row_id_field.data_type() != DataType::UInt64 {
-            return Err(Error::InvalidInput {
-                source: "Second field in RTree index schema must be of type UInt64".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Second field in RTree index schema must be of type UInt64".into(),
+            ));
         }
         Ok(())
     }
@@ -886,10 +881,9 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "RTree index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "RTree index does not support fragment training".into(),
+            ));
         }
 
         Self::validate_schema(&data.schema())?;

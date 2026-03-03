@@ -101,10 +101,9 @@ impl SupportedIvfIndexType {
             (true, true, false) => Self::IvfHnswPq,
             (true, false, true) => Self::IvfHnswSq,
             _ => {
-                return Err(Error::NotSupported {
-                    source: "Unsupported index type combination detected".into(),
-                    location: snafu::location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Unsupported index type combination detected".into(),
+                ));
             }
         };
 

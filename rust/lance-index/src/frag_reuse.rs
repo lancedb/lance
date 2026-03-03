@@ -14,7 +14,6 @@ use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
 use lance_table::format::{ExternalFile, Fragment, pb};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
@@ -360,19 +359,20 @@ impl Index for FragReuseIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "FragReuseIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "FragReuseIndex is not a vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let stats = FragReuseStatistics {
             num_versions: self.details.versions.len(),
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize fragment reuse index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize fragment reuse index statistics: {}",
+                e
+            ))
         })
     }
 

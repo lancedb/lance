@@ -98,7 +98,6 @@ use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
-use snafu::location;
 
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 
@@ -421,10 +420,9 @@ impl ExprFilter {
                 let ret_field = filter.to_field(&df_schema)?.1;
                 let ret_type = ret_field.data_type();
                 if ret_type != &DataType::Boolean {
-                    return Err(Error::InvalidInput {
-                        source: format!("The filter {} does not return a boolean", filter).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("The filter {} does not return a boolean", filter).into(),
+                    ));
                 }
 
                 let optimized = planner.optimize_expr(filter).map_err(|e| {
@@ -450,10 +448,9 @@ impl ExprFilter {
                 })
             }
             #[cfg(not(feature = "substrait"))]
-            Self::Substrait(_) => Err(Error::NotSupported {
-                source: "Substrait filter is not supported in this build".into(),
-                location: location!(),
-            }),
+            Self::Substrait(_) => Err(Error::not_supported_source(
+                "Substrait filter is not supported in this build".into(),
+            )),
             Self::Datafusion(expr) => Ok(expr.clone()),
         }
     }
@@ -1680,12 +1677,11 @@ impl Scanner {
 
         if field_path.len() == 1 {
             // Simple top-level column
-            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| Error::Internal {
-                message: format!(
+            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create column expression for '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         } else {
             // Nested field - build a chain of GetFieldFunc calls
@@ -1703,12 +1699,11 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
-                message: format!(
+            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         }
     }
@@ -1815,11 +1810,11 @@ impl Scanner {
             let row_id_pos = output_expr
                 .iter()
                 .position(|(_, name)| name == ROW_ID)
-                .ok_or_else(|| Error::Internal {
-                    message:
+                .ok_or_else(|| {
+                    Error::internal(
                         "user specified with_row_id but the _rowid column was not in the output"
                             .to_string(),
-                    location: location!(),
+                    )
                 })?;
             if row_id_pos != output_expr.len() - 1 {
                 // Row id is not last column.  Need to rotate it to the last spot.
@@ -1830,10 +1825,7 @@ impl Scanner {
 
         if self.legacy_with_row_addr {
             let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
-                Error::Internal {
-                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
-                    location: location!(),
-                }
+                Error::internal("user specified with_row_address but the _rowaddr column was not in the output".to_string())
             })?;
             if row_addr_pos != output_expr.len() - 1 {
                 // Row addr is not last column.  Need to rotate it to the last spot.
@@ -2152,28 +2144,23 @@ impl Scanner {
 
     fn validate_options(&self) -> Result<()> {
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
-            return Err(Error::InvalidInput {
-                source: "include_deleted_rows is set but with_row_id is false".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "include_deleted_rows is set but with_row_id is false".into(),
+            ));
         }
 
         if self.aggregate.is_some() {
             if self.limit.is_some() || self.offset.is_some() {
-                return Err(Error::InvalidInput {
-                    source:
-                        "Cannot use limit/offset with aggregate. Apply limit to the result instead."
-                            .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot use limit/offset with aggregate. Apply limit to the result instead."
+                        .into(),
+                ));
             }
             if self.ordering.is_some() {
-                return Err(Error::InvalidInput {
-                    source:
-                        "Cannot use order_by with aggregate. Apply ordering to the result instead."
-                            .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot use order_by with aggregate. Apply ordering to the result instead."
+                        .into(),
+                ));
             }
         }
 
@@ -2227,23 +2214,19 @@ impl Scanner {
             && self.nearest.is_none()
             && self.full_text_query.is_none()
         {
-            return Err(Error::InvalidInput {
-                source: "Query filter can only be used with full text search or vector search"
-                    .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Query filter can only be used with full text search or vector search".into(),
+            ));
         }
         if self.nearest.is_some() && filter_plan.vector_filter().is_some() {
-            return Err(Error::InvalidInput {
-                source: "Query filter can't be used with vector search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Query filter can't be used with vector search".into(),
+            ));
         }
         if self.full_text_query.is_some() && filter_plan.fts_filter().is_some() {
-            return Err(Error::InvalidInput {
-                source: "Fts filter can't be used with fts search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Fts filter can't be used with fts search".into(),
+            ));
         }
 
         Ok(filter_plan)
@@ -2352,10 +2335,7 @@ impl Scanner {
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
                     let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
-                    return Err(Error::NotSupported {
-                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into()));
                 }
 
                 let take_op = filter_plan
@@ -2384,10 +2364,9 @@ impl Scanner {
                 }
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: "Cannot have both nearest and full text search".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot have both nearest and full text search".into(),
+                ));
             }
         };
 
@@ -2542,10 +2521,9 @@ impl Scanner {
 
         let plan: Arc<dyn ExecutionPlan> = if filter_plan.has_index_query() {
             if self.include_deleted_rows {
-                return Err(Error::InvalidInput {
-                    source: "Cannot include deleted rows in a scalar indexed scan".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot include deleted rows in a scalar indexed scan".into(),
+                ));
             }
             self.scalar_indexed_scan(projection, filter_plan, fragments)
                 .await
@@ -2819,10 +2797,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("source is an fts search");
         if self.include_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "Cannot include deleted rows in an FTS search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in an FTS search".into(),
+            ));
         }
 
         // The source is an FTS search
@@ -2852,10 +2829,9 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if self.include_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "Cannot include deleted rows in a nearest neighbor search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in a nearest neighbor search".into(),
+            ));
         }
         let Some(query) = self.nearest.as_ref() else {
             return Err(Error::invalid_input("No nearest query".to_string()));
@@ -4383,7 +4359,6 @@ impl Scanner {
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
-
         analyze_plan(
             plan,
             LanceExecutionOptions {

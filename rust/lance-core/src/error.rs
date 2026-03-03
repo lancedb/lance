@@ -4,7 +4,7 @@
 use std::fmt;
 
 use arrow_schema::ArrowError;
-use snafu::{IntoError as _, Location, Snafu, location};
+use snafu::{IntoError as _, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -61,22 +61,29 @@ pub enum Error {
         location: Location,
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
-    DatasetAlreadyExists { uri: String, location: Location },
+    DatasetAlreadyExists {
+        uri: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Append with different schema: {difference}, location: {location}"))]
     SchemaMismatch {
         difference: String,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
         path: String,
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
         path: object_store::path::Path,
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
         // TODO: add backtrace?
     },
@@ -90,21 +97,28 @@ pub enum Error {
     CommitConflict {
         version: u64,
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Incompatible transaction: {source}, {location}"))]
     IncompatibleTransaction {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
         version: u64,
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
-    TooMuchWriteContention { message: String, location: Location },
+    TooMuchWriteContention {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"
     ))]
@@ -114,25 +128,51 @@ pub enum Error {
         location: Location,
     },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
-    PrerequisiteFailed { message: String, location: Location },
+    PrerequisiteFailed {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Unprocessable: {message}, {location}"))]
-    Unprocessable { message: String, location: Location },
+    Unprocessable {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
-    Arrow { message: String, location: Location },
+    Arrow {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
-    Schema { message: String, location: Location },
+    Schema {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Not found: {uri}, {location}"))]
-    NotFound { uri: String, location: Location },
+    NotFound {
+        uri: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("LanceError(IO): {source}, {location}"))]
     IO {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
-    Index { message: String, location: Location },
+    Index {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
     IndexNotFound {
         identity: String,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Cannot infer storage location from: {message}"))]
@@ -142,12 +182,21 @@ pub enum Error {
     #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
         error: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Cloned error: {message}, {location}"))]
-    Cloned { message: String, location: Location },
+    Cloned {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Query Execution error: {message}, {location}"))]
-    Execution { message: String, location: Location },
+    Execution {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Ref is invalid: {message}"))]
     InvalidRef { message: String },
     #[snafu(display("Ref conflict error: {message}"))]
@@ -163,6 +212,7 @@ pub enum Error {
         message: String,
         major_version: u16,
         minor_version: u16,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Namespace error: {source}, {location}"))]
@@ -185,17 +235,9 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn corrupt_file(
-        path: object_store::path::Path,
-        message: impl Into<String>,
-        location: Location,
-    ) -> Self {
-        let message: String = message.into();
-        Self::CorruptFile {
-            path,
-            source: message.into(),
-            location,
-        }
+    #[track_caller]
+    pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
+        CorruptFileSnafu { path }.into_error(message.into().into())
     }
 
     #[track_caller]
@@ -204,48 +246,70 @@ impl Error {
     }
 
     #[track_caller]
-    pub fn io(message: impl Into<String>) -> Self {
-        let message: String = message.into();
-        Self::IO {
-            source: message.into(),
-            location: location!(),
-        }
+    pub fn invalid_input_source(source: BoxedError) -> Self {
+        InvalidInputSnafu.into_error(source)
     }
 
+    #[track_caller]
+    pub fn io(message: impl Into<String>) -> Self {
+        IOSnafu.into_error(message.into().into())
+    }
+
+    #[track_caller]
+    pub fn io_source(source: BoxedError) -> Self {
+        IOSnafu.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn dataset_already_exists(uri: impl Into<String>) -> Self {
+        DatasetAlreadyExistsSnafu { uri: uri.into() }.build()
+    }
+
+    #[track_caller]
+    pub fn dataset_not_found(path: impl Into<String>, source: BoxedError) -> Self {
+        DatasetNotFoundSnafu { path: path.into() }.into_error(source)
+    }
+
+    #[track_caller]
     pub fn version_conflict(
         message: impl Into<String>,
         major_version: u16,
         minor_version: u16,
-        location: Location,
     ) -> Self {
-        let message: String = message.into();
-        Self::VersionConflict {
-            message,
+        VersionConflictSnafu {
+            message: message.into(),
             major_version,
             minor_version,
-            location,
         }
+        .build()
     }
 
+    #[track_caller]
     pub fn not_found(uri: impl Into<String>) -> Self {
-        Self::NotFound {
-            uri: uri.into(),
-            location: location!(),
-        }
+        NotFoundSnafu { uri: uri.into() }.build()
+    }
+
+    #[track_caller]
+    pub fn wrapped(error: BoxedError) -> Self {
+        WrappedSnafu { error }.build()
     }
 
     #[track_caller]
     pub fn schema(message: impl Into<String>) -> Self {
-        let message: String = message.into();
-        Self::Schema {
-            message,
-            location: location!(),
+        SchemaSnafu {
+            message: message.into(),
         }
+        .build()
     }
 
     #[track_caller]
     pub fn not_supported(message: impl Into<String>) -> Self {
         NotSupportedSnafu.into_error(message.into().into())
+    }
+
+    #[track_caller]
+    pub fn not_supported_source(source: BoxedError) -> Self {
+        NotSupportedSnafu.into_error(source)
     }
 
     #[track_caller]
@@ -264,6 +328,93 @@ impl Error {
     #[track_caller]
     pub fn namespace_source(source: Box<dyn std::error::Error + Send + Sync + 'static>) -> Self {
         NamespaceSnafu.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn arrow(message: impl Into<String>) -> Self {
+        ArrowSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn execution(message: impl Into<String>) -> Self {
+        ExecutionSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn cloned(message: impl Into<String>) -> Self {
+        ClonedSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn schema_mismatch(difference: impl Into<String>) -> Self {
+        SchemaMismatchSnafu {
+            difference: difference.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn unprocessable(message: impl Into<String>) -> Self {
+        UnprocessableSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn too_much_write_contention(message: impl Into<String>) -> Self {
+        TooMuchWriteContentionSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn prerequisite_failed(message: impl Into<String>) -> Self {
+        PrerequisiteFailedSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn index(message: impl Into<String>) -> Self {
+        IndexSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn index_not_found(identity: impl Into<String>) -> Self {
+        IndexNotFoundSnafu {
+            identity: identity.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn commit_conflict_source(version: u64, source: BoxedError) -> Self {
+        CommitConflictSnafu { version }.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn retryable_commit_conflict_source(version: u64, source: BoxedError) -> Self {
+        RetryableCommitConflictSnafu { version }.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn incompatible_transaction_source(source: BoxedError) -> Self {
+        IncompatibleTransactionSnafu.into_error(source)
     }
 
     /// Create an External error from a boxed error source.
@@ -312,11 +463,7 @@ pub trait LanceOptionExt<T> {
 impl<T> LanceOptionExt<T> for Option<T> {
     #[track_caller]
     fn expect_ok(self) -> Result<T> {
-        let location = location!();
-        self.ok_or_else(|| Error::Internal {
-            message: "Expected option to have value".to_string(),
-            location,
-        })
+        self.ok_or_else(|| Error::internal("Expected option to have value"))
     }
 }
 
@@ -336,10 +483,7 @@ impl From<ArrowError> for Error {
                     Err(source) => Self::External { source },
                 }
             }
-            other => Self::Arrow {
-                message: other.to_string(),
-                location: location!(),
-            },
+            other => Self::arrow(other.to_string()),
         }
     }
 }
@@ -347,100 +491,70 @@ impl From<ArrowError> for Error {
 impl From<&ArrowError> for Error {
     #[track_caller]
     fn from(e: &ArrowError) -> Self {
-        Self::Arrow {
-            message: e.to_string(),
-            location: location!(),
-        }
+        Self::arrow(e.to_string())
     }
 }
 
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<prost::DecodeError> for Error {
     #[track_caller]
     fn from(e: prost::DecodeError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<prost::EncodeError> for Error {
     #[track_caller]
     fn from(e: prost::EncodeError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<prost::UnknownEnumValue> for Error {
     #[track_caller]
     fn from(e: prost::UnknownEnumValue) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<tokio::task::JoinError> for Error {
     #[track_caller]
     fn from(e: tokio::task::JoinError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<object_store::path::Error> for Error {
     #[track_caller]
     fn from(e: object_store::path::Error) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<url::ParseError> for Error {
     #[track_caller]
     fn from(e: url::ParseError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
 impl From<serde_json::Error> for Error {
     #[track_caller]
     fn from(e: serde_json::Error) -> Self {
-        Self::Arrow {
-            message: e.to_string(),
-            location: location!(),
-        }
+        Self::arrow(e.to_string())
     }
 }
 
@@ -461,10 +575,7 @@ impl From<Error> for ArrowError {
 impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
@@ -472,10 +583,7 @@ impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
 impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
@@ -491,27 +599,18 @@ impl From<Error> for datafusion_common::DataFusionError {
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
-        let location = location!();
         match e {
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
-            | datafusion_common::DataFusionError::Configuration(..) => Self::InvalidInput {
-                source: box_error(e),
-                location,
-            },
-            datafusion_common::DataFusionError::SchemaError(..) => Self::Schema {
-                message: e.to_string(),
-                location,
-            },
+            | datafusion_common::DataFusionError::Configuration(..) => {
+                Self::invalid_input_source(box_error(e))
+            }
+            datafusion_common::DataFusionError::SchemaError(..) => Self::schema(e.to_string()),
             datafusion_common::DataFusionError::ArrowError(arrow_err, _) => Self::from(*arrow_err),
-            datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
-                source: box_error(e),
-                location,
-            },
-            datafusion_common::DataFusionError::Execution(..) => Self::Execution {
-                message: e.to_string(),
-                location,
-            },
+            datafusion_common::DataFusionError::NotImplemented(..) => {
+                Self::not_supported_source(box_error(e))
+            }
+            datafusion_common::DataFusionError::Execution(..) => Self::execution(e.to_string()),
             datafusion_common::DataFusionError::External(source) => {
                 // Try to downcast to lance_core::Error first
                 match source.downcast::<Self>() {
@@ -519,10 +618,7 @@ impl From<datafusion_common::DataFusionError> for Error {
                     Err(source) => Self::External { source },
                 }
             }
-            _ => Self::IO {
-                source: box_error(e),
-                location,
-            },
+            _ => Self::io_source(box_error(e)),
         }
     }
 }
@@ -554,10 +650,7 @@ pub struct CloneableError(pub Error);
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::Cloned {
-            message: self.0.to_string(),
-            location: location!(),
-        })
+        Self(Error::cloned(self.0.to_string()))
     }
 }
 

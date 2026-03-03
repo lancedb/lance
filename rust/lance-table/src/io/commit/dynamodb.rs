@@ -19,7 +19,6 @@ use aws_sdk_dynamodb::operation::{
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use object_store::path::Path;
 use snafu::OptionExt;
-use snafu::location;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -39,10 +38,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(e: WrappedSdkError<E>) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: location!(),
-        }
+        Self::io_source(box_error(e))
     }
 }
 
@@ -262,7 +258,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 "dynamodb not found: base_uri: {}; version: {}",
                 base_uri, version
             ),
-            location: location!(),
         })?;
 
         let path = item
@@ -296,7 +291,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 "dynamodb not found: base_uri: {}; version: {}",
                 base_uri, version
             ),
-            location: location!(),
         })?;
 
         let path = item

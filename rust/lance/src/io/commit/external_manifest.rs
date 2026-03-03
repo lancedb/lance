@@ -17,7 +17,6 @@ mod test {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
-    use snafu::location;
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -48,10 +47,7 @@ mod test {
             let store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(path) => Ok(path.clone()),
-                None => Err(Error::NotFound {
-                    uri: uri.to_string(),
-                    location: location!(),
-                }),
+                None => Err(Error::not_found(uri.to_string())),
             }
         }
 

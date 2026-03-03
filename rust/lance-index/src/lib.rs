@@ -18,7 +18,6 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::convert::TryFrom;
 
 pub mod frag_reuse;
@@ -180,10 +179,9 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
             v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
-            _ => Err(Error::InvalidInput {
-                source: format!("the input value {} is not a valid IndexType", value).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("the input value {} is not a valid IndexType", value).into(),
+            )),
         }
     }
 }

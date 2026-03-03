@@ -19,7 +19,6 @@ use bytes::Bytes;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use snafu::location;
 use tokio::sync::{mpsc, watch};
 
 use uuid::Uuid;
@@ -408,10 +407,7 @@ impl WalFlusher {
                     idx_registry.insert_batches_parallel(&stored_batches)
                 })
                 .await
-                .map_err(|e| Error::Internal {
-                    message: format!("Index update task panicked: {}", e),
-                    location: location!(),
-                })??;
+                .map_err(|e| Error::internal(format!("Index update task panicked: {}", e)))??;
                 Ok::<_, Error>((start.elapsed(), per_index))
             };
 

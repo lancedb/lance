@@ -16,7 +16,6 @@
 //! FSST encoding is transparent.
 
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -116,14 +115,13 @@ impl FsstCompressed {
                     ),
                 }
             }
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with FsstEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }

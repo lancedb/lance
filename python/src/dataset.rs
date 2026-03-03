@@ -31,7 +31,6 @@ use pyo3::{
     pyclass,
     types::{IntoPyDict, PyDict},
 };
-use snafu::location;
 
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -1250,10 +1249,7 @@ impl Dataset {
                 {
                     Ok((start, end)) => Some(Ok(start..end)),
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
-                    Err(err) => Some(Err(lance::Error::InvalidInput {
-                        source: Box::new(err),
-                        location: location!(),
-                    })),
+                    Err(err) => Some(Err(lance::Error::invalid_input_source(Box::new(err)))),
                 }
             })
         });
@@ -3147,6 +3143,12 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        if let Some(allow_external) =
+            get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
+        {
+            p = p.with_allow_external_blob_outside_bases(allow_external);
         }
 
         // Handle properties

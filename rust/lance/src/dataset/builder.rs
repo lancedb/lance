@@ -26,7 +26,6 @@ use lance_table::{
 use object_store::aws::AwsCredentialProvider;
 use object_store::{DynObjectStore, path::Path};
 use prost::Message;
-use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
 
@@ -131,16 +130,12 @@ impl DatasetBuilder {
         let response = namespace
             .describe_table(request)
             .await
-            .map_err(|e| Error::Namespace {
-                source: Box::new(e),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
-        let table_uri = response.location.ok_or_else(|| Error::Namespace {
-            source: Box::new(std::io::Error::other(
+        let table_uri = response.location.ok_or_else(|| {
+            Error::namespace_source(Box::new(std::io::Error::other(
                 "Table location not found in namespace response",
-            )),
-            location: location!(),
+            )))
         })?;
 
         let mut builder = Self::from_uri(&table_uri);
@@ -722,11 +717,7 @@ impl DatasetBuilder {
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
                     .await
-                    .map_err(|e| Error::DatasetNotFound {
-                        source: Box::new(e),
-                        path: base_path.to_string(),
-                        location: location!(),
-                    })?,
+                    .map_err(|e| Error::dataset_not_found(base_path.to_string(), Box::new(e)))?,
             };
             let manifest = Dataset::load_manifest(
                 &object_store,

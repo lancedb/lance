@@ -56,7 +56,6 @@
 
 use arrow_buffer::ArrowNativeType;
 use log::trace;
-use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor};
@@ -382,10 +381,9 @@ impl MiniBlockCompressor for RleEncoder {
 
                 Ok((compressed, encoding))
             }
-            _ => Err(Error::InvalidInput {
-                location: location!(),
-                source: "RLE encoding only supports FixedWidth data blocks".into(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                "RLE encoding only supports FixedWidth data blocks".into(),
+            )),
         }
     }
 }
@@ -409,10 +407,9 @@ impl BlockCompressor for RleEncoder {
                 combined.extend_from_slice(&all_buffers[1]);
                 Ok(LanceBuffer::from(combined))
             }
-            _ => Err(Error::InvalidInput {
-                location: location!(),
-                source: "RLE encoding only supports FixedWidth data blocks".into(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                "RLE encoding only supports FixedWidth data blocks".into(),
+            )),
         }
     }
 }
@@ -439,14 +436,13 @@ impl RleDecompressor {
         }
 
         if data.len() != 2 {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "RLE decompressor expects exactly 2 buffers, got {}",
                     data.len()
                 )
                 .into(),
-            });
+            ));
         }
 
         let values_buffer = &data[0];
@@ -483,38 +479,33 @@ impl RleDecompressor {
             if num_values == 0 {
                 return Ok(LanceBuffer::empty());
             } else {
-                return Err(Error::InvalidInput {
-                    location: location!(),
-                    source: format!("Empty buffers but expected {} values", num_values).into(),
-                });
+                return Err(Error::invalid_input_source(
+                    format!("Empty buffers but expected {} values", num_values).into(),
+                ));
             }
         }
 
         if !values_buffer.len().is_multiple_of(type_size) || lengths_buffer.is_empty() {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!(
-                    "Invalid buffer sizes for RLE {} decoding: values {} bytes (not divisible by {}), lengths {} bytes",
-                    std::any::type_name::<T>(),
-                    values_buffer.len(),
-                    type_size,
-                    lengths_buffer.len()
-                )
-                .into(),
-            });
+            return Err(Error::invalid_input_source(format!(
+                "Invalid buffer sizes for RLE {} decoding: values {} bytes (not divisible by {}), lengths {} bytes",
+                std::any::type_name::<T>(),
+                values_buffer.len(),
+                type_size,
+                lengths_buffer.len()
+            )
+            .into()));
         }
 
         let num_runs = values_buffer.len() / type_size;
         let num_length_entries = lengths_buffer.len();
         if num_runs != num_length_entries {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Inconsistent RLE buffers: {} runs but {} length entries",
                     num_runs, num_length_entries
                 )
                 .into(),
-            });
+            ));
         }
 
         let values_ref = values_buffer.borrow_to_typed_slice::<T>();
@@ -530,10 +521,9 @@ impl RleDecompressor {
             }
 
             if length == 0 {
-                return Err(Error::InvalidInput {
-                    location: location!(),
-                    source: "RLE decoding encountered a zero run length".into(),
-                });
+                return Err(Error::invalid_input_source(
+                    "RLE decoding encountered a zero run length".into(),
+                ));
             }
 
             let remaining = expected_value_count - decoded.len();
@@ -543,15 +533,14 @@ impl RleDecompressor {
         }
 
         if decoded.len() != expected_value_count {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "RLE decoding produced {} values, expected {}",
                     decoded.len(),
                     expected_value_count
                 )
                 .into(),
-            });
+            ));
         }
 
         trace!(
@@ -573,10 +562,9 @@ impl BlockDecompressor for RleDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         // fetch the values_size
         if data.len() < 8 {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!("Insufficient data size: {}", data.len()).into(),
-            });
+            return Err(Error::invalid_input_source(
+                format!("Insufficient data size: {}", data.len()).into(),
+            ));
         }
 
         let values_size_bytes: [u8; 8] =
@@ -585,23 +573,19 @@ impl BlockDecompressor for RleDecompressor {
 
         // parse values
         let values_start: usize = 8;
-        let values_size: usize = values_size.try_into().map_err(|_| Error::InvalidInput {
-            location: location!(),
-            source: format!("Invalid values buffer size: {}", values_size).into(),
+        let values_size: usize = values_size.try_into().map_err(|_| {
+            Error::invalid_input_source(
+                format!("Invalid values buffer size: {}", values_size).into(),
+            )
         })?;
-        let lengths_start =
-            values_start
-                .checked_add(values_size)
-                .ok_or_else(|| Error::InvalidInput {
-                    location: location!(),
-                    source: "Invalid RLE values buffer size".into(),
-                })?;
+        let lengths_start = values_start
+            .checked_add(values_size)
+            .ok_or_else(|| Error::invalid_input_source("Invalid RLE values buffer size".into()))?;
 
         if data.len() < lengths_start {
-            return Err(Error::InvalidInput {
-                location: location!(),
-                source: format!("Insufficient data size: {}", data.len()).into(),
-            });
+            return Err(Error::invalid_input_source(
+                format!("Insufficient data size: {}", data.len()).into(),
+            ));
         }
 
         let values_buffer = data.slice_with_length(values_start, values_size);

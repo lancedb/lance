@@ -67,7 +67,6 @@ use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
-use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
@@ -556,14 +555,13 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // sophisticated approach.
                 Ok(Box::new(ValueEncoder::default()))
             }
-            _ => Err(Error::NotSupported {
-                source: format!(
+            _ => Err(Error::not_supported_source(
+                format!(
                     "Mini-block compression not yet supported for block type {}",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 
@@ -586,10 +584,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 let has_variable_child = struct_block.has_variable_width_child();
                 if has_variable_child {
                     if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::NotSupported {
-                            source: "Variable packed struct encoding requires Lance file version 2.2 or later".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
                     }
                     Ok(Box::new(PackedStructVariablePerValueEncoder::new(
                         self.clone(),
@@ -772,10 +767,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             #[cfg(not(feature = "bitpacking"))]
-            Compression::InlineBitpacking(_) => Err(Error::NotSupported {
-                source: "this runtime was not built with bitpacking support".into(),
-                location: location!(),
-            }),
+            Compression::InlineBitpacking(_) => Err(Error::not_supported_source(
+                "this runtime was not built with bitpacking support".into(),
+            )),
             Compression::Variable(variable) => {
                 let Compression::Flat(offsets) = variable
                     .offsets
@@ -804,10 +798,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedWidthMiniBlockDecompressor::new(description),
             )),
-            Compression::VariablePackedStruct(_) => Err(Error::NotSupported {
-                source: "variable packed struct decoding is not yet implemented".into(),
-                location: location!(),
-            }),
+            Compression::VariablePackedStruct(_) => Err(Error::not_supported_source(
+                "variable packed struct decoding is not yet implemented".into(),
+            )),
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
@@ -973,10 +966,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 {
                     Compression::Flat(flat) => flat.bits_per_value,
                     _ => {
-                        return Err(Error::InvalidInput {
-                            location: location!(),
-                            source: "OutOfLineBitpacking values must use Flat encoding".into(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            "OutOfLineBitpacking values must use Flat encoding".into(),
+                        ));
                     }
                 };
                 Ok(Box::new(OutOfLineBitpacking::new(

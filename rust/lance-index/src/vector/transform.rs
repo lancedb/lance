@@ -14,7 +14,6 @@ use arrow_array::{Array, ArrowPrimitiveType, RecordBatch, UInt32Array, cast::AsA
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
-use snafu::location;
 
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_linalg::kernels::normalize_fsl;
@@ -59,16 +58,13 @@ impl NormalizeTransformer {
 impl Transformer for NormalizeTransformer {
     #[instrument(name = "NormalizeTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch
-            .column_by_name(&self.input_column)
-            .ok_or_else(|| Error::Index {
-                message: format!(
-                    "Normalize Transform: column {} not found in RecordBatch {}",
-                    self.input_column,
-                    batch.schema(),
-                ),
-                location: location!(),
-            })?;
+        let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
+            Error::index(format!(
+                "Normalize Transform: column {} not found in RecordBatch {}",
+                self.input_column,
+                batch.schema(),
+            ))
+        })?;
 
         let data = arr.as_fixed_size_list();
         let norm = normalize_fsl(data)?;
@@ -120,14 +116,11 @@ impl Transformer for KeepFiniteVectors {
             DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
             DataType::List(_) => arr.as_list::<i32>().values().as_fixed_size_list(),
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "KeepFiniteVectors: column {} is not a fixed size list: {}",
-                        self.column,
-                        arr.data_type()
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "KeepFiniteVectors: column {} is not a fixed size list: {}",
+                    self.column,
+                    arr.data_type()
+                )));
             }
         };
 
@@ -222,14 +215,11 @@ impl Transformer for Flatten {
                     RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(vectors)])?;
                 Ok(batch)
             }
-            _ => Err(Error::Index {
-                message: format!(
-                    "Flatten: column {} is not a vector: {}",
-                    self.column,
-                    arr.data_type()
-                ),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "Flatten: column {} is not a vector: {}",
+                self.column,
+                arr.data_type()
+            ))),
         }
     }
 }

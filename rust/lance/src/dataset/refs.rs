@@ -15,7 +15,6 @@ use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
-use snafu::location;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -795,7 +794,7 @@ where
         })
         .await?;
     let json_str = String::from_utf8(tag_bytes.to_vec())
-        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string(), location!()))?;
+        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
     Ok(serde_json::from_str(&json_str)?)
 }
 

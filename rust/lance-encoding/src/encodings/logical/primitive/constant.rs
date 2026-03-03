@@ -9,7 +9,6 @@ use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use snafu::location;
 
 use lance_core::{
     Error, Result,
@@ -352,16 +351,14 @@ impl ConstantPageDecoder {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: repetition buffer too short".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: repetition buffer too short",
+                ));
             }
             if rep[start] != self.max_rep {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: row did not start at max_rep".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: row did not start at max_rep",
+                ));
             }
             let mut end = start + 1;
             while end < rep.len() && rep[end] != self.max_rep {

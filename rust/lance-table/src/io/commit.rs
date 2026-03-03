@@ -41,7 +41,6 @@ use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use snafu::location;
 use tracing::info;
 use url::Url;
 
@@ -230,21 +229,14 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
     fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
-        let filename = meta.location.filename().ok_or_else(|| Error::Internal {
-            message: "ObjectMeta location does not have a filename".to_string(),
-            location: location!(),
+        let filename = meta.location.filename().ok_or_else(|| {
+            Error::internal("ObjectMeta location does not have a filename".to_string())
         })?;
-        let scheme =
-            ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+        let scheme = ManifestNamingScheme::detect_scheme(filename)
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         let version = scheme
             .parse_version(filename)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         Ok(Self {
             version,
             path: meta.location,
@@ -329,14 +321,11 @@ async fn current_manifest_path(
 
             while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
                 if entry_scheme != scheme {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
-                             Use `migrate_manifest_paths_v2` to migrate the directory.",
-                            scheme, entry_scheme
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                         Use `migrate_manifest_paths_v2` to migrate the directory.",
+                        scheme, entry_scheme
+                    )));
                 }
                 let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
@@ -354,10 +343,7 @@ async fn current_manifest_path(
                 e_tag: current_meta.e_tag,
             })
         }
-        (None, _) => Err(Error::NotFound {
-            uri: base.child(VERSIONS_DIR).to_string(),
-            location: location!(),
-        }),
+        (None, _) => Err(Error::not_found(base.child(VERSIONS_DIR).to_string())),
     }
 }
 
@@ -444,10 +430,7 @@ fn list_manifests<'a>(
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
-    Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
-        source: Box::new(e),
-        location: location!(),
-    })
+    Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
 
 #[cfg(feature = "dynamodb")]
@@ -700,38 +683,31 @@ pub async fn commit_handler_from_url(
         "file" | "file-object-store" => Ok(local_handler),
         "s3" | "gs" | "az" | "memory" | "oss" | "cos" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
-        "s3+ddb" => Err(Error::InvalidInput {
-            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
-            location: location!(),
-        }),
+        "s3+ddb" => Err(Error::invalid_input_source(
+            "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
+        )),
         #[cfg(feature = "dynamodb")]
         "s3+ddb" => {
             if url.query_pairs().count() != 1 {
-                return Err(Error::InvalidInput {
-                    source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                ));
             }
             let table_name = match url.query_pairs().next() {
                 Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
                     if key == DDB_URL_QUERY_KEY =>
                 {
                     if table_name.is_empty() {
-                        return Err(Error::InvalidInput {
-                            source: "`s3+ddb://` scheme requires non empty dynamodb table name"
-                                .into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            "`s3+ddb://` scheme requires non empty dynamodb table name".into(),
+                        ));
                     }
                     table_name
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                    ));
                 }
             };
             let options = options.clone().unwrap_or_default();
@@ -796,10 +772,7 @@ impl From<Error> for CommitError {
 impl From<CommitError> for Error {
     fn from(e: CommitError) -> Self {
         match e {
-            CommitError::CommitConflict => Self::Internal {
-                message: "Commit conflict".to_string(),
-                location: location!(),
-            },
+            CommitError::CommitConflict => Self::internal("Commit conflict".to_string()),
             CommitError::OtherError(e) => e,
         }
     }

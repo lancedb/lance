@@ -465,13 +465,11 @@ async fn create_aws_vendor(
     use lance_core::Error;
 
     // AWS requires role_arn to be configured
-    let role_arn = properties
-        .get(aws_props::ROLE_ARN)
-        .ok_or_else(|| Error::InvalidInput {
-            source: "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set"
-                .into(),
-            location: snafu::location!(),
-        })?;
+    let role_arn = properties.get(aws_props::ROLE_ARN).ok_or_else(|| {
+        Error::invalid_input_source(
+            "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set".into(),
+        )
+    })?;
 
     let duration_millis = parse_duration_millis(properties, aws_props::DURATION_MILLIS);
 
@@ -521,17 +519,12 @@ fn create_azure_vendor(
     use lance_core::Error;
 
     // Azure requires account_name to be configured
-    let account_name =
-        properties
-            .get(azure_props::ACCOUNT_NAME)
-            .ok_or_else(|| {
-                Error::InvalidInput {
-            source:
-                "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
-                    .into(),
-            location: snafu::location!(),
-        }
-            })?;
+    let account_name = properties.get(azure_props::ACCOUNT_NAME).ok_or_else(|| {
+        Error::invalid_input_source(
+            "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
+                .into(),
+        )
+    })?;
 
     let duration_millis = parse_duration_millis(properties, azure_props::DURATION_MILLIS);
     let permission = parse_permission(properties);

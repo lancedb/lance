@@ -13,7 +13,6 @@ use lance_index::scalar::CreatedIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
@@ -48,10 +47,9 @@ pub async fn merge_indices<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
@@ -67,22 +65,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let column = dataset
         .schema()
         .field_by_id(old_indices[0].fields[0])
-        .ok_or(Error::Index {
-            message: format!(
-                "Append index: column {} does not exist",
-                old_indices[0].fields[0]
-            ),
-            location: location!(),
-        })?;
+        .ok_or(Error::index(format!(
+            "Append index: column {} does not exist",
+            old_indices[0].fields[0]
+        )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
@@ -108,10 +102,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         .windows(2)
         .any(|w| w[0].index_type() != w[1].index_type())
     {
-        return Err(Error::Index {
-            message: format!("Append index: invalid index deltas: {:?}", old_indices),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Append index: invalid index deltas: {:?}",
+            old_indices
+        )));
     }
 
     let mut frag_bitmap = RoaringBitmap::new();
@@ -228,13 +222,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 },
             ))
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Append index: invalid index type: {:?}",
-                indices[0].index_type()
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::index(format!(
+            "Append index: invalid index type: {:?}",
+            indices[0].index_type()
+        ))),
     }?;
 
     let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();

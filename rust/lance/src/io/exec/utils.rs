@@ -29,7 +29,6 @@ use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
-use snafu::location;
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
@@ -78,10 +77,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         let mut allow_list = RowAddrTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
-                message: "input batch missing row id column even though it is in the schema for the stream".into(),
-                location: location!(),
-            })?;
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::internal("input batch missing row id column even though it is in the schema for the stream"))?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -102,19 +98,15 @@ impl FilterLoader for SelectionVectorToPrefilter {
             .0
             .try_next()
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: "Selection vector source for prefilter did not yield any batches".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal("Selection vector source for prefilter did not yield any batches")
             })
             .unwrap();
         RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::Internal {
-                message: format!(
-                    "Expected selection vector input to yield binary arrays but got {}",
-                    batch["result"].data_type()
-                ),
-                location: location!(),
-            }
+            Error::internal(format!(
+                "Expected selection vector input to yield binary arrays but got {}",
+                batch["result"].data_type()
+            ))
         })?)
     }
 }

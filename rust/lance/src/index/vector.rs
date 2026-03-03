@@ -55,7 +55,6 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::IndexMetadata;
 use serde::Serialize;
-use snafu::location;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
@@ -90,10 +89,10 @@ impl IndexFileVersion {
         match version.to_lowercase().as_str() {
             "legacy" => Ok(Self::Legacy),
             "v3" => Ok(Self::V3),
-            _ => Err(Error::Index {
-                message: format!("Invalid index file version: {}", version),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "Invalid index file version: {}",
+                version
+            ))),
         }
     }
 }
@@ -328,42 +327,35 @@ pub(crate) async fn build_distributed_vector_index(
     let stages = &params.stages;
 
     if stages.is_empty() {
-        return Err(Error::Index {
-            message: "Build Distributed Vector Index: must have at least 1 stage".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Distributed Vector Index: must have at least 1 stage".to_string(),
+        ));
     };
 
     let StageParams::Ivf(ivf_params0) = &stages[0] else {
-        return Err(Error::Index {
-            message: format!(
-                "Build Distributed Vector Index: invalid stages: {:?}",
-                stages
-            ),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Build Distributed Vector Index: invalid stages: {:?}",
+            stages
+        )));
     };
 
     if ivf_params0.centroids.is_none() {
-        return Err(Error::Index {
-            message: "Build Distributed Vector Index: missing precomputed IVF centroids; \
-please provide IvfBuildParams.centroids \
-for concurrent distributed create_index"
+        return Err(Error::index(
+            "Build Distributed Vector Index: missing precomputed IVF centroids; \
+        please provide IvfBuildParams.centroids \
+        for concurrent distributed create_index"
                 .to_string(),
-            location: location!(),
-        });
+        ));
     }
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
-        return Err(Error::Index {
-            message:
-                "Build Distributed Vector Index: multivector type supports only cosine distance"
-                    .to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Distributed Vector Index: multivector type supports only cosine distance"
+                .to_string(),
+        ));
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -408,12 +400,11 @@ for concurrent distributed create_index"
 
     let make_global_pq = |pq_params: &PQBuildParams| -> Result<ProductQuantizer> {
         if pq_params.codebook.is_none() {
-            return Err(Error::Index {
-                message: "Build Distributed Vector Index: missing precomputed PQ codebook; \
-please provide PQBuildParams.codebook for distributed indexing"
+            return Err(Error::index(
+                "Build Distributed Vector Index: missing precomputed PQ codebook; \
+            please provide PQBuildParams.codebook for distributed indexing"
                     .to_string(),
-                location: location!(),
-            });
+            ));
         }
 
         let dim = crate::index::vector::utils::get_vector_dim(filtered_dataset.schema(), column)?;
@@ -484,35 +475,27 @@ please provide PQBuildParams.codebook for distributed indexing"
                 .await?;
             }
             _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid data type: {:?}",
-                        element_type
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid data type: {:?}",
+                    element_type
+                )));
             }
         },
 
         IndexType::IvfPq => {
             let len = stages.len();
             let StageParams::PQ(pq_params) = &stages[len - 1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             match params.version {
                 IndexFileVersion::Legacy => {
-                    return Err(Error::Index {
-                        message: "Distributed indexing does not support legacy IVF_PQ format"
-                            .to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "Distributed indexing does not support legacy IVF_PQ format".to_string(),
+                    ));
                 }
                 IndexFileVersion::V3 => {
                     let index_dir = new_index_dir();
@@ -545,13 +528,10 @@ please provide PQBuildParams.codebook for distributed indexing"
 
         IndexType::IvfSq => {
             let StageParams::SQ(sq_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             let index_dir = new_index_dir();
@@ -575,13 +555,10 @@ please provide PQBuildParams.codebook for distributed indexing"
 
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             let index_dir = new_index_dir();
@@ -605,22 +582,16 @@ please provide PQBuildParams.codebook for distributed indexing"
 
         IndexType::IvfHnswPq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             let StageParams::PQ(pq_params) = &stages[2] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             let index_dir = new_index_dir();
@@ -651,22 +622,16 @@ please provide PQBuildParams.codebook for distributed indexing"
 
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             let StageParams::SQ(sq_params) = &stages[2] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Distributed Vector Index: invalid stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             let index_dir = new_index_dir();
@@ -689,24 +654,18 @@ please provide PQBuildParams.codebook for distributed indexing"
         }
 
         IndexType::IvfRq => {
-            return Err(Error::Index {
-                message: format!(
-                    "Build Distributed Vector Index: invalid index type: {:?} \
-is not supported in distributed mode; skipping this shard",
-                    index_type
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Build Distributed Vector Index: invalid index type: {:?} \
+            is not supported in distributed mode; skipping this shard",
+                index_type
+            )));
         }
 
         _ => {
-            return Err(Error::Index {
-                message: format!(
-                    "Build Distributed Vector Index: invalid index type: {:?}",
-                    index_type
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Build Distributed Vector Index: invalid index type: {:?}",
+                index_type
+            )));
         }
     };
 
@@ -727,28 +686,25 @@ pub(crate) async fn build_vector_index(
     let stages = &params.stages;
 
     if stages.is_empty() {
-        return Err(Error::Index {
-            message: "Build Vector Index: must have at least 1 stage".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Vector Index: must have at least 1 stage".to_string(),
+        ));
     };
 
     let StageParams::Ivf(ivf_params) = &stages[0] else {
-        return Err(Error::Index {
-            message: format!("Build Vector Index: invalid stages: {:?}", stages),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Build Vector Index: invalid stages: {:?}",
+            stages
+        )));
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
-        return Err(Error::Index {
-            message: "Build Vector Index: multivector type supports only cosine distance"
-                .to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Vector Index: multivector type supports only cosine distance".to_string(),
+        ));
     }
 
     let num_rows = dataset.count_rows(None).await?;
@@ -802,19 +758,19 @@ pub(crate) async fn build_vector_index(
                 .await?;
             }
             _ => {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid data type: {:?}",
+                    element_type
+                )));
             }
         },
         IndexType::IvfPq => {
             let len = stages.len();
             let StageParams::PQ(pq_params) = &stages[len - 1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             match params.version {
@@ -851,10 +807,10 @@ pub(crate) async fn build_vector_index(
         }
         IndexType::IvfSq => {
             let StageParams::SQ(sq_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
@@ -874,10 +830,10 @@ pub(crate) async fn build_vector_index(
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
 
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
@@ -897,10 +853,10 @@ pub(crate) async fn build_vector_index(
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                 dataset.clone(),
@@ -919,16 +875,16 @@ pub(crate) async fn build_vector_index(
         }
         IndexType::IvfHnswPq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             let StageParams::PQ(pq_params) = &stages[2] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
@@ -947,16 +903,16 @@ pub(crate) async fn build_vector_index(
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             let StageParams::SQ(sq_params) = &stages[2] else {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
             };
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
@@ -974,10 +930,10 @@ pub(crate) async fn build_vector_index(
             .await?;
         }
         _ => {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid index type: {:?}", index_type),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Build Vector Index: invalid index type: {:?}",
+                index_type
+            )));
         }
     };
     Ok(())
@@ -998,28 +954,25 @@ pub(crate) async fn build_vector_index_incremental(
     let stages = &params.stages;
 
     if stages.is_empty() {
-        return Err(Error::Index {
-            message: "Build Vector Index: must have at least 1 stage".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Vector Index: must have at least 1 stage".to_string(),
+        ));
     };
 
     let StageParams::Ivf(ivf_params) = &stages[0] else {
-        return Err(Error::Index {
-            message: format!("Build Vector Index: invalid stages: {:?}", stages),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Build Vector Index: invalid stages: {:?}",
+            stages
+        )));
     };
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
-        return Err(Error::Index {
-            message: "Build Vector Index: multivector type supports only cosine distance"
-                .to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Build Vector Index: multivector type supports only cosine distance".to_string(),
+        ));
     }
 
     // Extract IVF model and quantizer from existing index
@@ -1031,14 +984,11 @@ pub(crate) async fn build_vector_index_incremental(
         .num_partitions
         .unwrap_or(ivf_model.num_partitions());
     if ivf_model.num_partitions() != expected_partitions {
-        return Err(Error::Index {
-            message: format!(
-                "Number of partitions mismatch: existing index has {} partitions, but params specify {}",
-                ivf_model.num_partitions(),
-                expected_partitions
-            ),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Number of partitions mismatch: existing index has {} partitions, but params specify {}",
+            ivf_model.num_partitions(),
+            expected_partitions
+        )));
     }
 
     let temp_dir = TempStdDir::default();
@@ -1090,10 +1040,10 @@ pub(crate) async fn build_vector_index_incremental(
                 .await?;
             }
             _ => {
-                return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid data type: {:?}",
+                    element_type
+                )));
             }
         },
         // IVF_PQ
@@ -1153,13 +1103,10 @@ pub(crate) async fn build_vector_index_incremental(
         // IVF_HNSW variants
         (SubIndexType::Hnsw, quantization_type) => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-                return Err(Error::Index {
-                    message: format!(
-                        "Build Vector Index: HNSW index missing HNSW params in stages: {:?}",
-                        stages
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Build Vector Index: HNSW index missing HNSW params in stages: {:?}",
+                    stages
+                )));
             };
 
             match quantization_type {
@@ -1215,10 +1162,9 @@ pub(crate) async fn build_vector_index_incremental(
                     .await?;
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::Index {
-                        message: "Rabit quantization is not supported for HNSW index".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "Rabit quantization is not supported for HNSW index".to_string(),
+                    ));
                 }
             }
         }
@@ -1238,15 +1184,14 @@ pub(crate) async fn build_empty_vector_index(
 ) -> Result<()> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
-    Err(Error::NotSupported {
-        source: format!(
+    Err(Error::not_supported_source(
+        format!(
             "Creating empty vector indices with train=False is not yet implemented. \
-            Index '{}' for column '{}' cannot be created without training.",
+        Index '{}' for column '{}' cannot be created without training.",
             name, column
         )
         .into(),
-        location: location!(),
-    })
+    ))
 }
 
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
@@ -1313,18 +1258,18 @@ pub(crate) async fn open_vector_index(
             #[allow(unused_variables)]
             Some(Stage::Transform(tf)) => {
                 if last_stage.is_none() {
-                    return Err(Error::Index {
-                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
                 }
             }
             Some(Stage::Ivf(ivf_pb)) => {
                 if last_stage.is_none() {
-                    return Err(Error::Index {
-                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
@@ -1340,10 +1285,10 @@ pub(crate) async fn open_vector_index(
             }
             Some(Stage::Pq(pq_proto)) => {
                 if last_stage.is_some() {
-                    return Err(Error::Index {
-                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
                 };
                 let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
                 last_stage = Some(Arc::new(PQIndex::new(
@@ -1353,20 +1298,19 @@ pub(crate) async fn open_vector_index(
                 )));
             }
             Some(Stage::Diskann(_)) => {
-                return Err(Error::Index {
-                    message: "DiskANN support is removed from Lance.".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::index(
+                    "DiskANN support is removed from Lance.".to_string(),
+                ));
             }
             _ => {}
         }
     }
 
     if last_stage.is_none() {
-        return Err(Error::Index {
-            message: format!("Invalid index stages: {:?}", vec_idx.stages),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Invalid index stages: {:?}",
+            vec_idx.stages
+        )));
     }
     let idx = last_stage.unwrap();
     Ok(idx)
@@ -1384,10 +1328,7 @@ pub(crate) async fn open_vector_index_v2(
         .schema()
         .metadata
         .get(INDEX_METADATA_SCHEMA_KEY)
-        .ok_or(Error::Index {
-            message: "Index Metadata not found".to_owned(),
-            location: location!(),
-        })?;
+        .ok_or(Error::index("Index Metadata not found".to_owned()))?;
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
@@ -1396,10 +1337,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_meta = dataset
         .load_index(uuid)
         .await?
-        .ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
@@ -1468,17 +1406,16 @@ pub(crate) async fn open_vector_index_v2(
             {
                 ext.clone()
                     .to_vector()
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?
+                    .ok_or(Error::internal(
+                        "unable to cast index extension to vector".to_string(),
+                    ))?
                     .load_index(dataset.clone(), column, uuid, reader)
                     .await?
             } else {
-                return Err(Error::Index {
-                    message: format!("Unsupported index type: {}", index_metadata.index_type),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Unsupported index type: {}",
+                    index_metadata.index_type
+                )));
             }
         }
     };
@@ -1497,10 +1434,10 @@ pub async fn initialize_vector_index(
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {
-        return Err(Error::Index {
-            message: format!("Unsupported fields for vector index: {:?}", field_names),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Unsupported fields for vector index: {:?}",
+            field_names
+        )));
     }
 
     // Vector indices currently support only single fields, use the first one
@@ -1566,10 +1503,9 @@ pub async fn initialize_vector_index(
                     )
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::Index {
-                        message: "Rabit quantization is not supported for HNSW index".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "Rabit quantization is not supported for HNSW index".to_string(),
+                    ));
                 }
             }
         }
@@ -1591,13 +1527,12 @@ pub async fn initialize_vector_index(
     )
     .await?;
 
-    let field = target_dataset
-        .schema()
-        .field(column_name)
-        .ok_or_else(|| Error::Index {
-            message: format!("Column '{}' not found in target dataset", column_name),
-            location: location!(),
-        })?;
+    let field = target_dataset.schema().field(column_name).ok_or_else(|| {
+        Error::index(format!(
+            "Column '{}' not found in target dataset",
+            column_name
+        ))
+    })?;
 
     let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
         Some(roaring::RoaringBitmap::new())

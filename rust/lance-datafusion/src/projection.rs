@@ -7,7 +7,6 @@ use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
 use datafusion_common::{Column, DFSchema};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
-use snafu::location;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -445,10 +444,7 @@ impl ProjectionPlan {
         )?;
         let batches = stream.try_collect::<Vec<_>>().await?;
         if batches.len() != 1 {
-            Err(Error::Internal {
-                message: "Expected exactly one batch".to_string(),
-                location: location!(),
-            })
+            Err(Error::internal("Expected exactly one batch".to_string()))
         } else {
             Ok(batches.into_iter().next().unwrap())
         }

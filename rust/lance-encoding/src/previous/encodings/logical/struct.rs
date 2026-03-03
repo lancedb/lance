@@ -19,7 +19,6 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream::FuturesUnordered};
 use lance_core::{Error, Result};
 use log::trace;
-use snafu::location;
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -519,7 +518,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
                 .push_back(child.decoder);
         } else {
             // This decoder is intended for one of our children
-            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::Internal { message: format!("Decoder scheduled for child at index {} but we don't have any child at that index yet", child_idx), location: location!() })?;
+            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::internal(format!("Decoder scheduled for child at index {} but we don't have any child at that index yet", child_idx)))?;
             intended.accept_child(child)?;
         }
         Ok(())

@@ -12,7 +12,6 @@ use arrow_array::{Array, ArrayRef, UInt8Array, cast::AsArray};
 use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::vector::quantizer::QuantizerBuildParams;
 
@@ -29,25 +28,19 @@ impl BinaryQuantization {
     pub fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a float vector array, got: {:?}",
-                    data.data_type()
-                ),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!(
+                "Expect to be a float vector array, got: {:?}",
+                data.data_type()
+            )))?
             .clone();
 
         let data = fsl
             .values()
             .as_primitive_opt::<Float32Type>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a float32 vector array, got: {:?}",
-                    fsl.values().data_type()
-                ),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "Expect to be a float32 vector array, got: {:?}",
+                fsl.values().data_type()
+            )))?;
         let dim = fsl.value_length() as usize;
         let code = data
             .values()

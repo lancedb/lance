@@ -205,6 +205,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
         do_write_fragments(
+            None,
             object_store,
             &base_path,
             &schema,

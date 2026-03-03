@@ -49,7 +49,7 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             Some(SortedArray(array)) => Ok(Self::SortedArray(EncodedU64Array::try_from(array)?)),
             Some(Array(array)) => Ok(Self::Array(EncodedU64Array::try_from(array)?)),
             // TODO: why non-exhaustive?
-            // Some(_) => Err(Error::invalid_input("unknown segment type", location!())),
+            // Some(_) => Err(Error::invalid_input("unknown segment type")),
             None => Err(Error::invalid_input("missing segment type")),
         }
     }
@@ -101,7 +101,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                 Ok(Self::U64(values))
             }
             // TODO: shouldn't this enum be non-exhaustive?
-            // Some(_) => Err(Error::invalid_input("unknown array type", location!())),
+            // Some(_) => Err(Error::invalid_input("unknown array type")),
             None => Err(Error::invalid_input("missing array type")),
         }
     }

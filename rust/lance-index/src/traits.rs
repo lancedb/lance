@@ -6,7 +6,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
@@ -238,13 +237,10 @@ pub trait DatasetIndexExt {
         } else if indices.len() == 1 {
             Ok(Some(indices[0].clone()))
         } else {
-            Err(Error::Index {
-                message: format!(
-                    "Found multiple indices of the same name: {:?}, please use load_indices_by_name",
-                    indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()
-                ),
-                location: location!(),
-            })
+            Err(Error::index(format!(
+                "Found multiple indices of the same name: {:?}, please use load_indices_by_name",
+                indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()
+            )))
         }
     }
 

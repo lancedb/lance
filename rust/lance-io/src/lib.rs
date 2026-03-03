@@ -7,7 +7,6 @@ use std::{
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{PrimitiveArray, UInt32Array};
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -154,14 +153,13 @@ impl ReadBatchParams {
     /// return an error.
     pub fn slice(&self, start: usize, length: usize) -> Result<Self> {
         let out_of_bounds = |size: usize| {
-            Err(Error::InvalidInput {
-                source: format!(
+            Err(Error::invalid_input_source(
+                format!(
                     "Cannot slice from {} with length {} given a selection of size {}",
                     start, length, size
                 )
                 .into(),
-                location: location!(),
-            })
+            ))
         };
 
         match self {

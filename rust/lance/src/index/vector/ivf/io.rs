@@ -43,7 +43,6 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::location;
 use tokio::sync::Semaphore;
 
 use crate::Result;
@@ -93,10 +92,7 @@ async fn merge_streams(
             let codes = Arc::new(
                 batch
                     .column_by_name(column)
-                    .ok_or_else(|| Error::Index {
-                        message: format!("code column {} not found", column),
-                        location: location!(),
-                    })?
+                    .ok_or_else(|| Error::index(format!("code column {} not found", column)))?
                     .as_fixed_size_list()
                     .clone(),
             );
@@ -182,14 +178,10 @@ pub(super) async fn write_pq_partitions(
                 let sub_index = idx
                     .load_partition(part_id as usize, true, &NoOpMetricsCollector)
                     .await?;
-                let pq_index =
-                    sub_index
-                        .as_any()
-                        .downcast_ref::<PQIndex>()
-                        .ok_or(Error::Index {
-                            message: "Invalid sub index".to_string(),
-                            location: location!(),
-                        })?;
+                let pq_index = sub_index
+                    .as_any()
+                    .downcast_ref::<PQIndex>()
+                    .ok_or(Error::index("Invalid sub index".to_string()))?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
                     let row_ids = pq_index.row_ids.as_ref().unwrap();
                     let num_vectors = row_ids.len();
@@ -480,10 +472,9 @@ async fn build_hnsw_quantization_partition(
 
     let build_store = match quantizer {
         Quantizer::Flat(_) => {
-            return Err(Error::Index {
-                message: "Flat quantizer is not supported for IVF_HNSW".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Flat quantizer is not supported for IVF_HNSW".to_string(),
+            ));
         }
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
             metric_type,

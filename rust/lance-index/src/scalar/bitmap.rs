@@ -29,7 +29,6 @@ use lance_core::{
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 use tracing::instrument;
 
 use super::{AnyQuery, IndexStore, ScalarIndex};
@@ -217,10 +216,7 @@ impl BitmapIndex {
                 .column(0)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::Internal {
-                    message: "Invalid bitmap column type".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
             let bitmap_bytes = binary_bitmaps.value(0);
             let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -278,10 +274,7 @@ impl BitmapIndex {
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Invalid bitmap column type".to_string(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -324,10 +317,9 @@ impl Index for BitmapIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "BitmapIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "BitmapIndex is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -387,9 +379,11 @@ impl Index for BitmapIndex {
         let stats = BitmapStatistics {
             num_bitmaps: self.index_map.len() + if !self.null_map.is_empty() { 1 } else { 0 },
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize bitmap index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize bitmap index statistics: {}",
+                e
+            ))
         })
     }
 
@@ -539,10 +533,9 @@ impl ScalarIndex for BitmapIndex {
                 ((*self.null_map).clone(), None)
             }
             SargableQuery::FullTextSearch(_) => {
-                return Err(Error::NotSupported {
-                    source: "full text search is not supported for bitmap indexes".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "full text search is not supported for bitmap indexes".into(),
+                ));
             }
         };
 
@@ -712,12 +705,8 @@ impl BitmapIndexPlugin {
         }
 
         // Finish file with metadata that allows lightweight statistics reads
-        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps }).map_err(|e| {
-            Error::Internal {
-                message: format!("failed to serialize bitmap statistics: {e}"),
-                location: location!(),
-            }
-        })?;
+        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps })
+            .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
         let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
 
@@ -772,10 +761,9 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A bitmap index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A bitmap index can only be created on a non-nested field.".into(),
+            ));
         }
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
@@ -807,10 +795,9 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "Bitmap index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Bitmap index does not support fragment training".into(),
+            ));
         }
 
         Self::train_bitmap_index(data, index_store).await?;
@@ -839,9 +826,8 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     ) -> Result<Option<serde_json::Value>> {
         let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         if let Some(value) = reader.schema().metadata.get(INDEX_STATS_METADATA_KEY) {
-            let stats = serde_json::from_str(value).map_err(|e| Error::Internal {
-                message: format!("failed to parse bitmap statistics metadata: {e}"),
-                location: location!(),
+            let stats = serde_json::from_str(value).map_err(|e| {
+                Error::internal(format!("failed to parse bitmap statistics metadata: {e}"))
             })?;
             Ok(Some(stats))
         } else {

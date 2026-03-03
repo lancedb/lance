@@ -5,7 +5,6 @@ use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
-use snafu::location;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -231,14 +230,13 @@ impl ArrayEncoder for ValueEncoder {
                 index,
                 None,
             )),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot encode a data block of type {} with ValueEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }?;
         Ok(EncodedArray { data, encoding })
     }

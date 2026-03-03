@@ -14,7 +14,6 @@ use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
-use snafu::location;
 use std::collections::HashMap;
 
 use crate::buffer::LanceBuffer;
@@ -361,14 +360,13 @@ impl ArrayEncoder for DictionaryEncoder {
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
         if !matches!(data_type, DataType::Utf8) {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "DictionaryEncoder only supports string arrays but got {}",
                     data_type
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         // We only support string arrays for now
         let str_data = make_array(data.into_arrow(DataType::Utf8, false)?);

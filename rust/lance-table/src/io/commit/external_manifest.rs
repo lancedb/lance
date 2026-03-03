@@ -16,7 +16,6 @@ use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use snafu::location;
 use tracing::info;
 
 use super::{
@@ -209,7 +208,6 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
             Error::corrupt_file(
                 path.clone(),
                 "Path does not follow known manifest naming convention.",
-                location!(),
             )
         })
 }
@@ -391,10 +389,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Err(Error::NotFound { .. }) => {
                 let path = default_resolve_version(base_path, version, object_store)
                     .await
-                    .map_err(|_| Error::NotFound {
-                        uri: format!("{}@{}", base_path, version),
-                        location: location!(),
-                    })?
+                    .map_err(|_| Error::not_found(format!("{}@{}", base_path, version)))?
                     .path;
                 match object_store.head(&path).await {
                     Ok(ObjectMeta { size, e_tag, .. }) => {
@@ -425,10 +420,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
-                        return Err(Error::NotFound {
-                            uri: path.to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_found(path.to_string()));
                     }
                     Err(e) => return Err(e.into()),
                 }
