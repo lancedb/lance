@@ -254,3 +254,18 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
             }
         )
         assert result.num_rows == 4
+
+    def check_write(self):
+        """Verify can insert vectors and run optimize workflows."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "id": pa.array([1000]),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(32).cast(pa.float32()), 32
+                ),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
