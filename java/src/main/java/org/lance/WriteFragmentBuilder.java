@@ -37,7 +37,6 @@ import java.util.Map;
  *     .allocator(allocator)
  *     .data(vectorSchemaRoot)
  *     .storageOptions(storageOptions)
- *     .s3CredentialsRefreshOffsetSeconds(10)
  *     .execute();
  * }</pre>
  */
@@ -135,21 +134,6 @@ public class WriteFragmentBuilder {
   }
 
   /**
-   * Set the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param seconds refresh offset in seconds
-   * @return this builder
-   */
-  public WriteFragmentBuilder s3CredentialsRefreshOffsetSeconds(long seconds) {
-    ensureWriteParamsBuilder();
-    this.writeParamsBuilder.withS3CredentialsRefreshOffsetSeconds(seconds);
-    return this;
-  }
-
-  /**
    * Set the maximum number of rows per file.
    *
    * @param maxRowsPerFile maximum rows per file
@@ -212,10 +196,10 @@ public class WriteFragmentBuilder {
   /**
    * Set the data storage version.
    *
-   * @param version the data storage version
+   * @param version the data storage version (e.g., "legacy", "stable", "2.0")
    * @return this builder
    */
-  public WriteFragmentBuilder dataStorageVersion(WriteParams.LanceFileVersion version) {
+  public WriteFragmentBuilder dataStorageVersion(String version) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withDataStorageVersion(version);
     return this;

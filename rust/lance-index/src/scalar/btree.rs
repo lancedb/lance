@@ -14,34 +14,36 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
-        CreatedIndex, UpdateCriteria,
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
-use crate::{Index, IndexType};
 use arrow_arith::numeric::add;
-use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
+    union::UnionExec,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use deepsize::DeepSizeOf;
 use futures::{
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
+    Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
@@ -49,11 +51,10 @@ use lance_core::{
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result, ROW_ID,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
@@ -61,7 +62,6 @@ use object_store::path::Path;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
-use snafu::location;
 use tracing::{info, instrument};
 
 mod flat;
@@ -120,6 +120,38 @@ impl Ord for OrderableScalarValue {
         // any newly added enum variant will require editing this list
         // or else face a compile error
         match (&self.0, &other.0) {
+            (Decimal32(v1, p1, s1), Decimal32(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal32(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal32(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+            (Decimal64(v1, p1, s1), Decimal64(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal64(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal64(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
             (Decimal128(v1, p1, s1), Decimal128(v2, p2, s2)) => {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
@@ -152,6 +184,7 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (Decimal256(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+
             (Boolean(v1), Boolean(v2)) => v1.cmp(v2),
             (Boolean(v1), Null) => {
                 if v1.is_none() {
@@ -238,7 +271,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (Int64(_), _) => panic!("Attempt to compare Int16 with non-Int64"),
+            (Int64(_), _) => panic!("Attempt to compare Int64 with non-Int64"),
             (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
             (UInt8(v1), Null) => {
                 if v1.is_none() {
@@ -274,7 +307,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
+            (UInt64(_), _) => panic!("Attempt to compare UInt64 with non-UInt64"),
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
                 v1.cmp(v2)
             }
@@ -869,13 +902,12 @@ impl LazyRangedIndexReader {
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
-        let (page_file_name, offset) =
-            self.ranges_to_files
-                .get(&page_idx)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Unexpected page index, index {} is out of range.", page_idx),
-                    location: location!(),
-                })?;
+        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
+            Error::internal(format!(
+                "Unexpected page index, index {} is out of range.",
+                page_idx
+            ))
+        })?;
         let reader = self.get_reader(page_file_name).await?;
         Ok((reader.clone(), page_idx - *offset))
     }
@@ -1238,13 +1270,6 @@ impl BTreeIndex {
         Schema::new(vec![value_field, row_id_field])
     }
 
-    // For legacy reasons a btree index expects the serialized schema to be values/ids
-    fn flat_schema(&self) -> Schema {
-        let value_field = Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true);
-        let row_id_field = Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false);
-        Schema::new(vec![value_field, row_id_field])
-    }
-
     /// Create a stream of all the data in the index, in the same format used to train the index
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
@@ -1269,20 +1294,21 @@ impl BTreeIndex {
         )))
     }
 
-    async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
-        let stream = self.into_data_stream().await?;
-        Ok(Arc::new(OneShotExec::new(stream)))
-    }
-
     async fn combine_old_new(
         self,
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
+        valid_old_fragments: Option<RoaringBitmap>,
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_input = self.into_old_data().await?;
+        let old_stream = self.into_data_stream().await?;
+        let old_stream = match valid_old_fragments {
+            Some(valid_frags) => filter_row_ids_by_fragments(old_stream, valid_frags),
+            None => old_stream,
+        };
+        let old_input = Arc::new(OneShotExec::new(old_stream));
         debug_assert_eq!(
             old_input.schema().flattened_fields().len(),
             new_input.schema().flattened_fields().len()
@@ -1297,7 +1323,7 @@ impl BTreeIndex {
         };
         // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
         // them back into a single partition.
-        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
+        let all_data = UnionExec::try_new(vec![old_input, new_input])?;
         let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
 
         let unchunked = execute_plan(
@@ -1309,6 +1335,29 @@ impl BTreeIndex {
         )?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
+}
+
+/// Filter a stream of record batches to only include rows whose row address
+/// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
+/// ID in the upper 32 bits.
+fn filter_row_ids_by_fragments(
+    stream: SendableRecordBatchStream,
+    valid_fragments: RoaringBitmap,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .expect("expected UInt64Array for row_id column");
+        let mask: arrow_array::BooleanArray = row_ids
+            .iter()
+            .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+            .collect();
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
@@ -1350,10 +1399,9 @@ impl Index for BTreeIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "BTreeIndex is not vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "BTreeIndex is not vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1384,10 +1432,9 @@ impl Index for BTreeIndex {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1452,10 +1499,11 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
-            )),
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::invalid_input(
+                    "full text search is not supported for BTree index, build a inverted index for it",
+                ));
+            }
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
 
@@ -1493,38 +1541,69 @@ impl ScalarIndex for BTreeIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let part_page_files: Vec<&str> = if let Some(ranges_to_files) = &self.ranges_to_files {
-            // Range-based Index: Directly collect references to the file paths.
-            ranges_to_files
-                .iter()
-                .map(|(_, (path, _))| path.as_str())
-                .collect()
-        } else {
-            // Basic Index: There is only one source page file.
-            vec![BTREE_PAGES_NAME]
-        };
+        // (part_id, path)
+        // The part_id is None for a basic index
+        // For a range-based index we use Some(0), Some(1), ...
+        //   even if those weren't the original part ids
+        let part_page_files: Vec<(Option<u32>, &str)> =
+            if let Some(ranges_to_files) = &self.ranges_to_files {
+                // Range-based Index: Directly collect references to the file paths.
+                ranges_to_files
+                    .iter()
+                    .enumerate()
+                    .map(|(part_id, (_, (path, _)))| (Some(part_id as u32), path.as_str()))
+                    .collect()
+            } else {
+                // Basic Index: There is only one source page file.
+                vec![(None, BTREE_PAGES_NAME)]
+            };
 
-        for page_file in part_page_files {
-            // Remap and write the pages
-            let schema = Arc::new(self.flat_schema());
-            let mut sub_index_file = dest_store.new_index_file(page_file, schema).await?;
+        let mapping = Arc::new(mapping.clone());
+        let train_schema = Arc::new(self.train_schema());
 
+        // TODO: Could potentially parallelize this across parts, unclear it would be worth it
+        for (part_id, page_file) in part_page_files {
+            // Retrain on the remapped pages
             let sub_index_reader = self.store.open_index_file(page_file).await?;
-            let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-                .await
-                .buffered(self.store.io_parallelism());
-            while let Some(serialized) = reader_stream.try_next().await? {
-                let remapped = FlatIndex::remap_batch(serialized, mapping)?;
-                sub_index_file.write_record_batch(remapped).await?;
-            }
+            let mapping = mapping.clone();
 
-            sub_index_file.finish().await?;
+            let train_schema_clone = train_schema.clone();
+            let train_schema = train_schema.clone();
+
+            let remapped_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
+                .await
+                .buffered(self.store.io_parallelism())
+                .map_err(DataFusionError::from)
+                .and_then(move |batch| {
+                    // Remap the batch and then convert from the serialized schema to the training input schema
+                    let remapped =
+                        FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
+                    let with_train_schema = remapped.and_then(|batch| {
+                        RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
+                            .map_err(DataFusionError::from)
+                    });
+                    std::future::ready(with_train_schema)
+                });
+
+            let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
+                train_schema_clone,
+                remapped_stream,
+            ));
+
+            train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
         }
 
-        // Copy the lookup file as-is
-        self.store
-            .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
-            .await?;
+        if let Some(ranges_to_files) = &self.ranges_to_files {
+            let num_parts = ranges_to_files.len();
+            // Merge the lookups if we are a range-based index
+            let page_files = (0..num_parts)
+                .map(|part_id| part_page_data_file_path((part_id as u64) << 32))
+                .collect::<Vec<_>>();
+            let lookup_files = (0..num_parts)
+                .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
+                .collect::<Vec<_>>();
+            merge_metadata_files(dest_store, &page_files, &lookup_files, None).await?;
+        }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1537,11 +1616,12 @@ impl ScalarIndex for BTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, self.batch_size)
+            .combine_old_new(new_data, self.batch_size, valid_old_fragments.cloned())
             .await?;
         train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
 
@@ -1574,20 +1654,14 @@ struct BatchStats {
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
     if values.is_empty() {
-        return Err(Error::Internal {
-            message: "received an empty batch in btree training".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "received an empty batch in btree training".to_string(),
+        ));
     }
-    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
-        message: format!("failed to get min value from batch: {}", e),
-        location: location!(),
-    })?;
-    let max =
-        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
-            message: format!("failed to get max value from batch: {}", e),
-            location: location!(),
-        })?;
+    let min = ScalarValue::try_from_array(&values, 0)
+        .map_err(|e| Error::internal(format!("failed to get min value from batch: {}", e)))?;
+    let max = ScalarValue::try_from_array(&values, values.len() - 1)
+        .map_err(|e| Error::internal(format!("failed to get max value from batch: {}", e)))?;
 
     Ok(BatchStats {
         min,
@@ -1686,10 +1760,6 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Resu
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
-///
-/// Note: This is likely to change.  It is unreasonable to expect the caller to do the sorting
-/// and re-chunking into page-size batches.  This is left for simplicity as this feature is still
-/// a work in progress
 pub async fn train_btree_index(
     batches_source: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
@@ -1722,19 +1792,21 @@ pub async fn train_btree_index(
         Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
     ]));
 
-    let mut sub_index_file;
-    if partition_id.is_none() {
-        sub_index_file = index_store
-            .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
-            .await?;
-    } else {
-        sub_index_file = index_store
-            .new_index_file(
-                part_page_data_file_path(partition_id.unwrap()).as_str(),
-                flat_schema.clone(),
-            )
-            .await?;
-    }
+    let mut sub_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_page_data_file_path(partition_id).as_str(),
+                    flat_schema.clone(),
+                )
+                .await?
+        }
+    };
 
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
@@ -1769,19 +1841,21 @@ pub async fn train_btree_index(
         RANGE_PARTITIONED_META_KEY.to_string(),
         range_id.is_some().to_string(),
     );
-    let mut btree_index_file;
-    if partition_id.is_none() {
-        btree_index_file = index_store
-            .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
-            .await?;
-    } else {
-        btree_index_file = index_store
-            .new_index_file(
-                part_lookup_file_path(partition_id.unwrap()).as_str(),
-                Arc::new(file_schema),
-            )
-            .await?;
-    }
+    let mut btree_index_file = match partition_id {
+        None => {
+            index_store
+                .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
+                .await?
+        }
+        Some(partition_id) => {
+            index_store
+                .new_index_file(
+                    part_lookup_file_path(partition_id).as_str(),
+                    Arc::new(file_schema),
+                )
+                .await?
+        }
+    };
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())
@@ -1796,7 +1870,13 @@ pub async fn merge_index_files(
     // List all partition page / lookup files in the index directory
     let (part_page_files, part_lookup_files) =
         list_page_lookup_files(object_store, index_dir).await?;
-    merge_metadata_files(store, &part_page_files, &part_lookup_files, batch_readhead).await
+    merge_metadata_files(
+        store.as_ref(),
+        &part_page_files,
+        &part_lookup_files,
+        batch_readhead,
+    )
+    .await
 }
 
 /// List and filter files from the index directory
@@ -1828,13 +1908,12 @@ async fn list_page_lookup_files(
     }
 
     if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::Internal {
-            message: format!(
-                "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-                index_dir, part_page_files.len(), part_lookup_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
+            index_dir,
+            part_page_files.len(),
+            part_lookup_files.len()
+        )));
     }
 
     Ok((part_page_files, part_lookup_files))
@@ -1847,28 +1926,24 @@ async fn list_page_lookup_files(
 /// - For fragment-based indices, it performs a full K-way sort-merge of page files to create new global page and lookup files.
 /// - For range-based indices, it concatenates lookup files, as data is already globally sorted.
 async fn merge_metadata_files(
-    store: Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     part_page_files: &[String],
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
 ) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
-        return Err(Error::Internal {
-            message: "No partition files provided for merging".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "No partition files provided for merging".to_string(),
+        ));
     }
 
     // Step 1: Create lookup map for page files by partition ID
     if part_lookup_files.len() != part_page_files.len() {
-        return Err(Error::Internal {
-            message: format!(
-                "Number of partition lookup files ({}) does not match number of partition page files ({})",
-                part_lookup_files.len(),
-                part_page_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Number of partition lookup files ({}) does not match number of partition page files ({})",
+            part_lookup_files.len(),
+            part_page_files.len()
+        )));
     }
     let mut page_files_map = HashMap::new();
     for page_file in part_page_files {
@@ -1880,13 +1955,10 @@ async fn merge_metadata_files(
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
         if !page_files_map.contains_key(&partition_id) {
-            return Err(Error::Internal {
-                message: format!(
-                    "No corresponding page file found for lookup file: {} (partition_id: {})",
-                    lookup_file, partition_id
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "No corresponding page file found for lookup file: {} (partition_id: {})",
+                lookup_file, partition_id
+            )));
         }
     }
 
@@ -1925,7 +1997,7 @@ async fn merge_metadata_files(
     // Step 4: Merge pages and lookups and generate new index files
     if range_partitioned {
         merge_range_partitioned_lookups(
-            &store,
+            store,
             part_lookup_files,
             lookup_schema,
             metadata,
@@ -1935,7 +2007,7 @@ async fn merge_metadata_files(
         .await
     } else {
         merge_pages_and_lookups(
-            &store,
+            store,
             part_page_files,
             part_lookup_files,
             &page_files_map,
@@ -1978,7 +2050,7 @@ async fn merge_metadata_files(
 /// The final, merged `_page_lookup.lance` will have a single `page_idx` column containing
 /// `[0, 1, 2, 3, 4, 5, 6]`.
 async fn merge_range_partitioned_lookups(
-    store: &Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     part_lookup_files: &[String],
     lookup_schema: Arc<Schema>,
     mut metadata: HashMap<String, String>,
@@ -2027,7 +2099,7 @@ async fn merge_range_partitioned_lookups(
 /// writes a new global page file, and generates a corresponding global lookup file.
 #[allow(clippy::too_many_arguments)]
 async fn merge_pages_and_lookups(
-    store: &Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     part_page_files: &[String],
     part_lookup_files: &[String],
     page_files_map: &HashMap<u64, &String>,
@@ -2089,21 +2161,15 @@ async fn merge_pages_and_lookups(
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
 fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatch> {
-    let (page_idx_pos, _) =
-        batch
-            .schema()
-            .column_with_name("page_idx")
-            .ok_or_else(|| Error::Internal {
-                message: "Column 'page_idx' not found in RecordBatch schema".to_string(),
-                location: location!(),
-            })?;
+    let (page_idx_pos, _) = batch.schema().column_with_name("page_idx").ok_or_else(|| {
+        Error::internal("Column 'page_idx' not found in RecordBatch schema".to_string())
+    })?;
     let page_idx_array = batch
         .column(page_idx_pos)
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Failed to downcast 'page_idx' column to UInt32Array".to_string(),
-            location: location!(),
+        .ok_or_else(|| {
+            Error::internal("Failed to downcast 'page_idx' column to UInt32Array".to_string())
         })?;
     let offset_array = UInt32Array::from(vec![offset; page_idx_array.len()]);
     let new_page_idx_array_ref = add(page_idx_array, &offset_array)?;
@@ -2118,7 +2184,7 @@ fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatc
 async fn merge_pages(
     part_lookup_files: &[String],
     page_files_map: &HashMap<u64, &String>,
-    store: &Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     batch_size: u64,
     page_file: &mut Box<dyn IndexWriter>,
     arrow_schema: Arc<Schema>,
@@ -2140,14 +2206,13 @@ async fn merge_pages(
     let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name =
-            (*page_files_map
-                .get(&partition_id)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Page file not found for partition ID: {}", partition_id),
-                    location: location!(),
-                })?)
-            .clone();
+        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Page file not found for partition ID: {}",
+                partition_id
+            ))
+        })?)
+        .clone();
 
         let reader = store.open_index_file(&page_file_name).await?;
 
@@ -2164,7 +2229,7 @@ async fn merge_pages(
     }
 
     // Create Union execution plan to combine all partitions
-    let union_inputs = Arc::new(UnionExec::new(inputs));
+    let union_inputs = UnionExec::try_new(inputs)?;
 
     // Create SortPreservingMerge execution plan
     let value_column_index = stream_schema.index_of(VALUE_COLUMN_NAME)?;
@@ -2233,23 +2298,25 @@ fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<(u64, String)
 /// Expected format: "part_{partition_id}_{suffix}.lance"
 fn extract_partition_id(filename: &str) -> Result<u64> {
     if !filename.starts_with("part_") {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
     let parts: Vec<&str> = filename.split('_').collect();
     if parts.len() < 3 {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
-    parts[1].parse::<u64>().map_err(|_| Error::Internal {
-        message: format!("Failed to parse partition ID from filename: {}", filename),
-        location: location!(),
+    parts[1].parse::<u64>().map_err(|_| {
+        Error::internal(format!(
+            "Failed to parse partition ID from filename: {}",
+            filename
+        ))
     })
 }
 
@@ -2258,7 +2325,7 @@ fn extract_partition_id(filename: &str) -> Result<u64> {
 /// This function safely deletes partition lookup and page files after a successful merge operation.
 /// File deletion failures are logged but do not affect the overall success of the merge operation.
 async fn cleanup_partition_files(
-    store: &Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     part_lookup_files: &[String],
     part_page_files: &[String],
 ) {
@@ -2291,7 +2358,7 @@ async fn cleanup_partition_files(
 ///
 /// Performs safety checks on the filename pattern before attempting deletion.
 async fn cleanup_single_file(
-    store: &Arc<dyn IndexStore>,
+    store: &dyn IndexStore,
     file_name: &str,
     expected_prefix: &str,
     expected_suffix: &str,
@@ -2448,10 +2515,9 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A btree index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A btree index can only be created on a non-nested field.".into(),
+            ));
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;
@@ -2480,6 +2546,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
@@ -2520,20 +2587,21 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{record_batch, FixedSizeListArray};
+    use arrow_array::{FixedSizeListArray, record_batch};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
-        physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+        physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
-    use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
+    use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
     use deepsize::DeepSizeOf;
-    use futures::stream;
     use futures::TryStreamExt;
+    use futures::stream;
+    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
@@ -2541,15 +2609,15 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
-            lance_format::LanceIndexStore,
             IndexStore, SargableQuery, ScalarIndex, SearchResult,
+            btree::{BTREE_PAGES_NAME, BTreeIndex},
+            lance_format::LanceIndexStore,
         },
     };
 
     use super::{
-        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
-        DEFAULT_BTREE_BATCH_SIZE,
+        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
+        part_page_data_file_path, train_btree_index,
     };
     #[test]
     fn test_scalar_value_size() {
@@ -2820,7 +2888,7 @@ mod tests {
         ];
 
         super::merge_metadata_files(
-            fragment_store.clone(),
+            fragment_store.as_ref(),
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
@@ -3029,7 +3097,7 @@ mod tests {
         ];
 
         super::merge_metadata_files(
-            fragment_store.clone(),
+            fragment_store.as_ref(),
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
@@ -3379,7 +3447,7 @@ mod tests {
 
         // The cleanup function should handle both valid and invalid file patterns gracefully
         // This test mainly verifies that the function doesn't panic and handles edge cases
-        super::cleanup_partition_files(&test_store, &lookup_files, &page_files).await;
+        super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
     }
 
     #[tokio::test]
@@ -3552,7 +3620,7 @@ mod tests {
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
-            Option::from(1u32),
+            Option::from(0u32),
         )
         .await
         .unwrap();
@@ -3579,24 +3647,24 @@ mod tests {
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
-            Option::from(2u32),
+            Option::from(1u32),
         )
         .await
         .unwrap();
 
         // Merge the fragment files
         let part_page_files = vec![
+            part_page_data_file_path(0 << 32),
             part_page_data_file_path(1 << 32),
-            part_page_data_file_path(2 << 32),
         ];
 
         let part_lookup_files = vec![
+            part_lookup_file_path(0 << 32),
             part_lookup_file_path(1 << 32),
-            part_lookup_file_path(2 << 32),
         ];
 
         super::merge_metadata_files(
-            range_store.clone(),
+            range_store.as_ref(),
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
@@ -3913,7 +3981,7 @@ mod tests {
         ];
 
         super::merge_metadata_files(
-            old_store.clone(),
+            old_store.as_ref(),
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
@@ -3946,7 +4014,7 @@ mod tests {
 
         // update the ranged index
         ranged_index
-            .update(update_data_source, new_store.as_ref())
+            .update(update_data_source, new_store.as_ref(), None)
             .await
             .expect("Error in updating ranged index");
 
@@ -3979,6 +4047,124 @@ mod tests {
             }
             _ => {
                 panic!("Btree search result should always be Exact.");
+            }
+        }
+    }
+
+    /// Rust equivalent of Python test `test_btree_remap_big_deletions`
+    ///
+    /// This test verifies that btree index remapping works correctly when a large
+    /// portion of the data is deleted. The Python test:
+    /// 1. Writes 15K rows in 3 fragments (values 0-14999)
+    /// 2. Creates a btree index (will have multiple pages)
+    /// 3. Deletes rows where a > 1000 AND a < 10000 (deletes values 1001-9999)
+    /// 4. Runs compaction (materializes deletions via remap)
+    /// 5. Verifies the index still works for remaining values
+    #[tokio::test]
+    async fn test_btree_remap_big_deletions() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Generate 15000 rows with values 0-14999 and row_ids 0-14999
+        // Using a smaller batch size to ensure we get multiple pages
+        let batch_size = 4096;
+        let total_rows = 15000;
+
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(total_rows), BatchCount::from(1));
+
+        train_btree_index(stream, test_store.as_ref(), batch_size, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Create a mapping that simulates deleting rows where value > 1000 AND value < 10000
+        // Since values match row_ids in our test data:
+        // - Rows 0-1000 (values 0-1000) are kept with same row_ids
+        // - Rows 1001-9999 (values 1001-9999) are deleted (mapped to None)
+        // - Rows 10000-14999 (values 10000-14999) are remapped to new row_ids 1001-5999
+        let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
+
+        // Mark deleted rows (values 1001-9999)
+        for old_id in 1001..10000 {
+            mapping.insert(old_id, None);
+        }
+
+        let mut new_id_counter = 100_000;
+
+        // Remap all other rows
+        for old_id in (0..1000).chain(10000..15000) {
+            let new_id = new_id_counter;
+            new_id_counter += 1;
+            mapping.insert(old_id, Some(new_id));
+        }
+
+        let remap_dir = TempObjDir::default();
+        let remap_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remap_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Remap the index with our deletion mapping
+        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+
+        let remapped_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Verify values that should exist (values 0-1000 and 10000-14999)
+        // These correspond to: original values 0-1000 at row_ids 0-1000
+        // and original values 10000-14999 at new row_ids 1001-5999
+        let should_exist = vec![0, 500, 1000, 10000, 13000, 14000, 14999];
+        for value in should_exist {
+            let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+            let result = remapped_index
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            match result {
+                SearchResult::Exact(row_id_map) => {
+                    assert!(
+                        !row_id_map.is_empty(),
+                        "Value {} should exist in remapped index but was not found",
+                        value
+                    );
+                }
+                _ => {
+                    panic!("Btree search result should always be Exact.");
+                }
+            }
+        }
+
+        // Verify values that should NOT exist (values 1001-9999 were deleted)
+        let should_not_exist = vec![1001, 5000, 8000, 9999];
+        for value in should_not_exist {
+            let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+            let result = remapped_index
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            match result {
+                SearchResult::Exact(row_id_map) => {
+                    assert!(
+                        row_id_map.is_empty(),
+                        "Value {} should NOT exist in remapped index but was found",
+                        value
+                    );
+                }
+                _ => {
+                    panic!("Btree search result should always be Exact.");
+                }
             }
         }
     }

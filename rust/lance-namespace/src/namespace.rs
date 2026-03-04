@@ -6,20 +6,21 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance_core::{Error, Result};
-use snafu::Location;
 
 use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    CountTableRowsRequest, CreateEmptyTableRequest, CreateEmptyTableResponse,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
-    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
+    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
     DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
     ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
@@ -39,66 +40,82 @@ use lance_namespace_reqwest_client::models::{
 /// This trait defines the interface that all Lance namespace implementations
 /// must provide. Each method corresponds to a specific operation on namespaces
 /// or tables.
+///
+/// # Error Handling
+///
+/// All operations may return the following common errors (via [`crate::NamespaceError`]):
+///
+/// - [`crate::ErrorCode::Unsupported`] - Operation not supported by this backend
+/// - [`crate::ErrorCode::InvalidInput`] - Invalid request parameters
+/// - [`crate::ErrorCode::PermissionDenied`] - Insufficient permissions
+/// - [`crate::ErrorCode::Unauthenticated`] - Invalid credentials
+/// - [`crate::ErrorCode::ServiceUnavailable`] - Service temporarily unavailable
+/// - [`crate::ErrorCode::Internal`] - Unexpected internal error
+///
+/// See individual method documentation for operation-specific errors.
 #[async_trait]
 pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// List namespaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the parent namespace does not exist.
     async fn list_namespaces(
         &self,
         _request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        Err(Error::NotSupported {
-            source: "list_namespaces not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_namespaces not implemented"))
     }
 
     /// Describe a namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
     async fn describe_namespace(
         &self,
         _request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        Err(Error::NotSupported {
-            source: "describe_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("describe_namespace not implemented"))
     }
 
     /// Create a new namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceAlreadyExists`] if a namespace with the same name already exists.
     async fn create_namespace(
         &self,
         _request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        Err(Error::NotSupported {
-            source: "create_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("create_namespace not implemented"))
     }
 
     /// Drop a namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
+    /// - [`crate::ErrorCode::NamespaceNotEmpty`] if the namespace contains tables or child namespaces.
     async fn drop_namespace(
         &self,
         _request: DropNamespaceRequest,
     ) -> Result<DropNamespaceResponse> {
-        Err(Error::NotSupported {
-            source: "drop_namespace not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("drop_namespace not implemented"))
     }
 
     /// Check if a namespace exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
     async fn namespace_exists(&self, _request: NamespaceExistsRequest) -> Result<()> {
-        Err(Error::NotSupported {
-            source: "namespace_exists not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("namespace_exists not implemented"))
     }
 
     /// List tables in a namespace.
     async fn list_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
-        Err(Error::NotSupported {
-            source: "list_tables not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_tables not implemented"))
     }
 
     /// Describe a table.
@@ -106,10 +123,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
-        Err(Error::NotSupported {
-            source: "describe_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("describe_table not implemented"))
     }
 
     /// Register a table.
@@ -117,26 +131,17 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: RegisterTableRequest,
     ) -> Result<RegisterTableResponse> {
-        Err(Error::NotSupported {
-            source: "register_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("register_table not implemented"))
     }
 
     /// Check if a table exists.
     async fn table_exists(&self, _request: TableExistsRequest) -> Result<()> {
-        Err(Error::NotSupported {
-            source: "table_exists not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("table_exists not implemented"))
     }
 
     /// Drop a table.
     async fn drop_table(&self, _request: DropTableRequest) -> Result<DropTableResponse> {
-        Err(Error::NotSupported {
-            source: "drop_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("drop_table not implemented"))
     }
 
     /// Deregister a table.
@@ -144,18 +149,12 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
-        Err(Error::NotSupported {
-            source: "deregister_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("deregister_table not implemented"))
     }
 
     /// Count rows in a table.
     async fn count_table_rows(&self, _request: CountTableRowsRequest) -> Result<i64> {
-        Err(Error::NotSupported {
-            source: "count_table_rows not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("count_table_rows not implemented"))
     }
 
     /// Create a new table with data from Arrow IPC stream.
@@ -164,21 +163,28 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         _request: CreateTableRequest,
         _request_data: Bytes,
     ) -> Result<CreateTableResponse> {
-        Err(Error::NotSupported {
-            source: "create_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("create_table not implemented"))
+    }
+
+    /// Declare a table (metadata only operation).
+    async fn declare_table(&self, _request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        Err(Error::not_supported("declare_table not implemented"))
     }
 
     /// Create an empty table (metadata only operation).
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`declare_table`](Self::declare_table) instead. Support will be removed in 3.0.0.
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use declare_table instead. Support will be removed in 3.0.0."
+    )]
     async fn create_empty_table(
         &self,
         _request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
-        Err(Error::NotSupported {
-            source: "create_empty_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("create_empty_table not implemented"))
     }
 
     /// Insert data into a table.
@@ -187,10 +193,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         _request: InsertIntoTableRequest,
         _request_data: Bytes,
     ) -> Result<InsertIntoTableResponse> {
-        Err(Error::NotSupported {
-            source: "insert_into_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("insert_into_table not implemented"))
     }
 
     /// Merge insert data into a table.
@@ -199,18 +202,14 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         _request: MergeInsertIntoTableRequest,
         _request_data: Bytes,
     ) -> Result<MergeInsertIntoTableResponse> {
-        Err(Error::NotSupported {
-            source: "merge_insert_into_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "merge_insert_into_table not implemented",
+        ))
     }
 
     /// Update a table.
     async fn update_table(&self, _request: UpdateTableRequest) -> Result<UpdateTableResponse> {
-        Err(Error::NotSupported {
-            source: "update_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("update_table not implemented"))
     }
 
     /// Delete from a table.
@@ -218,18 +217,12 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DeleteFromTableRequest,
     ) -> Result<DeleteFromTableResponse> {
-        Err(Error::NotSupported {
-            source: "delete_from_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("delete_from_table not implemented"))
     }
 
     /// Query a table.
     async fn query_table(&self, _request: QueryTableRequest) -> Result<Bytes> {
-        Err(Error::NotSupported {
-            source: "query_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("query_table not implemented"))
     }
 
     /// Create a table index.
@@ -237,10 +230,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
-        Err(Error::NotSupported {
-            source: "create_table_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("create_table_index not implemented"))
     }
 
     /// List table indices.
@@ -248,10 +238,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: ListTableIndicesRequest,
     ) -> Result<ListTableIndicesResponse> {
-        Err(Error::NotSupported {
-            source: "list_table_indices not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_table_indices not implemented"))
     }
 
     /// Describe table index statistics.
@@ -259,10 +246,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DescribeTableIndexStatsRequest,
     ) -> Result<DescribeTableIndexStatsResponse> {
-        Err(Error::NotSupported {
-            source: "describe_table_index_stats not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "describe_table_index_stats not implemented",
+        ))
     }
 
     /// Describe a transaction.
@@ -270,10 +256,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
-        Err(Error::NotSupported {
-            source: "describe_transaction not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("describe_transaction not implemented"))
     }
 
     /// Alter a transaction.
@@ -281,10 +264,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: AlterTransactionRequest,
     ) -> Result<AlterTransactionResponse> {
-        Err(Error::NotSupported {
-            source: "alter_transaction not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("alter_transaction not implemented"))
     }
 
     /// Create a scalar index on a table.
@@ -292,10 +272,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: CreateTableIndexRequest,
     ) -> Result<CreateTableScalarIndexResponse> {
-        Err(Error::NotSupported {
-            source: "create_table_scalar_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "create_table_scalar_index not implemented",
+        ))
     }
 
     /// Drop a table index.
@@ -303,34 +282,22 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DropTableIndexRequest,
     ) -> Result<DropTableIndexResponse> {
-        Err(Error::NotSupported {
-            source: "drop_table_index not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("drop_table_index not implemented"))
     }
 
     /// List all tables across all namespaces.
     async fn list_all_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
-        Err(Error::NotSupported {
-            source: "list_all_tables not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_all_tables not implemented"))
     }
 
     /// Restore a table to a specific version.
     async fn restore_table(&self, _request: RestoreTableRequest) -> Result<RestoreTableResponse> {
-        Err(Error::NotSupported {
-            source: "restore_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("restore_table not implemented"))
     }
 
     /// Rename a table.
     async fn rename_table(&self, _request: RenameTableRequest) -> Result<RenameTableResponse> {
-        Err(Error::NotSupported {
-            source: "rename_table not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("rename_table not implemented"))
     }
 
     /// List all versions of a table.
@@ -338,10 +305,73 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: ListTableVersionsRequest,
     ) -> Result<ListTableVersionsResponse> {
-        Err(Error::NotSupported {
-            source: "list_table_versions not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_table_versions not implemented"))
+    }
+
+    /// Create a new table version entry.
+    ///
+    /// This operation supports `put_if_not_exists` semantics, where the operation
+    /// fails if the version already exists. This is used to coordinate concurrent
+    /// writes to a table through an external manifest store.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier, version number, manifest path,
+    ///   and optional metadata like size and ETag.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the version already exists (conflict).
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    async fn create_table_version(
+        &self,
+        _request: CreateTableVersionRequest,
+    ) -> Result<CreateTableVersionResponse> {
+        Err(Error::not_supported("create_table_version not implemented"))
+    }
+
+    /// Describe a specific table version.
+    ///
+    /// Returns metadata about a specific version of a table, including the
+    /// manifest path, size, ETag, and timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier and optionally the version
+    ///   number. If version is not specified, returns the latest version.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    /// - Returns an error if the specified version does not exist.
+    async fn describe_table_version(
+        &self,
+        _request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        Err(Error::not_supported(
+            "describe_table_version not implemented",
+        ))
+    }
+
+    /// Batch delete table versions.
+    ///
+    /// Deletes multiple version records from a table. This operation supports
+    /// deleting ranges of versions for efficient bulk cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains the table identifier and version ranges to delete.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    async fn batch_delete_table_versions(
+        &self,
+        _request: BatchDeleteTableVersionsRequest,
+    ) -> Result<BatchDeleteTableVersionsResponse> {
+        Err(Error::not_supported(
+            "batch_delete_table_versions not implemented",
+        ))
     }
 
     /// Update table schema metadata.
@@ -349,10 +379,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: UpdateTableSchemaMetadataRequest,
     ) -> Result<UpdateTableSchemaMetadataResponse> {
-        Err(Error::NotSupported {
-            source: "update_table_schema_metadata not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "update_table_schema_metadata not implemented",
+        ))
     }
 
     /// Get table statistics.
@@ -360,10 +389,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: GetTableStatsRequest,
     ) -> Result<GetTableStatsResponse> {
-        Err(Error::NotSupported {
-            source: "get_table_stats not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("get_table_stats not implemented"))
     }
 
     /// Explain a table query plan.
@@ -371,10 +397,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: ExplainTableQueryPlanRequest,
     ) -> Result<String> {
-        Err(Error::NotSupported {
-            source: "explain_table_query_plan not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "explain_table_query_plan not implemented",
+        ))
     }
 
     /// Analyze a table query plan.
@@ -382,10 +407,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: AnalyzeTableQueryPlanRequest,
     ) -> Result<String> {
-        Err(Error::NotSupported {
-            source: "analyze_table_query_plan not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "analyze_table_query_plan not implemented",
+        ))
     }
 
     /// Add columns to a table.
@@ -393,10 +417,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
-        Err(Error::NotSupported {
-            source: "alter_table_add_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "alter_table_add_columns not implemented",
+        ))
     }
 
     /// Alter columns in a table.
@@ -404,10 +427,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
-        Err(Error::NotSupported {
-            source: "alter_table_alter_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "alter_table_alter_columns not implemented",
+        ))
     }
 
     /// Drop columns from a table.
@@ -415,10 +437,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
-        Err(Error::NotSupported {
-            source: "alter_table_drop_columns not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "alter_table_drop_columns not implemented",
+        ))
     }
 
     /// List all tags for a table.
@@ -426,10 +447,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: ListTableTagsRequest,
     ) -> Result<ListTableTagsResponse> {
-        Err(Error::NotSupported {
-            source: "list_table_tags not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("list_table_tags not implemented"))
     }
 
     /// Get the version for a specific tag.
@@ -437,10 +455,9 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: GetTableTagVersionRequest,
     ) -> Result<GetTableTagVersionResponse> {
-        Err(Error::NotSupported {
-            source: "get_table_tag_version not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported(
+            "get_table_tag_version not implemented",
+        ))
     }
 
     /// Create a tag for a table.
@@ -448,10 +465,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: CreateTableTagRequest,
     ) -> Result<CreateTableTagResponse> {
-        Err(Error::NotSupported {
-            source: "create_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("create_table_tag not implemented"))
     }
 
     /// Delete a tag from a table.
@@ -459,10 +473,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: DeleteTableTagRequest,
     ) -> Result<DeleteTableTagResponse> {
-        Err(Error::NotSupported {
-            source: "delete_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("delete_table_tag not implemented"))
     }
 
     /// Update a tag for a table.
@@ -470,10 +481,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         &self,
         _request: UpdateTableTagRequest,
     ) -> Result<UpdateTableTagResponse> {
-        Err(Error::NotSupported {
-            source: "update_table_tag not implemented".into(),
-            location: Location::new(file!(), line!(), column!()),
-        })
+        Err(Error::not_supported("update_table_tag not implemented"))
     }
 
     /// Return a human-readable unique identifier for this namespace instance.

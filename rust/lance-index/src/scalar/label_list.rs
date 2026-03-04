@@ -8,18 +8,17 @@ use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::RecordBatchStream;
-use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
-use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
+use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_core::cache::LanceCache;
-use lance_core::utils::mask::NullableRowAddrSet;
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::instrument;
 
-use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarIndex};
+use super::{AnyQuery, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
@@ -45,11 +44,15 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
     ) -> Result<NullableRowAddrSet> {
         let result = self.search(query, metrics).await?;
         match result {
-            SearchResult::Exact(row_ids) => Ok(row_ids),
-            _ => Err(Error::Internal {
-                message: "Label list sub-index should return exact results".to_string(),
-                location: location!(),
-            }),
+            SearchResult::Exact(row_ids) => {
+                // Label list semantics treat NULL elements as non-matches, so only TRUE/FALSE
+                // results should remain for array_has_any/array_has_all when the list itself
+                // is non-NULL. Clear nulls to avoid propagating element-level NULLs.
+                Ok(row_ids.with_nulls(RowAddrTreeMap::new()))
+            }
+            _ => Err(Error::internal(
+                "Label list sub-index should return exact results".to_string(),
+            )),
         }
     }
 }
@@ -57,8 +60,8 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
 /// A scalar index that can be used on `List<T>` columns to
-/// support queries with array_contains_all and array_contains_any
-/// using an underlying bitmap index.
+/// accelerate list membership filters such as `array_has_all`, `array_has_any`,
+/// and `array_has` / `array_contains`, using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct LabelListIndex {
     values_index: Arc<dyn LabelListSubIndex>,
@@ -91,10 +94,9 @@ impl Index for LabelListIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "LabeListIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "LabeListIndex is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -207,9 +209,10 @@ impl ScalarIndex for LabelListIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.values_index
-            .update(unnest_chunks(new_data)?, dest_store)
+            .update(unnest_chunks(new_data)?, dest_store, valid_old_fragments)
             .await?;
 
         Ok(CreatedIndex {
@@ -368,14 +371,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             field.data_type(),
             DataType::List(_) | DataType::LargeList(_)
         ) {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
-                    field.data_type()
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(format!(
+                "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                field.data_type()
+            )
+            .into()));
         }
 
         Ok(Box::new(DefaultTrainingRequest::new(
@@ -409,22 +409,23 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "LabelList index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "LabelList index does not support fragment training".into(),
+            ));
         }
 
         let schema = data.schema();
         let field = schema
             .column_with_name(VALUE_COLUMN_NAME)
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Index training data missing value column"
-                    .to_string()
-                    .into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    "Index training data missing value column"
+                        .to_string()
+                        .into(),
+                )
             })?
             .1;
 
@@ -432,20 +433,17 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             field.data_type(),
             DataType::List(_) | DataType::LargeList(_)
         ) {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
-                    field.data_type()
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(format!(
+                "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                field.data_type()
+            )
+            .into()));
         }
 
         let data = unnest_chunks(data)?;
         let bitmap_plugin = BitmapIndexPlugin;
         bitmap_plugin
-            .train_index(data, index_store, request, fragment_ids)
+            .train_index(data, index_store, request, fragment_ids, progress)
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())

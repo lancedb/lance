@@ -61,6 +61,7 @@ from .fragment import (
     RowIdMeta as RowIdMeta,
 )
 from .indices import IndexDescription as IndexDescription
+from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
 )
@@ -95,7 +96,6 @@ class LanceFileWriter:
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
         storage_options_provider: Optional[StorageOptionsProvider],
-        s3_credentials_refresh_offset_seconds: Optional[int],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -110,7 +110,6 @@ class LanceFileSession:
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider: Optional[StorageOptionsProvider] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -135,7 +134,6 @@ class LanceFileReader:
         path: str,
         storage_options: Optional[Dict[str, str]],
         storage_options_provider: Optional[StorageOptionsProvider],
-        s3_credentials_refresh_offset_seconds: Optional[int],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -226,6 +224,7 @@ class _Dataset:
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
         filter: Optional[str] = None,
+        search_filter: Optional[PySearchFilter] = None,
         prefilter: Optional[bool] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -243,8 +242,14 @@ class _Dataset:
         fast_search: Optional[bool] = None,
         full_text_query: Optional[dict] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[Any], None]] = None,
+        strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[Any]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
+        substrait_aggregate: Optional[bytes] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -260,6 +265,16 @@ class _Dataset:
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
     ) -> pa.RecordBatch: ...
     def take_blobs(
+        self,
+        row_ids: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_addresses(
+        self,
+        row_addresses: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    def take_blobs_by_indices(
         self,
         row_indices: List[int],
         blob_column: str,
@@ -282,13 +297,14 @@ class _Dataset:
     def versions(self) -> List[Version]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
-    def checkout_version(self, version: int | str | Tuple[str, int]) -> _Dataset: ...
-    def checkout_branch(self, branch: str) -> _Dataset: ...
+    def checkout_version(
+        self, version: int | str | Tuple[Optional[str], Optional[int]]
+    ) -> _Dataset: ...
     def checkout_latest(self) -> _Dataset: ...
     def shallow_clone(
         self,
         target_path: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> _Dataset: ...
     def restore(self): ...
@@ -303,17 +319,23 @@ class _Dataset:
     def tags(self) -> Dict[str, Tag]: ...
     def tags_ordered(self, order: Optional[str]) -> List[Tuple[str, Tag]]: ...
     def create_tag(
-        self, tag: str, version: int, branch: Optional[str] = None
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
     ) -> Tag: ...
     def delete_tag(self, tag: str): ...
-    def update_tag(self, tag: str, version: int, branch: Optional[str] = None): ...
+    def update_tag(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ): ...
     # Branch operations
     def branches(self) -> Dict[str, Branch]: ...
     def branches_ordered(self, order: Optional[str]) -> List[Tuple[str, Branch]]: ...
     def create_branch(
         self,
         branch: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> _Dataset: ...
@@ -357,6 +379,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        enable_stable_row_ids: Optional[bool] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -428,15 +451,17 @@ class _Fragment:
     ) -> pa.RecordBatch: ...
     def scanner(
         self,
-        columns: Optional[List[str]],
-        columns_with_transform: Optional[List[Tuple[str, str]]],
-        batch_size: Optional[int],
-        filter: Optional[str],
-        limit: Optional[int],
-        offset: Optional[int],
-        with_row_id: Optional[bool],
-        batch_readahead: Optional[int],
-        **kwargs,
+        columns: Optional[List[str]] = None,
+        columns_with_transform: Optional[List[Tuple[str, str]]] = None,
+        batch_size: Optional[int] = None,
+        filter: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        batch_readahead: Optional[int] = None,
+        blob_handling: Optional[str] = None,
+        order_by: Optional[List[Any]] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
@@ -571,6 +596,15 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+
+class DatasetBasePath:
+    def __init__(
+        self,
+        path: str,
+        name: Optional[str] = None,
+        is_dataset_root: bool = False,
+        id: Optional[int] = None,
+    ) -> None: ...
 
 __version__: str
 language_model_home: Callable[[], str]

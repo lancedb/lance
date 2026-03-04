@@ -16,21 +16,27 @@ package org.lance;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
+import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
+import org.lance.index.IndexCriteria;
+import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
+import org.lance.index.OptimizeOptions;
 import org.lance.io.StorageOptionsProvider;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -71,6 +77,8 @@ public class Dataset implements Closeable {
 
   private BufferAllocator allocator;
   private boolean selfManagedAllocator = false;
+  private Session session;
+  private boolean ownsSession = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -140,8 +148,8 @@ public class Dataset implements Closeable {
               params.getMode(),
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
+              params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds(),
               params.getInitialBases(),
               params.getTargetBases());
       dataset.allocator = allocator;
@@ -186,6 +194,77 @@ public class Dataset implements Closeable {
       String path,
       WriteParams params,
       StorageOptionsProvider storageOptionsProvider) {
+    return create(allocator, stream, path, params, storageOptionsProvider, null, null);
+  }
+
+  private static native Dataset createWithFfiSchema(
+      long arrowSchemaMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
+      Optional<Boolean> enableV2ManifestPaths,
+      Map<String, String> storageOptions,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases);
+
+  private static native Dataset createWithFfiStream(
+      long arrowStreamMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
+      Optional<Boolean> enableV2ManifestPaths,
+      Map<String, String> storageOptions,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases);
+
+  private static native Dataset createWithFfiStreamAndProvider(
+      long arrowStreamMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
+      Optional<Boolean> enableV2ManifestPaths,
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases,
+      LanceNamespace namespace,
+      List<String> tableId);
+
+  /**
+   * Creates a dataset with optional namespace support for managed versioning.
+   *
+   * <p>When a namespace is provided, the commit handler will use the namespace's
+   * create_table_version method for version tracking.
+   *
+   * @param allocator buffer allocator
+   * @param stream arrow stream
+   * @param path dataset uri
+   * @param params write parameters
+   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
+   * @param namespace optional namespace implementation for managed versioning (can be null)
+   * @param tableId optional table identifier within the namespace (can be null)
+   * @return Dataset
+   */
+  static Dataset create(
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
@@ -200,57 +279,16 @@ public class Dataset implements Closeable {
             params.getMode(),
             params.getEnableStableRowIds(),
             params.getDataStorageVersion(),
+            params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
             Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds(),
             params.getInitialBases(),
-            params.getTargetBases());
+            params.getTargetBases(),
+            namespace,
+            tableId);
     dataset.allocator = allocator;
     return dataset;
   }
-
-  private static native Dataset createWithFfiSchema(
-      long arrowSchemaMemoryAddress,
-      String path,
-      Optional<Integer> maxRowsPerFile,
-      Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile,
-      Optional<String> mode,
-      Optional<Boolean> enableStableRowIds,
-      Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
-      Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
-
-  private static native Dataset createWithFfiStream(
-      long arrowStreamMemoryAddress,
-      String path,
-      Optional<Integer> maxRowsPerFile,
-      Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile,
-      Optional<String> mode,
-      Optional<Boolean> enableStableRowIds,
-      Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
-      Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
-
-  private static native Dataset createWithFfiStreamAndProvider(
-      long arrowStreamMemoryAddress,
-      String path,
-      Optional<Integer> maxRowsPerFile,
-      Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile,
-      Optional<String> mode,
-      Optional<Boolean> enableStableRowIds,
-      Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
-      Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
 
   /**
    * Open a dataset from the specified path.
@@ -261,7 +299,8 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
   }
 
   /**
@@ -275,7 +314,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
   }
 
   /**
@@ -304,7 +343,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options);
+    return open(allocator, false, path, options, null);
   }
 
   /**
@@ -315,10 +354,41 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   static Dataset open(
-      BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session) {
+    return open(allocator, selfManagedAllocator, path, options, session, null, null);
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options and namespace commit handler.
+   *
+   * @param path file path
+   * @param options the open options
+   * @param namespace the LanceNamespace to use for managed versioning (null if not using namespace)
+   * @param tableId table identifier (null if not using namespace)
+   * @return Dataset
+   */
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Session session,
+      LanceNamespace namespace,
+      List<String> tableId) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
+
+    Session effectiveSession = session;
+    if (effectiveSession == null && options.getSession().isPresent()) {
+      effectiveSession = options.getSession().get();
+    }
+    long sessionHandle = effectiveSession != null ? effectiveSession.getNativeHandle() : 0;
+
     Dataset dataset =
         openNative(
             path,
@@ -329,22 +399,32 @@ public class Dataset implements Closeable {
             options.getStorageOptions(),
             options.getSerializedManifest(),
             options.getStorageOptionsProvider(),
-            options.getS3CredentialsRefreshOffsetSeconds());
+            sessionHandle,
+            namespace,
+            tableId);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
+    if (effectiveSession != null) {
+      dataset.session = effectiveSession;
+    } else {
+      dataset.session = Session.fromHandle(dataset.nativeGetSessionHandle());
+      dataset.ownsSession = true;
+    }
     return dataset;
   }
 
   private static native Dataset openNative(
       String path,
-      Optional<Integer> version,
+      Optional<Long> version,
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      long sessionHandle,
+      LanceNamespace namespace,
+      List<String> tableId);
 
   /**
    * Creates a builder for opening a dataset.
@@ -431,14 +511,19 @@ public class Dataset implements Closeable {
     return allocator;
   }
 
+  /** Package-private setter for allocator, used by {@link CommitBuilder}. */
+  void setAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
    *
-   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   * @return A new instance of {@link SourcedTransaction.Builder} linked to the opened dataset.
    */
-  public Transaction.Builder newTransactionBuilder() {
-    return new Transaction.Builder(this).readVersion(version());
+  public SourcedTransaction.Builder newTransactionBuilder() {
+    return new SourcedTransaction.Builder(this);
   }
 
   /**
@@ -449,21 +534,37 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(Transaction transaction) {
-    Preconditions.checkNotNull(transaction);
-    try {
-      Dataset dataset = nativeCommitTransaction(transaction);
-      if (selfManagedAllocator) {
-        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        dataset.allocator = allocator;
-      }
-      return dataset;
-    } finally {
-      transaction.release();
-    }
+    return commitTransaction(transaction, false, true);
   }
 
-  private native Dataset nativeCommitTransaction(Transaction transaction);
+  /**
+   * Commit a single transaction and return a new Dataset with the new version. Original dataset
+   * version will not be refreshed.
+   *
+   * @param transaction The transaction to commit
+   * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, and this is a new dataset, uses the new V2 manifest
+   *     paths. These paths provide more efficient opening of datasets with many versions on object
+   *     stores. This parameter has no effect if the dataset already exists. To migrate an existing
+   *     dataset, instead use the `migrateManifestPathsV2` method. Default is true. WARNING: turning
+   *     this on will make the dataset unreadable for older versions of Lance (prior to 0.17.0).
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
+    Preconditions.checkNotNull(transaction);
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(transaction);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
+    }
+    return dataset;
+  }
 
   /**
    * Drop a Dataset.
@@ -472,6 +573,26 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Migrate the manifest paths to the new format.
+   *
+   * <p>This will update the manifest to use the new v2 format for paths.
+   *
+   * <p>This function is idempotent, and can be run multiple times without changing the state of the
+   * object store.
+   *
+   * <p>DANGER: this should not be run while other concurrent operations are happening. And it
+   * should also run until completion before resuming other operations.
+   */
+  public void migrateManifestPathsV2() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateManifestPathsV2();
+    }
+  }
+
+  private native void nativeMigrateManifestPathsV2();
 
   /**
    * Add columns to the dataset.
@@ -637,6 +758,19 @@ public class Dataset implements Closeable {
   private native void nativeDelete(String predicate);
 
   /**
+   * Truncate the dataset by deleting all rows. The schema is preserved and a new version is
+   * created.
+   */
+  public void truncateTable() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeTruncateTable();
+    }
+  }
+
+  private native void nativeTruncateTable();
+
+  /**
    * Gets the URI of the dataset.
    *
    * @return the URI of the dataset
@@ -687,7 +821,9 @@ public class Dataset implements Closeable {
 
   private native List<Version> nativeListVersions();
 
-  /** @return the latest version of the dataset. */
+  /**
+   * @return the latest version of the dataset.
+   */
   public long latestVersion() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -696,6 +832,42 @@ public class Dataset implements Closeable {
   }
 
   private native long nativeGetLatestVersionId();
+
+  /**
+   * Get the initial storage options used to open this dataset.
+   *
+   * <p>This returns the options that were provided when the dataset was opened, without any refresh
+   * from the provider. Returns null if no storage options were provided.
+   *
+   * @return the initial storage options, or null if none were provided
+   */
+  public Map<String, String> getInitialStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetInitialStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetInitialStorageOptions();
+
+  /**
+   * Get the latest storage options, potentially refreshed from the provider.
+   *
+   * <p>If a storage options provider was configured and credentials are expiring, this will refresh
+   * them.
+   *
+   * @return the latest storage options (static or refreshed from provider), or null if no storage
+   *     options were configured for this dataset
+   * @throws RuntimeException if an error occurs while fetching/refreshing options from the provider
+   */
+  public Map<String, String> getLatestStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLatestStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetLatestStorageOptions();
 
   /** Checkout the dataset to the latest version. */
   public void checkoutLatest() {
@@ -718,7 +890,13 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCheckoutVersion(version);
+      Dataset newDataset = nativeCheckoutVersion(version);
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
     }
   }
 
@@ -735,7 +913,13 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCheckoutTag(tag);
+      Dataset newDataset = nativeCheckoutTag(tag);
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
     }
   }
 
@@ -762,16 +946,17 @@ public class Dataset implements Closeable {
    * @param name the name of the created index
    * @param params index params
    * @param replace whether to replace the existing index
+   * @return the metadata of the created index
    * @deprecated please use {@link Dataset#createIndex(IndexOptions)} instead.
    */
   @Deprecated
-  public void createIndex(
+  public Index createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
       boolean replace) {
-    createIndex(
+    return createIndex(
         IndexOptions.builder(columns, indexType, params)
             .replace(replace)
             .withIndexName(name.orElse(null))
@@ -782,13 +967,14 @@ public class Dataset implements Closeable {
    * Creates a new index on the dataset.
    *
    * @param options options for building index
+   * @return the metadata of the created index
    */
-  public void createIndex(IndexOptions options) {
+  public Index createIndex(IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(
+      return nativeCreateIndex(
           options.getColumns(),
-          options.getIndexType().ordinal(),
+          options.getIndexType().getValue(),
           options.getIndexName(),
           options.getIndexParams(),
           options.isReplace(),
@@ -799,7 +985,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native void nativeCreateIndex(
+  private native Index nativeCreateIndex(
       List<String> columns,
       int indexTypeCode,
       Optional<String> name,
@@ -809,6 +995,21 @@ public class Dataset implements Closeable {
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
+
+  /**
+   * Drop an index by name.
+   *
+   * @param name the index name to drop
+   */
+  public void dropIndex(String name) {
+    Preconditions.checkArgument(name != null && !name.isEmpty(), "name cannot be null or empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropIndex(name);
+    }
+  }
+
+  private native void nativeDropIndex(String name);
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
@@ -846,6 +1047,26 @@ public class Dataset implements Closeable {
   }
 
   private native long nativeCountRows(Optional<String> filter);
+
+  /**
+   * Returns the session associated with this dataset.
+   *
+   * <p>The session holds runtime state for the dataset, including index and metadata caches. If a
+   * session was provided when opening the dataset, that session is returned. Otherwise, a new
+   * session was created automatically.
+   *
+   * <p>The returned session can be used to open other datasets to share caches.
+   *
+   * @return the session associated with this dataset
+   */
+  public Session session() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return session;
+    }
+  }
+
+  private native long nativeGetSessionHandle();
 
   /**
    * Count rows matching a filter using a specific scalar index. This directly queries the index and
@@ -956,7 +1177,24 @@ public class Dataset implements Closeable {
 
   private native Transaction nativeReadTransaction();
 
-  /** @return all the created indexes names */
+  /**
+   * Optimize index metadata and segments for this dataset.
+   *
+   * @param options options controlling index optimization behavior
+   */
+  public void optimizeIndices(OptimizeOptions options) {
+    Preconditions.checkNotNull(options);
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeOptimizeIndices(options);
+    }
+  }
+
+  private native void nativeOptimizeIndices(OptimizeOptions options);
+
+  /**
+   * @return all the created indexes names
+   */
   public List<String> listIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -981,6 +1219,54 @@ public class Dataset implements Closeable {
   private native List<Index> nativeGetIndexes();
 
   /**
+   * Get statistics for a specific index in JSON form.
+   *
+   * <p>The JSON structure matches the Rust/Python index_statistics API.
+   *
+   * @param indexName the name of the index
+   * @return JSON string with index statistics
+   */
+  public Map<String, Object> getIndexStatistics(String indexName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      String jsonDesc = nativeGetIndexStatistics(indexName);
+      return JsonUtils.fromJson(jsonDesc);
+    }
+  }
+
+  private native String nativeGetIndexStatistics(String indexName);
+
+  /**
+   * Describe indices on this dataset filtered by criteria.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.of(criteria));
+    }
+  }
+
+  /**
+   * Describe all indices on this dataset.
+   *
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
+
+  /**
    * Get the table config of the dataset.
    *
    * @return the table config
@@ -993,6 +1279,22 @@ public class Dataset implements Closeable {
   }
 
   private native Map<String, String> nativeGetConfig();
+
+  /**
+   * Get the Lance file format version of this dataset.
+   *
+   * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".
+   *
+   * @return the Lance file format version string
+   */
+  public String getLanceFileFormatVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceFileFormatVersion();
+    }
+  }
+
+  private native String nativeGetLanceFileFormatVersion();
 
   /**
    * Compact the dataset to improve performance.
@@ -1087,6 +1389,11 @@ public class Dataset implements Closeable {
       if (selfManagedAllocator) {
         allocator.close();
       }
+      if (ownsSession && session != null) {
+        session.close();
+        session = null;
+        ownsSession = false;
+      }
     }
   }
 
@@ -1172,6 +1479,44 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Create a branch at a specified version. The returned Dataset points to the created branch's
+   * initial version.
+   *
+   * @param branch the branch name to create
+   * @param ref the reference to create branch from
+   * @return a new Dataset of the branch
+   */
+  public Dataset createBranch(String branch, Ref ref) {
+    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
+    return innerCreateBranch(branch, ref, Optional.empty());
+  }
+
+  /**
+   * Create a branch at a specified version. The returned Dataset points to the created branch's
+   * initial version.
+   *
+   * @param branch the branch name to create
+   * @param ref the reference to create branch from
+   * @param storageOptions the storage options to create branch with
+   * @return a new Dataset of the branch
+   */
+  public Dataset createBranch(String branch, Ref ref, Map<String, String> storageOptions) {
+    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
+    Preconditions.checkArgument(
+        storageOptions != null && !storageOptions.isEmpty(), "storageOptions cannot be null");
+    return innerCreateBranch(branch, ref, Optional.of(storageOptions));
+  }
+
+  private Dataset innerCreateBranch(
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions) {
+    Preconditions.checkArgument(branch != null, "Branch cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCreateBranch(branch, ref, storageOptions);
+    }
+  }
+
+  /**
    * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
    * specified (branch_name, version_number).
    *
@@ -1182,7 +1527,13 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCheckout(ref);
+      Dataset newDataset = nativeCheckout(ref);
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
     }
   }
 
@@ -1204,30 +1555,42 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch.
+     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * #create(String, Ref)} instead.
      *
      * @param tag the tag name
      * @param versionNumber the version number to tag
      */
     public void create(String tag, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTag(tag, versionNumber);
-      }
+      Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
+      create(tag, Ref.ofMain(versionNumber));
     }
 
     /**
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param versionNumber the version number to tag
+     * @param ref the referenced version to tag
      */
-    public void create(String tag, long versionNumber, String targetBranch) {
-      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    public void create(String tag, Ref ref) {
+      Preconditions.checkArgument(tag != null, "Tag name cannot be null");
+      Preconditions.checkArgument(ref != null, "ref cannot be null");
+      try (LockManager.WriteLock readLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTagOnBranch(tag, versionNumber, targetBranch);
+        nativeCreateTag(tag, ref);
       }
+    }
+
+    /**
+     * Creates a new tag on the specified branch. This method will be removed in version 2.0.0. Use
+     * {@link #create(String, Ref)} instead.
+     *
+     * @param tag the name of the tag to create
+     * @param versionNumber the version number (or commit reference) to associate with the tag
+     */
+    @Deprecated
+    public void create(String tag, long versionNumber, String targetBranch) {
+      create(tag, Ref.ofBranch(targetBranch, versionNumber));
     }
 
     /**
@@ -1243,29 +1606,29 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version on main branch.
+     * Update a tag to a new version_number on main. This is left for compatibility. We should use
+     * {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the version number to tag
+     * @param versionNumber the versionNumber on main.
      */
     public void update(String tag, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTag(tag, versionNumber);
-      }
+      Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
+      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
     }
 
     /**
-     * Update a tag to a new version on a specified branch.
+     * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param version the version to tag
+     * @param ref the referenced version to tag
      */
-    public void update(String tag, long version, String targetBranch) {
-      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
+    public void update(String tag, Ref ref) {
+      Preconditions.checkArgument(tag != null, "tag cannot be null");
+      Preconditions.checkArgument(ref != null, "ref cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTagOnBranch(tag, version, targetBranch);
+        nativeUpdateTag(tag, ref);
       }
     }
 
@@ -1297,51 +1660,6 @@ public class Dataset implements Closeable {
 
   /** Branch operations of the dataset. */
   public class Branches {
-    /**
-     * Create a branch at a specified version. The returned Dataset points to the created branch's
-     * initial version.
-     *
-     * @param branch the branch name to create
-     * @param versionNumber the version number to create branch from
-     * @return a new Dataset of the branch
-     */
-    public Dataset create(String branch, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        return nativeCreateBranch(branch, versionNumber, Optional.empty());
-      }
-    }
-
-    /**
-     * Create a branch from a specific source branch and version.
-     *
-     * @param branchName the branch name to create
-     * @param versionNumber the version number to create branch from
-     * @param sourceBranch the source branch name
-     * @return a new Dataset of the created branch
-     */
-    public Dataset create(String branchName, long versionNumber, String sourceBranch) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        Preconditions.checkNotNull(sourceBranch);
-        return nativeCreateBranch(branchName, versionNumber, Optional.of(sourceBranch));
-      }
-    }
-
-    /**
-     * Create a branch from a tag reference.
-     *
-     * @param branchName the branch name to create
-     * @param sourceTag the tag name to create branch from
-     * @return a new Dataset of the created branch
-     */
-    public Dataset create(String branchName, String sourceTag) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        Preconditions.checkNotNull(sourceTag);
-        return nativeCreateBranchOnTag(branchName, sourceTag);
-      }
-    }
 
     /**
      * Delete a branch and its metadata.
@@ -1382,6 +1700,39 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Compute the delta between current version and this version.
+   *
+   * @param comparedAgainst the version to compare the current dataset against
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public DatasetDelta delta(long comparedAgainst) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(Optional.of(comparedAgainst), Optional.empty(), Optional.empty());
+    }
+  }
+
+  /**
+   * Compute the delta between both {@code beginVersion} (exclusive) and {@code endVersion}
+   * (inclusive).
+   *
+   * @param beginVersion the beginning version (exclusive) for explicit range
+   * @param endVersion the ending version (inclusive) for explicit range
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public DatasetDelta delta(long beginVersion, long endVersion) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(Optional.empty(), Optional.of(beginVersion), Optional.of(endVersion));
+    }
+  }
+
+  private native DatasetDelta nativeBuildDelta(
+      Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion);
+
+  /**
    * Merge source data with the existing target data.
    *
    * <p>This will take in the source, merge it with the existing target data, and insert new rows,
@@ -1395,7 +1746,7 @@ public class Dataset implements Closeable {
    * @return MergeInsertResult containing the new merged Dataset.
    */
   public MergeInsertResult mergeInsert(MergeInsertParams mergeInsert, ArrowArrayStream source) {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
 
       Dataset newDataset = result.dataset();
@@ -1412,15 +1763,11 @@ public class Dataset implements Closeable {
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
-  private native void nativeCreateTag(String tag, long versionNumber);
-
-  private native void nativeCreateTagOnBranch(String tag, long versionNumber, String branch);
+  private native void nativeCreateTag(String tag, Ref ref);
 
   private native void nativeDeleteTag(String tag);
 
-  private native void nativeUpdateTag(String tag, long versionNumber);
-
-  private native void nativeUpdateTagOnBranch(String tag, long versionNumber, String branch);
+  private native void nativeUpdateTag(String tag, Ref ref);
 
   private native List<Tag> nativeListTags();
 
@@ -1430,9 +1777,7 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckout(Ref ref);
 
   private native Dataset nativeCreateBranch(
-      String branch, long versionNumber, Optional<String> sourceBranch);
-
-  private native Dataset nativeCreateBranchOnTag(String branch, String tagName);
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions);
 
   private native void nativeDeleteBranch(String branch);
 

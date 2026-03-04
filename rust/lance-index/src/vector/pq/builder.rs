@@ -9,18 +9,17 @@ use std::sync::Arc;
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, cast::AsArray, types::Float32Type};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
-use lance_linalg::distance::{Dot, Normalize, L2};
-use snafu::location;
+use lance_linalg::distance::{Dot, L2, Normalize};
 
-use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::vector::kmeans::{train_kmeans, KMeansParams};
+use super::utils::divide_to_subvectors;
+use crate::vector::kmeans::{KMeansParams, train_kmeans};
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -161,23 +160,17 @@ impl PQBuildParams {
     /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "PQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "PQ builder: input is not a FixedSizeList: {}",
+            data.data_type()
+        )))?;
 
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         if data.len() < num_centroids {
-            return Err(Error::Unprocessable {
-                message: format!(
-                    "Not enough rows to train PQ. Requires {num_centroids} rows but only {} available",
-                    data.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::unprocessable(format!(
+                "Not enough rows to train PQ. Requires {num_centroids} rows but only {} available",
+                data.len()
+            )));
         }
 
         // TODO: support bf16 later.
@@ -185,10 +178,10 @@ impl PQBuildParams {
             DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),
             DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
             DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
-            _ => Err(Error::Index {
-                message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "PQ builder: unsupported data type: {}",
+                fsl.value_type()
+            ))),
         }
     }
 }

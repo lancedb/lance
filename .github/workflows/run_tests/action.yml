@@ -9,9 +9,16 @@ inputs:
     required: false
     description: "Skip pytorch tests"
     default: "false"
+  memtest:
+    required: false
+    description: "Run memtest"
+    default: "false"
 runs:
   using: "composite"
   steps:
+    - name: Setup MSVC for torch.compile
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
     - name: Install dependencies
       working-directory: python
       shell: bash
@@ -24,6 +31,13 @@ runs:
       run: |
         # Install cpu only pytorch
         pip install torch --index-url https://download.pytorch.org/whl/cpu
+    - name: Install memtest
+      working-directory: memtest
+      if: inputs.memtest == 'true'
+      shell: bash
+      run: |
+        make build-release
+        echo "LD_PRELOAD=$(lance-memtest)" >> $GITHUB_ENV
     - name: Run python tests
       shell: bash
       working-directory: python

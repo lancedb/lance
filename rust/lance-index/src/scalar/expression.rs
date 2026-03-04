@@ -13,8 +13,8 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
-    expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
+    expr::{InList, ScalarFunction},
 };
 use tokio::try_join;
 
@@ -22,13 +22,14 @@ use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchResult, TextQuery, TokenQuery,
 };
+#[cfg(feature = "geo")]
+use super::{GeoQuery, RelationQuery};
 use lance_core::{
-    utils::mask::{NullableRowIdMask, RowIdMask},
     Error, Result,
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -256,15 +257,15 @@ impl ScalarQueryParser for SargableQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        if let Bound::Included(val) | Bound::Excluded(val) = low {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = low
+            && val.is_null()
+        {
+            return None;
         }
-        if let Bound::Included(val) | Bound::Excluded(val) = high {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = high
+            && val.is_null()
+        {
+            return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query_with_recheck(
@@ -490,9 +491,32 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // DataFusion normalizes array_contains to array_has
+        if func.name() == "array_has" {
+            let inner_type = match data_type {
+                DataType::List(field) | DataType::LargeList(field) => field.data_type(),
+                _ => return None,
+            };
+            let scalar = maybe_scalar(&args[1], inner_type)?;
+            // array_has(..., NULL) returns no matches in datafusion, but the index would
+            // match rows containing NULL. Fallback to match datafusion behavior.
+            if scalar.is_null() {
+                return None;
+            }
+            let query = LabelListQuery::HasAnyLabel(vec![scalar]);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
+        }
+
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
+            if list_values.is_empty() {
+                return None;
+            }
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
@@ -654,15 +678,125 @@ impl ScalarQueryParser for FtsQueryParser {
             return None;
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains_tokens" {
-                let query = TokenQuery::TokensContains(scalar_str);
-                return Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ));
-            }
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar
+            && func.name() == "contains_tokens"
+        {
+            let query = TokenQuery::TokensContains(scalar_str);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
+        }
+        None
+    }
+}
+
+/// A parser for geo indices that handles spatial queries
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone)]
+pub struct GeoQueryParser {
+    index_name: String,
+}
+
+#[cfg(feature = "geo")]
+impl GeoQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
+
+#[cfg(feature = "geo")]
+impl ScalarQueryParser for GeoQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(GeoQuery::IsNull),
+            true,
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if (func.name() == "st_intersects"
+            || func.name() == "st_contains"
+            || func.name() == "st_within"
+            || func.name() == "st_touches"
+            || func.name() == "st_crosses"
+            || func.name() == "st_overlaps"
+            || func.name() == "st_covers"
+            || func.name() == "st_coveredby")
+            && args.len() == 2
+        {
+            let left_arg = &args[0];
+            let right_arg = &args[1];
+            return match (left_arg, right_arg) {
+                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
+                    let mut field = Field::new("_geo", left_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: left_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
+                    let mut field = Field::new("_geo", right_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: right_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                _ => None,
+            };
         }
         None
     }
@@ -858,9 +992,9 @@ impl PartialEq for ScalarIndexSearch {
 /// modify the results of scalar lookups
 #[derive(Debug, Clone)]
 pub enum ScalarIndexExpr {
-    Not(Box<ScalarIndexExpr>),
-    And(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Or(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
     Query(ScalarIndexSearch),
 }
 
@@ -907,17 +1041,17 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 #[derive(Debug)]
 enum NullableIndexExprResult {
-    Exact(NullableRowIdMask),
-    AtMost(NullableRowIdMask),
-    AtLeast(NullableRowIdMask),
+    Exact(NullableRowAddrMask),
+    AtMost(NullableRowAddrMask),
+    AtLeast(NullableRowAddrMask),
 }
 
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
         match result {
-            SearchResult::Exact(mask) => Self::Exact(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::AtMost(NullableRowIdMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowIdMask::AllowList(mask)),
+            SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
         }
     }
 }
@@ -983,19 +1117,19 @@ impl NullableIndexExprResult {
 #[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowIdMask),
+    Exact(RowAddrMask),
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowIdMask),
+    AtMost(RowAddrMask),
     // The answer is at least the rows in the allow list minus the rows in the block list
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
-    AtLeast(RowIdMask),
+    AtLeast(RowAddrMask),
 }
 
 impl IndexExprResult {
-    pub fn row_id_mask(&self) -> &RowIdMask {
+    pub fn row_addr_mask(&self) -> &RowAddrMask {
         match self {
             Self::Exact(mask) => mask,
             Self::AtMost(mask) => mask,
@@ -1011,15 +1145,14 @@ impl IndexExprResult {
         }
     }
 
-    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
         match discriminant {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
             2 => Ok(Self::AtLeast(mask)),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+            )),
         }
     }
 
@@ -1028,8 +1161,8 @@ impl IndexExprResult {
         &self,
         fragments_covered_by_result: &RoaringBitmap,
     ) -> Result<RecordBatch> {
-        let row_id_mask = self.row_id_mask();
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let row_addr_mask = self.row_addr_mask();
+        let row_addr_mask_arr = row_addr_mask.into_arrow()?;
         let discriminant = self.discriminant();
         let discriminant_arr =
             Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
@@ -1043,7 +1176,7 @@ impl IndexExprResult {
         Ok(RecordBatch::try_new(
             INDEX_EXPR_RESULT_SCHEMA.clone(),
             vec![
-                Arc::new(row_id_mask_arr),
+                Arc::new(row_addr_mask_arr),
                 Arc::new(discriminant_arr),
                 Arc::new(fragments_covered_arr),
             ],
@@ -1199,12 +1332,11 @@ fn maybe_indexed_column<'b>(
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
-    if let Some(nested_path) = extract_nested_column_path(expr) {
-        if let Some((data_type, parser)) = index_info.get_index(&nested_path) {
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                return Some((nested_path, data_type, parser));
-            }
-        }
+    if let Some(nested_path) = extract_nested_column_path(expr)
+        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
+        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+    {
+        return Some((nested_path, data_type, parser));
     }
 
     match expr {
@@ -1534,16 +1666,14 @@ fn visit_node(
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     if depth >= MAX_DEPTH {
-        return Err(Error::invalid_input(
-            format!(
-                "the filter expression is too long, lance limit the max number of conditions to {}",
-                MAX_DEPTH
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "the filter expression is too long, lance limit the max number of conditions to {}",
+            MAX_DEPTH
+        )));
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
+        Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
@@ -1699,7 +1829,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
-    use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+    use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2213,7 +2343,7 @@ mod tests {
         }
 
         // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
-        let at_most = NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(
+        let at_most = NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
@@ -2223,7 +2353,7 @@ mod tests {
         ));
 
         // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
-        let at_least = NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(
+        let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
@@ -2233,7 +2363,7 @@ mod tests {
         ));
 
         // Exact should stay Exact
-        let exact = NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(
+        let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         assert!(matches!(
@@ -2248,21 +2378,25 @@ mod tests {
 
         // Test that AND/OR correctly propagate certainty
         let make_at_most = || {
-            NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[1, 2, 3]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_at_least = || {
-            NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
-                RowAddrTreeMap::from_iter(&[2, 3, 4]),
-                RowAddrTreeMap::new(),
-            )))
+            NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
         };
 
         let make_exact = || {
-            NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(&[1, 2]),
                 RowAddrTreeMap::new(),
             )))

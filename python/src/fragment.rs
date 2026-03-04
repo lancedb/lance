@@ -19,11 +19,12 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
+use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
-use lance::Error;
+use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
@@ -34,13 +35,12 @@ use pyo3::basic::CompareOp;
 use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
-use snafu::location;
 
-use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
+use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
-use crate::schema::{logical_schema_from_lance, LanceSchema};
-use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{rt, Dataset, Scanner};
+use crate::schema::{LanceSchema, logical_schema_from_lance};
+use crate::utils::{PyLance, export_vec, extract_vec};
+use crate::{Dataset, Scanner, rt};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -112,7 +112,7 @@ impl FileFragment {
 
         let batches = convert_reader(reader)?;
 
-        reader.py().allow_threads(|| {
+        reader.py().detach(|| {
             rt().runtime.block_on(async move {
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
@@ -171,11 +171,11 @@ impl FileFragment {
     }
 
     #[pyo3(signature=(row_indices, columns=None))]
-    fn take(
-        self_: PyRef<'_, Self>,
+    fn take<'py>(
+        self_: PyRef<'py, Self>,
         row_indices: Vec<usize>,
         columns: Option<Vec<String>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
@@ -196,7 +196,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -208,6 +208,7 @@ impl FileFragment {
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
+        blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
@@ -253,6 +254,24 @@ impl FileFragment {
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
+        if let Some(blob_handling) = blob_handling {
+            let handling = if let Ok(handling) = blob_handling.extract::<String>() {
+                match handling.as_str() {
+                    "all_binary" => BlobHandling::AllBinary,
+                    "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+                    "all_descriptions" => BlobHandling::AllDescriptions,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                        )));
+                    }
+                }
+            } else {
+                return Err(PyTypeError::new_err("blob_handling must be a str"));
+            };
+
+            scanner.blob_handling(handling);
+        }
         if let Some(orderings) = order_by {
             let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
             scanner
@@ -286,11 +305,12 @@ impl FileFragment {
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
     fn add_columns(
         &mut self,
+        py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
-        let transforms = transforms_from_python(transforms)?;
+        let transforms = transforms_from_python(py, transforms)?;
 
         let fragment = self.fragment.clone();
         let (fragment, schema) = rt()
@@ -351,7 +371,7 @@ impl FileFragment {
         }
     }
 
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
         logical_schema.to_pyarrow(self_.py())
@@ -419,18 +439,15 @@ fn do_write_fragments(
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
     dest: PyWriteDest,
-    reader: &Bound<PyAny>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<PyObject>> {
+    reader: &Bound<'_, PyAny>,
+    kwargs: Option<&Bound<PyDict>>,
+) -> PyResult<Vec<Py<PyAny>>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
         Operation::Append { fragments, .. } => Ok(fragments),
-        _ => Err(Error::Internal {
-            message: "Unexpected operation".into(),
-            location: location!(),
-        }),
+        _ => Err(Error::internal("Unexpected operation")),
     };
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
@@ -487,7 +504,7 @@ impl PyDeletionFile {
                 return Err(PyValueError::new_err(format!(
                     "file_type must be either 'array' or 'bitmap', got '{}'",
                     file_type
-                )))
+                )));
             }
         };
         Ok(Self(DeletionFile {
@@ -581,7 +598,7 @@ impl PyDeletionFile {
         Ok(Self(deletion_file))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -633,7 +650,7 @@ impl PyRowIdMeta {
         Ok(Self(row_id_meta))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -682,7 +699,7 @@ impl PyRowDatasetVersionMeta {
         Ok(Self(dataset_version_meta))
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let state = self.json()?;
         let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.fragment")?
@@ -712,7 +729,7 @@ pub struct FragmentSession {
 #[pymethods]
 impl FragmentSession {
     #[pyo3(signature=(indices))]
-    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
+    pub fn take<'py>(self_: PyRef<'py, Self>, indices: Vec<u32>) -> PyResult<Bound<'py, PyAny>> {
         let session = self_.session.clone();
         let batch = rt()
             .spawn(

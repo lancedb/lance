@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
-use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
 use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::{jint, jlong},
-    JNIEnv,
 };
 use lance::datatypes::Schema;
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
@@ -21,12 +21,12 @@ use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance};
+use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
-    RT,
 };
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub(crate) struct FragmentUpdateResult {
 //////////////////
 // Read Methods //
 //////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_countRowsNative(
     mut env: JNIEnv,
     _jfragment: JObject,
@@ -76,7 +76,7 @@ fn inner_count_rows_native(
 ///////////////////
 // Write Methods //
 ///////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -91,7 +91,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -108,7 +107,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
         ),
         JObject::default()
     )
@@ -128,7 +126,6 @@ fn inner_create_with_ffi_array<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -154,12 +151,11 @@ fn inner_create_with_ffi_array<'local>(
         data_storage_version,
         storage_options_obj,
         storage_options_provider_obj,
-        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -173,7 +169,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -189,7 +184,6 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
         ),
         JObject::null()
     )
@@ -208,7 +202,6 @@ fn inner_create_with_ffi_stream<'local>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -224,7 +217,6 @@ fn inner_create_with_ffi_stream<'local>(
         data_storage_version,
         storage_options_obj,
         storage_options_provider_obj,
-        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
@@ -241,7 +233,6 @@ fn create_fragment<'a>(
     data_storage_version: JObject,         // Optional<String>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -254,9 +245,9 @@ fn create_fragment<'a>(
         &mode,
         &enable_stable_row_ids,
         &data_storage_version,
+        None,
         &storage_options_obj,
         &storage_options_provider_obj,
-        &s3_credentials_refresh_offset_seconds_obj,
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
     )?;
@@ -269,7 +260,7 @@ fn create_fragment<'a>(
     export_vec(env, &fragments)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeDeleteRows<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -316,14 +307,14 @@ fn inner_delete_rows<'local>(
             return Err(Error::runtime_error(format!(
                 "Cannot delete rows in fragment {}: {:?}",
                 fragment_id, e
-            )))
+            )));
         }
     };
 
     Ok(obj)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeMergeColumns<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -369,7 +360,7 @@ fn inner_merge_column<'local>(
         None => {
             return Err(Error::input_error(format!(
                 "Fragment not found: {fragment_id}"
-            )))
+            )));
         }
     };
 
@@ -387,7 +378,7 @@ fn inner_merge_column<'local>(
     result.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeUpdateColumns<'a>(
     mut env: JNIEnv<'a>,
     _obj: JObject,
@@ -429,7 +420,7 @@ fn inner_update_column<'local>(
         None => {
             return Err(Error::input_error(format!(
                 "Fragment not found: {fragment_id}"
-            )))
+            )));
         }
     };
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -453,7 +444,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResult";
@@ -745,19 +736,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
 }
 
 fn get_base_id(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
-    let base_id = env
-        .call_method(obj, "getBaseId", "()Ljava/util/Optional;", &[])?
-        .l()?;
-
-    if env.call_method(&base_id, "isPresent", "()Z", &[])?.z()? {
-        let inner_value = env
-            .call_method(&base_id, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
-        Ok(Some(int_value as u32))
-    } else {
-        Ok(None)
-    }
+    env.get_optional_u32_from_method(obj, "getBaseId")
 }
 
 fn convert_to_java_integer<'local>(

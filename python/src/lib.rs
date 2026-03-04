@@ -25,8 +25,8 @@
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{self, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{self, Ordering};
 
 use std::ffi::CString;
 
@@ -34,6 +34,7 @@ use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
@@ -43,11 +44,11 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery};
+use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
-    stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata,
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use lance_index::DatasetIndexExt;
 use log::Level;
@@ -77,15 +78,15 @@ pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
 
-pub use crate::arrow::{bfloat16_array, BFloat16};
+pub use crate::arrow::{BFloat16, bfloat16_array};
 use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
-use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
-pub use crate::tracing::{trace_to_chrome, TraceGuard};
+use crate::tracing::{PyTraceEvent, capture_trace_events, shutdown_tracing};
+pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
-pub use dataset::write_dataset;
 pub use dataset::Dataset;
+pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
@@ -161,9 +162,17 @@ pub fn init_logging(mut log_builder: Builder) {
 
     let max_level = logger.filter();
 
-    let log_level = max_level.to_level().unwrap_or(Level::Error);
+    let trace_level = env::var("LANCE_TRACING").unwrap_or_default().to_lowercase();
+    let trace_level = match trace_level.as_str() {
+        "debug" => Level::Debug,
+        "info" => Level::Info,
+        "warn" => Level::Warn,
+        "error" => Level::Error,
+        "trace" => Level::Trace,
+        _ => Level::Info,
+    };
 
-    tracing::initialize_tracing(log_level);
+    tracing::initialize_tracing(trace_level);
     log::set_boxed_logger(Box::new(logger)).unwrap();
     log::set_max_level(max_level);
 }
@@ -199,14 +208,14 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
         let path = Path::new(&log_file_path);
 
         // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                println!(
-                    "Failed to create parent directories for log file '{}': {}, using stderr",
-                    log_file_path, e
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            println!(
+                "Failed to create parent directories for log file '{}': {}, using stderr",
+                log_file_path, e
+            );
+            return;
         }
 
         // Try to open/create the log file
@@ -268,11 +277,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
+    m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
-    #[cfg(feature = "rest")]
     m.add_class::<namespace::PyRestNamespace>()?;
-    #[cfg(feature = "rest-adapter")]
     m.add_class::<namespace::PyRestAdapter>()?;
+    m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -387,6 +396,7 @@ impl FFILanceTableProvider {
     fn __datafusion_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
         let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
@@ -395,9 +405,27 @@ impl FFILanceTableProvider {
             self.with_row_addr,
         ));
 
-        let ffi_provider =
-            FFI_TableProvider::new(a_lance_table_provider, true, rt().get_runtime_handle());
-        let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
-        capsule
+        let codec = ffi_logical_codec_from_pycapsule(session)?;
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(
+            a_lance_table_provider,
+            true,
+            rt().get_runtime_handle(),
+            codec,
+        );
+        PyCapsule::new(py, ffi_provider, Some(name.clone()))
     }
+}
+
+fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
+    let attr_name = "__datafusion_logical_extension_codec__";
+    let capsule = if obj.hasattr(attr_name)? {
+        obj.getattr(attr_name)?.call0()?
+    } else {
+        obj
+    };
+
+    let capsule = capsule.downcast::<PyCapsule>()?;
+    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+
+    Ok(codec.clone())
 }

@@ -26,7 +26,7 @@ lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
-lance-geo = { workspace = true }
+lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -41,6 +41,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
 deepsize.workspace = true
@@ -81,6 +82,7 @@ humantime = { workspace = true }
 async_cell = "0.2.2"
 semver.workspace = true
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -91,6 +93,7 @@ lzma-sys = { version = "0.1" }
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
+libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
@@ -113,10 +116,10 @@ aws-sdk-s3 = { workspace = true }
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
-
+datafusion-substrait = { workspace = true }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -133,7 +136,9 @@ aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
+tencent = ["lance-io/tencent"]
 huggingface = ["lance-io/huggingface"]
+geo = ["dep:lance-geo", "lance-geo/geo", "lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 
@@ -162,7 +167,31 @@ name = "take"
 harness = false
 
 [[bench]]
+name = "take_blob"
+harness = false
+
+[[bench]]
 name = "random_access"
+harness = false
+
+[[bench]]
+name = "fts_search"
+harness = false
+
+[[bench]]
+name = "vector_throughput"
+harness = false
+
+[[bench]]
+name = "mem_wal_write"
+harness = false
+
+[[bench]]
+name = "memtable_read"
+harness = false
+
+[[bench]]
+name = "mem_wal_read"
 harness = false
 
 [lints]

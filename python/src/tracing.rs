@@ -18,38 +18,37 @@
 use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
-use pyo3::pyclass;
+use pyo3::Bound;
+use pyo3::IntoPyObject;
+use pyo3::PyErr;
+use pyo3::PyResult;
+use pyo3::Python;
 use pyo3::pyfunction;
 use pyo3::pymethods;
 use pyo3::types::PyDict;
 use pyo3::types::PyDictMethods;
 use pyo3::types::PyTuple;
-use pyo3::Bound;
-use pyo3::IntoPyObject;
-use pyo3::PyErr;
-use pyo3::PyObject;
-use pyo3::PyResult;
-use pyo3::Python;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
-use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::TrySendError;
+use pyo3::{Py, PyAny, pyclass};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::TrySendError;
 use std::thread::JoinHandle;
+use tracing::Event;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
 use tracing::subscriber;
-use tracing::Event;
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::Registry;
 
 static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
@@ -121,7 +120,7 @@ impl LoggingPassthroughState {
         self.inner = Some(inner);
     }
 
-    fn set_callback(&mut self, callback: PyObject) {
+    fn set_callback(&mut self, callback: Py<PyAny>) {
         if self.callback_sender.is_some() {
             panic!("Callback already set");
         }
@@ -129,7 +128,7 @@ impl LoggingPassthroughState {
         self.callback_sender = Some(sender);
         self.callback_handle = Some(std::thread::spawn(move || {
             while let Ok(event) = receiver.recv() {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let call_python = |py: Python, event: TraceEvent| {
                         let py_event = PyTraceEvent::from(event);
                         let args = match PyTuple::new(py, [py_event]) {
@@ -226,10 +225,10 @@ pub struct LoggingPassthroughRef(Arc<RwLock<Option<LoggingPassthroughState>>>);
 impl LoggingPassthroughRef {
     fn inner_do<F: FnOnce(&ChromeLayer<Registry>)>(&self, f: F) {
         let state_guard = self.0.read().unwrap();
-        if let Some(state) = state_guard.as_ref() {
-            if let Some(inner) = state.inner.as_ref() {
-                f(inner)
-            }
+        if let Some(state) = state_guard.as_ref()
+            && let Some(inner) = state.inner.as_ref()
+        {
+            f(inner)
         }
     }
 }
@@ -364,7 +363,7 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
+pub fn capture_trace_events(callback: Py<PyAny>, py: Python<'_>) {
     SUBSCRIBER
         .write()
         .unwrap()
@@ -377,7 +376,7 @@ pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
 #[pyo3(signature=())]
 pub fn shutdown_tracing(py: Python<'_>) {
     // Release Python GIL to avoid deadlock between current thread with the receiver thread.
-    py.allow_threads(|| {
+    py.detach(|| {
         SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
     });
 }

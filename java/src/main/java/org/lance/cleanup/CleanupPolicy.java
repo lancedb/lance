@@ -26,16 +26,19 @@ public class CleanupPolicy {
   private final Optional<Long> beforeVersion;
   private final Optional<Boolean> deleteUnverified;
   private final Optional<Boolean> errorIfTaggedOldVersions;
+  private final Optional<Boolean> cleanReferencedBranches;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
       Optional<Long> beforeVersion,
       Optional<Boolean> deleteUnverified,
-      Optional<Boolean> errorIfTaggedOldVersions) {
+      Optional<Boolean> errorIfTaggedOldVersions,
+      Optional<Boolean> cleanReferencedBranches) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
     this.deleteUnverified = deleteUnverified;
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
+    this.cleanReferencedBranches = cleanReferencedBranches;
   }
 
   public static Builder builder() {
@@ -58,12 +61,17 @@ public class CleanupPolicy {
     return errorIfTaggedOldVersions;
   }
 
+  public Optional<Boolean> getCleanReferencedBranches() {
+    return cleanReferencedBranches;
+  }
+
   /** Builder for CleanupPolicy. */
   public static class Builder {
     private Optional<Long> beforeTimestampMillis = Optional.empty();
     private Optional<Long> beforeVersion = Optional.empty();
     private Optional<Boolean> deleteUnverified = Optional.empty();
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
+    private Optional<Boolean> cleanReferencedBranches = Optional.empty();
 
     private Builder() {}
 
@@ -91,9 +99,19 @@ public class CleanupPolicy {
       return this;
     }
 
+    /** If true, clean referenced branches before clean the current branch. */
+    public Builder withCleanReferencedBranches(boolean cleanReferencedBranches) {
+      this.cleanReferencedBranches = Optional.of(cleanReferencedBranches);
+      return this;
+    }
+
     public CleanupPolicy build() {
       return new CleanupPolicy(
-          beforeTimestampMillis, beforeVersion, deleteUnverified, errorIfTaggedOldVersions);
+          beforeTimestampMillis,
+          beforeVersion,
+          deleteUnverified,
+          errorIfTaggedOldVersions,
+          cleanReferencedBranches);
     }
   }
 }

@@ -67,6 +67,19 @@ public class MergeInsertParams {
   }
 
   /**
+   * Specify that when a row in the source table matches a row in the target table, the row in the
+   * target table is deleted.
+   *
+   * <p>This can be used to achieve "when matched delete" behavior.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedDelete() {
+    this.whenMatched = WhenMatched.Delete;
+    return this;
+  }
+
+  /**
    * Specify that when a row in the source table matches a row in the target table and the
    * expression evaluates to true, the row in the target table is updated by the matched row from
    * the source table.
@@ -303,6 +316,12 @@ public class MergeInsertParams {
      * used to ensure that no existing rows are overwritten or modified after inserted.
      */
     Fail,
+
+    /**
+     * The row is deleted from the target table when a row in the source table matches a row in the
+     * target table.
+     */
+    Delete
   }
 
   public enum WhenNotMatched {

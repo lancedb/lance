@@ -185,9 +185,9 @@ def btree_comparison_datasets(tmp_path):
 
 
 def test_load_indices(indexed_dataset: lance.LanceDataset):
-    indices = indexed_dataset.list_indices()
-    vec_idx = next(idx for idx in indices if idx["type"] == "IVF_PQ")
-    scalar_idx = next(idx for idx in indices if idx["type"] == "BTree")
+    indices = indexed_dataset.describe_indices()
+    vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
+    scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
 
@@ -663,6 +663,11 @@ def test_filter_with_fts_index(dataset):
         assert query == row.as_py()
 
 
+def test_create_scalar_index_fts_alias(dataset):
+    dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
+    assert any(idx.index_type == "Inverted" for idx in dataset.describe_indices())
+
+
 def test_multi_index_create(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
@@ -672,24 +677,23 @@ def test_multi_index_create(tmp_path):
         "ints", index_type="BITMAP", name="ints_bitmap_idx", replace=True
     )
 
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 2
 
-    assert indices[0]["name"] == "ints_idx"
-    assert indices[0]["type"] == "BTree"
-    assert indices[1]["name"] == "ints_bitmap_idx"
-    assert indices[1]["type"] == "Bitmap"
+    idx_by_name = {idx.name: idx for idx in indices}
+    assert idx_by_name["ints_idx"].index_type == "BTree"
+    assert idx_by_name["ints_bitmap_idx"].index_type == "Bitmap"
 
     # Test that we can drop one of the indices
     dataset.drop_index("ints_idx")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "ints_bitmap_idx"
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].name == "ints_bitmap_idx"
+    assert indices[0].index_type == "Bitmap"
 
     # Test that we can drop the last index
     dataset.drop_index("ints_bitmap_idx")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 0
 
 
@@ -1544,9 +1548,53 @@ def test_bitmap_index(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("a", index_type="BITMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].index_type == "Bitmap"
+
+
+def test_bitmap_empty_range(tmp_path: Path):
+    data = pa.table({"c0": pa.array([1, 2, 3], type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "dataset")
+    dataset.create_scalar_index("c0", index_type="BITMAP")
+    filters = [
+        "c0 BETWEEN 2 AND 1",
+        "c0 > 2 AND c0 < 2",
+        "c0 >= 2 AND c0 < 2",
+        "c0 > 2 AND c0 <= 2",
+    ]
+    for filter_expr in filters:
+        result = dataset.to_table(filter=filter_expr, use_scalar_index=True)
+        assert result.num_rows == 0
+
+
+def test_btree_remap_big_deletions(tmp_path: Path):
+    # Write 15K rows in 3 fragments
+    ds = lance.write_dataset(pa.table({"a": range(5000)}), tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"a": range(5000, 10000)}), tmp_path, mode="append"
+    )
+    ds = lance.write_dataset(
+        pa.table({"a": range(10000, 15000)}), tmp_path, mode="append"
+    )
+
+    # Create index (will have 4 pages)
+    ds.create_scalar_index("a", index_type="BTREE")
+
+    # Delete a lot of data (now there will only be two pages worth)
+    ds.delete("a > 1000 AND a < 10000")
+
+    # Run compaction (deletions will be materialized)
+    ds.optimize.compact_files()
+
+    # Reload dataset and ensure index still works
+    ds = lance.dataset(tmp_path)
+
+    for idx in [0, 500, 1000, 10000, 13000, 14000, 14999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 1
+
+    for idx in [1001, 5000, 8000, 9999]:
+        assert ds.to_table(filter=f"a = {idx}").num_rows == 0
 
 
 def test_bitmap_remap(tmp_path: Path):
@@ -1580,9 +1628,9 @@ def test_ngram_index(tmp_path: Path):
     def test_with(tbl: pa.Table):
         dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
         dataset.create_scalar_index("words", index_type="NGRAM")
-        indices = dataset.list_indices()
+        indices = dataset.describe_indices()
         assert len(indices) == 1
-        assert indices[0]["type"] == "NGram"
+        assert indices[0].index_type == "NGram"
 
         scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
             True
@@ -1634,7 +1682,7 @@ def test_zonemap_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([pa.array([i for i in range(8193)])], names=["values"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("values", index_type="ZONEMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
     # Get detailed index statistics
@@ -1730,9 +1778,9 @@ def test_zonemap_index_remapping(tmp_path: Path):
 
     # Train a zone map index
     dataset.create_scalar_index("values", index_type="ZONEMAP")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "ZoneMap"
+    assert indices[0].index_type == "ZoneMap"
 
     # Confirm the zone map index is used if you search the dataset
     scanner = dataset.scanner(filter="values > 2500", prefilter=True)
@@ -1779,7 +1827,7 @@ def test_bloomfilter_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("values", index_type="BLOOMFILTER")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
     # Get detailed index statistics
@@ -1967,9 +2015,157 @@ def test_label_list_index(tmp_path: Path):
     tbl = pa.Table.from_arrays([tag_list], names=["tags"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("tags", index_type="LABEL_LIST")
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "LabelList"
+    assert indices[0].index_type == "LabelList"
+
+
+def test_label_list_index_array_contains(tmp_path: Path):
+    # Include lists with NULL items to ensure NULL needle behavior matches
+    # non-index execution.
+    tbl = pa.table(
+        {"labels": [["foo", "bar"], ["bar"], ["baz"], ["qux", None], [None], [], None]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    expected_null_rows = dataset.to_table(
+        filter="array_contains(labels, NULL)"
+    ).num_rows
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    result = dataset.to_table(filter="array_contains(labels, 'foo')")
+    assert result.num_rows == 1
+
+    result = dataset.to_table(filter="array_contains(labels, 'bar')")
+    assert result.num_rows == 2
+
+    result = dataset.to_table(filter="array_contains(labels, 'oof')")
+    assert result.num_rows == 0
+
+    explain = dataset.scanner(filter="array_contains(labels, 'foo')").explain_plan()
+    assert "ScalarIndexQuery" in explain
+
+    # NULL needle: preserve semantics (must match pre-index execution) and avoid
+    # using the LABEL_LIST index.
+    actual_null_rows = dataset.to_table(filter="array_contains(labels, NULL)").num_rows
+    assert actual_null_rows == expected_null_rows
+    explain = dataset.scanner(filter="array_contains(labels, NULL)").explain_plan()
+    assert "ScalarIndexQuery" not in explain
+
+
+def test_label_list_index_empty_list_filters(tmp_path: Path):
+    """Empty list filters should not panic and should match pre-index results."""
+    tbl = pa.table({"labels": [["foo"], ["bar"], ["foo", None], [None], [], None]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, [])",
+        "array_has_all(labels, [])",
+        "NOT array_has_all(labels, [])",
+        "NOT array_has_any(labels, [])",
+    ]
+    expected = {f: dataset.to_table(filter=f).num_rows for f in filters}
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    for f in filters:
+        assert dataset.to_table(filter=f).num_rows == expected[f]
+
+
+def test_label_list_index_null_element_match(tmp_path: Path):
+    """Covers NULL elements inside non-NULL lists (list itself is never NULL)."""
+    tbl = pa.table(
+        {"labels": [["foo", None], ["foo"], ["bar", None], [None], ["bar"], []]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, ['foo'])",
+        "array_has_all(labels, ['foo'])",
+        "array_contains(labels, 'foo')",
+        "NOT array_has_any(labels, ['foo'])",
+        "NOT array_has_all(labels, ['foo'])",
+        "NOT array_contains(labels, 'foo')",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_null_list_match(tmp_path: Path):
+    """Covers NULL lists (list itself is NULL, elements are not NULL)."""
+    tbl = pa.table({"labels": [["foo"], ["bar"], None, []]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, ['foo'])",
+        "array_has_all(labels, ['foo'])",
+        "array_contains(labels, 'foo')",
+        # TODO(issue #5904): Enable after fixing NOT filters with whole-list NULLs
+        # "NOT array_has_any(labels, ['foo'])",
+        # "NOT array_has_all(labels, ['foo'])",
+        # "NOT array_contains(labels, 'foo')",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_null_literal_filters(tmp_path: Path):
+    """Ensure filters with NULL literal needles produce consistent results with scan."""
+    tbl = pa.table(
+        {"labels": [["foo", None], ["bar", None], [None], ["foo"], ["bar"], []]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, [NULL])",
+        "array_has_all(labels, [NULL])",
+        "array_contains(labels, NULL)",
+        "NOT array_has_any(labels, [NULL])",
+        "NOT array_has_all(labels, [NULL])",
+        "NOT array_contains(labels, NULL)",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_explain_null_literals(tmp_path: Path):
+    tbl = pa.table({"labels": [["foo", None], ["foo"]]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    # explain_plan should not panic when list literals include NULLs.
+    for expr in [
+        "array_has_any(labels, [NULL])",
+        "array_has_all(labels, [NULL])",
+        "array_has_any(labels, ['foo', NULL])",
+        "array_has_all(labels, ['foo', NULL])",
+    ]:
+        explain = dataset.scanner(filter=expr).explain_plan()
+        assert isinstance(explain, str)
 
 
 def test_create_index_empty_dataset(tmp_path: Path):
@@ -2018,8 +2214,8 @@ def test_create_index_empty_dataset(tmp_path: Path):
     test_searches()
 
     # Make sure fetching index stats on empty index is ok
-    for idx in ds.list_indices():
-        ds.stats.index_stats(idx["name"])
+    for idx in ds.describe_indices():
+        ds.stats.index_stats(idx.name)
 
     # Make sure updating empty indices is ok
     ds.optimize.optimize_indices()
@@ -2089,17 +2285,17 @@ def test_drop_index(tmp_path):
     ds.create_scalar_index("fts", index_type="INVERTED")
     ds.create_scalar_index("ngram", index_type="NGRAM")
 
-    assert len(ds.list_indices()) == 4
+    assert len(ds.describe_indices()) == 4
 
     # Attempt to drop index (name does not exist)
     with pytest.raises(RuntimeError, match="index not found"):
         ds.drop_index("nonexistent_name")
 
-    for idx in ds.list_indices():
-        idx_name = idx["name"]
+    for idx in ds.describe_indices():
+        idx_name = idx.name
         ds.drop_index(idx_name)
 
-    assert len(ds.list_indices()) == 0
+    assert len(ds.describe_indices()) == 0
 
     # Ensure we can still search columns
     assert ds.to_table(filter="btree = 1").num_rows == 1
@@ -2365,10 +2561,23 @@ def compare_fts_results(
     single_df = single_machine_results.to_pandas()
     distributed_df = distributed_results.to_pandas()
 
-    # Sort both by row_id to ensure consistent ordering
-    if "_rowid" in single_df.columns:
-        single_df = single_df.sort_values("_rowid").reset_index(drop=True)
-        distributed_df = distributed_df.sort_values("_rowid").reset_index(drop=True)
+    # Normalize row ordering for comparisons.
+    #
+    # FTS search results do not guarantee a stable order for tied scores and
+    # different execution modes (single-machine vs distributed) may return rows
+    # in different (but equivalent) orders.
+    sort_cols = (
+        ["_rowid"]
+        if "_rowid" in single_df.columns
+        else [c for c in single_df.columns if c != "_score"]
+    )
+    if sort_cols:
+        single_df = single_df.sort_values(sort_cols, kind="mergesort").reset_index(
+            drop=True
+        )
+        distributed_df = distributed_df.sort_values(
+            sort_cols, kind="mergesort"
+        ).reset_index(drop=True)
 
     # Compare row IDs (most important)
     if "_rowid" in single_df.columns:
@@ -2380,8 +2589,8 @@ def compare_fts_results(
 
     # Compare scores with tolerance
     if "_score" in single_df.columns:
-        single_scores = single_df["_score"].values
-        distributed_scores = distributed_df["_score"].values
+        single_scores = single_df["_score"].to_numpy(dtype=float)
+        distributed_scores = distributed_df["_score"].to_numpy(dtype=float)
         score_diff = np.abs(single_scores - distributed_scores)
         max_diff = np.max(score_diff)
         assert max_diff <= tolerance, (
@@ -2392,27 +2601,11 @@ def compare_fts_results(
     # Compare other columns (exact match for non-score columns)
     for col in single_df.columns:
         if col not in ["_score"]:  # Skip score column (already compared with tolerance)
-            single_values = (
-                set(single_df[col])
-                if single_df[col].dtype == "object"
-                else single_df[col].values
+            np.testing.assert_array_equal(
+                single_df[col].to_numpy(dtype=object),
+                distributed_df[col].to_numpy(dtype=object),
+                err_msg=f"Column {col} values don't match",
             )
-            distributed_values = (
-                set(distributed_df[col])
-                if distributed_df[col].dtype == "object"
-                else distributed_df[col].values
-            )
-
-            if isinstance(single_values, set):
-                assert single_values == distributed_values, (
-                    f"Column {col} content mismatch"
-                )
-            else:
-                np.testing.assert_array_equal(
-                    single_values,
-                    distributed_values,
-                    err_msg=f"Column {col} values don't match",
-                )
 
     return True
 
@@ -2770,20 +2963,10 @@ def test_build_distributed_fts_index_basic(tmp_path):
     )
 
     # Verify the index was created
-    indices = distributed_ds.list_indices()
-    assert len(indices) > 0, "No indices found after distributed index creation"
-
-    # Find our distributed index
-    distributed_index = None
-    for idx in indices:
-        if "distributed" in idx["name"]:
-            distributed_index = idx
-            break
-
-    assert distributed_index is not None, "Distributed index not found"
-    assert distributed_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {distributed_index['type']}"
-    )
+    index_name = "text_distributed_idx"
+    stats = distributed_ds.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "Inverted"
 
     # Test that the index works for searching
     results = distributed_ds.scanner(
@@ -3198,19 +3381,9 @@ def test_distribute_fts_index_build(tmp_path):
     )
 
     # Verify the index was created and is functional
-    indices = ds_committed.list_indices()
-    assert len(indices) > 0, "No indices found after commit"
-
-    # Find our index
-    our_index = None
-    for idx in indices:
-        if idx["name"] == index_name:
-            our_index = idx
-            break
-    assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert our_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {our_index['type']}"
-    )
+    stats = ds_committed.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "Inverted"
 
     # Test that the index works for searching
     # Get a sample text from the dataset to search for
@@ -3278,10 +3451,10 @@ def test_backward_compatibility_no_fragment_ids(tmp_path):
     )
 
     # Verify the index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "full_dataset_idx"
-    assert indices[0]["type"] == "Inverted"
+    assert indices[0].name == "full_dataset_idx"
+    assert indices[0].index_type == "Inverted"
 
     # Test that the index works
     sample_data = ds.take([0], columns=["text"])
@@ -3302,10 +3475,10 @@ def test_backward_compatibility_changed_index_protos(tmp_path):
     shutil.copytree(path, tmp_path, dirs_exist_ok=True)
     ds = lance.dataset(tmp_path)
 
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["name"] == "x_idx"
-    assert indices[0]["type"] == "BTree"
+    assert indices[0].name == "x_idx"
+    assert indices[0].index_type == "BTree"
 
     results = ds.scanner(filter="x = 100").to_table()
     assert results.num_rows == 1
@@ -3389,20 +3562,9 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
     # Verify the index was created and is functional
-    indices = ds_committed.list_indices()
-    assert len(indices) > 0, "No indices found after commit"
-
-    # Find our index
-    our_index = None
-    for idx in indices:
-        if idx["name"] == index_name:
-            our_index = idx
-            break
-
-    assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert our_index["type"] == "BTree", (
-        f"Expected BTree index, got {our_index['type']}"
-    )
+    stats = ds_committed.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "BTree"
 
     # Test that the index works for searching
     # Test exact equality queries
@@ -3790,10 +3952,10 @@ def test_nested_field_btree_index(tmp_path):
     dataset.create_scalar_index(column="meta.lang", index_type="BTREE")
 
     # Verify index was created
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["meta.lang"]
-    assert indices[0]["type"] == "BTree"
+    assert indices[0].field_names == ["lang"]
+    assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
     result = dataset.scanner(filter="meta.lang = 'en'").to_table()
@@ -3891,10 +4053,10 @@ def test_nested_field_fts_index(tmp_path):
     ds.create_scalar_index("data.text", index_type="INVERTED", with_position=False)
 
     # Verify index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["data.text"]
-    assert indices[0]["type"] == "Inverted"
+    assert indices[0].field_names == ["text"]
+    assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
     results = ds.to_table(full_text_query="lance")
@@ -3965,10 +4127,10 @@ def test_nested_field_bitmap_index(tmp_path):
     ds.create_scalar_index("attributes.color", index_type="BITMAP")
 
     # Verify index was created
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["attributes.color"]
-    assert indices[0]["type"] == "Bitmap"
+    assert indices[0].field_names == ["color"]
+    assert indices[0].index_type == "Bitmap"
 
     # Test equality query
     results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)
@@ -4194,3 +4356,122 @@ def test_describe_indices(tmp_path):
     indices = ds.describe_indices()
     for index in indices:
         assert index.num_rows_indexed == 50
+
+
+def test_vector_filter_fts_search(tmp_path):
+    # Create test data
+    ids = list(range(1, 301))
+    vectors = [[float(i)] * 4 for i in ids]
+
+    # Create text data:
+    #   "text <i>" for ids 1-255, 299, 300,
+    #   "noop <i>" for 256-298,
+    texts = []
+    for i in ids:
+        if i <= 255:
+            texts.append(f"text {i}")
+        elif i <= 298:
+            texts.append(f"noop {i}")
+        else:
+            texts.append(f"text {i}")
+
+    categories = []
+    for i in ids:
+        if i % 3 == 1:
+            categories.append("literature")
+        elif i % 3 == 2:
+            categories.append("science")
+        else:
+            categories.append("geography")
+
+    table = pa.table(
+        {
+            "id": ids,
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 4)),
+            "text": texts,
+            "category": categories,
+        }
+    )
+
+    # Write dataset and create indices
+    ds = lance.write_dataset(table, tmp_path)
+
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=4,
+    )
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    # Create vector_query
+    vector_query = {
+        "column": "vector",
+        "q": np.array([300, 300, 300, 300], dtype=np.float32),
+        "k": 5,
+        "minimum_nprobes": 20,
+        "use_index": True,
+    }
+
+    # Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
+    scanner = ds.scanner(
+        prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
+    )
+    result = scanner.to_table()
+    assert [300, 299] == result["id"].to_pylist()
+
+    # Case 2: search with prefilter=true, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = ds.scanner(
+        prefilter=True,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300, 255, 252, 249, 246] == result["id"].to_pylist()
+
+    # Case 3: search with prefilter=false, search_filter=match("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter=MatchQuery("text", "text"),
+    )
+    result = scanner.to_table()
+    assert [300, 299] == result["id"].to_pylist()
+
+    # Case 4: search with prefilter=false, search_filter=match("text"),
+    #       filter="category='geography'"
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300] == result["id"].to_pylist()
+
+    # Case 5: search with prefilter=false, search_filter=phrase("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter=PhraseQuery("text", "text"),
+    )
+    result = scanner.to_table()
+    assert [299, 300] == result["id"].to_pylist()
+
+    # Case 6: search with prefilter=false, search_filter=phrase("text")
+    scanner = ds.scanner(
+        prefilter=False,
+        nearest=vector_query,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": PhraseQuery("text", "text"),
+        },
+    )
+    result = scanner.to_table()
+    assert [300] == result["id"].to_pylist()

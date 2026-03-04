@@ -5,18 +5,17 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
-use opendal::{services::Gcs, Operator};
-use snafu::location;
+use opendal::{Operator, services::Gcs};
 
 use object_store::{
-    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
     RetryConfig, StaticCredentialProvider,
+    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
 };
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -31,7 +30,7 @@ impl GcsStoreProvider {
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
-            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name", location!()))?
+            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name"))?
             .to_string();
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
@@ -48,12 +47,7 @@ impl GcsStoreProvider {
         }
 
         let operator = Operator::from_iter::<Gcs>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create GCS operator: {:?}", e),
-                    location!(),
-                )
-            })?
+            .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?
             .finish();
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
@@ -74,7 +68,8 @@ impl GcsStoreProvider {
 
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_url(base_path.as_ref())
-            .with_retry(retry_config);
+            .with_retry(retry_config)
+            .with_client_options(storage_options.client_options()?);
         for (key, value) in storage_options.as_gcs_options() {
             builder = builder.with_config(key, value);
         }
@@ -96,7 +91,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options.clone().unwrap_or_default());
+            StorageOptions(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_gcs();
         let download_retry_count = storage_options.download_retry_count();
 
@@ -124,6 +119,8 @@ impl ObjectStoreProvider for GcsStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 }
@@ -180,16 +177,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_use_opendal_flag() {
+        use crate::object_store::StorageOptionsAccessor;
         let provider = GcsStoreProvider;
         let url = Url::parse("gs://test-bucket/path").unwrap();
         let params_with_flag = ObjectStoreParams {
-            storage_options: Some(HashMap::from([
-                ("use_opendal".to_string(), "true".to_string()),
-                (
-                    "service_account".to_string(),
-                    "test@example.iam.gserviceaccount.com".to_string(),
-                ),
-            ])),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    (
+                        "service_account".to_string(),
+                        "test@example.iam.gserviceaccount.com".to_string(),
+                    ),
+                ]),
+            ))),
             ..Default::default()
         };
 

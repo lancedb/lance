@@ -118,6 +118,8 @@ jobs:
         with:
           args: "--profile ci"
       - uses: ./.github/workflows/run_tests
+        with:
+          memtest: true
       - name: Upload wheels as artifacts
         if: ${{ matrix.python-minor-version == '13' }}
         uses: actions/upload-artifact@v4

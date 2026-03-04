@@ -203,6 +203,53 @@ class IndicesBuilder:
         )
         return PqModel(num_subvectors, pq_codebook)
 
+    def prepare_global_ivf_pq(
+        self,
+        num_partitions: Optional[int],
+        num_subvectors: Optional[int],
+        *,
+        distance_type: str = "l2",
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
+        sample_rate: int = 256,
+        max_iters: int = 50,
+    ) -> dict:
+        """
+        Perform global training for IVF+PQ using existing CPU training paths and
+        return preprocessed artifacts for distributed builds.
+
+        Returns
+        -------
+        dict
+            A dictionary with two entries:
+            - "ivf_centroids": pyarrow.FixedSizeListArray of centroids
+            - "pq_codebook": pyarrow.FixedSizeListArray of PQ codebook
+
+        Notes
+        -----
+        This method uses the existing CPU training path by delegating to
+        `IndicesBuilder.train_ivf` (indices.train_ivf_model) and
+        `IndicesBuilder.train_pq` (indices.train_pq_model). No public method
+        names elsewhere are changed.
+        """
+        # Global IVF training
+        ivf_model = self.train_ivf(
+            num_partitions,
+            distance_type=distance_type,
+            accelerator=accelerator,  # None by default (CPU path)
+            sample_rate=sample_rate,
+            max_iters=max_iters,
+        )
+
+        # Global PQ training using IVF residuals
+        pq_model = self.train_pq(
+            ivf_model,
+            num_subvectors,
+            sample_rate=sample_rate,
+            max_iters=max_iters,
+        )
+
+        return {"ivf_centroids": ivf_model.centroids, "pq_codebook": pq_model.codebook}
+
     def assign_ivf_partitions(
         self,
         ivf_model: IvfModel,

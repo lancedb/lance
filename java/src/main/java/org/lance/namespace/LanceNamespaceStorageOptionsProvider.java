@@ -73,11 +73,13 @@ public class LanceNamespaceStorageOptionsProvider implements StorageOptionsProvi
   /**
    * Fetch credentials from the namespace.
    *
-   * <p>This calls namespace.describeTable() to get the latest credentials and their expiration
-   * time.
+   * <p>This calls namespace.describeTable() to get the latest credentials and optionally their
+   * expiration time.
    *
-   * @return Flat map of string key-value pairs containing credentials and expires_at_millis
-   * @throws RuntimeException if the namespace doesn't return storage credentials or expiration time
+   * @return Flat map of string key-value pairs containing credentials. May optionally include
+   *     expires_at_millis. If expires_at_millis is not provided, credentials are treated as
+   *     non-expiring and will not be automatically refreshed.
+   * @throws RuntimeException if the namespace doesn't return storage credentials
    */
   @Override
   public Map<String, String> fetchStorageOptions() {
@@ -96,14 +98,9 @@ public class LanceNamespaceStorageOptionsProvider implements StorageOptionsProvi
               + "Ensure the namespace supports credential vending.");
     }
 
-    // Verify expires_at_millis is present
-    if (!storageOptions.containsKey("expires_at_millis")) {
-      throw new RuntimeException(
-          "Namespace storage_options missing 'expires_at_millis'. "
-              + "Credential refresh will not work properly.");
-    }
-
     // Return storage_options directly - it's already a flat Map<String, String>
+    // Note: expires_at_millis is optional. If not provided, credentials are treated
+    // as non-expiring and will not be automatically refreshed.
     return storageOptions;
   }
 

@@ -1,33 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::{jint, jlong},
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{BlobHandling, OnMissing, Projection, Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
+    ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
-    ReadBatchParams,
 };
 use object_store::path::Path;
 
@@ -92,7 +94,7 @@ fn create_java_reader_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
     Ok(res)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_openNative<'local>(
     mut env: JNIEnv<'local>,
     _reader_class: JObject,
@@ -112,7 +114,9 @@ fn inner_open<'local>(
     let storage_options = to_rust_map(env, &jmap)?;
     let reader = RT.block_on(async move {
         let object_params = ObjectStoreParams {
-            storage_options: Some(storage_options),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+            )),
             ..Default::default()
         };
         let (obj_store, path) = ObjectStore::from_uri_and_params(
@@ -142,7 +146,7 @@ fn inner_open<'local>(
     reader.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_closeNative<'local>(
     mut env: JNIEnv<'local>,
     reader: JObject,
@@ -158,7 +162,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_closeNative<'local>(
     JObject::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_numRowsNative(
     mut env: JNIEnv<'_>,
     reader: JObject,
@@ -190,7 +194,7 @@ fn inner_num_rows(env: &mut JNIEnv<'_>, reader: JObject) -> Result<jlong> {
     Ok(reader.num_rows() as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_populateSchemaNative(
     mut env: JNIEnv,
     reader: JObject,
@@ -208,7 +212,7 @@ fn inner_populate_schema(env: &mut JNIEnv, reader: JObject, schema_addr: jlong) 
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
     mut env: JNIEnv<'_>,
     reader: JObject,
@@ -216,10 +220,10 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
     projected_names: JObject,
     selection_ranges: JObject,
     stream_addr: jlong,
+    blob_read_mode: jint,
 ) {
     let result = (|| -> Result<()> {
         let mut read_parameter = ReadBatchParams::default();
-        let mut reader_projection: Option<ReaderProjection> = None;
         // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
         // If we get reader from env.get_rust_field, we can't use env (can't borrow again) until we drop the reader.
         #[allow(unused_variables)]
@@ -237,17 +241,44 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
         };
 
         let file_version = reader.inner.metadata().version();
+        let base_schema = Schema::try_from(reader.schema()?.as_ref())?;
 
-        if !projected_names.is_null() {
-            let schema = Schema::try_from(reader.schema()?.as_ref())?;
-            let column_names: Vec<String> = env.get_strings(&projected_names)?;
-            let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
-            reader_projection = Some(ReaderProjection::from_column_names(
+        let blob_handling = if blob_read_mode == 1 {
+            BlobHandling::BlobsDescriptions
+        } else {
+            BlobHandling::AllBinary
+        };
+
+        let reader_projection = {
+            let mut projection =
+                Projection::empty(Arc::new(base_schema.clone())).with_blob_handling(blob_handling);
+
+            if !projected_names.is_null() {
+                let column_names: Vec<String> = env.get_strings(&projected_names)?;
+                projection = projection.union_columns(&column_names, OnMissing::Error)?;
+            } else {
+                projection = projection.union_predicate(|_| true);
+            }
+
+            let transformed_schema = projection.to_bare_schema();
+
+            let field_id_to_column_index = base_schema
+                .fields_pre_order()
+                .filter(|field| {
+                    file_version < LanceFileVersion::V2_1
+                        || field.is_leaf()
+                        || field.is_packed_struct()
+                })
+                .enumerate()
+                .map(|(idx, field)| (field.id as u32, idx as u32))
+                .collect::<BTreeMap<_, _>>();
+
+            Some(ReaderProjection::from_field_ids(
                 file_version,
-                &schema,
-                names.as_slice(),
-            )?);
-        }
+                &transformed_schema,
+                &field_id_to_column_index,
+            )?)
+        };
 
         if !selection_ranges.is_null() {
             let mut ranges: Vec<Range<u64>> = Vec::new();

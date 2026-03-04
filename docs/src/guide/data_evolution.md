@@ -48,6 +48,11 @@ assert dataset.schema == pa.schema([
 
 This operation is very fast, as it only updates the metadata of the dataset.
 
+For Lance file format `<= 2.1`, adding sub-columns under an existing `struct` is not supported.
+Starting with Lance file format `2.2`, schema-only add can also extend nested `struct` fields
+(including `struct` fields nested inside list types), for example by adding
+`people.item.location` under `list<struct<...>>`.
+
 ### With data backfill
 
 New columns can be added and populated within a single operation using the
@@ -153,10 +158,25 @@ print(dataset.schema)
 # id: int64
 ```
 
+Starting with Lance file format `2.2`, nested sub-column removal is supported for
+nested types (for example `people.item.city` on `list<struct<...>>`), instead of
+being limited to `struct` only.
+
 To actually remove the data from disk, the files must be rewritten to remove the
 columns and then the old files must be deleted. This can be done using
 `lance.dataset.DatasetOptimizer.compact_files()` followed by
 `lance.LanceDataset.cleanup_old_versions()`.
+
+!!! warning
+
+    `drop_columns` is metadata-only and remains reversible as long as old versions are retained.
+    After `compact_files()` rewrites data files and `cleanup_old_versions()` removes old manifests/files,
+    removed data may become permanently unrecoverable.
+
+    For production workflows, use a rollback window:
+    - create a tag (or snapshot/backup) before nested column drops
+    - delay cleanup until the rollback window has passed
+    - only run aggressive cleanup after rollback validation
 
 ## Renaming columns
 

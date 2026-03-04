@@ -4,13 +4,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
-    DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
-use lance_core::error::Result;
 use lance_core::Error;
+use lance_core::error::Result;
 use object_store::{local::LocalFileSystem, path::Path};
-use snafu::location;
 use url::Url;
 
 #[derive(Default, Debug)]
@@ -20,7 +19,7 @@ pub struct FileStoreProvider;
 impl ObjectStoreProvider for FileStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(LocalFileSystem::new()),
@@ -32,21 +31,20 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        if let Ok(file_path) = url.to_file_path() {
-            if let Ok(path) = Path::from_absolute_path(&file_path) {
-                return Ok(path);
-            }
+        if let Ok(file_path) = url.to_file_path()
+            && let Ok(path) = Path::from_absolute_path(&file_path)
+        {
+            return Ok(path);
         }
 
         Path::parse(url.path()).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to parse path '{}': {}", url.path(), e),
-                location!(),
-            )
+            Error::invalid_input(format!("Failed to parse path '{}': {}", url.path(), e))
         })
     }
 
@@ -121,6 +119,10 @@ mod tests {
             (
                 "C:\\Users\\ADMINI~1\\AppData\\Local\\..\\",
                 "C:/Users/ADMINI~1/AppData",
+            ),
+            (
+                "file-object-store:///C:/Users/ADMINI~1/AppData/Local",
+                "C:/Users/ADMINI~1/AppData/Local",
             ),
         ];
 

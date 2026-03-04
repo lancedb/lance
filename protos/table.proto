@@ -504,80 +504,176 @@ message FragmentReuseIndexDetails {
   }
 }
 
-message MemWalIndexDetails {
+// ============================================================================
+// MemWAL Index Types
+// ============================================================================
 
-  repeated MemWal mem_wal_list = 1;
+// Region manifest containing epoch-based fencing and WAL state.
+// Each region has exactly one active writer at any time.
+message RegionManifest {
+  // Region identifier (UUID v4).
+  UUID region_id = 11;
 
-  message MemWalId {
-    // The name of the region that this specific MemWAL is responsible for.
-    string region = 1;
+  // Manifest version number.
+  // Matches the version encoded in the filename.
+  uint64 version = 1;
 
-    // The generation of the MemWAL.
-    // Every time a new MemWAL is created and an old one is sealed,
-    // the generation number of the next MemWAL is incremented.
-    // At any given point of time for all MemWALs of the same name,
-    // there must be only 1 generation that is not sealed.
-    uint64 generation = 2;
-  }
+  // Region spec ID this region was created with.
+  // Set at region creation and immutable thereafter.
+  // A value of 0 indicates a manually-created region not governed by any spec.
+  uint32 region_spec_id = 10;
 
-  // A combination of MemTable and WAL for fast upsert.
-  message MemWal {
+  // Writer fencing token - monotonically increasing.
+  // A writer must increment this when claiming the region.
+  uint64 writer_epoch = 2;
 
-    enum State {
-      // MemWAL is open and accepting new entries
-      OPEN = 0;
-      // When a MemTable is considered full, the writer should update this MemWAL as sealed
-      // and create a new MemWAL to write to atomically.
-      SEALED = 1;
-      // When a MemTable is sealed, it can be flushed asynchronously to disk.
-      // This state indicates the data has been persisted to disk but not yet merged
-      // into the source table.
-      FLUSHED = 2;
-      // When the flushed data has been merged into the source table.
-      // After a MemWAL is merged, the cleanup process can delete the WAL.
-      MERGED = 3;
-    }
+  // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
+  // During recovery, replay starts from replay_after_wal_entry_position + 1.
+  uint64 replay_after_wal_entry_position = 3;
 
-    MemWalId id = 1;
+  // The most recent WAL entry position (0-based) at the time manifest was updated.
+  // This is a hint, not authoritative - recovery must list files to find actual state.
+  uint64 wal_entry_position_last_seen = 4;
 
-    // The MemTable location, which is likely an in-memory address starting with memory://.
-    // The actual details of how the MemTable is stored is outside the concern of Lance.
-    string mem_table_location = 2;
+  // Next generation ID to create (incremented after each MemTable flush).
+  uint64 current_generation = 6;
 
-    // the root location of the WAL.
-    // THe WAL storage durability determines the data durability.
-    // This location is immutable once set at MemWAL creation time.
-    string wal_location = 3;
+  // Field 7 removed: merged_generation moved to MemWalIndexDetails.merged_generations
+  // which is the authoritative source for merge progress.
 
-    // All entries in the WAL, serialized as U64Segment.
-    // Each entry in the WAL has a uint64 sequence ID starting from 0.
-    // The actual details of how the WAL entry is stored is outside the concern of Lance.
-    // In most cases this U64Segment should be a simple range.
-    // Every time the writer starts writing, it must always try to atomically write to the last entry ID + 1.
-    // If fails due to concurrent writer, it then tries to write to the +2, +3, +4, etc. entry ID until succeed.
-    // but if there are 2 writers accidentally writing to the same WAL concurrently,
-    // although one writer will fail to update this index at commit time,
-    // the WAL entry is already written,
-    // causing some holes within the U64Segment range.
-    bytes wal_entries = 4;
-
-    // The current state of the MemWAL, indicating its lifecycle phase.
-    // States progress: OPEN -> SEALED -> FLUSHED
-    // OPEN: MemWAL is accepting new WAL entries
-    // SEALED: MemWAL has been sealed and no longer accepts new WAL entries
-    // FLUSHED: MemWAL has been flushed to the source Lance table and can be cleaned up
-    State state = 5;
-
-    // The owner identifier for this MemWAL, used for compare-and-swap operations.
-    // When a writer wants to perform any operation on this MemWAL, it must provide
-    // the expected owner_id. This serves as an optimistic lock to prevent concurrent
-    // writers from interfering with each other. When a new writer starts replay,
-    // it must first atomically update this owner_id to claim ownership.
-    // All subsequent operations will fail if the owner_id has changed.
-    string owner_id = 6;
-
-    // The dataset version that last updated this MemWAL.
-    // This is set to the new dataset version whenever the MemWAL is created or modified.
-    uint64 last_updated_dataset_version = 7;
-  }
+  // List of flushed MemTable generations and their directory paths.
+  repeated FlushedGeneration flushed_generations = 8;
 }
+
+// A flushed MemTable generation and its storage location.
+message FlushedGeneration {
+  // Generation number.
+  uint64 generation = 1;
+
+  // Directory name relative to the region directory.
+  string path = 2;
+}
+
+// A region's merged generation, used in MemWalIndexDetails.
+message MergedGeneration {
+  // Region identifier (UUID v4).
+  UUID region_id = 1;
+
+  // Last generation merged to base table for this region.
+  uint64 generation = 2;
+}
+
+// Tracks which merged generation a base table index has been rebuilt to cover.
+// Used to determine whether to read from flushed MemTable indexes or base table.
+message IndexCatchupProgress {
+  // Name of the base table index (must match an entry in maintained_indexes).
+  string index_name = 1;
+
+  // Per-region progress: the generation up to which this index covers.
+  // If a region is not present, the index is assumed to be fully caught up
+  // (i.e., caught_up_generation >= merged_generation for that region).
+  repeated MergedGeneration caught_up_generations = 2;
+}
+
+// Index details for MemWAL Index, stored in IndexMetadata.index_details.
+// This is the centralized structure for all MemWAL metadata:
+// - Configuration (region specs, indexes to maintain)
+// - Merge progress (merged generations per region)
+// - Region state snapshots
+//
+// Writers read this index to get configuration before writing.
+// Readers read this index to discover regions and their state.
+// A background process updates the index periodically to keep region snapshots current.
+//
+// Region snapshots are stored as a Lance file with one row per region.
+// The schema has one column per RegionManifest field, with region fields as columns:
+//   region_id: fixed_size_binary(16)  -- UUID bytes
+//   version: uint64
+//   region_spec_id: uint32
+//   writer_epoch: uint64
+//   replay_after_wal_entry_position: uint64
+//   wal_entry_position_last_seen: uint64
+//   current_generation: uint64
+//   merged_generation: uint64
+//   flushed_generations: list<struct<generation: uint64, path: string>>
+message MemWalIndexDetails {
+  // Snapshot timestamp (Unix timestamp in milliseconds).
+  int64 snapshot_ts_millis = 1;
+
+  // Number of regions in the snapshot.
+  // Used to determine storage format without reading the snapshot data.
+  uint32 num_regions = 2;
+
+  // Inline region snapshots for small region counts.
+  // When num_regions <= threshold (implementation-defined, e.g., 100),
+  // snapshots are stored inline as serialized bytes.
+  // Format: Lance file bytes with the region snapshot schema.
+  optional bytes inline_snapshots = 3;
+
+  // Region specs defining how to derive region identifiers.
+  // This configuration determines how rows are partitioned into regions.
+  repeated RegionSpec region_specs = 7;
+
+  // Indexes from the base table to maintain in MemTables.
+  // These are index names referencing indexes defined on the base table.
+  // The primary key btree index is always maintained implicitly and
+  // should not be listed here.
+  //
+  // For vector indexes, MemTables inherit quantization parameters (PQ codebook,
+  // SQ params) from the base table index to ensure distance comparability.
+  repeated string maintained_indexes = 8;
+
+  // Last generation merged to base table for each region.
+  // This is updated atomically with merge-insert data commits, enabling
+  // conflict resolution when multiple mergers operate concurrently.
+  //
+  // Note: This is separate from region snapshots because:
+  // 1. merged_generations is updated by mergers (atomic with data commit)
+  // 2. region snapshots are updated by background index builder
+  repeated MergedGeneration merged_generations = 9;
+
+  // Per-index catchup progress tracking.
+  // When data is merged to the base table, base table indexes are rebuilt
+  // asynchronously. This field tracks which generation each index covers.
+  //
+  // For indexed queries, if an index's caught_up_generation < merged_generation,
+  // readers should use flushed MemTable indexes for the gap instead of
+  // scanning unindexed data in the base table.
+  //
+  // If an index is not present in this list, it is assumed to be fully caught up.
+  repeated IndexCatchupProgress index_catchup = 10;
+}
+
+// Region spec definition.
+message RegionSpec {
+  // Unique identifier for this spec within the index.
+  // IDs are never reused.
+  uint32 spec_id = 1;
+
+  // Region field definitions that determine how to compute region identifiers.
+  repeated RegionField fields = 2;
+}
+
+// Region field definition.
+message RegionField {
+  // Unique string identifier for this region field.
+  string field_id = 1;
+
+  // Field IDs referencing source columns in the schema.
+  repeated int32 source_ids = 2;
+
+  // Well-known region transform name (e.g., "identity", "year", "bucket").
+  // Mutually exclusive with expression.
+  optional string transform = 3;
+
+  // DataFusion SQL expression for custom logic.
+  // Mutually exclusive with transform.
+  optional string expression = 4;
+
+  // Output type of the region value (Arrow type name).
+  string result_type = 5;
+
+  // Transform parameters (e.g., num_buckets for bucket transform).
+  map<string, string> parameters = 6;
+}
+

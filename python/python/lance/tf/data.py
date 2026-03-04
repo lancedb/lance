@@ -29,6 +29,8 @@ from lance.log import LOGGER
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from lance import LanceNamespace
+
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
     """Convert Pyarrow DataType to Tensorflow."""
@@ -132,20 +134,24 @@ def column_to_tensor(array: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
 
 
 def from_lance(
-    dataset: Union[str, Path, LanceDataset],
+    dataset: Optional[Union[str, Path, LanceDataset]] = None,
     *,
     columns: Optional[Union[List[str], Dict[str, str]]] = None,
     batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
+    namespace: Optional["LanceNamespace"] = None,
+    table_id: Optional[List[str]] = None,
+    ignore_namespace_table_storage_options: bool = False,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
 
     Parameters
     ----------
-    dataset : Union[str, Path, LanceDataset]
-        Lance dataset or dataset URI/path.
+    dataset : Union[str, Path, LanceDataset], optional
+        Lance dataset or dataset URI/path. Either ``dataset`` or both
+        ``namespace`` and ``table_id`` must be provided.
     columns : Optional[List[str]], optional
         List of columns to include in the output dataset.
         If not set, all columns will be read.
@@ -159,6 +165,13 @@ def from_lance(
     output_signature : Optional[tf.TypeSpec], optional
         Override output signature of the returned tensors. If not provided,
         the output signature is inferred from the projection Schema.
+    namespace : Optional[LanceNamespace], optional
+        Namespace to resolve the table location when ``table_id`` is provided.
+    table_id : Optional[List[str]], optional
+        Table identifier used together with ``namespace`` to locate the table.
+    ignore_namespace_table_storage_options : bool, default False
+        When using ``namespace``/``table_id``, ignore storage options returned
+        by the namespace.
 
     Examples
     --------
@@ -198,8 +211,19 @@ def from_lance(
             print(batch["image"].shape)
 
     """
-    if not isinstance(dataset, LanceDataset):
-        dataset = lance.dataset(dataset)
+    if isinstance(dataset, LanceDataset):
+        if namespace is not None or table_id is not None:
+            raise ValueError(
+                "Cannot specify 'namespace' or 'table_id' when passing "
+                "a LanceDataset instance"
+            )
+    else:
+        dataset = lance.dataset(
+            dataset,
+            namespace=namespace,
+            table_id=table_id,
+            ignore_namespace_table_storage_options=ignore_namespace_table_storage_options,
+        )
 
     if isinstance(fragments, tf.data.Dataset):
         fragments = list(fragments.as_numpy_iterator())

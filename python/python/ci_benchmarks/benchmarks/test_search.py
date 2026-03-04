@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import re
 
 import lance
 import pytest
@@ -203,22 +202,10 @@ def test_basic_bitmap_search(
     do_basic_search(benchmark, filt, payload, use_cache)
 
 
-IOPS = 0.0
-
-
-def set_iops(iops: float):
-    global IOPS
-    IOPS = iops
-
-
-def iops_timer():
-    return IOPS
-
-
-@pytest.mark.benchmark(warmup=False, timer=iops_timer)
+@pytest.mark.io_memory_benchmark()
 @pytest.mark.parametrize("filt", BASIC_BTREE_FILTERS, ids=BASIC_BTREE_FILTER_LABELS)
 @pytest.mark.parametrize("payload", ["small_strings", "integers"])
-def test_iops_basic_btree_search(benchmark, filt: str | None, payload: str):
+def test_io_mem_basic_btree_search(io_mem_benchmark, filt: str | None, payload: str):
     dataset_uri = get_dataset_uri("basic")
     ds = lance.dataset(dataset_uri)
 
@@ -226,23 +213,12 @@ def test_iops_basic_btree_search(benchmark, filt: str | None, payload: str):
     if payload is not None:
         columns = [payload]
 
-    def bench():
-        plan = ds.scanner(
+    def bench(dataset):
+        dataset.to_table(
             columns=columns,
             filter=filt,
             with_row_id=True,
             batch_size=32 * 1024,
-        ).analyze_plan()
-        iops = re.search(r"iops=(\d+)", plan)
-        if iops is not None:
-            set_iops(float(iops.group(1)))
-        else:
-            set_iops(0.0)
+        )
 
-    def clear_timer():
-        set_iops(0.0)
-
-    # We still do a warmup since caching may reduce IOPS and not just latency
-    benchmark.pedantic(
-        bench, warmup_rounds=1, rounds=1, iterations=1, setup=clear_timer
-    )
+    io_mem_benchmark(bench, ds)

@@ -9,7 +9,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::datagen::DatafusionDatagenExt;
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 
 /// Total number of rows in the dataset
 pub const TOTAL_ROWS: u64 = 1_000_000;

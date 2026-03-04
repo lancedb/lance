@@ -3,17 +3,19 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use object_store::path::Path;
-use snafu::location;
 use url::Url;
 
-use crate::object_store::uri_to_url;
 use crate::object_store::WrappingObjectStore;
+use crate::object_store::uri_to_url;
 
-use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
+use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -28,6 +30,8 @@ pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
 pub mod oss;
+#[cfg(feature = "tencent")]
+pub mod tencent;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -41,9 +45,8 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        Path::parse(url.path()).map_err(|_| {
-            Error::invalid_input(format!("Invalid path in URL: {}", url.path()), location!())
-        })
+        Path::parse(url.path())
+            .map_err(|_| Error::invalid_input(format!("Invalid path in URL: {}", url.path())))
     }
 
     /// Calculate the unique prefix that should be used for this object store.
@@ -65,6 +68,17 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     ) -> Result<String> {
         Ok(format!("{}${}", url.scheme(), url.authority()))
     }
+}
+
+/// Statistics for the object store registry cache.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectStoreRegistryStats {
+    /// Number of cache hits (store was already cached and reused).
+    pub hits: u64,
+    /// Number of cache misses (new store had to be created).
+    pub misses: u64,
+    /// Number of currently active object stores in the cache.
+    pub active_stores: usize,
 }
 
 /// A registry of object store providers.
@@ -93,6 +107,9 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    // Cache statistics
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl ObjectStoreRegistry {
@@ -104,6 +121,8 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -147,13 +166,31 @@ impl ObjectStoreRegistry {
         output
     }
 
+    /// Get cache statistics for monitoring and debugging.
+    ///
+    /// Returns the number of cache hits, misses, and currently active stores.
+    /// This is useful for detecting configuration issues that cause excessive
+    /// cache misses (e.g., storage options that vary per-request).
+    pub fn stats(&self) -> ObjectStoreRegistryStats {
+        let active_stores = self
+            .active_stores
+            .read()
+            .map(|s| s.values().filter(|w| w.strong_count() > 0).count())
+            .unwrap_or(0);
+        ObjectStoreRegistryStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            active_stores,
+        }
+    }
+
     fn scheme_not_found_error(&self, scheme: &str) -> Error {
         let mut message = format!("No object store provider found for scheme: '{}'", scheme);
         if let Ok(providers) = self.providers.read() {
             let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
             message.push_str(&format!("\nValid schemes: {}", valid_schemes));
         }
-        Error::invalid_input(message, location!())
+        Error::invalid_input(message)
     }
 
     /// Get an object store for a given base path and parameters.
@@ -172,7 +209,7 @@ impl ObjectStoreRegistry {
         };
 
         let cache_path =
-            provider.calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?;
+            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params
@@ -186,6 +223,7 @@ impl ObjectStoreRegistry {
                 .cloned();
             if let Some(store) = maybe_store {
                 if let Some(store) = store.upgrade() {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(store);
                 } else {
                     // Remove the weak reference if it is no longer valid
@@ -193,15 +231,17 @@ impl ObjectStoreRegistry {
                         .active_stores
                         .write()
                         .expect("ObjectStoreRegistry lock poisoned");
-                    if let Some(store) = cache_lock.get(&cache_key) {
-                        if store.upgrade().is_none() {
-                            // Remove the weak reference if it is no longer valid
-                            cache_lock.remove(&cache_key);
-                        }
+                    if let Some(store) = cache_lock.get(&cache_key)
+                        && store.upgrade().is_none()
+                    {
+                        // Remove the weak reference if it is no longer valid
+                        cache_lock.remove(&cache_key);
                     }
                 }
             }
         }
+
+        self.misses.fetch_add(1, Ordering::Relaxed);
 
         let mut store = provider.new_store(base_path, params).await?;
 
@@ -274,11 +314,15 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "tencent")]
+        providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 }
@@ -296,6 +340,8 @@ impl ObjectStoreRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[derive(Debug)]
@@ -369,5 +415,40 @@ mod tests {
                 .calculate_object_store_prefix("dummy://mybucket/my/long/path", None)
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_stats_hit_miss_tracking() {
+        use crate::object_store::StorageOptionsAccessor;
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+
+        let params1 = ObjectStoreParams::default();
+        let params2 = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("k".into(), "v".into())]),
+            ))),
+            ..Default::default()
+        };
+
+        // (hits, misses, active)
+        let cases: &[(&ObjectStoreParams, (u64, u64, usize))] = &[
+            (&params1, (0, 1, 1)), // miss: new params
+            (&params1, (1, 1, 1)), // hit: same params
+            (&params2, (1, 2, 2)), // miss: different storage_options
+        ];
+
+        let mut stores = vec![]; // retain the stores
+        for (params, (hits, misses, active)) in cases {
+            stores.push(registry.get_store(url.clone(), params).await.unwrap());
+            let s = registry.stats();
+            assert_eq!(
+                (s.hits, s.misses, s.active_stores),
+                (*hits, *misses, *active)
+            );
+        }
+
+        // Same params returns same instance
+        assert!(Arc::ptr_eq(&stores[0], &stores[1]));
     }
 }

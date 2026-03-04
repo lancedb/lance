@@ -5,20 +5,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{
     array::{RecordBatch, StructArray},
-    ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type},
 };
 use arrow_schema::DataType;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::jlong,
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_file::{
@@ -62,7 +62,7 @@ fn create_java_writer_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
     Ok(res)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
@@ -94,7 +94,9 @@ fn inner_open<'local>(
 
     let writer = RT.block_on(async move {
         let object_params = ObjectStoreParams {
-            storage_options: Some(storage_options),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+            )),
             ..Default::default()
         };
         let (obj_store, path) = ObjectStore::from_uri_and_params(
@@ -122,7 +124,7 @@ fn inner_open<'local>(
     writer.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
@@ -149,7 +151,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     JObject::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_nativeAddSchemaMetadata<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
@@ -178,7 +180,7 @@ fn inner_add_schema_metadata(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_writeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,

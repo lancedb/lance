@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use arrow_array::RecordBatch;
 
-use crate::{datatypes::Schema, Result};
+use crate::{Result, datatypes::Schema};
 
 /// `TakeRow` trait.
 ///

@@ -5,20 +5,20 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
+use lance_index::VECTOR_INDEX_VERSION;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::CreatedIndex;
-use lance_index::VECTOR_INDEX_VERSION;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
-use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
-use crate::dataset::index::LanceIndexStoreExt;
+use super::vector::ivf::optimize_vector_indices;
 use crate::dataset::Dataset;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
@@ -47,10 +47,9 @@ pub async fn merge_indices<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
@@ -66,40 +65,47 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let column = dataset
         .schema()
         .field_by_id(old_indices[0].fields[0])
-        .ok_or(Error::Index {
-            message: format!(
-                "Append index: column {} does not exist",
-                old_indices[0].fields[0]
-            ),
-            location: location!(),
-        })?;
+        .ok_or(Error::index(format!(
+            "Append index: column {} does not exist",
+            old_indices[0].fields[0]
+        )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
-        let index = dataset
+        match dataset
             .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
-            .await?;
-        indices.push(index);
+            .await
+        {
+            Ok(index) => indices.push(index),
+            Err(e) => {
+                log::warn!(
+                    "Cannot open index on column '{}': {}. \
+                     Skipping index merge for this column.",
+                    field_path,
+                    e
+                );
+                return Ok(None);
+            }
+        }
     }
 
     if indices
         .windows(2)
         .any(|w| w[0].index_type() != w[1].index_type())
     {
-        return Err(Error::Index {
-            message: format!("Append index: invalid index deltas: {:?}", old_indices),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Append index: invalid index deltas: {:?}",
+            old_indices
+        )));
     }
 
     let mut frag_bitmap = RoaringBitmap::new();
@@ -110,11 +116,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     let index_type = indices[0].index_type();
     let (new_uuid, indices_merged, created_index) = match index_type {
         it if it.is_scalar() => {
-            // There are no delta indices for scalar, so adding all indexed
-            // fragments to the new index.
-            old_indices.iter().for_each(|idx| {
-                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-            });
+            // Use effective bitmap (intersected with existing dataset fragments)
+            // to avoid carrying stale data from pruned indices.
+            let effective_old_frags: RoaringBitmap = old_indices
+                .iter()
+                .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
+                .fold(RoaringBitmap::new(), |mut acc, b| {
+                    acc |= &b;
+                    acc
+                });
+            frag_bitmap |= &effective_old_frags;
 
             let index = dataset
                 .open_scalar_index(
@@ -143,8 +154,28 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-            let created_index = index.update(new_data_stream, &new_store).await?;
+            let created_index = if effective_old_frags.is_empty() {
+                // Old data is fully stale (bitmap pruned to empty). Rebuild
+                // from scratch instead of merging stale entries.
+                let params = index.derive_index_params()?;
+                super::scalar::build_scalar_index(
+                    dataset.as_ref(),
+                    column.name.as_str(),
+                    &new_uuid.to_string(),
+                    &params,
+                    true,
+                    None,
+                    Some(new_data_stream),
+                    Arc::new(NoopIndexBuildProgress),
+                )
+                .await?
+            } else {
+                let new_store =
+                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                index
+                    .update(new_data_stream, &new_store, Some(&effective_old_frags))
+                    .await?
+            };
 
             // TODO: don't hard-code index version
             Ok((new_uuid, 1, created_index))
@@ -191,18 +222,17 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 },
             ))
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Append index: invalid index type: {:?}",
-                indices[0].index_type()
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::index(format!(
+            "Append index: invalid index type: {:?}",
+            indices[0].index_type()
+        ))),
     }?;
 
     let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
     for removed in removed_indices.iter() {
-        frag_bitmap |= removed.fragment_bitmap.as_ref().unwrap();
+        if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap) {
+            frag_bitmap |= &effective;
+        }
     }
 
     Ok(Some(IndexMergeResults {
@@ -226,12 +256,12 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{array, Dimension, RowCount};
+    use lance_datagen::{Dimension, RowCount, array};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
+        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -286,11 +316,13 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            !dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
@@ -313,11 +345,13 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 
-        assert!(dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // There should be two indices directories existed.
         let object_store = dataset.object_store();

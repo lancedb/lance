@@ -102,6 +102,8 @@ public class TestVectorDataset implements AutoCloseable {
         for (int j = 0; j < 32; j++) {
           vecItemsVector.setSafe(i * 32 + j, (float) (i * 32 + j));
         }
+        // Mark the fixed-size list value as non-null
+        vecVector.setNotNull(i);
       }
       root.setRowCount(80);
 
@@ -127,6 +129,8 @@ public class TestVectorDataset implements AutoCloseable {
         for (int j = 0; j < 32; j++) {
           vecItemsVector.setSafe(i * 32 + j, (float) i);
         }
+        // Mark the fixed-size list value as non-null
+        vecVector.setNotNull(i);
       }
       root.setRowCount(10);
 

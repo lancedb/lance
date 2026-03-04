@@ -7,36 +7,36 @@ use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
     format::pb21::{
-        compressive_encoding::Compression, BufferCompression, CompressiveEncoding, PageLayout,
+        BufferCompression, CompressiveEncoding, PageLayout, compressive_encoding::Compression,
     },
 };
 
-use arrow_array::{make_array, Array, StructArray, UInt64Array};
+use arrow_array::{Array, StructArray, UInt64Array, make_array};
 use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
-use futures::{future::BoxFuture, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{utils::bit::pad_bytes, Result};
-use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
+use lance_core::{Result, utils::bit::pad_bytes};
+use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::{
-        create_decode_stream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins,
-        FilterExpression, PageInfo,
+        ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins, FilterExpression,
+        PageInfo, create_decode_stream,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
+        ColumnIndexSequence, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
+        MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers, default_encoding_strategy,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
-    EncodingsIo,
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -126,6 +126,14 @@ fn column_indices_from_schema_helper(
                     is_structural_encoding,
                 );
             }
+            DataType::Map(entries, _) => {
+                column_indices_from_schema_helper(
+                    std::slice::from_ref(entries),
+                    column_indices,
+                    column_counter,
+                    is_structural_encoding,
+                );
+            }
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
@@ -208,8 +216,10 @@ async fn test_decode(
         batch_size,
         is_structural_encoding,
         /*should_validate=*/ true,
+        /*spawn_structural_batch_decode_tasks=*/ is_structural_encoding,
         rx,
-    );
+    )
+    .unwrap();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
@@ -235,14 +245,14 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
-                            i,
-                            offset,
-                            expected,
-                            actual,
-                            expected.slice(i, 1),
-                            actual.slice(i, 1)
-                        );
+                                "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                                i,
+                                offset,
+                                expected,
+                                actual,
+                                expected.slice(i, 1),
+                                actual.slice(i, 1)
+                            );
                         }
                     }
                 } else {
@@ -339,6 +349,7 @@ pub async fn check_round_trip_encoding_generated(
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -474,15 +485,15 @@ impl TestCases {
     fn get_versions(&self) -> Vec<LanceFileVersion> {
         LanceFileVersion::iter_non_legacy()
             .filter(|v| {
-                if let Some(min_file_version) = &self.min_file_version {
-                    if v < min_file_version {
-                        return false;
-                    }
+                if let Some(min_file_version) = &self.min_file_version
+                    && v < min_file_version
+                {
+                    return false;
                 }
-                if let Some(max_file_version) = &self.max_file_version {
-                    if v > max_file_version {
-                        return false;
-                    }
+                if let Some(max_file_version) = &self.max_file_version
+                    && v > max_file_version
+                {
+                    return false;
                 }
                 true
             })
@@ -630,6 +641,9 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
+                if mini_block.dictionary.is_some() {
+                    actual_chain.push("dictionary".to_string());
+                }
                 // Check value compression
                 if let Some(ref value_comp) = mini_block.value_compression {
                     let chain = extract_array_encoding_chain(value_comp);
@@ -643,8 +657,8 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     actual_chain.extend(chain);
                 }
             }
-            Layout::AllNullLayout(_) => {
-                // No value encoding for all null
+            Layout::ConstantLayout(_) => {
+                // Constant layout does not describe a value encoding chain.
             }
             Layout::BlobLayout(blob) => {
                 if let Some(inner_layout) = &blob.inner_layout {
@@ -665,13 +679,24 @@ fn verify_page_encoding(
 ) -> Result<()> {
     use crate::decoder::PageEncoding;
     use lance_core::Error;
-    use snafu::location;
 
     let mut actual_chain = Vec::new();
 
     match &page.description {
         PageEncoding::Structural(layout) => {
             collect_page_encoding(layout, &mut actual_chain)?;
+
+            // All-null structural pages may legitimately contain no encodings to verify.
+            // This can happen even when compression is configured because there is no value data
+            // (and rep/def compression is not currently described in the page layout).
+            if actual_chain.is_empty()
+                && page.data.is_empty()
+                && let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+                    layout.layout.as_ref()
+                && cl.inline_value.is_none()
+            {
+                return Ok(());
+            }
         }
         PageEncoding::Legacy(_) => {
             // We don't need to care about legacy.
@@ -681,14 +706,13 @@ fn verify_page_encoding(
     // Check that all expected encodings appear in the actual chain
     for expected in expected_chain {
         if !actual_chain.iter().any(|actual| actual.contains(expected)) {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Column {} expected encoding chain {:?} but got {:?}",
                     col_idx, expected_chain, actual_chain
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
     }
     Ok(())
@@ -727,6 +751,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version: file_version,
             };
             let encoder = encoding_strategy
                 .create_field_encoder(
@@ -860,11 +885,11 @@ async fn check_round_trip_encoding_inner(
             log_page(&encoded_page);
 
             // For V2.1, verify encoding in the page if expected
-            if file_version >= LanceFileVersion::V2_1 {
-                if let Some(ref expected) = test_cases.expected_encoding {
-                    verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                        .unwrap();
-                }
+            if file_version >= LanceFileVersion::V2_1
+                && let Some(ref expected) = test_cases.expected_encoding
+            {
+                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                    .unwrap();
             }
 
             writer.write_page(encoded_page);
@@ -882,11 +907,11 @@ async fn check_round_trip_encoding_inner(
         log_page(&encoded_page);
 
         // For V2.1, verify encoding in the page if expected
-        if file_version >= LanceFileVersion::V2_1 {
-            if let Some(ref expected) = test_cases.expected_encoding {
-                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                    .unwrap();
-            }
+        if file_version >= LanceFileVersion::V2_1
+            && let Some(ref expected) = test_cases.expected_encoding
+        {
+            verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                .unwrap();
         }
 
         writer.write_page(encoded_page);
@@ -952,8 +977,7 @@ async fn check_round_trip_encoding_inner(
     let decode_field = if is_structural_encoding {
         let mut lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
         if lance_field.is_blob() && matches!(lance_field.data_type(), DataType::Struct(_)) {
-            lance_field =
-                lance_field.into_unloaded_with_version(lance_core::datatypes::BlobVersion::V2);
+            lance_field.unloaded_mut();
             let mut arrow_field = ArrowField::from(&lance_field);
             let mut metadata = arrow_field.metadata().clone();
             metadata.insert("lance-encoding:packed".to_string(), "true".to_string());

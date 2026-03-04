@@ -4,30 +4,29 @@
 use std::{collections::VecDeque, sync::Arc, vec};
 
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, Array, ArrayRef, LargeBinaryArray, PrimitiveArray,
-    StructArray, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, PrimitiveArray, StructArray, UInt64Array, cast::AsArray,
+    types::UInt64Type,
 };
 use arrow_buffer::{
     BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
 use arrow_schema::DataType;
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
-use snafu::location;
+use futures::{FutureExt, future::BoxFuture};
 
-use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
+use lance_core::{Error, Result, datatypes::BLOB_DESC_FIELDS};
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
-    format::pb::{column_encoding, Blob, ColumnEncoding},
+    format::pb::{Blob, ColumnEncoding, column_encoding},
     previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     repdef::RepDefBuilder,
-    EncodingsIo,
 };
 
 /// A field scheduler for large binary data
@@ -293,12 +292,11 @@ impl BlobFieldEncoder {
     }
 
     fn write_bins(array: ArrayRef, external_buffers: &mut OutOfLineBuffers) -> Result<ArrayRef> {
-        let binarray = array
-            .as_binary_opt::<i64>()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("Expected large_binary and received {}", array.data_type()).into(),
-                location: location!(),
-            })?;
+        let binarray = array.as_binary_opt::<i64>().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Expected large_binary and received {}", array.data_type()).into(),
+            )
+        })?;
         let mut positions = Vec::with_capacity(array.len());
         let mut sizes = Vec::with_capacity(array.len());
         let data = binarray.values();
@@ -400,7 +398,7 @@ pub mod tests {
 
     use crate::{
         format::pb::column_encoding,
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
         version::LanceFileVersion,
     };
 
@@ -414,7 +412,11 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_basic_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_basic_random(field).await;
+        check_specific_random(
+            field,
+            TestCases::basic().with_max_file_version(LanceFileVersion::V2_1),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -423,6 +425,7 @@ pub mod tests {
         let val2: &[u8] = &[7, 8, 9];
         let array = Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2)]));
         let test_cases = TestCases::default()
+            .with_max_file_version(LanceFileVersion::V2_1)
             .with_expected_encoding("packed_struct")
             .with_verify_encoding(Arc::new(|cols, version| {
                 if version < &LanceFileVersion::V2_1 {

@@ -10,4 +10,4 @@ lint rust: `cargo clippy --tests --manifest-path ./lance-jni/Cargo.toml`
 compile: `./mvnw compile`
 test: `./mvnw test`
 
-JDK: pom.xml targets Java 8 (`maven.compiler.release` 8); align Rust toolchain with repository `rust-toolchain.toml`.
+JDK: pom.xml targets Java 11 (`maven.compiler.release` 11); align Rust toolchain with repository `rust-toolchain.toml`.

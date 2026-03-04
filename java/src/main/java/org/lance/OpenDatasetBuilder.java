@@ -58,7 +58,7 @@ public class OpenDatasetBuilder {
   private LanceNamespace namespace;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
-  private boolean ignoreNamespaceTableStorageOptions = false;
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
   OpenDatasetBuilder() {}
@@ -129,15 +129,20 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describeTable().
+   * Sets the session to share caches between multiple datasets.
    *
-   * @param ignoreNamespaceTableStorageOptions If true, storage options returned from
-   *     describeTable() will be ignored (treated as null)
+   * <p>When a session is provided, the index and metadata caches from the session will be used
+   * instead of creating new caches. This can improve cache hit rates when opening multiple related
+   * datasets.
+   *
+   * <p>Note: When a session is provided, the indexCacheSizeBytes and metadataCacheSizeBytes
+   * settings in ReadOptions are ignored because the session's caches are used instead.
+   *
+   * @param session The session to use
    * @return this builder instance
    */
-  public OpenDatasetBuilder ignoreNamespaceTableStorageOptions(
-      boolean ignoreNamespaceTableStorageOptions) {
-    this.ignoreNamespaceTableStorageOptions = ignoreNamespaceTableStorageOptions;
+  public OpenDatasetBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
@@ -187,7 +192,7 @@ public class OpenDatasetBuilder {
     }
 
     // Handle URI-based opening
-    return Dataset.open(allocator, selfManagedAllocator, uri, options);
+    return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
   }
 
   private Dataset buildFromNamespace() {
@@ -204,8 +209,10 @@ public class OpenDatasetBuilder {
       throw new IllegalArgumentException("Namespace did not return a table location");
     }
 
-    Map<String, String> namespaceStorageOptions =
-        ignoreNamespaceTableStorageOptions ? null : response.getStorageOptions();
+    // Check if namespace manages versioning (commits go through namespace API)
+    Boolean managedVersioning = response.getManagedVersioning();
+
+    Map<String, String> namespaceStorageOptions = response.getStorageOptions();
 
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
@@ -221,9 +228,6 @@ public class OpenDatasetBuilder {
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-    options
-        .getS3CredentialsRefreshOffsetSeconds()
-        .ifPresent(optionsBuilder::setS3CredentialsRefreshOffsetSeconds);
 
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
     if (namespaceStorageOptions != null) {
@@ -231,7 +235,19 @@ public class OpenDatasetBuilder {
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
-    // Open dataset with regular open method
-    return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build());
+    // If managed_versioning is true, pass namespace for commit handler setup
+    if (Boolean.TRUE.equals(managedVersioning)) {
+      return Dataset.open(
+          allocator,
+          selfManagedAllocator,
+          location,
+          optionsBuilder.build(),
+          session,
+          namespace,
+          tableId);
+    }
+
+    // Open dataset with regular open method (no namespace commit handler)
+    return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build(), session);
   }
 }

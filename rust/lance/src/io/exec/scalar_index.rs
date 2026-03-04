@@ -5,32 +5,33 @@ use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
-    dataset::rowids::load_row_id_sequences,
-    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
+    dataset::rowids::load_row_id_sequences,
+    index::{DatasetIndexInternalExt, prefilter::DatasetPreFilter},
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
-    common::{stats::Precision, Statistics},
+    common::{Statistics, stats::Precision},
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use lance_core::utils::mask::RowSetOps;
 use lance_core::{
+    Error, ROW_ID_FIELD, Result,
     utils::{
         address::RowAddress,
-        mask::{RowAddrTreeMap, RowIdMask},
+        mask::{RowAddrMask, RowAddrTreeMap},
     },
-    Error, Result, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -39,19 +40,18 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
+    DatasetIndexExt, IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
-        expression::{
-            IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch,
-            INDEX_EXPR_RESULT_SCHEMA,
-        },
         SargableQuery, ScalarIndex,
+        expression::{
+            INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
+            ScalarIndexSearch,
+        },
     },
-    DatasetIndexExt, IndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::{debug_span, instrument};
 
 #[async_trait]
@@ -65,10 +65,7 @@ impl ScalarIndexLoader for Dataset {
         let idx = self
             .load_scalar_index(IndexCriteria::default().with_name(index_name))
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
-                location: location!()
-            })?;
+            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
         self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }
@@ -295,7 +292,7 @@ impl MapIndexExec {
         column_name: String,
         index_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowIdMask>>,
+        deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -310,16 +307,16 @@ impl MapIndexExec {
             needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        let IndexExprResult::Exact(mut row_id_mask) = query_result else {
+        let IndexExprResult::Exact(mut row_addr_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
         };
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_id_mask = row_id_mask & deletion_mask.as_ref().clone();
+            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
         }
 
-        let row_id_iter = row_id_mask
-            .iter_ids()
+        let row_id_iter = row_addr_mask
+            .iter_addrs()
             .ok_or(datafusion::error::DataFusionError::Internal(
                 "IndexedLookupExec: Cannot iterate over row addresses (BlockList or contains full fragments)".to_string(),
             ))?;
@@ -572,12 +569,12 @@ impl MaterializeIndexExec {
 
 #[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
 async fn row_ids_for_mask(
-    mask: RowIdMask,
+    mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
     match mask {
-        RowIdMask::BlockList(block_list) if block_list.is_empty() => {
+        RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
             // Matches all row ids in the given fragments.
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
@@ -595,7 +592,7 @@ async fn row_ids_for_mask(
                 Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
             }
         }
-        RowIdMask::AllowList(mut allow_list) => {
+        RowAddrMask::AllowList(mut allow_list) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
             if let Some(allow_list_iter) = allow_list.row_addrs() {
@@ -608,7 +605,7 @@ async fn row_ids_for_mask(
                     .collect())
             }
         }
-        RowIdMask::BlockList(block_list) => {
+        RowAddrMask::BlockList(block_list) => {
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
@@ -745,17 +742,17 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
-        scalar::{
-            expression::{ScalarIndexExpr, ScalarIndexSearch},
-            SargableQuery, ScalarIndexParams,
-        },
         DatasetIndexExt, IndexType,
+        scalar::{
+            SargableQuery, ScalarIndexParams,
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+        },
     };
 
     use crate::{
+        Dataset,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
-        Dataset,
     };
 
     use super::{MapIndexExec, ScalarIndexExec};

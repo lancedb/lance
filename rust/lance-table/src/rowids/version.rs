@@ -12,11 +12,10 @@ use lance_core::Error;
 use lance_core::Result;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
-use crate::format::{pb, ExternalFile, Fragment};
+use crate::format::{ExternalFile, Fragment, pb};
 use crate::rowids::segment::U64Segment;
-use crate::rowids::{read_row_ids, RowIdSequence};
+use crate::rowids::{RowIdSequence, read_row_ids};
 
 /// A run of identical versions over a contiguous span of row positions.
 ///
@@ -108,10 +107,10 @@ impl RowDatasetVersionSequence {
     pub fn get_version_for_row_id(&self, row_ids: &RowIdSequence, row_id: u64) -> Option<u64> {
         let mut offset = 0usize;
         for seg in &row_ids.0 {
-            if seg.range().is_some_and(|r| r.contains(&row_id)) {
-                if let Some(local) = seg.position(row_id) {
-                    return self.version_at(offset + local);
-                }
+            if seg.range().is_some_and(|r| r.contains(&row_id))
+                && let Some(local) = seg.position(row_id)
+            {
+                return self.version_at(offset + local);
             }
             offset += seg.len();
         }
@@ -303,18 +302,16 @@ pub fn write_dataset_versions(sequence: &RowDatasetVersionSequence) -> Vec<u8> {
 
 /// Deserialize a dataset version sequence from bytes (following RowIdSequence pattern)
 pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<RowDatasetVersionSequence> {
-    let pb_sequence = pb::RowDatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
-        message: format!("Failed to decode RowDatasetVersionSequence: {}", e),
-        location: location!(),
+    let pb_sequence = pb::RowDatasetVersionSequence::decode(data).map_err(|e| {
+        Error::internal(format!("Failed to decode RowDatasetVersionSequence: {}", e))
     })?;
 
     let segments = pb_sequence
         .runs
         .into_iter()
         .map(|pb_run| {
-            let positions_pb = pb_run.span.ok_or_else(|| Error::Internal {
-                message: "Missing positions in RowDatasetVersionRun".to_string(),
-                location: location!(),
+            let positions_pb = pb_run.span.ok_or_else(|| {
+                Error::internal("Missing positions in RowDatasetVersionRun".to_string())
             })?;
             let segment = U64Segment::try_from(positions_pb)?;
             Ok(RowDatasetVersionRun {
@@ -343,23 +340,17 @@ pub fn rechunk_version_sequences(
         .peekable();
 
     let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
-        Error::invalid_input(
-            format!(
-                "Got too few version runs for chunk {}. Expected chunk size: {}, remaining needed: {}",
-                chunk_index, expected_chunk_size, remaining
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too few version runs for chunk {}. Expected chunk size: {}, remaining needed: {}",
+            chunk_index, expected_chunk_size, remaining
+        ))
     };
 
     let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
-        Error::invalid_input(
-            format!(
-                "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
-                processed_chunks, total_chunk_sizes
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
+            processed_chunks, total_chunk_sizes
+        ))
     };
 
     let mut segment_offset = 0_u64;
@@ -431,23 +422,23 @@ pub fn build_version_meta(
     fragment: &Fragment,
     current_version: u64,
 ) -> Option<RowDatasetVersionMeta> {
-    if let Some(physical_rows) = fragment.physical_rows {
-        if physical_rows > 0 {
-            // Verify row_id_meta exists (sanity check for stable row IDs)
-            if fragment.row_id_meta.is_none() {
-                panic!("Can not find row id meta, please make sure you have enabled stable row id.")
-            }
-
-            // Use physical_rows directly as the authoritative row count
-            // This is correct even for compacted fragments where row_id_meta might
-            // have been partially copied
-            let version_sequence = RowDatasetVersionSequence::from_uniform_row_count(
-                physical_rows as u64,
-                current_version,
-            );
-
-            return Some(RowDatasetVersionMeta::from_sequence(&version_sequence).unwrap());
+    if let Some(physical_rows) = fragment.physical_rows
+        && physical_rows > 0
+    {
+        // Verify row_id_meta exists (sanity check for stable row IDs)
+        if fragment.row_id_meta.is_none() {
+            panic!("Can not find row id meta, please make sure you have enabled stable row id.")
         }
+
+        // Use physical_rows directly as the authoritative row count
+        // This is correct even for compacted fragments where row_id_meta might
+        // have been partially copied
+        let version_sequence = RowDatasetVersionSequence::from_uniform_row_count(
+            physical_rows as u64,
+            current_version,
+        );
+
+        return Some(RowDatasetVersionMeta::from_sequence(&version_sequence).unwrap());
     }
     None
 }

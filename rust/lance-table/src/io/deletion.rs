@@ -4,12 +4,12 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt32Array};
+use arrow_ipc::CompressionType;
 use arrow_ipc::reader::FileReader as ArrowFileReader;
 use arrow_ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
-use arrow_ipc::CompressionType;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
-use lance_core::error::{box_error, CorruptFileSnafu};
+use lance_core::error::{CorruptFileSnafu, box_error};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
@@ -17,12 +17,12 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, ResultExt};
+use snafu::ResultExt;
 use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType};
 
-pub(crate) const DELETION_DIRS: &str = "_deletions";
+pub const DELETIONS_DIR: &str = "_deletions";
 
 /// Get the Arrow schema for an Arrow deletion file.
 fn deletion_arrow_schema() -> Arc<Schema> {
@@ -42,8 +42,19 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
         ..
     } = deletion_file;
     let suffix = file_type.suffix();
-    base.child(DELETION_DIRS)
+    base.child(DELETIONS_DIR)
         .child(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
+}
+
+pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    let DeletionFile {
+        read_version,
+        id,
+        file_type,
+        ..
+    } = deletion_file;
+    let suffix = file_type.suffix();
+    format!("{DELETIONS_DIR}/{fragment_id}-{read_version}-{id}.{suffix}")
 }
 
 /// Write a deletion file for a fragment for a given deletion vector.
@@ -145,10 +156,7 @@ pub async fn read_deletion_file(
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path: path.clone(),
-                    location: location!(),
-                })?;
+                .context(CorruptFileSnafu { path: path.clone() })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -157,7 +165,6 @@ pub async fn read_deletion_file(
                         "Expected exactly one batch in deletion file, got {}",
                         batches.len()
                     ),
-                    location!(),
                 ));
             }
 
@@ -170,7 +177,6 @@ pub async fn read_deletion_file(
                         deletion_arrow_schema(),
                         batch.schema()
                     ),
-                    location!(),
                 ));
             }
 
@@ -187,7 +193,6 @@ pub async fn read_deletion_file(
                     return Err(Error::corrupt_file(
                         path,
                         "Null values are not allowed in deletion files",
-                        location!(),
                     ));
                 }
             }
@@ -202,10 +207,7 @@ pub async fn read_deletion_file(
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu {
-                    path,
-                    location: location!(),
-                })?;
+                .context(CorruptFileSnafu { path })?;
 
             Ok(DeletionVector::Bitmap(bitmap))
         }

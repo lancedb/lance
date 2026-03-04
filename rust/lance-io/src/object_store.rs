@@ -14,20 +14,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
-use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
-#[cfg(feature = "aws")]
-use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
-use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+use object_store::{ClientOptions, HeaderMap, HeaderValue};
+use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use shellexpand::tilde;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
@@ -37,7 +37,8 @@ pub mod providers;
 pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
-use crate::object_writer::WriteResult;
+use crate::object_writer::{LocalWriter, WriteResult};
+use crate::traits::Writer;
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -64,7 +65,8 @@ pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
-    LanceNamespaceStorageOptionsProvider, StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 
 #[async_trait]
@@ -127,6 +129,10 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    /// The datastore prefix that uniquely identifies this object store. It encodes information
+    /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
+    /// path uniquely identifies any object inside the store.
+    pub store_prefix: String,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -183,13 +189,18 @@ pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
     #[deprecated(note = "Implement an ObjectStoreProvider instead")]
     pub object_store: Option<(Arc<DynObjectStore>, Url)>,
+    /// Refresh offset for AWS credentials when using the legacy AWS credentials path.
+    /// For StorageOptionsAccessor, use `refresh_offset_millis` storage option instead.
     pub s3_credentials_refresh_offset: Duration,
     #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-    pub storage_options: Option<HashMap<String, String>>,
-    /// Dynamic storage options provider for automatic credential refresh
-    pub storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
+    /// Unified storage options accessor with caching and automatic refresh
+    ///
+    /// Provides storage options and optionally a dynamic provider for automatic
+    /// credential refresh. Use `StorageOptionsAccessor::with_static_options()` for static
+    /// options or `StorageOptionsAccessor::with_initial_and_provider()` for dynamic refresh.
+    pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
     /// Use constant size upload parts for multipart uploads. Only necessary
     /// for Cloudflare R2, which doesn't support variable size parts. When this
     /// is false, max upload size is 2.5TB. When this is true, the max size is
@@ -208,11 +219,26 @@ impl Default for ObjectStoreParams {
             #[cfg(feature = "aws")]
             aws_credentials: None,
             object_store_wrapper: None,
-            storage_options: None,
-            storage_options_provider: None,
+            storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
         }
+    }
+}
+
+impl ObjectStoreParams {
+    /// Get the StorageOptionsAccessor from the params
+    pub fn get_accessor(&self) -> Option<Arc<StorageOptionsAccessor>> {
+        self.storage_options_accessor.clone()
+    }
+
+    /// Get storage options from the accessor, if any
+    ///
+    /// Returns the initial storage options from the accessor without triggering refresh.
+    pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.storage_options_accessor
+            .as_ref()
+            .and_then(|a| a.initial_storage_options())
     }
 }
 
@@ -220,7 +246,7 @@ impl Default for ObjectStoreParams {
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper, and storage options provider
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper
         self.block_size.hash(state);
         if let Some((store, url)) = &self.object_store {
             Arc::as_ptr(store).hash(state);
@@ -234,14 +260,8 @@ impl std::hash::Hash for ObjectStoreParams {
         if let Some(wrapper) = &self.object_store_wrapper {
             Arc::as_ptr(wrapper).hash(state);
         }
-        if let Some(storage_options) = &self.storage_options {
-            for (key, value) in storage_options {
-                key.hash(state);
-                value.hash(state);
-            }
-        }
-        if let Some(provider) = &self.storage_options_provider {
-            provider.provider_id().hash(state);
+        if let Some(accessor) = &self.storage_options_accessor {
+            accessor.accessor_id().hash(state);
         }
         self.use_constant_size_upload_parts.hash(state);
         self.list_is_lexically_ordered.hash(state);
@@ -259,7 +279,7 @@ impl PartialEq for ObjectStoreParams {
         }
 
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
-        // For storage_options_provider, we use provider_id() for semantic equality
+        // For accessor, we use accessor_id() for semantic equality
         self.block_size == other.block_size
             && self
                 .object_store
@@ -272,15 +292,14 @@ impl PartialEq for ObjectStoreParams {
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
-            && self.storage_options == other.storage_options
             && self
-                .storage_options_provider
+                .storage_options_accessor
                 .as_ref()
-                .map(|p| p.provider_id())
+                .map(|a| a.accessor_id())
                 == other
-                    .storage_options_provider
+                    .storage_options_accessor
                     .as_ref()
-                    .map(|p| p.provider_id())
+                    .map(|a| a.accessor_id())
             && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
             && self.list_is_lexically_ordered == other.list_is_lexically_ordered
     }
@@ -318,28 +337,44 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 }
 
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
-    let expanded = tilde(str_path.as_ref()).to_string();
+    let str_path = str_path.as_ref();
+    let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
-    if let Some(s) = expanded_path.as_path().to_str() {
-        if s.is_empty() {
-            expanded_path = std::env::current_dir()?;
-        }
+    if let Some(s) = expanded_path.as_path().to_str()
+        && s.is_empty()
+    {
+        expanded_path = std::env::current_dir()?;
     }
 
     Ok(expanded_path)
 }
 
+fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
+    let home_dir = std::env::home_dir()?;
+    if path == "~" {
+        return Some(home_dir);
+    }
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return Some(home_dir.join(stripped));
+    }
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix("~\\") {
+        return Some(home_dir.join(stripped));
+    }
+
+    None
+}
+
 fn local_path_to_url(str_path: &str) -> Result<Url> {
     let expanded_path = expand_path(str_path)?;
 
-    Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
-        source: format!("Invalid table location: '{}'", str_path).into(),
-        location: location!(),
+    Url::from_directory_path(expanded_path).map_err(|_| {
+        Error::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
     })
 }
 
@@ -360,7 +395,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
     if segments.len() < 2 {
         return Err(Error::invalid_input(
             "Huggingface URL must contain at least owner and repo",
-            location!(),
         ));
     }
 
@@ -369,7 +403,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
         if segments.len() < 3 {
             return Err(Error::invalid_input(
                 "Huggingface URL missing owner/repo after repo type",
-                location!(),
             ));
         }
         (segments[1].as_str(), segments[2].as_str())
@@ -410,7 +443,7 @@ impl ObjectStore {
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
             let store_prefix =
-                registry.calculate_object_store_prefix(uri, params.storage_options.as_ref())?;
+                registry.calculate_object_store_prefix(uri, params.storage_options())?;
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
@@ -429,6 +462,7 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
+                store_prefix,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -458,9 +492,9 @@ impl ObjectStore {
     /// The extracted path component
     pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
         let url = uri_to_url(uri)?;
-        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
-            Error::invalid_input(format!("Unknown scheme: {}", url.scheme()), location!())
-        })?;
+        let provider = registry
+            .get_provider(url.scheme())
+            .ok_or_else(|| Error::invalid_input(format!("Unknown scheme: {}", url.scheme())))?;
         provider.extract_path(&url)
     }
 
@@ -614,7 +648,7 @@ impl ObjectStore {
         let object_store = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
-        object_store.create(&os_path).await
+        ObjectWriter::new(&object_store, &os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
@@ -626,15 +660,40 @@ impl ObjectStore {
     }
 
     /// Create a new file.
-    pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self, path).await
+    pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
+        match self.scheme.as_str() {
+            "file" => {
+                let local_path = super::local::to_local_path(path);
+                let local_path = std::path::PathBuf::from(&local_path);
+                if let Some(parent) = local_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let parent = local_path
+                    .parent()
+                    .expect("file path must have parent")
+                    .to_owned();
+                let named_temp =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await
+                        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+                let (std_file, temp_path) = named_temp.into_parts();
+                let file = tokio::fs::File::from_std(std_file);
+                Ok(Box::new(LocalWriter::new(
+                    file,
+                    path.clone(),
+                    temp_path,
+                    Arc::new(self.io_tracker.clone()),
+                )))
+            }
+            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
+        }
     }
 
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
-        writer.shutdown().await
+        Writer::shutdown(writer.as_mut()).await
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -687,7 +746,7 @@ impl ObjectStore {
         let path = Path::parse(&path)?;
 
         if self.is_local() {
-            // Local file system needs to delete directories as well.
+            // The local file system provider needs to delete both files and directories.
             return super::local::remove_dir_all(&path);
         }
         let sub_entries = self
@@ -699,6 +758,11 @@ impl ObjectStore {
             .delete_stream(sub_entries)
             .try_collect::<Vec<_>>()
             .await?;
+        if self.scheme == "file-object-store" {
+            // file-object-store tries to do everything as similarly as possible to the remote
+            // object stores. But we still have to delete the directory entries afterwards.
+            return super::local::remove_dir_all(&path);
+        }
         Ok(())
     }
 
@@ -755,10 +819,9 @@ impl FromStr for LanceConfigKey {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "download_retry_count" => Ok(Self::DownloadRetryCount),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid LanceConfigKey: {}", s).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid LanceConfigKey: {}", s).into(),
+            )),
         }
     }
 }
@@ -826,6 +889,36 @@ impl StorageOptions {
         self.0.get(key)
     }
 
+    /// Build [`ClientOptions`] with default headers extracted from `headers.*` keys.
+    ///
+    /// Keys prefixed with `headers.` are parsed into HTTP headers. For example,
+    /// `headers.x-ms-version = 2023-11-03` results in a default header
+    /// `x-ms-version: 2023-11-03`.
+    ///
+    /// Returns an error if any `headers.*` key has an invalid header name or value.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    pub fn client_options(&self) -> Result<ClientOptions> {
+        let mut headers = HeaderMap::new();
+        for (key, value) in &self.0 {
+            if let Some(header_name) = key.strip_prefix("headers.") {
+                let name = header_name
+                    .parse::<http::header::HeaderName>()
+                    .map_err(|e| {
+                        Error::invalid_input(format!("invalid header name '{header_name}': {e}"))
+                    })?;
+                let val = HeaderValue::from_str(value).map_err(|e| {
+                    Error::invalid_input(format!("invalid header value for '{header_name}': {e}"))
+                })?;
+                headers.insert(name, val);
+            }
+        }
+        let mut client_options = ClientOptions::default();
+        if !headers.is_empty() {
+            client_options = client_options.with_default_headers(headers);
+        }
+        Ok(client_options)
+    }
+
     /// Get the expiration time in milliseconds since epoch, if present
     pub fn expires_at_millis(&self) -> Option<u64> {
         self.0
@@ -858,14 +951,21 @@ impl ObjectStore {
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-
-        let store = match wrapper {
-            Some(wrapper) => {
-                let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
-                    .calculate_object_store_prefix(location.as_ref(), storage_options)
-                    .unwrap();
-                wrapper.wrap(&store_prefix, store)
+        let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
+            Some(provider) => provider
+                .calculate_object_store_prefix(&location, storage_options)
+                .unwrap(),
+            None => {
+                let store_prefix = format!("{}${}", location.scheme(), location.authority());
+                log::warn!(
+                    "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
+                    store_prefix
+                );
+                store_prefix
             }
+        };
+        let store = match wrapper {
+            Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
@@ -883,6 +983,7 @@ impl ObjectStore {
             io_parallelism,
             download_retry_count,
             io_tracker,
+            store_prefix,
         }
     }
 }
@@ -910,8 +1011,7 @@ mod tests {
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
-        let expanded = tilde(path_str).to_string();
-        let path = StdPath::new(&expanded);
+        let path = expand_path(path_str).map_err(std::io::Error::other)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
     }
@@ -974,8 +1074,11 @@ mod tests {
     ) {
         // Test the default
         let registry = Arc::new(ObjectStoreRegistry::default());
+        let accessor = storage_options
+            .clone()
+            .map(|opts| Arc::new(StorageOptionsAccessor::with_static_options(opts)));
         let params = ObjectStoreParams {
-            storage_options: storage_options.clone(),
+            storage_options_accessor: accessor.clone(),
             ..ObjectStoreParams::default()
         };
         let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
@@ -987,7 +1090,7 @@ mod tests {
         let registry = Arc::new(ObjectStoreRegistry::default());
         let params = ObjectStoreParams {
             block_size: Some(1024),
-            storage_options: storage_options.clone(),
+            storage_options_accessor: accessor,
             ..ObjectStoreParams::default()
         };
         let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
@@ -1072,7 +1175,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_directory() {
+    async fn test_delete_directory_local_store() {
+        test_delete_directory("").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_file_object_store() {
+        test_delete_directory("file-object-store").await;
+    }
+
+    async fn test_delete_directory(scheme: &str) {
         let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
@@ -1086,8 +1198,16 @@ mod tests {
             "delete",
         )
         .unwrap();
-        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
-        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let url = if scheme.is_empty() {
+            file_url
+        } else {
+            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+            // Use the file:// URL's normalized path so this works on Windows too.
+            url.set_path(file_url.path());
+            url
+        };
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
@@ -1157,7 +1277,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let reader = ObjectStore::open_local(&file_path).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
@@ -1169,7 +1289,7 @@ mod tests {
         let file_path = TempStdFile::default();
         let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
-        writer.shutdown().await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
 
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();
@@ -1287,5 +1407,67 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_extracts_headers() {
+        let opts = StorageOptions(HashMap::from([
+            ("headers.x-custom-foo".to_string(), "bar".to_string()),
+            ("headers.x-ms-version".to_string(), "2023-11-03".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]));
+        let client_options = opts.client_options().unwrap();
+
+        // Verify non-header keys are not consumed as headers by creating
+        // another StorageOptions with no headers.* keys.
+        let opts_no_headers = StorageOptions(HashMap::from([(
+            "region".to_string(),
+            "us-west-2".to_string(),
+        )]));
+        opts_no_headers.client_options().unwrap();
+
+        // Smoke test: the client_options with headers should be usable
+        // in a builder (we can't inspect the headers directly, but building
+        // should not fail).
+        #[cfg(feature = "gcp")]
+        {
+            use object_store::gcp::GoogleCloudStorageBuilder;
+            let _builder = GoogleCloudStorageBuilder::new()
+                .with_client_options(client_options)
+                .with_url("gs://test-bucket");
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_rejects_invalid_header_name() {
+        let opts = StorageOptions(HashMap::from([(
+            "headers.bad header".to_string(),
+            "value".to_string(),
+        )]));
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header name"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_rejects_invalid_header_value() {
+        let opts = StorageOptions(HashMap::from([(
+            "headers.x-good-name".to_string(),
+            "bad\x01value".to_string(),
+        )]));
+        let err = opts.client_options().unwrap_err();
+        assert!(err.to_string().contains("invalid header value"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn test_client_options_empty_when_no_header_keys() {
+        let opts = StorageOptions(HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("access_key_id".to_string(), "AKID".to_string()),
+        ]));
+        opts.client_options().unwrap();
     }
 }

@@ -5,23 +5,21 @@ use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::{iter, ops::MulAssign};
 
-use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
+use crate::vector::kmeans::{KMeansAlgoFloat, compute_partitions};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, UInt32Type},
-    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
-use snafu::location;
 use tracing::instrument;
 
-use super::{transform::Transformer, PQ_CODE_COLUMN};
+use super::{PQ_CODE_COLUMN, transform::Transformer};
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
@@ -83,16 +81,13 @@ where
 
     let vectors_slice = vectors.values();
     let centroids_slice = centroids.values();
-    let residuals = vectors_slice
-        .chunks_exact(dimension)
-        .enumerate()
-        .flat_map(|(idx, vector)| {
-            let part_id = part_ids[idx] as usize;
-            let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
-            iter::zip(vector, c).map(|(v, cent)| *v - *cent)
-        })
-        .exact_size(vectors.len())
-        .collect::<Vec<_>>();
+    let mut residuals = Vec::with_capacity(vectors.len());
+    for (idx, vector) in vectors_slice.chunks_exact(dimension).enumerate() {
+        let part_id = part_ids[idx] as usize;
+        let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
+        residuals.extend(iter::zip(vector, c).map(|(v, cent)| *v - *cent));
+    }
+    debug_assert_eq!(residuals.len(), vectors.len());
     let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
     debug_assert_eq!(residual_arr.len(), vectors.len());
     Ok(FixedSizeListArray::try_new_from_values(
@@ -115,14 +110,11 @@ pub(crate) fn compute_residual(
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray> {
     if centroids.value_length() != vectors.value_length() {
-        return Err(Error::Index {
-            message: format!(
-                "Compute residual vector: centroid and vector length mismatch: centroid: {}, vector: {}",
-                centroids.value_length(),
-                vectors.value_length(),
-            ),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Compute residual vector: centroid and vector length mismatch: centroid: {}, vector: {}",
+            centroids.value_length(),
+            vectors.value_length(),
+        )));
     }
     // TODO: Bf16 is not supported yet.
     match (centroids.value_type(), vectors.value_type()) {
@@ -135,21 +127,17 @@ pub(crate) fn compute_residual(
         (DataType::Float64, DataType::Float64) => {
             do_compute_residual::<Float64Type>(centroids, vectors, distance_type, partitions)
         }
-        (DataType::Float32, DataType::Int8) => {
-            do_compute_residual::<Float32Type>(
-                centroids,
-                &vectors.convert_to_floating_point()?,
-                distance_type,
-                partitions)
-        }
-        _ => Err(Error::Index {
-            message: format!(
-                "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
-                centroids.value_type(),
-                vectors.value_type(),
-            ),
-            location: location!(),
-        })
+        (DataType::Float32, DataType::Int8) => do_compute_residual::<Float32Type>(
+            centroids,
+            &vectors.convert_to_floating_point()?,
+            distance_type,
+            partitions,
+        ),
+        _ => Err(Error::index(format!(
+            "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
+            centroids.value_type(),
+            vectors.value_type(),
+        ))),
     }
 }
 
@@ -164,29 +152,26 @@ impl Transformer for ResidualTransform {
             return Ok(batch.clone());
         }
 
-        let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
-            message: format!(
+        let part_ids = batch
+            .column_by_name(&self.part_col)
+            .ok_or(Error::index(format!(
                 "Compute residual vector: partition id column not found: {}",
                 self.part_col
-            ),
-            location: location!(),
-        })?;
-        let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
-            message: format!(
+            )))?;
+        let original = batch
+            .column_by_name(&self.vec_col)
+            .ok_or(Error::index(format!(
                 "Compute residual vector: original vector column {} not found in batch {}",
                 self.vec_col,
                 batch.schema(),
-            ),
-            location: location!(),
-        })?;
-        let original_vectors = original.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
+            )))?;
+        let original_vectors = original
+            .as_fixed_size_list_opt()
+            .ok_or(Error::index(format!(
                 "Compute residual vector: original vector column {} is not fixed size list: {}",
                 self.vec_col,
                 original.data_type(),
-            ),
-            location: location!(),
-        })?;
+            )))?;
 
         let part_ids_ref = part_ids.as_primitive::<UInt32Type>();
         let residual_arr =

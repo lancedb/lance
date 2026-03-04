@@ -18,6 +18,8 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -77,10 +79,10 @@ public class WriteDatasetBuilder {
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
-  private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
-  private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+  private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -266,26 +268,11 @@ public class WriteDatasetBuilder {
   /**
    * Sets the data storage version.
    *
-   * @param dataStorageVersion The Lance file version to use
+   * @param dataStorageVersion The Lance file version to use (e.g., "legacy", "stable", "2.0")
    * @return this builder instance
    */
-  public WriteDatasetBuilder dataStorageVersion(WriteParams.LanceFileVersion dataStorageVersion) {
+  public WriteDatasetBuilder dataStorageVersion(String dataStorageVersion) {
     this.dataStorageVersion = Optional.of(dataStorageVersion);
-    return this;
-  }
-
-  /**
-   * Sets the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder s3CredentialsRefreshOffsetSeconds(
-      long s3CredentialsRefreshOffsetSeconds) {
-    this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
     return this;
   }
 
@@ -296,6 +283,21 @@ public class WriteDatasetBuilder {
 
   public WriteDatasetBuilder targetBases(List<String> targetBases) {
     this.targetBases = Optional.of(targetBases);
+    return this;
+  }
+
+  /**
+   * Sets the session to share caches with other datasets.
+   *
+   * <p>Note: For write operations, the session is currently not used during the write itself, but
+   * is stored for future use when the resulting dataset needs to be reopened with the same session.
+   * This is a placeholder for future session support in write operations.
+   *
+   * @param session The session to use
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
@@ -362,21 +364,40 @@ public class WriteDatasetBuilder {
   private Dataset executeWithNamespace() {
     String tableUri;
     Map<String, String> namespaceStorageOptions = null;
+    boolean managedVersioning = false;
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
-      // Call namespace.createEmptyTable() to create new table
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
-      request.setId(tableId);
+      // Try declareTable first, fall back to deprecated createEmptyTable
+      // for backward compatibility with older namespace implementations.
+      // createEmptyTable support will be removed in 3.0.0.
+      String location;
+      Map<String, String> responseStorageOptions;
 
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      try {
+        DeclareTableRequest declareRequest = new DeclareTableRequest();
+        declareRequest.setId(tableId);
+        DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
+        location = declareResponse.getLocation();
+        responseStorageOptions = declareResponse.getStorageOptions();
+        managedVersioning = Boolean.TRUE.equals(declareResponse.getManagedVersioning());
+      } catch (UnsupportedOperationException e) {
+        // Fall back to deprecated createEmptyTable
+        // Note: createEmptyTable doesn't support managedVersioning
+        CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
+        fallbackRequest.setId(tableId);
+        CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
+        location = fallbackResponse.getLocation();
+        responseStorageOptions = fallbackResponse.getStorageOptions();
+        managedVersioning = false;
+      }
 
-      tableUri = response.getLocation();
+      tableUri = location;
       if (tableUri == null || tableUri.isEmpty()) {
         throw new IllegalArgumentException("Namespace did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : responseStorageOptions;
     } else {
       // For APPEND/OVERWRITE modes, call namespace.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();
@@ -390,6 +411,7 @@ public class WriteDatasetBuilder {
       }
 
       namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      managedVersioning = Boolean.TRUE.equals(response.getManagedVersioning());
     }
 
     // Merge storage options (namespace options + user options, with namespace taking precedence)
@@ -407,8 +429,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
@@ -421,8 +441,13 @@ public class WriteDatasetBuilder {
             ? null
             : new LanceNamespaceStorageOptionsProvider(namespace, tableId);
 
-    // Use Dataset.create() which handles CREATE/APPEND/OVERWRITE modes
-    return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    // Only use namespace for commit handling if managedVersioning is enabled
+    if (managedVersioning) {
+      return createDatasetWithStreamAndNamespace(
+          tableUri, params, storageOptionsProvider, namespace, tableId);
+    } else {
+      return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    }
   }
 
   private Dataset executeWithUri() {
@@ -434,8 +459,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
 
@@ -460,6 +483,36 @@ public class WriteDatasetBuilder {
     }
 
     // If only schema is provided (empty table), use Dataset.create with schema
+    if (schema != null) {
+      return Dataset.create(allocator, path, schema, params);
+    }
+
+    throw new IllegalStateException("No data source provided");
+  }
+
+  private Dataset createDatasetWithStreamAndNamespace(
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider,
+      LanceNamespace namespace,
+      List<String> tableId) {
+    // If stream is directly provided, use it
+    if (stream != null) {
+      return Dataset.create(
+          allocator, stream, path, params, storageOptionsProvider, namespace, tableId);
+    }
+
+    // If reader is provided, convert to stream
+    if (reader != null) {
+      try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, tempStream);
+        return Dataset.create(
+            allocator, tempStream, path, params, storageOptionsProvider, namespace, tableId);
+      }
+    }
+
+    // If only schema is provided (empty table), use Dataset.create with schema
+    // Note: Schema-only creation doesn't support namespace-based commit handling
     if (schema != null) {
       return Dataset.create(allocator, path, schema, params);
     }

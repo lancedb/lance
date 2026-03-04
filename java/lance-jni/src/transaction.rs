@@ -1,25 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
-use crate::error::Result;
-use crate::traits::{export_vec, import_vec_from_method, FromJObjectWithEnv, IntoJava, JLance};
-use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
+use crate::RT;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::error::Result;
+use crate::storage_options::JavaStorageOptionsProvider;
+use crate::traits::{
+    FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
+};
+use crate::utils::{to_java_map, to_rust_map};
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
-use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jbyte;
 use jni::JNIEnv;
+use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
+use jni::sys::{jboolean, jint};
+use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
 use lance::io::ObjectStoreParams;
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
+use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::version::LanceFileVersion;
+use lance_io::object_store::StorageOptionsProvider;
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -75,166 +86,6 @@ impl IntoJava for &DataReplacementGroup {
             "(JLorg/lance/fragment/DataFile;)V",
             &[JValue::Long(fragment_id as i64), JValue::Object(&new_file)],
         )?)
-    }
-}
-
-impl IntoJava for &IndexMetadata {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let uuid = self.uuid.into_java(env)?;
-
-        let fields = {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for field in &self.fields {
-                let field_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*field)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&field_obj)],
-                )?;
-            }
-            array_list
-        };
-        let name = env.new_string(&self.name)?;
-
-        let fragments = if let Some(bitmap) = &self.fragment_bitmap {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for frag_id in bitmap.iter() {
-                let id_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(frag_id as i32)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&id_obj)],
-                )?;
-            }
-            array_list
-        } else {
-            JObject::null()
-        };
-
-        // Convert index_details to byte array
-        let index_details = if let Some(details) = &self.index_details {
-            let bytes = details.encode_to_vec();
-            let jbytes: &[jbyte] =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) };
-
-            let byte_array = env.new_byte_array(bytes.len() as i32)?;
-            env.set_byte_array_region(&byte_array, 0, jbytes)?;
-            byte_array.into()
-        } else {
-            JObject::null()
-        };
-
-        // Convert created_at to Instant
-        let created_at = if let Some(dt) = &self.created_at {
-            let seconds = dt.timestamp();
-            let nanos = dt.timestamp_subsec_nanos() as i64;
-            env.call_static_method(
-                "java/time/Instant",
-                "ofEpochSecond",
-                "(JJ)Ljava/time/Instant;",
-                &[JValue::Long(seconds), JValue::Long(nanos)],
-            )?
-            .l()?
-        } else {
-            JObject::null()
-        };
-
-        // Convert base_id from Option<u32> to Integer for Java
-        let base_id = if let Some(id) = self.base_id {
-            env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(id as i32)])?
-        } else {
-            JObject::null()
-        };
-
-        // Determine index type from index_details type_url
-        let index_type = determine_index_type(env, &self.index_details)?;
-
-        // Create Index object
-        Ok(env.new_object(
-            "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
-            &[
-                JValue::Object(&uuid),
-                JValue::Object(&fields),
-                JValue::Object(&name),
-                JValue::Long(self.dataset_version as i64),
-                JValue::Object(&fragments),
-                JValue::Object(&index_details),
-                JValue::Int(self.index_version),
-                JValue::Object(&created_at),
-                JValue::Object(&base_id),
-                JValue::Object(&index_type),
-            ],
-        )?)
-    }
-}
-
-/// Determine the IndexType enum value from index_details protobuf
-fn determine_index_type<'local>(
-    env: &mut JNIEnv<'local>,
-    index_details: &Option<Arc<Any>>,
-) -> Result<JObject<'local>> {
-    let type_name = if let Some(details) = index_details {
-        // Extract type name from type_url (e.g., ".lance.index.BTreeIndexDetails" -> "BTREE")
-        let type_url = &details.type_url;
-        let type_part = type_url.split('.').next_back().unwrap_or("");
-        let lower = type_part.to_lowercase();
-
-        if lower.contains("btree") {
-            Some("BTREE")
-        } else if lower.contains("bitmap") {
-            Some("BITMAP")
-        } else if lower.contains("labellist") {
-            Some("LABEL_LIST")
-        } else if lower.contains("inverted") {
-            Some("INVERTED")
-        } else if lower.contains("ngram") {
-            Some("NGRAM")
-        } else if lower.contains("zonemap") {
-            Some("ZONEMAP")
-        } else if lower.contains("bloomfilter") {
-            Some("BLOOM_FILTER")
-        } else if lower.contains("ivfhnsw") {
-            if lower.contains("sq") {
-                Some("IVF_HNSW_SQ")
-            } else if lower.contains("pq") {
-                Some("IVF_HNSW_PQ")
-            } else {
-                Some("IVF_HNSW_FLAT")
-            }
-        } else if lower.contains("ivf") {
-            if lower.contains("sq") {
-                Some("IVF_SQ")
-            } else if lower.contains("pq") {
-                Some("IVF_PQ")
-            } else {
-                Some("IVF_FLAT")
-            }
-        } else if lower.contains("vector") {
-            Some("VECTOR")
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    match type_name {
-        Some(name) => {
-            let index_type = env
-                .get_static_field(
-                    "org/lance/index/IndexType",
-                    name,
-                    "Lorg/lance/index/IndexType;",
-                )?
-                .l()?;
-            Ok(index_type)
-        }
-        None => Ok(JObject::null()),
     }
 }
 
@@ -427,7 +278,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeReadTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -446,18 +297,21 @@ fn inner_read_transaction<'local>(
     };
 
     let transaction = match transaction {
-        Some(transaction) => convert_to_java_transaction(env, transaction, &java_dataset)?,
+        Some(transaction) => convert_to_java_transaction(env, transaction)?,
         None => JObject::null(),
     };
     Ok(transaction)
 }
 
-fn convert_to_java_transaction<'local>(
+pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
-    java_dataset: &JObject,
 ) -> Result<JObject<'local>> {
     let uuid = env.new_string(transaction.uuid)?;
+    let tag = match transaction.tag {
+        Some(tag) => JObject::from(env.new_string(tag)?),
+        None => JObject::null(),
+    };
     let transaction_properties = match transaction.transaction_properties {
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
@@ -466,20 +320,19 @@ fn convert_to_java_transaction<'local>(
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(Lorg/lance/Dataset;JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
-            JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&JObject::null()),
+            JValue::Object(&tag),
             JValue::Object(&transaction_properties),
         ],
     )?;
     Ok(java_transaction)
 }
 
-fn convert_to_java_operation<'local>(
+pub(crate) fn convert_to_java_operation<'local>(
     env: &mut JNIEnv<'local>,
     operation: Option<Operation>,
 ) -> Result<JObject<'local>> {
@@ -554,14 +407,31 @@ fn convert_to_java_operation_inner<'local>(
                 ],
             )?)
         }
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => {
+            let java_new_indices = export_vec(env, &new_indices)?;
+            let java_removed_indices = export_vec(env, &removed_indices)?;
+
+            Ok(env.new_object(
+                "org/lance/operation/CreateIndex",
+                "(Ljava/util/List;Ljava/util/List;)V",
+                &[
+                    JValue::Object(&java_new_indices),
+                    JValue::Object(&java_removed_indices),
+                ],
+            )?)
+        }
         Operation::Update {
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
             fields_modified,
-            mem_wal_to_merge: _,
+            merged_generations: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
+            inserted_rows_filter: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -707,7 +577,7 @@ fn convert_to_java_operation_inner<'local>(
     }
 }
 
-fn convert_to_java_schema<'local>(
+pub(crate) fn convert_to_java_schema<'local>(
     env: &mut JNIEnv<'local>,
     schema: LanceSchema,
 ) -> Result<JObject<'local>> {
@@ -722,56 +592,170 @@ fn convert_to_java_schema<'local>(
         .l()?)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
+fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
+    match name.to_lowercase().as_str() {
+        "legacy" => Ok(LanceFileVersion::Legacy),
+        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
+        "stable" => Ok(LanceFileVersion::Stable),
+        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
+        "next" => Ok(LanceFileVersion::Next),
+        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
+        _ => Err(Error::input_error(format!(
+            "Unknown storage format: {}",
+            name
+        ))),
+    }
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
+    _cls: JObject,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(&mut env, java_dataset, java_transaction)
+        inner_commit_to_dataset(
+            &mut env,
+            java_dataset,
+            java_transaction,
+            detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
+            write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
+        )
     )
 }
 
-fn inner_commit_transaction<'local>(
+#[allow(clippy::too_many_arguments)]
+fn inner_commit_to_dataset<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached: bool,
+    enable_v2_manifest_paths: bool,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
 ) -> Result<JObject<'local>> {
-    let write_param_jobj = env
-        .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
-        .l()?;
-    let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let mut write_param = to_rust_map(env, &write_param_jmap)?;
-
-    // Extract s3_credentials_refresh_offset_seconds from write_param
-    let s3_credentials_refresh_offset = write_param
-        .remove("s3_credentials_refresh_offset_seconds")
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
-
-    // Get the Dataset's storage_options_provider
-    let storage_options_provider = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.get_storage_options_provider()
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
     };
 
-    // Build ObjectStoreParams using write_param for storage_options and provider from Dataset
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
+    };
+
+    // Get the Dataset's storage_options_accessor and merge with write_param
+    let storage_options_accessor = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        let existing_accessor = dataset_guard.inner.storage_options_accessor();
+
+        // Merge write_param with existing accessor's initial options
+        match existing_accessor {
+            Some(accessor) => {
+                let mut merged = accessor
+                    .initial_storage_options()
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(write_param);
+                if let Some(provider) = accessor.provider().cloned() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_initial_and_provider(
+                            merged, provider,
+                        ),
+                    ))
+                } else {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(merged),
+                    ))
+                }
+            }
+            None => {
+                if !write_param.is_empty() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(write_param),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
+    // Build ObjectStoreParams using the merged accessor
     let store_params = ObjectStoreParams {
-        storage_options: Some(write_param),
-        storage_options_provider,
-        s3_credentials_refresh_offset,
+        storage_options_accessor,
         ..Default::default()
     };
 
-    let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_dataset))?;
+    let java_allocator = env
+        .call_method(
+            &java_dataset,
+            "allocator",
+            "()Lorg/apache/arrow/memory/BufferAllocator;",
+            &[],
+        )?
+        .l()?;
+
+    // BlockingDataset from java dataset.
+    let mut java_blocking_ds = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        BlockingDataset::new(dataset_guard.inner.clone())
+    };
+    let transaction = convert_to_rust_transaction(
+        env,
+        java_transaction,
+        Some(&java_allocator),
+        Some(&mut java_blocking_ds),
+    )?;
+
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params)?
+        dataset_guard.commit_transaction(
+            transaction,
+            store_params,
+            detached,
+            enable_v2_manifest_paths,
+            use_stable_row_ids,
+            storage_format,
+            max_retries,
+            skip_auto_cleanup,
+        )?
     };
     new_blocking_ds.into_java(env)
 }
@@ -779,7 +763,8 @@ fn inner_commit_transaction<'local>(
 fn convert_to_rust_transaction(
     env: &mut JNIEnv,
     java_transaction: JObject,
-    java_dataset: Option<&JObject>,
+    allocator: Option<&JObject>,
+    dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
@@ -791,7 +776,12 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, &op, java_dataset)?;
+    let op = convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
+
+    let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
+        let tag_str = JString::from(tag_obj);
+        tag_str.extract(env)
+    })?;
 
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
@@ -803,6 +793,7 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
+        .tag(tag)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }
@@ -810,42 +801,192 @@ fn convert_to_rust_transaction(
 fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
-    java_dataset: &JObject,
+    java_allocator: &JObject,
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
 ) -> Result<LanceSchema> {
-    let java_buffer_allocator = env
-        .call_method(
-            java_dataset,
-            "allocator",
-            "()Lorg/apache/arrow/memory/BufferAllocator;",
-            &[],
-        )?
-        .l()?;
     let schema_ptr = env
         .call_method(
             java_operation,
             "exportSchema",
             "(Lorg/apache/arrow/memory/BufferAllocator;)J",
-            &[JValue::Object(&java_buffer_allocator)],
+            &[JValue::Object(java_allocator)],
         )?
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+
+    if let Some(dataset) = dataset {
+        let arrow_schema = Schema::try_from(&c_schema)?;
+
+        // Derive field ids based on the transaction read dataset schema.
+        let read_schema = {
+            if dataset.inner.version().version == read_version {
+                dataset.inner.schema().clone()
+            } else {
+                let read_dataset = dataset.checkout_version(read_version)?;
+                read_dataset.inner.schema().clone()
+            }
+        };
+
+        let max_field_id = dataset.inner.manifest().max_field_id();
+        let schema =
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(read_schema), Some(max_field_id))?;
+        Ok(schema)
+    } else {
+        let schema = Schema::try_from(&c_schema)?;
+        LanceSchema::try_from(&schema).map_err(|e| {
+            Error::input_error(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })
+    }
+}
+
+trait SchemaExt {
+    /// Walk through the fields and assign a new field id to each field that does not have one
+    /// (e.g. is set to -1)
+    ///
+    /// If this schema is on an existing dataset, pass the schema of the dataset to `base_schema`
+    /// and the result of `Manifest::max_field_id` to `max_existing_id`.
+    ///
+    /// If this schema is not associated with a dataset, pass `None` to `base_schema` and
+    /// `max_existing_id`.
+    ///
+    /// The rule of assigning id is:
+    /// 1. If a lance field with same name exists in `base_schema` (including nested field), id is
+    ///    derived from the field.
+    /// 2. Otherwise, set field id based on max id, which is computed from `max_existing_id`,
+    ///    `base_schema` max id and self max id.
+    fn set_field_id_from_schema(
+        &mut self,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<()>;
+
+    /// Create schema from `arrow_schema`, with field id priority below:
+    /// 1. arrow metadata field id.
+    /// 2. field id from `base_schema`.
+    /// 3. field id from `max_existing_id`.
+    fn from_arrow_schema(
+        arrow_schema: &Schema,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<LanceSchema>;
+}
+
+impl SchemaExt for LanceSchema {
+    fn set_field_id_from_schema(
+        &mut self,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<()> {
+        // Set id from base_schema
+        if let Some(base_schema) = &base_schema {
+            for field in self.fields.iter_mut() {
+                if let Some(base_field) = base_schema.field(&field.name) {
+                    field.set_field_id_from_field(-1, base_field)?;
+                }
+            }
+        };
+
+        // Set id from max_id
+        let max_id = base_schema
+            .map(|s| s.max_field_id().unwrap_or(-1))
+            .unwrap_or(-1);
+        let max_id = max_id.max(max_existing_id.unwrap_or(-1));
+        self.set_field_id(Some(max_id));
+        Ok(())
+    }
+
+    fn from_arrow_schema(
+        arrow_schema: &Schema,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<LanceSchema> {
+        let mut schema = Self {
+            fields: arrow_schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<lance_core::Result<_>>()?,
+            metadata: arrow_schema.metadata.clone(),
+        };
+        schema.set_field_id_from_schema(base_schema, max_existing_id)?;
+        schema.validate()?;
+        schema.verify_primary_key()?;
+
+        Ok(schema)
+    }
+}
+
+trait FieldExt {
+    /// Recursively set field ID and parent ID for this field and all its children.
+    fn set_field_id_from_field(
+        &mut self,
+        parent_id: i32,
+        base_field: &Field,
+    ) -> lance_core::Result<()>;
+}
+
+impl FieldExt for Field {
+    fn set_field_id_from_field(
+        &mut self,
+        parent_id: i32,
+        base_field: &Field,
+    ) -> lance_core::Result<()> {
+        self.parent_id = parent_id;
+
+        if self.name != base_field.name {
+            return Ok(());
+        }
+
+        if self.logical_type != base_field.logical_type {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "Expecting logical type {} but got {} for field {}",
+                    base_field.logical_type, self.logical_type, self.name
+                )
+                .into(),
+            ));
+        }
+
+        if self.id < 0 {
+            // use id from base
+            self.id = base_field.id;
+        }
+
+        for child in &mut self.children {
+            if let Some(base_child) = base_field.children.iter().find(|f| f.name == child.name) {
+                child.set_field_id_from_field(self.id, base_child)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
-    java_dataset: Option<&JObject<'_>>,
+    allocator: Option<&JObject<'_>>,
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+            schema: convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Project operations".to_string(),
+                    )
+                })?,
+                dataset,
+                read_version,
+            )?,
         },
         "UpdateConfig" => {
             let config_updates_obj = env
@@ -966,7 +1107,17 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?;
+            let schema = convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Overwrite operations".to_string(),
+                    )
+                })?,
+                dataset,
+                read_version,
+            )?;
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -1040,9 +1191,10 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: None,
+                merged_generations: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter: None,
             }
         }
         "DataReplacement" => {
@@ -1059,7 +1211,17 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
-                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+                schema: convert_schema_from_operation(
+                    env,
+                    java_operation,
+                    allocator.ok_or_else(|| {
+                        Error::input_error(
+                            "BufferAllocator is required for Merge operations".to_string(),
+                        )
+                    })?,
+                    dataset,
+                    read_version,
+                )?,
             }
         }
         "Restore" => {
@@ -1171,5 +1333,443 @@ fn export_update_map<'a>(
             )?;
             Ok(update_map_obj)
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JObject,
+    uri: JString,
+    java_transaction: JObject,
+    detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
+    storage_options_provider_obj: JObject,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_to_uri(
+            &mut env,
+            uri,
+            java_transaction,
+            detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
+            storage_options_provider_obj,
+            namespace_obj,
+            table_id_obj,
+            allocator_obj,
+            write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_commit_to_uri<'local>(
+    env: &mut JNIEnv<'local>,
+    uri: JString,
+    java_transaction: JObject,
+    detached: bool,
+    enable_v2_manifest_paths: bool,
+    storage_options_provider_obj: JObject,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
+) -> Result<JObject<'local>> {
+    let uri_str: String = uri.extract(env)?;
+
+    // Extract write params from parameter
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
+
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
+    };
+
+    // Build storage options accessor
+    let storage_options_provider: Option<JavaStorageOptionsProvider> = env
+        .get_optional(&storage_options_provider_obj, |env, provider_obj| {
+            JavaStorageOptionsProvider::new(env, provider_obj)
+        })?;
+    let storage_options_provider =
+        storage_options_provider.map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
+
+    // Keep a copy of initial options for opening the read dataset.
+    let initial_storage_options = write_param.clone();
+
+    let accessor = match (write_param.is_empty(), storage_options_provider.clone()) {
+        (false, Some(provider)) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(write_param, provider),
+        )),
+        (false, None) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(write_param),
+        )),
+        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
+            provider,
+        ))),
+        (true, None) => None,
+    };
+
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: accessor,
+        ..Default::default()
+    };
+
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let (open_namespace, open_table_id) = match &namespace_info {
+        Some((ns, tid)) => (Some(ns.clone()), Some(tid.clone())),
+        None => (None, None),
+    };
+
+    // Open the read dataset using the same storage options (and provider, if any) so that
+    // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
+    let mut ds = BlockingDataset::open(
+        &uri_str,
+        None,
+        None,
+        6 * 1024 * 1024,
+        1024 * 1024,
+        initial_storage_options,
+        None,
+        storage_options_provider,
+        None,
+        open_namespace,
+        open_table_id,
+    )
+    .ok();
+
+    // Convert Java transaction to Rust
+    let allocator_ref = if allocator_obj.is_null() {
+        None
+    } else {
+        Some(allocator_obj)
+    };
+    let transaction =
+        convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
+
+    // Build CommitBuilder with URI
+    let mut builder = CommitBuilder::new(&*uri_str)
+        .with_store_params(store_params)
+        .with_detached(detached)
+        .enable_v2_manifest_paths(enable_v2_manifest_paths);
+
+    if let Some(use_stable) = use_stable_row_ids {
+        builder = builder.use_stable_row_ids(use_stable);
+    }
+    if let Some(format) = storage_format {
+        builder = builder.with_storage_format(format);
+    }
+    if max_retries > 0 {
+        builder = builder.with_max_retries(max_retries);
+    }
+    if skip_auto_cleanup {
+        builder = builder.with_skip_auto_cleanup(true);
+    }
+
+    // Set namespace commit handler if provided
+    if let Some((ns, tid)) = namespace_info {
+        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+        let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        builder = builder.with_commit_handler(commit_handler);
+    }
+
+    let dataset = RT.block_on(builder.execute(transaction))?;
+    let blocking_ds = BlockingDataset { inner: dataset };
+    blocking_ds.into_java(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::{
+        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+        Schema as ArrowSchema,
+    };
+    use std::{collections::HashMap, sync::Arc};
+
+    use super::*;
+
+    pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
+    #[test]
+    fn test_create_schema_from_arrow() {
+        // base_schema has an existing field id
+        let mut base_a = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
+        base_a.set_id(-1, &mut 10);
+        let mut base_b = Field::new_arrow("b", ArrowDataType::Int32, false).unwrap();
+        base_b.set_id(-1, &mut 11);
+
+        // base struct: s{x,y}
+        let mut base_s = Field::try_from(&ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("x", ArrowDataType::Int32, false),
+                ArrowField::new("y", ArrowDataType::Int32, false),
+            ])),
+            false,
+        ))
+        .unwrap();
+        base_s.set_id(-1, &mut 20);
+        let base_s_x = base_s.children.iter_mut().find(|c| c.name == "x").unwrap();
+        base_s_x.set_id(20, &mut 21);
+        let base_s_y = base_s.children.iter_mut().find(|c| c.name == "y").unwrap();
+        base_s_y.set_id(20, &mut 22);
+
+        // base list: l<item>
+        let mut base_l = Field::try_from(&ArrowField::new(
+            "l",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        ))
+        .unwrap();
+        base_l.set_id(-1, &mut 30);
+        let base_l_item = base_l
+            .children
+            .iter_mut()
+            .find(|c| c.name == "item")
+            .unwrap();
+        base_l_item.set_id(30, &mut 31);
+
+        // base map: m<entries{key,value}>
+        let base_map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut base_m = Field::try_from(&ArrowField::new(
+            "m",
+            ArrowDataType::Map(Arc::new(base_map_entries), false),
+            true,
+        ))
+        .unwrap();
+        base_m.set_id(-1, &mut 40);
+
+        let base_m_entries = base_m
+            .children
+            .iter_mut()
+            .find(|c| c.name == "entries")
+            .unwrap();
+        base_m_entries.set_id(40, &mut 41);
+
+        let base_m_key = base_m_entries
+            .children
+            .iter_mut()
+            .find(|c| c.name == "key")
+            .unwrap();
+        base_m_key.set_id(41, &mut 42);
+
+        let base_m_val = base_m_entries
+            .children
+            .iter_mut()
+            .find(|c| c.name == "value")
+            .unwrap();
+        base_m_val.set_id(41, &mut 43);
+
+        let base_schema = LanceSchema {
+            fields: vec![base_a, base_b, base_s, base_l, base_m],
+            metadata: HashMap::from([("base_schema_k".to_string(), "base_schema_v".to_string())]),
+        };
+
+        // new_schema specifies:
+        // - field a: manual field id
+        // - field b: no id -> should inherit from base_schema
+        // - field c: new field -> should be assigned based on max_field_id
+        // - struct s: parent+child(x) manual, child(y) inherit, child(z) max_field_id
+        // - list l: parent manual, child(item) inherit
+        // - list l2: parent manual, child(item) max_field_id
+        // - map m: parent manual, child(entries/key/value) inherit
+        // - map m2: parent manual, child(entries/key/value) max_field_id
+        let mut a_meta = HashMap::new();
+        a_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "5".to_string());
+        let arrow_a = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(a_meta);
+        let arrow_b = ArrowField::new("b", ArrowDataType::Int32, false);
+        let arrow_c = ArrowField::new("c", ArrowDataType::Int32, false);
+
+        // struct s: manual parent + manual child x
+        let mut s_meta = HashMap::new();
+        s_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "50".to_string());
+        let mut x_meta = HashMap::new();
+        x_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "51".to_string());
+        let arrow_s = ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("x", ArrowDataType::Int32, false).with_metadata(x_meta),
+                ArrowField::new("y", ArrowDataType::Int32, false),
+                ArrowField::new("z", ArrowDataType::Int32, true),
+            ])),
+            false,
+        )
+        .with_metadata(s_meta);
+
+        // list l: parent manual, item inherit
+        let mut l_meta = HashMap::new();
+        l_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "60".to_string());
+        let arrow_l = ArrowField::new(
+            "l",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        )
+        .with_metadata(l_meta);
+
+        // list l2: parent manual, item max_field_id (no base match)
+        let mut l2_meta = HashMap::new();
+        l2_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "61".to_string());
+        let arrow_l2 = ArrowField::new(
+            "l2",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        )
+        .with_metadata(l2_meta);
+
+        // map m: parent manual, entries/key/value inherit
+        let map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut m_meta = HashMap::new();
+        m_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "70".to_string());
+        let arrow_m = ArrowField::new("m", ArrowDataType::Map(Arc::new(map_entries), false), true)
+            .with_metadata(m_meta);
+
+        // map m2: parent manual, entries/key/value max_field_id (no base match)
+        let map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut m2_meta = HashMap::new();
+        m2_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "71".to_string());
+        let arrow_m2 =
+            ArrowField::new("m2", ArrowDataType::Map(Arc::new(map_entries), false), true)
+                .with_metadata(m2_meta);
+
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            vec![
+                arrow_a, arrow_b, arrow_c, arrow_s, arrow_l, arrow_l2, arrow_m, arrow_m2,
+            ],
+            HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())]),
+        );
+
+        let schema =
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(100)).unwrap();
+
+        // 1. Manually specified field id
+        let got_a = schema.field("a").unwrap();
+        assert_eq!(got_a.id, 5);
+        assert!(!got_a.metadata.contains_key(LANCE_FIELD_ID_KEY));
+
+        // 2. Inherit field id + metadata from base_schema (field b)
+        let got_b = schema.field("b").unwrap();
+        assert_eq!(got_b.id, 11);
+
+        // 3. Assign a new field id using max_field_id (field c)
+        let got_c = schema.field("c").unwrap();
+        assert_eq!(got_c.id, 101);
+
+        // 4. struct: parent+child(x) manual, child(y) inherit, child(z) max_field_id
+        let got_s = schema.field("s").unwrap();
+        assert_eq!(got_s.id, 50);
+        let got_sx = schema.field("s.x").unwrap();
+        assert_eq!(got_sx.id, 51);
+        let got_sy = schema.field("s.y").unwrap();
+        assert_eq!(got_sy.id, 22);
+        let got_sz = schema.field("s.z").unwrap();
+        assert_eq!(got_sz.id, 102);
+
+        // 5. list l: parent manual, item inherit
+        let got_l = schema.field("l").unwrap();
+        assert_eq!(got_l.id, 60);
+        let got_li = schema.field("l.item").unwrap();
+        assert_eq!(got_li.id, 31);
+
+        // 6. list l2: parent manual, item max_field_id
+        let got_l2 = schema.field("l2").unwrap();
+        assert_eq!(got_l2.id, 61);
+        let got_l2i = schema.field("l2.item").unwrap();
+        assert_eq!(got_l2i.id, 103);
+
+        // 7. map m: parent manual, entries/key/value inherit
+        let got_m = schema.field("m").unwrap();
+        assert_eq!(got_m.id, 70);
+        let got_me = schema.field("m.entries").unwrap();
+        assert_eq!(got_me.id, 41);
+        let got_mk = schema.field("m.entries.key").unwrap();
+        assert_eq!(got_mk.id, 42);
+        let got_mv = schema.field("m.entries.value").unwrap();
+        assert_eq!(got_mv.id, 43);
+
+        // 8. map m2: parent manual, entries/key/value max_field_id
+        let got_m2 = schema.field("m2").unwrap();
+        assert_eq!(got_m2.id, 71);
+        let got_m2e = schema.field("m2.entries").unwrap();
+        assert_eq!(got_m2e.id, 104);
+        let got_m2k = schema.field("m2.entries.key").unwrap();
+        assert_eq!(got_m2k.id, 105);
+        let got_m2v = schema.field("m2.entries.value").unwrap();
+        assert_eq!(got_m2v.id, 106);
+
+        // 9. Schema metadata: when new_schema.metadata is non-empty, use new_schema metadata
+        assert_eq!(
+            schema.metadata,
+            HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
+        );
     }
 }

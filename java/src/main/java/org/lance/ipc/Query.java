@@ -29,7 +29,7 @@ public class Query {
   private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
-  private final DistanceType distanceType;
+  private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
 
   private Query(Builder builder) {
@@ -48,7 +48,7 @@ public class Query {
     this.maximumNprobes = builder.maximumNprobes;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
-    this.distanceType = Preconditions.checkNotNull(builder.distanceType, "Metric type must be set");
+    this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
   }
 
@@ -80,8 +80,12 @@ public class Query {
     return refineFactor;
   }
 
-  public String getDistanceType() {
-    return distanceType.toString();
+  public Optional<DistanceType> getDistanceType() {
+    return distanceType;
+  }
+
+  public Optional<String> getDistanceTypeString() {
+    return distanceType.map(DistanceType::toString);
   }
 
   public boolean isUseIndex() {
@@ -98,7 +102,7 @@ public class Query {
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
-        .add("distanceType", distanceType)
+        .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
         .toString();
   }
@@ -111,7 +115,7 @@ public class Query {
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
-    private DistanceType distanceType = DistanceType.L2;
+    private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
 
     /**
@@ -219,11 +223,14 @@ public class Query {
     /**
      * Sets the distance metric type.
      *
+     * <p>If not set, the query will use the index's metric type (if an index is available), or the
+     * default metric for the data type (L2 for float vectors, Hamming for binary).
+     *
      * @param distanceType The DistanceType to use for the query.
      * @return The Builder instance for method chaining.
      */
     public Builder setDistanceType(DistanceType distanceType) {
-      this.distanceType = distanceType;
+      this.distanceType = Optional.ofNullable(distanceType);
       return this;
     }
 

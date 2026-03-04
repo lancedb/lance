@@ -7,7 +7,7 @@ use std::vec;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{ManifestWriteConfig, TRANSACTIONS_DIR, write_manifest_file};
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
@@ -16,10 +16,10 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
-use arrow_array::{types::Int32Type, Int32Array, RecordBatchIterator, StringArray};
+use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
-use lance_datagen::{array, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array};
 use lance_index::DatasetIndexExt;
 
 use crate::datafusion::LanceTableProvider;
@@ -214,7 +214,16 @@ async fn test_migrate_v2_manifest_paths() {
     let data = lance_datagen::gen_batch()
         .col("key", array::step::<Int32Type>())
         .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let mut dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         dataset.manifest_location().naming_scheme,
         ManifestNamingScheme::V1
@@ -297,7 +306,7 @@ async fn test_inline_transaction() {
 
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
-            let tx_path = ds.base.child("_transactions").child(tx_file.as_str());
+            let tx_path = ds.base.child(TRANSACTIONS_DIR).child(tx_file.as_str());
             let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }

@@ -12,8 +12,9 @@ const BITMAP_THRESDHOLD: usize = 5_000;
 // TODO: Benchmark to find a better value.
 
 /// Represents a set of deleted row offsets in a single fragment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum DeletionVector {
+    #[default]
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
@@ -179,12 +180,6 @@ impl OffsetMapper {
                 }
             }
         }
-    }
-}
-
-impl Default for DeletionVector {
-    fn default() -> Self {
-        Self::NoDeletions
     }
 }
 
@@ -408,9 +403,11 @@ mod test {
     #[test]
     fn test_build_predicate() {
         let addrs = [0u64, 1, 2, 3, 4];
-        assert!(DeletionVector::NoDeletions
-            .build_predicate(addrs.iter())
-            .is_none());
+        assert!(
+            DeletionVector::NoDeletions
+                .build_predicate(addrs.iter())
+                .is_none()
+        );
 
         let pred = set_dv([1, 3]).build_predicate(addrs.iter()).unwrap();
         assert_eq!(

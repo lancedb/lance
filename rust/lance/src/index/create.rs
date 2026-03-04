@@ -2,32 +2,47 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::{
+    Error, Result,
     dataset::{
-        transaction::{Operation, Transaction},
         Dataset,
+        transaction::{Operation, Transaction},
     },
     index::{
+        DatasetIndexExt, DatasetIndexInternalExt,
         scalar::build_scalar_index,
         vector::{
-            build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+            LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
+            build_empty_vector_index, build_vector_index,
         },
-        vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
+        vector_index_details,
     },
-    Error, Result,
 };
 use futures::future::BoxFuture;
+use lance_core::datatypes::format_field_path;
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::{IndexParams, IndexType, VECTOR_INDEX_VERSION, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
-    scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
+    scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::IndexMetadata;
-use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
+
+/// Generate default index name from field path.
+///
+/// Joins field names with `.` to create the base index name.
+/// For example: `["meta-data", "user-id"]` -> `"meta-data.user-id"`
+fn default_index_name(fields: &[&str]) -> String {
+    if fields.iter().any(|f| f.contains('.')) {
+        format_field_path(fields)
+    } else {
+        fields.join(".")
+    }
+}
 
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
@@ -40,6 +55,7 @@ pub struct CreateIndexBuilder<'a> {
     fragments: Option<Vec<u32>>,
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    progress: Arc<dyn IndexBuildProgress>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -60,6 +76,7 @@ impl<'a> CreateIndexBuilder<'a> {
             fragments: None,
             index_uuid: None,
             preprocessed_data: None,
+            progress: Arc::new(NoopIndexBuildProgress),
         }
     }
 
@@ -96,21 +113,32 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
+        self.progress = p;
+        self
+    }
+
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
         if self.columns.len() != 1 {
-            return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
+        let column_input = &self.columns[0];
+        // Use case-insensitive lookup for both simple and nested paths.
+        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column_input}' does not exist"
+            )));
         };
+        let field = *field_path.last().unwrap();
+        // Reconstruct the column path with correct case from schema
+        // Use quoted format for SQL parsing (special chars are quoted)
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        let quoted_column: String = format_field_path(&names);
+        let column = quoted_column.as_str();
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -125,33 +153,42 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = if let Some(name) = self.name.take() {
+            name
+        } else {
+            // Generate default name with collision handling
+            let column_path = default_index_name(&names);
+            let base_name = format!("{column_path}_idx");
+            let mut candidate = base_name.clone();
+            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
+            // Find unique name by appending numeric suffix if needed
+            while indices
+                .iter()
+                .any(|idx| idx.name == candidate && idx.fields != [field.id])
+            {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        };
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists, \
-                        please specify a different name or use replace=True"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index name '{index_name} already exists, \
+                    please specify a different name or use replace=True"
+                )));
             };
             if idx.fields != [field.id] {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists with different fields, \
-                        please specify a different name"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index name '{index_name} already exists with different fields, \
+                    please specify a different name"
+                )));
             }
         }
 
         let index_id = match &self.index_uuid {
-            Some(uuid_str) => Uuid::parse_str(uuid_str).map_err(|e| Error::Index {
-                message: format!("Invalid UUID string provided: {}", e),
-                location: location!(),
-            })?,
+            Some(uuid_str) => Uuid::parse_str(uuid_str)
+                .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
             None => Uuid::new_v4(),
         };
         let created_index = match (self.index_type, self.params.index_name()) {
@@ -162,7 +199,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::NGram
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
-                | IndexType::LabelList,
+                | IndexType::LabelList
+                | IndexType::RTree,
                 LANCE_SCALAR_INDEX,
             ) => {
                 assert!(
@@ -203,6 +241,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     preprocesssed_data,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -212,9 +251,8 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index("Scalar index type must take a ScalarIndexParams".to_string())
                     })?;
                 build_scalar_index(
                     self.dataset,
@@ -224,6 +262,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -233,9 +272,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index(
+                            "Inverted index type must take a InvertedIndexParams".to_string(),
+                        )
                     })?;
 
                 let params =
@@ -248,6 +288,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
+                    self.progress.clone(),
                 )
                 .await?
             }
@@ -256,6 +297,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfPq
                 | IndexType::IvfSq
                 | IndexType::IvfFlat
+                | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq,
@@ -266,22 +308,39 @@ impl<'a> CreateIndexBuilder<'a> {
                     .params
                     .as_any()
                     .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
 
                 if train {
-                    // this is a large future so move it to heap
-                    Box::pin(build_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        &index_id.to_string(),
-                        vec_params,
-                        fri,
-                    ))
-                    .await?;
+                    // Check if this is distributed indexing (fragment-level)
+                    if self.fragments.is_some() {
+                        // For distributed indexing, build only on specified fragments
+                        // This creates temporary index metadata without committing
+                        Box::pin(build_distributed_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                            self.fragments.as_ref().unwrap(),
+                            self.progress.clone(),
+                        ))
+                        .await?;
+                    } else {
+                        // Standard full dataset indexing
+                        Box::pin(build_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                            self.progress.clone(),
+                        ))
+                        .await?;
+                    }
                 } else {
                     // Create empty vector index
                     build_empty_vector_index(
@@ -317,10 +376,9 @@ impl<'a> CreateIndexBuilder<'a> {
                     .to_vector()
                     // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::internal(
+                        "unable to cast index extension to vector".to_string(),
+                    ))?;
 
                 if train {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
@@ -334,19 +392,14 @@ impl<'a> CreateIndexBuilder<'a> {
                 }
             }
             (IndexType::FragmentReuse, _) => {
-                return Err(Error::Index {
-                    message: "Fragment reuse index can only be created through compaction"
-                        .to_string(),
-                    location: location!(),
-                })
+                return Err(Error::index(
+                    "Fragment reuse index can only be created through compaction".to_string(),
+                ));
             }
             (index_type, index_name) => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index type {index_type} with name {index_name} is not supported"
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Index type {index_type} with name {index_name} is not supported"
+                )));
             }
         };
 
@@ -378,8 +431,9 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     #[instrument(skip_all)]
-    async fn execute(mut self) -> Result<()> {
+    async fn execute(mut self) -> Result<IndexMetadata> {
         let new_idx = self.execute_uncommitted().await?;
+        let index_uuid = new_idx.uuid;
         let transaction = Transaction::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
@@ -393,13 +447,25 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        Ok(())
+        // Fetch the committed index metadata from the dataset.
+        // This ensures we return the version that may have been modified by the commit.
+        let indices = self.dataset.load_indices().await?;
+        indices
+            .iter()
+            .find(|idx| idx.uuid == index_uuid)
+            .cloned()
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Index with UUID {} not found after commit",
+                    index_uuid
+                ))
+            })
     }
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
-    type Output = Result<()>;
-    type IntoFuture = BoxFuture<'a, Result<()>>;
+    type Output = Result<IndexMetadata>;
+    type IntoFuture = BoxFuture<'a, Result<IndexMetadata>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -410,16 +476,140 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::RecordBatchIterator;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen;
+    use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+
+    #[test]
+    fn test_default_index_name() {
+        // Single field - preserved as-is
+        assert_eq!(default_index_name(&["user-id"]), "user-id");
+        assert_eq!(default_index_name(&["user:id"]), "user:id");
+        assert_eq!(default_index_name(&["userId"]), "userId");
+
+        // Nested paths - joined with dot
+        assert_eq!(
+            default_index_name(&["meta-data", "user-id"]),
+            "meta-data.user-id"
+        );
+        assert_eq!(
+            default_index_name(&["MetaData", "userId"]),
+            "MetaData.userId"
+        );
+
+        // Path with dots in field names - escape
+        assert_eq!(
+            default_index_name(&["meta.data", "user.id"]),
+            "`meta.data`.`user.id`"
+        );
+
+        // Empty input
+        assert_eq!(default_index_name(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn test_default_index_name_with_special_chars() {
+        // Verify default index names preserve special characters in column names.
+        let mut dataset = gen_batch()
+            .col("user-id", lance_datagen::array::step::<Int32Type>())
+            .col("user:id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // Create index on column with hyphen
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["user-id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "user-id_idx");
+
+        // Create index on column with colon
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["user:id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx2.name, "user:id_idx");
+
+        // Verify both indices exist
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_index_name_collision_with_explicit_name() {
+        // Test collision handling when explicit name conflicts with default name.
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // (a) Explicit name on first index, default on second that would collide
+        // Create index on "a" with explicit name "b_idx"
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("b_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "b_idx");
+
+        // Create index on "b" with default name - would be "b_idx" but that's taken
+        // so it should get "b_idx_2"
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx2.name, "b_idx_2");
+
+        // Verify both indices exist
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_index_name_collision_explicit_errors() {
+        // Test that explicit name collision with existing index errors.
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // (b) Default name on first, explicit same name on second should error
+        // Create index on "a" with default name "a_idx"
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(idx1.name, "a_idx");
+
+        // Try to create index on "b" with explicit name "a_idx" - should error
+        let result = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
@@ -749,13 +939,17 @@ mod tests {
                 && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
         );
         assert_eq!(vector_indices.len(), 2);
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(
+            vector_indices
+                .iter()
+                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+        );
+        assert!(
+            vector_indices
+                .iter()
+                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+        );
     }
 }

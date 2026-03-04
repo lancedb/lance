@@ -4,7 +4,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::{
-    cmp::{min, Reverse},
+    cmp::{Reverse, min},
     collections::BinaryHeap,
 };
 use std::{collections::HashMap, ops::Range};
@@ -31,45 +31,39 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
-use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::utils::{
-    mask::RowIdMask,
-    tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
-};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
+use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::compress_posting_list,
+    encoding::{compress_posting_list, compress_posting_list_with_scores},
     iter::CompressedPostingListIterator,
 };
-use super::{
-    encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
-};
-use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use super::{encoding::compress_positions, iter::PostingListIterator};
+use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
@@ -79,7 +73,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -114,6 +107,21 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+#[derive(Debug)]
+struct PartitionCandidates {
+    tokens_by_position: Vec<String>,
+    candidates: Vec<DocCandidate>,
+}
+
+impl PartitionCandidates {
+    fn empty() -> Self {
+        Self {
+            tokens_by_position: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum TokenSetFormat {
     Arrow,
@@ -138,10 +146,10 @@ impl FromStr for TokenSetFormat {
             "" => Ok(Self::Arrow),
             "arrow" => Ok(Self::Arrow),
             "fst" => Ok(Self::Fst),
-            other => Err(Error::Index {
-                message: format!("unsupported token set format {}", other),
-                location: location!(),
-            }),
+            other => Err(Error::index(format!(
+                "unsupported token set format {}",
+                other
+            ))),
         }
     }
 }
@@ -224,6 +232,11 @@ impl InvertedIndex {
         &self.params
     }
 
+    /// Returns the number of partitions in this inverted index.
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
@@ -259,19 +272,28 @@ impl InvertedIndex {
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
                         .await?;
                     if postings.is_empty() {
-                        return Ok(Vec::new());
+                        return Ok(PartitionCandidates::empty());
+                    }
+                    let mut tokens_by_position = vec![String::new(); postings.len()];
+                    for posting in &postings {
+                        let idx = posting.term_index() as usize;
+                        tokens_by_position[idx] = posting.token().to_owned();
                     }
                     let params = params.clone();
                     let mask = mask.clone();
                     let metrics = metrics.clone();
                     spawn_cpu(move || {
-                        part.bm25_search(
+                        let candidates = part.bm25_search(
                             params.as_ref(),
                             operator,
                             mask,
                             postings,
                             metrics.as_ref(),
-                        )
+                        )?;
+                        Ok(PartitionCandidates {
+                            tokens_by_position,
+                            candidates,
+                        })
                     })
                     .await
                 }
@@ -279,16 +301,34 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
+            if res.candidates.is_empty() {
+                continue;
+            }
+            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+            for token in &res.tokens_by_position {
+                let idf_weight = match idf_cache.get(token) {
+                    Some(weight) => *weight,
+                    None => {
+                        let weight = scorer.query_weight(token);
+                        idf_cache.insert(token.clone(), weight);
+                        weight
+                    }
+                };
+                idf_by_position.push(idf_weight);
+            }
             for DocCandidate {
                 row_id,
                 freqs,
                 doc_length,
-            } in res
+            } in res.candidates
             {
                 let mut score = 0.0;
-                for (token, freq) in freqs.into_iter() {
-                    score += scorer.score(token.as_str(), freq, doc_length);
+                for (term_index, freq) in freqs.into_iter() {
+                    debug_assert!((term_index as usize) < idf_by_position.len());
+                    score +=
+                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -386,20 +426,17 @@ impl InvertedIndex {
 
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
-                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
-                    message: "params not found in metadata".to_owned(),
-                    location: location!(),
-                })?;
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
                 let params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                let partitions =
-                    reader
-                        .schema()
-                        .metadata
-                        .get("partitions")
-                        .ok_or(Error::Index {
-                            message: "partitions not found in metadata".to_owned(),
-                            location: location!(),
-                        })?;
+                let partitions = reader
+                    .schema()
+                    .metadata
+                    .get("partitions")
+                    .ok_or(Error::index("partitions not found in metadata".to_owned()))?;
                 let partitions: Vec<u64> = serde_json::from_str(partitions)?;
                 let token_set_format = reader
                     .schema()
@@ -464,7 +501,6 @@ impl Index for InvertedIndex {
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
         Err(Error::invalid_input(
             "inverted index cannot be cast to vector index",
-            location!(),
         ))
     }
 
@@ -583,6 +619,7 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
@@ -697,11 +734,8 @@ impl InvertedPartition {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
             };
-            let lev =
-                fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
-                    message: format!("failed to construct the fuzzy query: {}", e),
-                    location: location!(),
-                })?;
+            let lev = fst::automaton::Levenshtein::new(token, fuzziness)
+                .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
 
             let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
@@ -718,10 +752,9 @@ impl InvertedPartition {
                     }
                 }
             } else {
-                return Err(Error::Index {
-                    message: "tokens is not fst, which is not expected".to_owned(),
-                    location: location!(),
-                });
+                return Err(Error::index(
+                    "tokens is not fst, which is not expected".to_owned(),
+                ));
             }
         }
         Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
@@ -789,7 +822,7 @@ impl InvertedPartition {
         &self,
         params: &FtsSearchParams,
         operator: Operator,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate>> {
@@ -906,13 +939,6 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
-    }
-
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
         match format {
             TokenSetFormat::Arrow => self.into_arrow_batch(),
@@ -1001,10 +1027,7 @@ impl TokenSet {
         for (token, token_id) in entries {
             builder
                 .insert(&token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
-                    location: location!(),
-                })?;
+                .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
         }
         Ok(builder.into_map())
     }
@@ -1028,27 +1051,19 @@ impl TokenSet {
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
             for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-                let token = token.ok_or(Error::Index {
-                    message: "found null token in token set".to_owned(),
-                    location: location!(),
-                })?;
+                let token =
+                    token.ok_or(Error::index("found null token in token set".to_owned()))?;
                 next_id = next_id.max(token_id + 1);
                 total_length += token.len();
-                tokens
-                    .insert(token, token_id as u64)
-                    .map_err(|e| Error::Index {
-                        message: format!("failed to insert token {}: {}", token, e),
-                        location: location!(),
-                    })?;
+                tokens.insert(token, token_id as u64).map_err(|e| {
+                    Error::index(format!("failed to insert token {}: {}", token, e))
+                })?;
             }
 
             Ok::<_, Error>((tokens.into_map(), next_id, total_length))
         })
         .await
-        .map_err(|err| Error::Execution {
-            message: format!("failed to spawn blocking task: {}", err),
-            location: location!(),
-        })??;
+        .map_err(|err| Error::execution(format!("failed to spawn blocking task: {}", err)))??;
 
         Ok(Self {
             tokens: TokenMap::Fst(tokens),
@@ -1060,43 +1075,40 @@ impl TokenSet {
     async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         if batch.num_rows() == 0 {
-            return Err(Error::Index {
-                message: "token set batch is empty".to_owned(),
-                location: location!(),
-            });
+            return Err(Error::index("token set batch is empty".to_owned()));
         }
 
         let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
         let bytes = fst_col.value(0);
-        let map = fst::Map::new(bytes.to_vec()).map_err(|e| Error::Index {
-            message: format!("failed to load fst tokens: {}", e),
-            location: location!(),
-        })?;
+        let map = fst::Map::new(bytes.to_vec())
+            .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
         let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        let next_id = next_id_col.values().first().copied().ok_or(Error::Index {
-            message: "token next id column is empty".to_owned(),
-            location: location!(),
-        })?;
+        let next_id = next_id_col
+            .values()
+            .first()
+            .copied()
+            .ok_or(Error::index("token next id column is empty".to_owned()))?;
 
         let total_length = total_length_col
             .values()
             .first()
             .copied()
-            .ok_or(Error::Index {
-                message: "token total length column is empty".to_owned(),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(
+                "token total length column is empty".to_owned(),
+            ))?;
 
         Ok(Self {
             tokens: TokenMap::Fst(map),
             next_id,
-            total_length: usize::try_from(total_length).map_err(|_| Error::Index {
-                message: format!("token total length {} overflows usize", total_length),
-                location: location!(),
+            total_length: usize::try_from(total_length).map_err(|_| {
+                Error::index(format!(
+                    "token total length {} overflows usize",
+                    total_length
+                ))
             })?,
         })
     }
@@ -1116,6 +1128,24 @@ impl TokenSet {
         }
 
         token_id
+    }
+
+    pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
+        let next_id = self.next_id;
+        match self.tokens {
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&token_id) = map.get(token) {
+                    return token_id;
+                }
+
+                map.insert(token.to_owned(), next_id);
+            }
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        }
+
+        self.next_id += 1;
+        self.total_length += token.len();
+        next_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -1236,10 +1266,10 @@ impl PostingListReader {
     fn load_metadata(
         schema: &lance_core::datatypes::Schema,
     ) -> Result<(Vec<usize>, Option<Vec<f32>>)> {
-        let offsets = schema.metadata.get("offsets").ok_or(Error::Index {
-            message: "offsets not found in metadata".to_owned(),
-            location: location!(),
-        })?;
+        let offsets = schema
+            .metadata
+            .get("offsets")
+            .ok_or(Error::index("offsets not found in metadata".to_owned()))?;
         let offsets = serde_json::from_str(offsets)?;
 
         let max_scores = schema
@@ -1345,8 +1375,7 @@ impl PostingListReader {
                 let batch = self.posting_batch(token_id, false).await?;
                 self.posting_list_from_batch(&batch, token_id)
             })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .await?
             .as_ref()
             .clone();
 
@@ -1396,10 +1425,9 @@ impl PostingListReader {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1435,10 +1463,7 @@ impl PostingListReader {
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location!(),
-                        ),
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                         e => e
                     }
                 })?;
@@ -1600,7 +1625,7 @@ impl PostingList {
                     let freq = freq as u32;
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1618,7 +1643,7 @@ impl PostingList {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
-                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                            PositionRecorder::Position(positions.collect::<Vec<_>>().into())
                         }
                         None => PositionRecorder::Count(freq),
                     };
@@ -1861,18 +1886,13 @@ impl PostingListBuilder {
         }
     }
 
-    // assume the posting list is sorted by doc id
-    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    fn build_batch(
+        self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
         let length = self.len();
-        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-
-        let schema = inverted_list_schema(self.has_positions());
-        let compressed = compress_posting_list(
-            self.doc_ids.len(),
-            self.doc_ids.iter(),
-            self.frequencies.iter(),
-            block_max_scores.into_iter(),
-        )?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1883,7 +1903,7 @@ impl PostingListBuilder {
             )?) as ArrayRef,
             Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
             Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                self.len() as u32
+                length as u32,
             ))) as ArrayRef,
         ];
 
@@ -1905,6 +1925,37 @@ impl PostingListBuilder {
 
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+
+    // assume the posting list is sorted by doc id
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let schema = inverted_list_schema(self.has_positions());
+        let compressed = compress_posting_list(
+            self.doc_ids.len(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            block_max_scores.into_iter(),
+        )?;
+        self.build_batch(compressed, max_score, schema)
+    }
+
+    pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
+        let length = self.len();
+        let avgdl = docs.average_length();
+        let idf_scale = idf(length, docs.len()) * (K1 + 1.0);
+        let (compressed, max_score) = compress_posting_list_with_scores(
+            length,
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            |doc_id, freq| {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
+                let freq = freq as f32;
+                freq / (freq + doc_norm)
+            },
+            idf_scale,
+        )?;
+        self.build_batch(compressed, max_score, schema)
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -2153,7 +2204,9 @@ impl DocSet {
     ) -> Vec<f32> {
         let avgdl = self.average_length();
         let length = doc_ids.size_hint().0;
-        let mut block_max_scores = Vec::with_capacity(length);
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        let idf_scale = idf(length, self.len()) * (K1 + 1.0);
         let mut max_score = f32::MIN;
         for (i, (doc_id, freq)) in doc_ids.zip(freqs).enumerate() {
             let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
@@ -2163,13 +2216,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                max_score *= idf(length, self.len()) * (K1 + 1.0);
+                max_score *= idf_scale;
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
-        if length % BLOCK_SIZE > 0 {
-            max_score *= idf(length, self.len()) * (K1 + 1.0);
+        if !length.is_multiple_of(BLOCK_SIZE) {
+            max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
         block_max_scores
@@ -2338,17 +2391,16 @@ pub fn flat_full_text_search(
     if is_phrase_query(query) {
         return Err(Error::invalid_input(
             "phrase query is not supported for flat full text search, try using FTS index",
-            location!(),
         ));
     }
 
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
-        data_type => Err(Error::invalid_input(
-            format!("unsupported data type {} for inverted index", data_type),
-            location!(),
-        )),
+        data_type => Err(Error::invalid_input(format!(
+            "unsupported data type {} for inverted index",
+            data_type
+        ))),
     }
 }
 
@@ -2459,7 +2511,7 @@ pub fn flat_bm25_search_stream(
                     token_docs.insert(token.clone(), token_nq);
                 }
                 MemBM25Scorer::new(
-                    index_bm25_scorer.avg_doc_length() as u64 * index_bm25_scorer.num_docs() as u64,
+                    index_bm25_scorer.total_tokens(),
                     index_bm25_scorer.num_docs(),
                     token_docs,
                 )
@@ -2509,10 +2561,12 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, UInt32Type};
 
     use super::*;
 
@@ -2544,14 +2598,66 @@ mod tests {
                 .as_binary::<i64>(),
         )
         .unwrap();
-        assert!(doc_ids
+        assert!(
+            doc_ids
+                .iter()
+                .zip(expected.doc_ids.iter())
+                .all(|(a, b)| a == b)
+        );
+        assert!(
+            freqs
+                .iter()
+                .zip(expected.frequencies.iter())
+                .all(|(a, b)| a == b)
+        );
+    }
+
+    #[test]
+    fn test_posting_list_batch_matches_docset_scoring() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE + 3;
+        for doc_id in 0..num_docs as u32 {
+            docs.append(doc_id as u64, doc_id % 7 + 1);
+        }
+
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        let freqs = doc_ids
             .iter()
-            .zip(expected.doc_ids.iter())
-            .all(|(a, b)| a == b));
-        assert!(freqs
-            .iter()
-            .zip(expected.frequencies.iter())
-            .all(|(a, b)| a == b));
+            .map(|doc_id| doc_id % 5 + 1)
+            .collect::<Vec<_>>();
+
+        let mut builder_scores = PostingListBuilder::new(false);
+        let mut builder_docs = PostingListBuilder::new(false);
+        for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+            builder_scores.add(doc_id, PositionRecorder::Count(freq));
+            builder_docs.add(doc_id, PositionRecorder::Count(freq));
+        }
+
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let batch_scores = builder_scores.to_batch(block_max_scores).unwrap();
+        let batch_docs = builder_docs
+            .to_batch_with_docs(&docs, inverted_list_schema(false))
+            .unwrap();
+
+        let scores_posting = batch_scores[POSTING_COL].as_list::<i32>().value(0);
+        let scores_posting = scores_posting.as_binary::<i64>();
+        let docs_posting = batch_docs[POSTING_COL].as_list::<i32>().value(0);
+        let docs_posting = docs_posting.as_binary::<i64>();
+        assert_eq!(scores_posting, docs_posting);
+
+        let score_left = batch_scores[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let score_right = batch_docs[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert!((score_left - score_right).abs() < 1e-6);
+
+        let len_left = batch_scores[LENGTH_COL]
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let len_right = batch_docs[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        assert_eq!(len_left, len_right);
     }
 
     #[tokio::test]
@@ -2731,5 +2837,104 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[test]
+    fn test_block_max_scores_capacity_matches_block_count() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE * 3 + 7;
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        for doc_id in &doc_ids {
+            docs.append(*doc_id as u64, 1);
+        }
+
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let expected_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+
+        assert_eq!(block_max_scores.len(), expected_blocks);
+        assert_eq!(block_max_scores.capacity(), expected_blocks);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_uses_global_idf() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Partition 0: 3 docs, only one contains "alpha".
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.tokens.add("beta".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(2, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.docs.append(101, 1);
+        builder0.docs.append(102, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        // Partition 1: 1 doc, contains "alpha".
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(200, 1);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids.len(), 2);
+        assert!(row_ids.contains(&100));
+        assert!(row_ids.contains(&200));
+        assert_eq!(row_ids.len(), scores.len());
+
+        let expected_idf = idf(2, 4);
+        for score in scores {
+            assert!(
+                (score - expected_idf).abs() < 1e-6,
+                "score: {}, expected: {}",
+                score,
+                expected_idf
+            );
+        }
     }
 }

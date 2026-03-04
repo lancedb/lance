@@ -6,9 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
-use snafu::location;
 
-use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -153,6 +152,8 @@ pub trait DatasetIndexExt {
     ///            if not provided, it will auto-generate one.
     ///  - `params`: index parameters.
     ///  - `replace`: replace the existing index if it exists.
+    ///
+    /// Returns the metadata of the created index.
     async fn create_index(
         &mut self,
         columns: &[&str],
@@ -160,7 +161,7 @@ pub trait DatasetIndexExt {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()>;
+    ) -> Result<IndexMetadata>;
 
     /// Drop indices by name.
     ///
@@ -236,11 +237,10 @@ pub trait DatasetIndexExt {
         } else if indices.len() == 1 {
             Ok(Some(indices[0].clone()))
         } else {
-            Err(Error::Index {
-                message: format!("Found multiple indices of the same name: {:?}, please use load_indices_by_name", 
-                    indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()),
-                location: location!(),
-            })
+            Err(Error::index(format!(
+                "Found multiple indices of the same name: {:?}, please use load_indices_by_name",
+                indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()
+            )))
         }
     }
 

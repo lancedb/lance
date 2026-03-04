@@ -24,24 +24,23 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
-use futures::future::Either;
 use futures::Stream;
+use futures::future::Either;
 use futures::{
+    StreamExt, TryStreamExt,
     future::{self, BoxFuture},
     stream::BoxStream,
-    StreamExt, TryStreamExt,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
+use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::PutOptions;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::location;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
 use url::Url;
 
@@ -51,23 +50,23 @@ pub mod external_manifest;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
-use lance_io::traits::WriteExt;
+use lance_io::traits::{WriteExt, Writer};
 
-use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
+use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-    aws_credential_types::provider::error::CredentialsError,
     aws_credential_types::provider::ProvideCredentials,
-    lance_io::object_store::{providers::aws::build_aws_credential, StorageOptions},
+    aws_credential_types::provider::error::CredentialsError,
+    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
     std::time::{Duration, SystemTime},
 };
 
-const VERSIONS_DIR: &str = "_versions";
+pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 
@@ -204,7 +203,7 @@ pub fn write_manifest_file_to_path<'a>(
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let res = object_writer.shutdown().await?;
+        let res = Writer::shutdown(&mut object_writer).await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
@@ -230,21 +229,14 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
     fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
-        let filename = meta.location.filename().ok_or_else(|| Error::Internal {
-            message: "ObjectMeta location does not have a filename".to_string(),
-            location: location!(),
+        let filename = meta.location.filename().ok_or_else(|| {
+            Error::internal("ObjectMeta location does not have a filename".to_string())
         })?;
-        let scheme =
-            ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+        let scheme = ManifestNamingScheme::detect_scheme(filename)
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         let version = scheme
             .parse_version(filename)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         Ok(Self {
             version,
             path: meta.location,
@@ -260,10 +252,10 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
-            return Ok(location);
-        }
+    if object_store.is_local()
+        && let Ok(Some(location)) = current_manifest_local(base)
+    {
+        return Ok(location);
     }
 
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
@@ -318,23 +310,24 @@ async fn current_manifest_path(
                 e_tag: meta.e_tag,
             })
         }
-        // If the first valid manifest we see if V1, assume for now that we are
-        // using V1 naming scheme for all manifests. Since we are listing the
-        // directory anyways, we will assert there aren't any V2 manifests.
-        (Some((scheme, meta)), _) => {
-            let mut current_version = scheme
+        // If the list is not lexically ordered, we need to iterate all manifests
+        // to find the latest version. This works for both V1 and V2 schemes.
+        (Some((first_scheme, meta)), _) => {
+            let mut current_version = first_scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
             let mut current_meta = meta;
+            let scheme = first_scheme;
 
-            while let Some((scheme, meta)) = valid_manifests.next().await.transpose()? {
-                if matches!(scheme, ManifestNamingScheme::V2) {
-                    return Err(Error::Internal {
-                        message: "Found V2 manifest in a V1 manifest directory".to_string(),
-                        location: location!(),
-                    });
+            while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
+                if entry_scheme != scheme {
+                    return Err(Error::internal(format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                         Use `migrate_manifest_paths_v2` to migrate the directory.",
+                        scheme, entry_scheme
+                    )));
                 }
-                let version = scheme
+                let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
                     .unwrap();
                 if version > current_version {
@@ -350,10 +343,7 @@ async fn current_manifest_path(
                 e_tag: current_meta.e_tag,
             })
         }
-        (None, _) => Err(Error::NotFound {
-            uri: base.child(VERSIONS_DIR).to_string(),
-            location: location!(),
-        }),
+        (None, _) => Err(Error::not_found(base.child(VERSIONS_DIR).to_string())),
     }
 }
 
@@ -422,36 +412,6 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     }
 }
 
-// Based on object store's implementation.
-fn get_etag(metadata: &std::fs::Metadata) -> String {
-    let inode = get_inode(metadata);
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .unwrap_or_default()
-        .as_micros();
-
-    // Use an ETag scheme based on that used by many popular HTTP servers
-    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
-    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
-    format!("{inode:x}-{mtime:x}-{size:x}")
-}
-
-#[cfg(unix)]
-/// We include the inode when available to yield an ETag more resistant to collisions
-/// and as used by popular web servers such as [Apache](https://httpd.apache.org/docs/2.2/mod/core.html#fileetag)
-fn get_inode(metadata: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(metadata)
-}
-
-#[cfg(not(unix))]
-/// On platforms where an inode isn't available, fallback to just relying on size and mtime
-fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
-    0
-}
-
 fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
@@ -470,10 +430,7 @@ fn list_manifests<'a>(
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
-    Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
-        source: Box::new(e),
-        location: location!(),
-    })
+    Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
 
 #[cfg(feature = "dynamodb")]
@@ -678,8 +635,8 @@ async fn build_dynamodb_external_store(
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{
-        config::{retry::RetryConfig, IdentityCache, Region},
         Client,
+        config::{IdentityCache, Region, retry::RetryConfig},
     };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
@@ -724,57 +681,52 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "memory" | "oss" => Ok(Arc::new(ConditionalPutCommitHandler)),
+        "s3" | "gs" | "az" | "memory" | "oss" | "cos" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
-        "s3+ddb" => Err(Error::InvalidInput {
-            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
-            location: location!(),
-        }),
+        "s3+ddb" => Err(Error::invalid_input_source(
+            "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
+        )),
         #[cfg(feature = "dynamodb")]
         "s3+ddb" => {
             if url.query_pairs().count() != 1 {
-                return Err(Error::InvalidInput {
-                    source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                ));
             }
             let table_name = match url.query_pairs().next() {
                 Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
                     if key == DDB_URL_QUERY_KEY =>
                 {
                     if table_name.is_empty() {
-                        return Err(Error::InvalidInput {
-                            source: "`s3+ddb://` scheme requires non empty dynamodb table name"
-                                .into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            "`s3+ddb://` scheme requires non empty dynamodb table name".into(),
+                        ));
                     }
                     table_name
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                    ));
                 }
             };
             let options = options.clone().unwrap_or_default();
-            let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
-            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
-            let expires_at_millis = storage_options.expires_at_millis();
-            let storage_options = storage_options.as_s3_options();
+            let storage_options_raw =
+                StorageOptions(options.storage_options().cloned().unwrap_or_default());
+            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options_raw);
+            let storage_options = storage_options_raw.as_s3_options();
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
+
+            // Get accessor from the options
+            let accessor = options.get_accessor();
 
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
-                options.storage_options_provider.clone(),
-                expires_at_millis,
+                accessor,
             )
             .await?;
 
@@ -820,10 +772,7 @@ impl From<Error> for CommitError {
 impl From<CommitError> for Error {
     fn from(e: CommitError) -> Self {
         match e {
-            CommitError::CommitConflict => Self::Internal {
-                message: "Commit conflict".to_string(),
-                location: location!(),
-            },
+            CommitError::CommitConflict => Self::internal("Commit conflict".to_string()),
             CommitError::OtherError(e) => e,
         }
     }
@@ -1239,5 +1188,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_current_manifest_path(
+        #[values(true, false)] lexical_list_store: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        // Use memory store for both cases to avoid local FS special codepath.
+        // Modify list_is_lexically_ordered to simulate different object stores.
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = lexical_list_store;
+        let object_store = Box::new(object_store);
+        let base = Path::from("base");
+
+        // Write 12 manifest files in non-sequential order
+        for version in [5, 2, 11, 0, 8, 3, 10, 1, 7, 4, 9, 6] {
+            let path = naming_scheme.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+
+        assert_eq!(location.version, 11);
+        assert_eq!(location.naming_scheme, naming_scheme);
+        assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
     }
 }

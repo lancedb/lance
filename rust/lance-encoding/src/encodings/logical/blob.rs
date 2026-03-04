@@ -4,18 +4,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
+    Array, ArrayRef, StructArray, UInt64Array,
     builder::{PrimitiveBuilder, StringBuilder},
     cast::AsArray,
-    types::{UInt32Type, UInt64Type, UInt8Type},
-    Array, ArrayRef, StructArray, UInt64Array,
+    types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    datatypes::Field, datatypes::BLOB_V2_DESC_FIELDS, error::LanceOptionExt, Error, Result,
+    Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
 };
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -90,11 +89,9 @@ impl BlobStructuralEncoder {
                     let encoded_page = encoded_page?;
 
                     let PageEncoding::Structural(inner_layout) = encoded_page.description else {
-                        return Err(Error::Internal {
-                            message: "Expected inner encoding to return structural layout"
-                                .to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(
+                            "Expected inner encoding to return structural layout".to_string(),
+                        ));
                     };
 
                     let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);
@@ -128,12 +125,11 @@ impl FieldEncoder for BlobStructuralEncoder {
         }
 
         // Convert input array to LargeBinary
-        let binary_array = array
-            .as_binary_opt::<i64>()
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("Expected LargeBinary array, got {}", array.data_type()).into(),
-                location: location!(),
-            })?;
+        let binary_array = array.as_binary_opt::<i64>().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Expected LargeBinary array, got {}", array.data_type()).into(),
+            )
+        })?;
 
         let repdef = RepDefBuilder::serialize(vec![repdef]);
 
@@ -141,10 +137,13 @@ impl FieldEncoder for BlobStructuralEncoder {
         let def = repdef.definition_levels.as_ref();
         let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
 
-        if self.def_meaning.is_none() {
-            self.def_meaning = Some(def_meaning.clone());
-        } else {
-            debug_assert_eq!(self.def_meaning.as_ref().unwrap(), &def_meaning);
+        match self.def_meaning.as_ref() {
+            None => {
+                self.def_meaning = Some(def_meaning.clone());
+            }
+            Some(existing) => {
+                debug_assert_eq!(existing, &def_meaning);
+            }
         }
 
         // Collect positions and sizes
@@ -281,27 +280,39 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
         let kind_col = struct_arr
             .column_by_name("kind")
-            .expect("kind column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `kind` field".into())
+            })?
             .as_primitive::<UInt8Type>();
         let data_col = struct_arr
             .column_by_name("data")
-            .expect("data column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `data` field".into())
+            })?
             .as_binary::<i64>();
         let uri_col = struct_arr
             .column_by_name("uri")
-            .expect("uri column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `uri` field".into())
+            })?
             .as_string::<i32>();
         let blob_id_col = struct_arr
             .column_by_name("blob_id")
-            .expect("blob_id column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `blob_id` field".into())
+            })?
             .as_primitive::<UInt32Type>();
         let blob_size_col = struct_arr
             .column_by_name("blob_size")
-            .expect("blob_size column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `blob_size` field".into())
+            })?
             .as_primitive::<UInt64Type>();
         let packed_position_col = struct_arr
             .column_by_name("position")
-            .expect("position column must exist")
+            .ok_or_else(|| {
+                Error::invalid_input_source("Blob v2 struct missing `position` field".into())
+            })?
             .as_primitive::<UInt64Type>();
 
         let row_count = struct_arr.len();
@@ -326,13 +337,31 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             blob_id_col.value(i),
                             "".to_string(),
                         ),
-                        BlobKind::External => (
-                            BlobKind::External as u8,
-                            0,
-                            0,
-                            0,
-                            uri_col.value(i).to_string(),
-                        ),
+                        BlobKind::External => {
+                            let uri = uri_col.value(i).to_string();
+                            let position = if packed_position_col.is_null(i) {
+                                0
+                            } else {
+                                packed_position_col.value(i)
+                            };
+                            let size = if blob_size_col.is_null(i) {
+                                0
+                            } else {
+                                blob_size_col.value(i)
+                            };
+                            let external_base_id = if blob_id_col.is_null(i) {
+                                0
+                            } else {
+                                blob_id_col.value(i)
+                            };
+                            (
+                                BlobKind::External as u8,
+                                position,
+                                size,
+                                external_base_id,
+                                uri,
+                            )
+                        }
                         BlobKind::Packed => (
                             BlobKind::Packed as u8,
                             packed_position_col.value(i),
@@ -409,13 +438,13 @@ mod tests {
         compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{
-            check_round_trip_encoding_of_data, check_round_trip_encoding_of_data_with_expected,
-            TestCases,
+            TestCases, check_round_trip_encoding_of_data,
+            check_round_trip_encoding_of_data_with_expected,
         },
         version::LanceFileVersion,
     };
     use arrow_array::{
-        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField};
 
@@ -498,13 +527,20 @@ mod tests {
         ]));
 
         // Use the standard test harness
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_blob_v2_external_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -579,8 +615,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
@@ -641,9 +679,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_v2_external_with_range_round_trip() {
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
+
+        let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
+        let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+        let blob_id_field = Arc::new(ArrowField::new("blob_id", DataType::UInt32, true));
+        let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
+        let position_field = Arc::new(ArrowField::new("position", DataType::UInt64, true));
+
+        let kind_array = UInt8Array::from(vec![BlobKind::External as u8]);
+        let data_array = LargeBinaryArray::from(vec![None::<&[u8]>]);
+        let uri_array = StringArray::from(vec![Some("memory://container.pack")]);
+        let blob_id_array = UInt32Array::from(vec![0]);
+        let blob_size_array = UInt64Array::from(vec![42]);
+        let position_array = UInt64Array::from(vec![7]);
+
+        let struct_array = StructArray::from(vec![
+            (kind_field, Arc::new(kind_array) as ArrayRef),
+            (data_field, Arc::new(data_array) as ArrayRef),
+            (uri_field, Arc::new(uri_array) as ArrayRef),
+            (blob_id_field, Arc::new(blob_id_array) as ArrayRef),
+            (blob_size_field, Arc::new(blob_size_array) as ArrayRef),
+            (position_field, Arc::new(position_array) as ArrayRef),
+        ]);
+
+        let expected_descriptor = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
+                Arc::new(UInt8Array::from(vec![BlobKind::External as u8])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![42])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["memory://container.pack"])) as ArrayRef,
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data_with_expected(
+            vec![Arc::new(struct_array)],
+            Some(Arc::new(expected_descriptor)),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_packed_round_trip() {
-        let blob_metadata =
-            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_metadata = HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]);
 
         let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));

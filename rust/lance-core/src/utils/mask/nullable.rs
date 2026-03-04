@@ -3,7 +3,7 @@
 
 use deepsize::DeepSizeOf;
 
-use super::{RowAddrTreeMap, RowIdMask};
+use super::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 
 /// A set of row ids, with optional set of nulls.
 ///
@@ -121,18 +121,18 @@ impl std::ops::BitOrAssign<&Self> for NullableRowAddrSet {
     }
 }
 
-/// A version of [`RowIdMask`] that supports nulls.
+/// A version of [`RowAddrMask`] that supports nulls.
 ///
 /// This mask handles three-valued logic for SQL expressions, where a filter can
 /// evaluate to TRUE, FALSE, or NULL. The `selected` set includes rows that are
 /// TRUE or NULL. The `nulls` set includes rows that are NULL.
 #[derive(Clone, Debug)]
-pub enum NullableRowIdMask {
+pub enum NullableRowAddrMask {
     AllowList(NullableRowAddrSet),
     BlockList(NullableRowAddrSet),
 }
 
-impl NullableRowIdMask {
+impl NullableRowAddrMask {
     pub fn selected(&self, row_id: u64) -> bool {
         match self {
             Self::AllowList(NullableRowAddrSet { selected, nulls }) => {
@@ -144,19 +144,19 @@ impl NullableRowIdMask {
         }
     }
 
-    pub fn drop_nulls(self) -> RowIdMask {
+    pub fn drop_nulls(self) -> RowAddrMask {
         match self {
             Self::AllowList(NullableRowAddrSet { selected, nulls }) => {
-                RowIdMask::AllowList(selected - nulls)
+                RowAddrMask::AllowList(selected - nulls)
             }
             Self::BlockList(NullableRowAddrSet { selected, nulls }) => {
-                RowIdMask::BlockList(selected | nulls)
+                RowAddrMask::BlockList(selected | nulls)
             }
         }
     }
 }
 
-impl std::ops::Not for NullableRowIdMask {
+impl std::ops::Not for NullableRowAddrMask {
     type Output = Self;
 
     fn not(self) -> Self::Output {
@@ -167,7 +167,7 @@ impl std::ops::Not for NullableRowIdMask {
     }
 }
 
-impl std::ops::BitAnd for NullableRowIdMask {
+impl std::ops::BitAnd for NullableRowAddrMask {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
@@ -214,7 +214,7 @@ impl std::ops::BitAnd for NullableRowIdMask {
     }
 }
 
-impl std::ops::BitOr for NullableRowIdMask {
+impl std::ops::BitOr for NullableRowAddrMask {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -237,26 +237,31 @@ impl std::ops::BitOr for NullableRowIdMask {
             }
             (Self::AllowList(allow), Self::BlockList(block))
             | (Self::BlockList(block), Self::AllowList(allow)) => {
+                let allow_true = allow.selected.clone() - &allow.nulls;
+                let block_false = block.selected.clone() - &block.nulls;
+
                 let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
                     RowAddrTreeMap::new() // Fast path
                 } else {
-                    // null or null -> null (excluding rows that are true in either)
-                    let allow_true = allow.selected.clone() - &allow.nulls;
-                    ((allow.nulls | block.nulls) & block.selected.clone()) - allow_true
+                    // NULL|FALSE=NULL, FALSE|NULL=NULL, NULL|NULL=NULL, TRUE|NULL=TRUE.
+                    // So NULL rows are: (allow NULL & block FALSE) or (block NULL & allow not TRUE).
+                    (allow.nulls & &block_false) | (block.nulls - &allow_true)
                 };
-                let selected = (block.selected - allow.selected) | &nulls;
+                let selected = (block_false - &allow_true) | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
             (Self::BlockList(a), Self::BlockList(b)) => {
+                let a_false = a.selected.clone() - &a.nulls;
+                let b_false = b.selected.clone() - &b.nulls;
                 let nulls = if a.nulls.is_empty() && b.nulls.is_empty() {
                     RowAddrTreeMap::new() // Fast path
                 } else {
-                    // null or null -> null (excluding rows that are true in either)
-                    let false_rows =
-                        (a.selected.clone() - &a.nulls) & (b.selected.clone() - &b.nulls);
-                    (a.nulls | &b.nulls) - false_rows
+                    // NULL if: (A NULL & B FALSE) or (A FALSE & B NULL) or (A NULL & B NULL).
+                    (a.nulls.clone() & &b_false)
+                        | (b.nulls.clone() & &a_false)
+                        | (a.nulls & &b.nulls)
                 };
-                let selected = (a.selected & b.selected) | &nulls;
+                let selected = (a_false & b_false) | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
         }
@@ -275,15 +280,15 @@ mod tests {
         NullableRowAddrSet::new(rows(selected), rows(nulls))
     }
 
-    fn allow(selected: &[u64], nulls: &[u64]) -> NullableRowIdMask {
-        NullableRowIdMask::AllowList(nullable_set(selected, nulls))
+    fn allow(selected: &[u64], nulls: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::AllowList(nullable_set(selected, nulls))
     }
 
-    fn block(selected: &[u64], nulls: &[u64]) -> NullableRowIdMask {
-        NullableRowIdMask::BlockList(nullable_set(selected, nulls))
+    fn block(selected: &[u64], nulls: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::BlockList(nullable_set(selected, nulls))
     }
 
-    fn assert_mask_selects(mask: &NullableRowIdMask, selected: &[u64], not_selected: &[u64]) {
+    fn assert_mask_selects(mask: &NullableRowAddrMask, selected: &[u64], not_selected: &[u64]) {
         for &id in selected {
             assert!(mask.selected(id), "Expected row {} to be selected", id);
         }
@@ -361,6 +366,41 @@ mod tests {
 
         // Row 0: FALSE in both; Rows 1,2,3: NULL in at least one
         assert_mask_selects(&result, &[], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_or_allow_block_keeps_block_nulls() {
+        // Allow|Block OR must preserve NULLs from block even when block.selected is empty.
+        // allow: TRUE=[1], NULL=[0]; block: FALSE=[], NULL=[0]
+        let allow_mask = allow(&[1], &[0]);
+        let block_mask = block(&[], &[0]);
+        let result = allow_mask | block_mask;
+
+        // Row 1 is TRUE; row 0 remains NULL (not selected)
+        assert_mask_selects(&result, &[1], &[0]);
+    }
+
+    #[test]
+    fn test_or_allow_block_keeps_block_nulls_with_false_rows() {
+        // Ensure FALSE stays FALSE and NULL stays NULL when both appear on the block side.
+        // allow: TRUE=[2], NULL=[]; block: FALSE=[1], NULL=[0]
+        let allow_mask = allow(&[2], &[]);
+        let block_mask = block(&[1], &[0]);
+        let result = allow_mask | block_mask;
+
+        // Row 2 is TRUE; row 1 is FALSE; row 0 remains NULL (not selected)
+        assert_mask_selects(&result, &[2], &[0, 1]);
+    }
+
+    #[test]
+    fn test_or_block_block_true_overrides_null() {
+        // TRUE OR NULL should be TRUE, even when both sides are BlockList.
+        let true_mask = block(&[], &[]);
+        let null_mask = block(&[], &[0]);
+        let result = true_mask | null_mask;
+
+        // Row 0 should be TRUE.
+        assert_mask_selects(&result, &[0], &[]);
     }
 
     #[test]
@@ -520,7 +560,7 @@ mod tests {
         let not_mask = !block_mask;
 
         // NOT(BlockList) = AllowList
-        assert!(matches!(not_mask, NullableRowIdMask::AllowList(_)));
+        assert!(matches!(not_mask, NullableRowAddrMask::AllowList(_)));
     }
 
     #[test]

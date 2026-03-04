@@ -3,12 +3,13 @@
 
 use core::slice;
 
+use crate::Error;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
-use crate::Error;
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
+use lance_index::scalar::inverted::query::{Occur, Operator};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -97,6 +98,8 @@ pub trait JNIEnvExt {
         obj: &JObject,
         method_name: &str,
     ) -> Result<Option<u32>>;
+    // Get f32 from Java Float with given method name.
+    fn get_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<f32>;
 
     fn get_optional_integer_from_method<T>(
         &mut self,
@@ -145,7 +148,11 @@ pub trait JNIEnvExt {
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
-        F: FnOnce(&mut JNIEnv, &JObject) -> Result<T>;
+        F: FnOnce(&mut JNIEnv, JObject) -> Result<T>;
+
+    fn get_fts_operator_from_method(&mut self, obj: &JObject) -> Result<Operator>;
+
+    fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
@@ -197,9 +204,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_string_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_string_obj| {
             let jstr = JString::from(java_string_obj);
             let val = env.get_string(&jstr)?;
             Ok(val.to_str()?.to_string())
@@ -207,17 +212,11 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_list_obj = java_obj_gen.l()?;
-            env.get_strings(&java_list_obj)
-        })
+        self.get_optional(obj, |env, java_list_obj| env.get_strings(&java_list_obj))
     }
 
     fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_int_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_int_obj| {
             let int_obj = env.call_method(java_int_obj, "intValue", "()I", &[])?;
             let int_value = int_obj.i()?;
             Ok(int_value)
@@ -225,17 +224,11 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_ints_opt(&mut self, obj: &JObject) -> Result<Option<Vec<i32>>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_list_obj = java_obj_gen.l()?;
-            env.get_integers(&java_list_obj)
-        })
+        self.get_optional(obj, |env, java_list_obj| env.get_integers(&java_list_obj))
     }
 
     fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_long_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_long_obj| {
             let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[])?;
             let long_value = long_obj.j()?;
             Ok(long_value)
@@ -243,9 +236,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_boolean_opt(&mut self, obj: &JObject) -> Result<Option<bool>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_boolean_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_boolean_obj| {
             let boolean_obj = env.call_method(java_boolean_obj, "booleanValue", "()Z", &[])?;
             let boolean_value = boolean_obj.z()?;
             Ok(boolean_value)
@@ -253,9 +244,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_f32_opt(&mut self, obj: &JObject) -> Result<Option<f32>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_float_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_float_obj| {
             let float_obj = env.call_method(java_float_obj, "floatValue", "()F", &[])?;
             let float_value = float_obj.f()?;
             Ok(float_value)
@@ -263,9 +252,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_u64_opt(&mut self, obj: &JObject) -> Result<Option<u64>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_long_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_long_obj| {
             let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[])?;
             let long_value = long_obj.j()?;
             Ok(long_value as u64)
@@ -273,9 +260,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>> {
-        self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
-            let java_byte_buffer_obj = java_obj_gen.l()?;
+        self.get_optional(obj, |env, java_byte_buffer_obj| {
             let j_byte_buffer = JByteBuffer::from(java_byte_buffer_obj);
             let raw_data = env.get_direct_buffer_address(&j_byte_buffer)?;
             let capacity = env.get_direct_buffer_capacity(&j_byte_buffer)?;
@@ -288,10 +273,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     where
         F: Fn(&mut JNIEnv, &JObject) -> Result<T>,
     {
-        self.get_optional(obj, |env, opt_obj| {
-            let list_obj = env
-                .call_method(opt_obj, "get", "()Ljava/lang/Object;", &[])?
-                .l()?;
+        self.get_optional(obj, |env, list_obj| {
             let list = env.get_list(&list_obj)?;
             let mut iter = list.iter(env)?;
             let mut items: Vec<T> = Vec::with_capacity(list.size(env)? as usize);
@@ -301,6 +283,34 @@ impl JNIEnvExt for JNIEnv<'_> {
 
             Ok(items)
         })
+    }
+
+    fn get_fts_operator_from_method(&mut self, obj: &JObject) -> Result<Operator> {
+        let operator_obj = self
+            .call_method(
+                obj,
+                "getOperator",
+                "()Lorg/lance/ipc/FullTextQuery$Operator;",
+                &[],
+            )?
+            .l()?;
+        let operator_str = self.get_string_from_method(&operator_obj, "name")?;
+        Operator::try_from(operator_str.as_str())
+            .map_err(|e| Error::input_error(format!("Invalid operator: {:?}", e)))
+    }
+
+    fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur> {
+        let occur_obj = self
+            .call_method(
+                obj,
+                "getOccur",
+                "()Lorg/lance/ipc/FullTextQuery$Occur;",
+                &[],
+            )?
+            .l()?;
+        let occur_str = self.get_string_from_method(&occur_obj, "name")?;
+        Occur::try_from(occur_str.as_str())
+            .map_err(|e| Error::input_error(format!("Invalid occur: {:?}", e)))
     }
 
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
@@ -360,6 +370,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         self.get_optional_integer_from_method(obj, method_name)
     }
 
+    fn get_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<f32> {
+        let float_obj = self.call_method(obj, method_name, "()F", &[])?;
+        let float_value = float_obj.f()?;
+        Ok(float_value)
+    }
+
     fn get_optional_integer_from_method<T>(
         &mut self,
         obj: &JObject,
@@ -369,24 +385,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         T: TryFrom<i32>,
         <T as TryFrom<i32>>::Error: std::fmt::Debug,
     {
-        let java_object = self
-            .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
-            .l()?;
-        let rust_obj = if self
-            .call_method(&java_object, "isPresent", "()Z", &[])?
-            .z()?
-        {
-            let inner_jobj = self
-                .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
-                .l()?;
-            let inner_value = self.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
-            Some(T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
-            })?)
-        } else {
-            None
-        };
-        Ok(rust_obj)
+        self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
+            let inner_value = env.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
+            T::try_from(inner_value).map_err(|e| {
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+            })
+        })
     }
 
     fn get_optional_i64_from_method(
@@ -414,26 +418,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         T: TryFrom<i64>,
         <T as TryFrom<i64>>::Error: std::fmt::Debug,
     {
-        let java_object = self
-            .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
-            .l()?;
-        let rust_obj = if self
-            .call_method(&java_object, "isPresent", "()Z", &[])?
-            .z()?
-        {
-            let inner_jobj = self
-                .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
-                .l()?;
-            let inner_value = self
-                .call_method(&inner_jobj, "longValue", "()J", &[])?
-                .j()?;
-            Some(T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
-            })?)
-        } else {
-            None
-        };
-        Ok(rust_obj)
+        self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
+            let inner_value = env.call_method(&inner_jobj, "longValue", "()J", &[])?.j()?;
+            T::try_from(inner_value).map_err(|e| {
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+            })
+        })
     }
 
     fn get_optional_string_from_method(
@@ -460,30 +450,22 @@ impl JNIEnvExt for JNIEnv<'_> {
         let optional_obj = self
             .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
             .l()?;
-
-        if self
-            .call_method(&optional_obj, "isPresent", "()Z", &[])?
-            .z()?
-        {
-            let inner_obj = self
-                .call_method(&optional_obj, "get", "()Ljava/lang/Object;", &[])?
-                .l()?;
-            f(self, inner_obj).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.get_optional(&optional_obj, f)
     }
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
-        F: FnOnce(&mut JNIEnv, &JObject) -> Result<T>,
+        F: FnOnce(&mut JNIEnv, JObject) -> Result<T>,
     {
         if obj.is_null() {
             return Ok(None);
         }
         let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
         if is_present.z()? {
-            f(self, obj).map(Some)
+            let inner_obj = self
+                .call_method(obj, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            f(self, inner_obj).map(Some)
         } else {
             // TODO(lu): put get java object into here cuz can only get java Object
             Ok(None)
@@ -491,7 +473,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     mut env: JNIEnv,
     _obj: JObject,
@@ -500,7 +482,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     ok_or_throw_without_return!(env, env.get_integers(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     mut env: JNIEnv,
     _obj: JObject,
@@ -509,7 +491,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     ok_or_throw_without_return!(env, env.get_longs(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     mut env: JNIEnv,
     _obj: JObject,
@@ -518,7 +500,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     ok_or_throw_without_return!(env, env.get_ints_opt(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     mut env: JNIEnv,
     _obj: JObject,
@@ -527,7 +509,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIndexParams(
     mut env: JNIEnv,
     _obj: JObject,

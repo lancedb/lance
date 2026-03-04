@@ -3,7 +3,6 @@
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -90,6 +89,11 @@ pub struct InvertedIndexParams {
     /// whether prefix only
     #[serde(default)]
     pub(crate) prefix_only: bool,
+
+    /// If true, skip the partition merge stage after indexing.
+    /// This can be useful for distributed indexing where merge is handled separately.
+    #[serde(default)]
+    pub(crate) skip_merge: bool,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -135,6 +139,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
+            skip_merge: defaults.skip_merge,
         })
     }
 }
@@ -186,6 +191,7 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
+            skip_merge: false,
         }
     }
 
@@ -214,6 +220,11 @@ impl InvertedIndexParams {
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
         self
+    }
+
+    /// Get whether positions are stored in this index.
+    pub fn has_positions(&self) -> bool {
+        self.with_position
     }
 
     pub fn max_token_length(mut self, max_token_length: Option<usize>) -> Self {
@@ -269,6 +280,12 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Skip merging partitions after indexing.
+    pub fn skip_merge(mut self, skip_merge: bool) -> Self {
+        self.skip_merge = skip_merge;
+        self
+    }
+
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
@@ -287,13 +304,10 @@ impl InvertedIndexParams {
                 Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
                 None => {
                     tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "removing stop words for language {:?} is not supported yet",
-                                self.language
-                            ),
-                            location!(),
-                        )
+                        Error::invalid_input(format!(
+                            "removing stop words for language {:?} is not supported yet",
+                            self.language
+                        ))
                     })?
                 }
             };
@@ -308,13 +322,10 @@ impl InvertedIndexParams {
             Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
             Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            _ => Err(Error::invalid_input(
-                format!(
-                    "unknown lance tokenizer {}",
-                    self.lance_tokenizer.as_ref().unwrap()
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "unknown lance tokenizer {}",
+                self.lance_tokenizer.as_ref().unwrap()
+            ))),
         }
     }
 
@@ -338,16 +349,16 @@ impl InvertedIndexParams {
                     self.max_ngram_length as usize,
                     self.prefix_only,
                 )
-                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+                .map_err(|e| Error::invalid_input(e.to_string()))?,
             )
             .dynamic()),
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
                 let Some(home) = language_model_home() else {
-                    return Err(Error::invalid_input(
-                        format!("unknown base tokenizer {}", self.base_tokenizer),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "unknown base tokenizer {}",
+                        self.base_tokenizer
+                    )));
                 };
                 lindera::LinderaBuilder::load(&home.join(s))?.build()
             }
@@ -355,17 +366,17 @@ impl InvertedIndexParams {
             s if s.starts_with("jieba/") || s == "jieba" => {
                 let s = if s == "jieba" { "jieba/default" } else { s };
                 let Some(home) = language_model_home() else {
-                    return Err(Error::invalid_input(
-                        format!("unknown base tokenizer {}", self.base_tokenizer),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "unknown base tokenizer {}",
+                        self.base_tokenizer
+                    )));
                 };
                 jieba::JiebaBuilder::load(&home.join(s))?.build()
             }
-            _ => Err(Error::invalid_input(
-                format!("unknown base tokenizer {}", self.base_tokenizer),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "unknown base tokenizer {}",
+                self.base_tokenizer
+            ))),
         }
     }
 }

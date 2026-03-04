@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::exec::{get_session_context, LanceExecutionOptions};
+use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
@@ -16,8 +16,8 @@ use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionState;
@@ -34,11 +34,11 @@ use datafusion::sql::planner::{
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
     Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+    ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, Between, BinaryExpr, Like, Operator},
+    logical_expr::{Between, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -48,7 +48,6 @@ use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
-use snafu::location;
 
 use chrono::Utc;
 use lance_core::{Error, Result};
@@ -252,6 +251,23 @@ impl Planner {
         self
     }
 
+    /// Resolve a column name using case-insensitive matching against the schema.
+    /// Returns the actual field name if found, otherwise returns the original name.
+    fn resolve_column_name(&self, name: &str) -> String {
+        // Try exact match first
+        if self.schema.field_with_name(name).is_ok() {
+            return name.to_string();
+        }
+        // Fall back to case-insensitive match
+        for field in self.schema.fields() {
+            if field.name().eq_ignore_ascii_case(name) {
+                return field.name().clone();
+            }
+        }
+        // Not found in schema - return original (might be computed column, system column, etc.)
+        name.to_string()
+    }
+
     fn column(&self, idents: &[Ident]) -> Expr {
         fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
             for ident in idents {
@@ -268,14 +284,16 @@ impl Planner {
         if self.enable_relations && idents.len() > 1 {
             // Create qualified column reference (relation.column)
             let relation = &idents[0].value;
-            let column_name = &idents[1].value;
-            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let column_name = self.resolve_column_name(&idents[1].value);
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name));
             let mut result = column;
             handle_remaining_idents(&mut result, &idents[2..]);
             result
         } else {
             // Default behavior - treat as struct field access
-            let mut column = col(&idents[0].value);
+            // Use resolved column name to handle case-insensitive matching
+            let resolved_name = self.resolve_column_name(&idents[0].value);
+            let mut column = Expr::Column(Column::from_name(resolved_name));
             handle_remaining_idents(&mut column, &idents[1..]);
             column
         }
@@ -298,10 +316,9 @@ impl Planner {
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
             _ => {
-                return Err(Error::invalid_input(
-                    format!("Operator {op} is not supported"),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Operator {op} is not supported"
+                )));
             }
         })
     }
@@ -328,10 +345,7 @@ impl Planner {
                         Err(_) => lit(-n
                             .parse::<f64>()
                             .map_err(|_e| {
-                                Error::invalid_input(
-                                    format!("negative operator can be only applied to integer and float operands, got: {n}"),
-                                    location!(),
-                                )
+                                Error::invalid_input(format!("negative operator can be only applied to integer and float operands, got: {n}"))
                             })?),
                     },
                     _ => {
@@ -341,10 +355,10 @@ impl Planner {
             }
 
             _ => {
-                return Err(Error::invalid_input(
-                    format!("Unary operator '{:?}' is not supported", op),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Unary operator '{:?}' is not supported",
+                    op
+                )));
             }
         })
     }
@@ -361,10 +375,7 @@ impl Planner {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
-                Error::invalid_input(
-                    format!("'{value}' is not supported number value."),
-                    location!(),
-                )
+                Error::invalid_input(format!("'{value}' is not supported number value."))
             })
         }
     }
@@ -386,10 +397,10 @@ impl Planner {
     fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported function args: {:?}", func_args),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported function args: {:?}",
+                func_args
+            ))),
         }
     }
 
@@ -403,29 +414,28 @@ impl Planner {
         match &func.args {
             FunctionArguments::List(args) => {
                 if func.name.0.len() != 1 {
-                    return Err(Error::invalid_input(
-                        format!("Function name must have 1 part, got: {:?}", func.name.0),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Function name must have 1 part, got: {:?}",
+                        func.name.0
+                    )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
                     self.parse_function_args(&args.args[0])?,
                 )))
             }
-            _ => Err(Error::invalid_input(
-                format!("Unsupported function args: {:?}", &func.args),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported function args: {:?}",
+                &func.args
+            ))),
         }
     }
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
-        if let SQLExpr::Function(function) = &function {
-            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
-                if &name.value == "is_valid" {
-                    return self.legacy_parse_function(function);
-                }
-            }
+        if let SQLExpr::Function(function) = &function
+            && let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first()
+            && &name.value == "is_valid"
+        {
+            return self.legacy_parse_function(function);
         }
         let sql_to_rel = SqlToRel::new_with_options(
             &self.context_provider,
@@ -444,7 +454,7 @@ impl Planner {
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         sql_to_rel
             .sql_to_expr(function, &schema, &mut planner_context)
-            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}"), location!()))
+            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}")))
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -486,7 +496,6 @@ impl Planner {
                     _ => {
                         return Err(Error::invalid_input(
                             "Timezone not supported in timestamp".to_string(),
-                            location!(),
                         ));
                     }
                 };
@@ -498,10 +507,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "Unsupported datetime resolution: {:?}",
+                            resolution
+                        )));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -514,10 +523,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "Unsupported datetime resolution: {:?}",
+                            resolution
+                        )));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -526,21 +535,15 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => Err(Error::invalid_input(
-                    format!(
-                        "Must provide precision and scale for decimal: {:?}",
-                        number_info
-                    ),
-                    location!(),
-                )),
+                _ => Err(Error::invalid_input(format!(
+                    "Must provide precision and scale for decimal: {:?}",
+                    number_info
+                ))),
             },
-            _ => Err(Error::invalid_input(
-                format!(
-                    "Unsupported data type: {:?}. Supported types: {:?}",
-                    data_type, SUPPORTED_TYPES
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported data type: {:?}. Supported types: {:?}",
+                data_type, SUPPORTED_TYPES
+            ))),
         }
     }
 
@@ -554,10 +557,7 @@ impl Planner {
                 }
             }
         }
-        Err(Error::invalid_input(
-            "Field access could not be planned",
-            location!(),
-        ))
+        Err(Error::invalid_input("Field access could not be planned"))
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
@@ -586,13 +586,10 @@ impl Planner {
                 let mut values = vec![];
 
                 let array_literal_error = |pos: usize, value: &_| {
-                    Err(Error::invalid_input(
-                        format!(
-                            "Expected a literal value in array, instead got {} at position {}",
-                            value, pos
-                        ),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input(format!(
+                        "Expected a literal value in array, instead got {} at position {}",
+                        value, pos
+                    )))
                 };
 
                 for (pos, expr) in elem.iter().enumerate() {
@@ -633,10 +630,7 @@ impl Planner {
 
                     for value in &mut values {
                         if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(
-                                format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
-                                location!()
-                            ))?;
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type())))?;
                         }
                     }
                     Field::new("item", data_type, true)
@@ -660,7 +654,9 @@ impl Planner {
                 Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
             // For example, DATE '2020-01-01'
-            SQLExpr::TypedString { data_type, value } => {
+            SQLExpr::TypedString(TypedString {
+                data_type, value, ..
+            }) => {
                 let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
                     expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
@@ -699,10 +695,12 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(
-                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
-                        location!()
-                    )),
+                    Some(value) => {
+                        return Err(Error::invalid_input(format!(
+                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
+                            value
+                        )));
+                    }
                     None => None,
                 },
                 true,
@@ -719,10 +717,12 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 match escape_char {
                     Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => return Err(Error::invalid_input(
-                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
-                        location!()
-                    )),
+                    Some(value) => {
+                        return Err(Error::invalid_input(format!(
+                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
+                            value
+                        )));
+                    }
                     None => None,
                 },
                 false,
@@ -745,10 +745,7 @@ impl Planner {
                     data_type: self.parse_type(data_type)?,
                 })),
             },
-            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
-                "JSON access is not supported",
-                location!(),
-            )),
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input("JSON access is not supported")),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
                 let mut expr = self.parse_sql_expr(root)?;
 
@@ -771,17 +768,13 @@ impl Planner {
                             GetFieldAccess::ListIndex { key }
                         }
                         AccessExpr::Subscript(Subscript::Slice { .. }) => {
-                            return Err(Error::invalid_input(
-                                "Slice subscript is not supported",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Slice subscript is not supported"));
                         }
                         _ => {
                             // Handle other cases like JSON access
                             // Note: JSON access is not supported in lance
                             return Err(Error::invalid_input(
                                 "Only dot notation or index access is supported for field access",
-                                location!(),
                             ));
                         }
                     };
@@ -811,10 +804,9 @@ impl Planner {
                 ));
                 Ok(between)
             }
-            _ => Err(Error::invalid_input(
-                format!("Expression '{expr}' is not supported SQL in lance"),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Expression '{expr}' is not supported SQL in lance"
+            ))),
         }
     }
 
@@ -828,10 +820,7 @@ impl Planner {
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
-            Error::invalid_input(
-                format!("Error resolving filter expression {filter}: {e}"),
-                location!(),
-            )
+            Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
@@ -842,10 +831,14 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
-        if self.schema.field_with_name(expr).is_ok() {
-            return Ok(col(expr));
+        // First check if it's a simple column reference (no operators, functions, etc.)
+        // resolve_column_name tries exact match first, then falls back to case-insensitive
+        let resolved_name = self.resolve_column_name(expr);
+        if self.schema.field_with_name(&resolved_name).is_ok() {
+            return Ok(Expr::Column(Column::from_name(resolved_name)));
         }
 
+        // Parse as SQL expression
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
@@ -999,7 +992,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
-        logical_expr::{lit, Cast},
+        logical_expr::{Cast, col, lit},
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;

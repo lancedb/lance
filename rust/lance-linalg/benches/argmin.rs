@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{Float32Array, UInt32Array};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_linalg::kernels::argmin_opt;
 use lance_testing::datagen::generate_random_array_with_seed;
 

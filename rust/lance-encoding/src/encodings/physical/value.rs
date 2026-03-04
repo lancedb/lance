@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_buffer::{bit_util, BooleanBufferBuilder};
-use snafu::location;
+use arrow_buffer::{BooleanBufferBuilder, bit_util};
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{
@@ -13,12 +12,12 @@ use crate::data::{
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
-    MAX_MINIBLOCK_VALUES,
+    MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
+    MiniBlockCompressor,
 };
+use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
 use crate::format::pb21::{self, CompressiveEncoding};
-use crate::format::ProtobufUtils21;
 
 use lance_core::{Error, Result};
 
@@ -53,7 +52,7 @@ impl ValueEncoder {
         // or FSL<boolean> we might have some number of bits per value that isn't
         // divisible by 8.  In this case, to avoid chunking in the middle of a byte
         // we calculate how many 8-value words we can fit in a chunk.
-        let (bytes_per_word, values_per_word) = if data.bits_per_value % 8 == 0 {
+        let (bytes_per_word, values_per_word) = if data.bits_per_value.is_multiple_of(8) {
             (data.bits_per_value / 8, 1)
         } else {
             (data.bits_per_value, 8)
@@ -65,7 +64,7 @@ impl ValueEncoder {
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
-        let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+        let bytes_per_chunk = u32::try_from(bytes_per_chunk).unwrap();
         debug_assert!(bytes_per_chunk > 0);
 
         let data_buffer = data.data;
@@ -86,7 +85,7 @@ impl ValueEncoder {
             } else if row_offset < data.num_values {
                 // Final chunk, special values
                 let num_bytes = data_buffer.len() as u64 - bytes_counter;
-                let num_bytes = u16::try_from(num_bytes).unwrap();
+                let num_bytes = u32::try_from(num_bytes).unwrap();
                 chunks.push(MiniBlockChunk {
                     log_num_values: 0,
                     buffer_sizes: vec![num_bytes],
@@ -147,7 +146,7 @@ impl ValueEncoder {
         row_offset: usize,
         num_rows: usize,
         validity_buffers: &mut [Vec<u8>],
-    ) -> Vec<u16> {
+    ) -> Vec<u32> {
         let mut row_offset = row_offset;
         let mut num_values = num_rows;
         let mut buffer_counter = 0;
@@ -160,14 +159,14 @@ impl ValueEncoder {
                     .clone()
                     .bit_slice_le_with_length(row_offset, num_values);
                 validity_buffers[buffer_counter].extend_from_slice(&validity_slice);
-                buffer_sizes.push(validity_slice.len() as u16);
+                buffer_sizes.push(validity_slice.len() as u32);
                 buffer_counter += 1;
             }
         }
 
         let bits_in_chunk = data.bits_per_value * num_values as u64;
         let bytes_in_chunk = bits_in_chunk.div_ceil(8);
-        let bytes_in_chunk = u16::try_from(bytes_in_chunk).unwrap();
+        let bytes_in_chunk = u32::try_from(bytes_in_chunk).unwrap();
         debug_assert!(bytes_in_chunk > 0);
         buffer_sizes.push(bytes_in_chunk);
 
@@ -192,7 +191,7 @@ impl ValueEncoder {
         }
         // It's an estimate because validity buffers may have some padding bits
         let cum_bits_per_value = data.bits_per_value * cum_dim;
-        let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value % 8 == 0 {
+        let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value.is_multiple_of(8) {
             (cum_bits_per_value / 8, 1)
         } else {
             (cum_bits_per_value, 8)
@@ -473,14 +472,13 @@ impl MiniBlockCompressor for ValueEncoder {
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
             DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
                     chunk.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -758,12 +756,12 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, new_null_array, types::UInt32Type, Array, ArrayRef, Decimal128Array,
-        FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+        make_array, new_null_array, types::UInt32Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -777,8 +775,8 @@ pub(crate) mod tests {
         },
         format::pb21::compressive_encoding::Compression,
         testing::{
-            check_basic_random, check_round_trip_encoding_generated,
-            check_round_trip_encoding_of_data, FnArrayGeneratorProvider, TestCases,
+            FnArrayGeneratorProvider, TestCases, check_basic_random,
+            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
         },
         version::LanceFileVersion,
     };
@@ -837,13 +835,9 @@ pub(crate) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_simple_range() {
-        let items = Arc::new(Int32Array::from_iter((0..5000).map(|i| {
-            if i % 2 == 0 {
-                Some(i)
-            } else {
-                None
-            }
-        })));
+        let items = Arc::new(Int32Array::from_iter(
+            (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+        ));
 
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
 
@@ -901,13 +895,9 @@ pub(crate) mod tests {
         // Same as above but with mixed validity
         let data2 = (0..100)
             .map(|_| {
-                Arc::new(Int32Array::from_iter((0..100).map(|i| {
-                    if i % 2 == 0 {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                }))) as Arc<dyn Array>
+                Arc::new(Int32Array::from_iter(
+                    (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+                )) as Arc<dyn Array>
             })
             .collect::<Vec<_>>();
 
@@ -915,13 +905,9 @@ pub(crate) mod tests {
         // TODO: Re-enable once the all-null path is complete
         let _data3 = (0..100)
             .map(|chunk_idx| {
-                Arc::new(Int32Array::from_iter((0..100).map(|i| {
-                    if chunk_idx < 50 {
-                        None
-                    } else {
-                        Some(i)
-                    }
-                }))) as Arc<dyn Array>
+                Arc::new(Int32Array::from_iter(
+                    (0..100).map(|i| if chunk_idx < 50 { None } else { Some(i) }),
+                )) as Arc<dyn Array>
             })
             .collect::<Vec<_>>();
 

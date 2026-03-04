@@ -6,7 +6,6 @@ use super::query::{
 };
 use lance_core::{Error, Result};
 use serde_json::Value;
-use snafu::location;
 
 pub trait JsonParser {
     fn from_json(value: &Value) -> Result<Self>
@@ -19,7 +18,7 @@ impl JsonParser for MatchQuery {
         let column = value["column"].as_str().map(String::from);
         let terms = value["terms"]
             .as_str()
-            .ok_or_else(|| Error::invalid_input("missing terms in match query", location!()))?
+            .ok_or_else(|| Error::invalid_input("missing terms in match query"))?
             .to_string();
         let boost = value["boost"]
             .as_f64()
@@ -61,7 +60,7 @@ impl JsonParser for PhraseQuery {
         let column = value["column"].as_str().map(String::from);
         let terms = value["terms"]
             .as_str()
-            .ok_or_else(|| Error::invalid_input("missing terms in phrase query", location!()))?
+            .ok_or_else(|| Error::invalid_input("missing terms in phrase query"))?
             .to_string();
         let slop = value["slop"].as_u64().map(|v| v as u32).unwrap_or(0);
 
@@ -77,12 +76,12 @@ impl JsonParser for BoostQuery {
     fn from_json(value: &Value) -> Result<Self> {
         let positive = value["positive"]
             .as_object()
-            .ok_or_else(|| Error::invalid_input("missing positive in boost query", location!()))?;
+            .ok_or_else(|| Error::invalid_input("missing positive in boost query"))?;
         let positive_query = from_json_value(&Value::Object(positive.clone()))?;
 
         let negative = value["negative"]
             .as_object()
-            .ok_or_else(|| Error::invalid_input("missing negative in boost query", location!()))?;
+            .ok_or_else(|| Error::invalid_input("missing negative in boost query"))?;
         let negative_query = from_json_value(&Value::Object(negative.clone()))?;
 
         let negative_boost = value["negative_boost"].as_f64().map(|v| v as f32);
@@ -93,16 +92,16 @@ impl JsonParser for BoostQuery {
 
 impl JsonParser for MultiMatchQuery {
     fn from_json(value: &Value) -> Result<Self> {
-        let query = value["match_queries"].as_array().ok_or_else(|| {
-            Error::invalid_input("missing match_queries in multi_match query", location!())
-        })?;
+        let query = value["match_queries"]
+            .as_array()
+            .ok_or_else(|| Error::invalid_input("missing match_queries in multi_match query"))?;
         let query = query
             .iter()
             .map(MatchQuery::from_json)
             .collect::<Result<Vec<MatchQuery>>>()?;
 
         if query.is_empty() {
-            return Err(Error::invalid_input("empty multi_match query", location!()));
+            return Err(Error::invalid_input("empty multi_match query"));
         }
 
         Ok(Self {
@@ -143,12 +142,9 @@ impl JsonParser for BooleanQuery {
 fn from_json_value(value: &Value) -> Result<FtsQuery> {
     let value = value
         .as_object()
-        .ok_or_else(|| Error::invalid_input("value must be a JSON object", location!()))?;
+        .ok_or_else(|| Error::invalid_input("value must be a JSON object"))?;
     if value.len() != 1 {
-        return Err(Error::invalid_input(
-            "value must be a single JSON object",
-            location!(),
-        ));
+        return Err(Error::invalid_input("value must be a single JSON object"));
     }
 
     let (query_type, query_val) = value.into_iter().next().unwrap();
@@ -158,16 +154,16 @@ fn from_json_value(value: &Value) -> Result<FtsQuery> {
         "boost" => Ok(FtsQuery::Boost(BoostQuery::from_json(query_val)?)),
         "multi_match" => Ok(FtsQuery::MultiMatch(MultiMatchQuery::from_json(query_val)?)),
         "boolean" => Ok(FtsQuery::Boolean(BooleanQuery::from_json(query_val)?)),
-        _ => Err(Error::invalid_input(
-            format!("unknown fts query type: {}", query_type),
-            location!(),
-        )),
+        _ => Err(Error::invalid_input(format!(
+            "unknown fts query type: {}",
+            query_type
+        ))),
     }
 }
 
 pub fn from_json(json: &str) -> Result<FtsQuery> {
     let value: Value = serde_json::from_str(json)
-        .map_err(|e| Error::invalid_input(format!("invalid json: {}", e), location!()))?;
+        .map_err(|e| Error::invalid_input(format!("invalid json: {}", e)))?;
     from_json_value(&value)
 }
 

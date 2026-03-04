@@ -23,15 +23,14 @@
 
 use arrow_buffer::ArrowNativeType;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use std::str::FromStr;
 
 use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
-    pb21::{self, CompressiveEncoding},
     ProtobufUtils21,
+    pb21::{self, CompressiveEncoding},
 };
 use crate::{
     buffer::LanceBuffer,
@@ -76,10 +75,10 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
         match scheme {
             CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
             CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -91,10 +90,10 @@ impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
         match scheme {
             pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
             pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported compression scheme: {:?}",
+                scheme
+            ))),
         }
     }
 }
@@ -120,10 +119,10 @@ impl FromStr for CompressionScheme {
             "fsst" => Ok(Self::Fsst),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
-            _ => Err(Error::invalid_input(
-                format!("Unknown compression scheme: {}", s),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Unknown compression scheme: {}",
+                s
+            ))),
         }
     }
 }
@@ -137,20 +136,56 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
 #[cfg(feature = "zstd")]
 mod zstd {
     use std::io::{Cursor, Write};
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
 
-    use ::zstd::bulk::decompress_to_buffer;
+    use ::zstd::bulk::{Compressor, decompress_to_buffer};
     use ::zstd::stream::copy_decode;
 
-    #[derive(Debug, Default)]
+    /// A zstd buffer compressor that lazily creates and reuses compression contexts.
+    ///
+    /// The compression context is cached to enable reuse across chunks within a
+    /// page. It is lazily initialized to prevent it from getting initialized on
+    /// decode-only codepaths.
+    ///
+    /// Reuse is not implemented for decompression, only for compression:
+    /// * The single-threaded benefit of reuse was negligible when measured.
+    /// * Decompressors can get shared across threads, leading to mutex
+    ///   contention if the same strategy is used as for compression here. This
+    ///   should be mitigable with pooling but we can skip the complexity until a
+    ///   need is demonstrated. The multithreaded decode benchmark effectively
+    ///   demonstrates this scenario.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
+        compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
+    }
+
+    impl std::fmt::Debug for ZstdBufferCompressor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ZstdBufferCompressor")
+                .field("compression_level", &self.compression_level)
+                .finish()
+        }
     }
 
     impl ZstdBufferCompressor {
         pub fn new(compression_level: i32) -> Self {
-            Self { compression_level }
+            Self {
+                compression_level,
+                compressor: OnceLock::new(),
+            }
+        }
+
+        fn get_compressor(&self) -> Result<&Mutex<Compressor<'static>>> {
+            self.compressor
+                .get_or_init(|| {
+                    Compressor::new(self.compression_level)
+                        .map(Mutex::new)
+                        .map_err(|e| e.to_string())
+                })
+                .as_ref()
+                .map_err(|e| Error::internal(format!("Failed to create zstd compressor: {}", e)))
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -213,13 +248,20 @@ mod zstd {
     impl BufferCompressor for ZstdBufferCompressor {
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
-            let mut encoder = ::zstd::stream::Encoder::new(output_buf, self.compression_level)?;
 
-            encoder.write_all(input_buf)?;
-            match encoder.finish() {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            let max_compressed_size = ::zstd::zstd_safe::compress_bound(input_buf.len());
+            let start_pos = output_buf.len();
+            output_buf.resize(start_pos + max_compressed_size, 0);
+
+            let compressed_size = self
+                .get_compressor()?
+                .lock()
+                .unwrap()
+                .compress_to_buffer(input_buf, &mut output_buf[start_pos..])
+                .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
+
+            output_buf.truncate(start_pos + compressed_size);
+            Ok(())
         }
 
         fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -269,10 +311,7 @@ mod lz4 {
                 true,
                 &mut output_buf[start_pos..],
             )
-            .map_err(|err| Error::Internal {
-                message: format!("LZ4 compression error: {}", err),
-                location: location!(),
-            })?;
+            .map_err(|err| Error::internal(format!("LZ4 compression error: {}", err)))?;
 
             // Truncate to actual size
             output_buf.truncate(start_pos + compressed_size);
@@ -283,10 +322,7 @@ mod lz4 {
             // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
             // We can read this to know exactly how much space we need
             if input_buf.len() < 4 {
-                return Err(Error::Internal {
-                    message: "LZ4 compressed data too short".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal("LZ4 compressed data too short".to_string()));
             }
 
             // Read the uncompressed size from the first 4 bytes (little-endian)
@@ -303,10 +339,7 @@ mod lz4 {
             // Now decompress directly into the buffer slice
             let decompressed_size =
                 ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start_pos..])
-                    .map_err(|err| Error::Internal {
-                    message: format!("LZ4 decompression error: {}", err),
-                    location: location!(),
-                })?;
+                    .map_err(|err| Error::internal(format!("LZ4 decompression error: {}", err)))?;
 
             // Truncate to actual decompressed size (should be same as uncompressed_size)
             output_buf.truncate(start_pos + decompressed_size);
@@ -353,10 +386,9 @@ impl GeneralBufferCompressor {
     ) -> Result<Box<dyn BufferCompressor>> {
         match compression_config.scheme {
             // FSST has its own compression path and isn't implemented as a generic buffer compressor
-            CompressionScheme::Fsst => Err(Error::InvalidInput {
-                source: "fsst is not usable as a general buffer compressor".into(),
-                location: location!(),
-            }),
+            CompressionScheme::Fsst => Err(Error::invalid_input_source(
+                "fsst is not usable as a general buffer compressor".into(),
+            )),
             CompressionScheme::Zstd => {
                 #[cfg(feature = "zstd")]
                 {
@@ -366,10 +398,9 @@ impl GeneralBufferCompressor {
                 }
                 #[cfg(not(feature = "zstd"))]
                 {
-                    Err(Error::InvalidInput {
-                        source: "package was not built with zstd support".into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        "package was not built with zstd support".into(),
+                    ))
                 }
             }
             CompressionScheme::Lz4 => {
@@ -379,10 +410,9 @@ impl GeneralBufferCompressor {
                 }
                 #[cfg(not(feature = "lz4"))]
                 {
-                    Err(Error::InvalidInput {
-                        source: "package was not built with lz4 support".into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        "package was not built with lz4 support".into(),
+                    ))
                 }
             }
             CompressionScheme::None => Ok(Box::new(NoopBufferCompressor {})),
@@ -500,13 +530,10 @@ impl CompressedBufferEncoder {
 impl PerValueCompressor for CompressedBufferEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let data_type = data.name();
-        let data = data.as_variable_width().ok_or(Error::Internal {
-            message: format!(
-                "Attempt to use CompressedBufferEncoder on data of type {}",
-                data_type
-            ),
-            location: location!(),
-        })?;
+        let data = data.as_variable_width().ok_or(Error::internal(format!(
+            "Attempt to use CompressedBufferEncoder on data of type {}",
+            data_type
+        )))?;
 
         let data_bytes = &data.data;
         let mut compressed = Vec::with_capacity(data_bytes.len());
@@ -585,10 +612,9 @@ impl BlockCompressor for CompressedBufferEncoder {
                 BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: "Unsupported data block type".into(),
-                    location: location!(),
-                })
+                return Err(Error::invalid_input_source(
+                    "Unsupported data block type".into(),
+                ));
             }
         };
 
@@ -738,7 +764,7 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY,
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
-            testing::{check_round_trip_encoding_generated, FnArrayGeneratorProvider, TestCases},
+            testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
             version::LanceFileVersion,
         };
 
