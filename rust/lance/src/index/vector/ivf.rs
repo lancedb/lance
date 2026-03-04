@@ -92,6 +92,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
+use tokio::time::Instant;
 use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
@@ -1864,11 +1865,21 @@ pub async fn finalize_distributed_merge(
     requested_index_type: Option<IndexType>,
 ) -> Result<()> {
     // Merge per-shard auxiliary files into a unified auxiliary.idx.
+    let start = Instant::now();
+    let initial_io_stats = object_store.io_stats_snapshot();
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
         index_dir,
     )
     .await?;
+    let secs = start.elapsed().as_secs_f64();
+    let final_io_stats = object_store.io_stats_snapshot();
+    let iops = final_io_stats.read_iops - initial_io_stats.read_iops;
+    let iops_per_sec = (iops as f64) / secs;
+    let bytes_read = final_io_stats.read_bytes - initial_io_stats.read_bytes;
+    let bytes_read_per_sec = (bytes_read as f64) / secs;
+    log::info!("merge_partial_vector_auxiliary_files: IOPS: {}, IOPS/s: {:.3}, bytes read: {}, bytes read/s: {:3}",
+        iops, iops_per_sec, bytes_read, bytes_read_per_sec);
 
     // Open the unified auxiliary file.
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
