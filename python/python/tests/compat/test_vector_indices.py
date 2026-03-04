@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -245,7 +246,7 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
     def check_read(self):
         """Verify vector query can run (indexed or brute-force fallback)."""
         ds = lance.dataset(self.path)
-        q = pc.random(32).cast(pa.float32())
+        q = np.random.random(32).astype(np.float32)
         result = ds.to_table(
             nearest={
                 "q": q,
