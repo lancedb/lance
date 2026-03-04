@@ -206,28 +206,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             .boxed()
             .await?;
 
-            let merged_indices = &old_indices[old_indices.len() - indices_merged..];
-            merged_indices.iter().for_each(|idx| {
-                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-            });
-            let index_version = old_indices
+            old_indices[old_indices.len() - indices_merged..]
                 .iter()
-                .map(|idx| idx.index_version)
-                .max()
-                .ok_or_else(|| Error::index("Append index: no previous index found".to_string()))?;
-            if index_version < 0 {
-                return Err(Error::index(format!(
-                    "Append index: invalid vector index version {}",
-                    index_version
-                )));
-            }
+                .for_each(|idx| {
+                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+                });
 
             Ok((
                 new_uuid,
                 indices_merged,
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    index_version: index_version as u32,
+                    // retain_supported_indices guarantees all old_indices have
+                    // index_version <= our max supported version, so we can safely
+                    // write the current library's version for this index type.
+                    index_version: it.version() as u32,
                 },
             ))
         }
