@@ -49,7 +49,6 @@ use lance_index::vector::{
 };
 use lance_index::{
     DatasetIndexExt, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType,
-    VECTOR_INDEX_VERSION,
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -1553,7 +1552,7 @@ pub async fn initialize_vector_index(
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
         index_details: Some(Arc::new(vector_index_details())),
-        index_version: VECTOR_INDEX_VERSION as i32,
+        index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
     };

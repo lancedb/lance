@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
-use lance_index::VECTOR_INDEX_VERSION;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::NoopIndexBuildProgress;
@@ -207,18 +206,28 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             .boxed()
             .await?;
 
-            old_indices[old_indices.len() - indices_merged..]
+            let merged_indices = &old_indices[old_indices.len() - indices_merged..];
+            merged_indices.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+            let index_version = old_indices
                 .iter()
-                .for_each(|idx| {
-                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-                });
+                .map(|idx| idx.index_version)
+                .max()
+                .ok_or_else(|| Error::index("Append index: no previous index found".to_string()))?;
+            if index_version < 0 {
+                return Err(Error::index(format!(
+                    "Append index: invalid vector index version {}",
+                    index_version
+                )));
+            }
 
             Ok((
                 new_uuid,
                 indices_merged,
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                    index_version: index_version as u32,
                 },
             ))
         }

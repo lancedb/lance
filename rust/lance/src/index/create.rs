@@ -20,7 +20,7 @@ use crate::{
 use futures::future::BoxFuture;
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, VECTOR_INDEX_VERSION, scalar::CreatedIndex};
+use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
@@ -311,6 +311,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     .ok_or_else(|| {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
+                let index_version = vec_params.index_type().version() as u32;
 
                 if train {
                     // Check if this is distributed indexing (fragment-level)
@@ -354,7 +355,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 }
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                    index_version,
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -388,7 +389,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 }
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                    index_version: self.index_type.version() as u32,
                 }
             }
             (IndexType::FragmentReuse, _) => {
