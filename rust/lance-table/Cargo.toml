@@ -25,6 +25,7 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
+sqlx = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -60,6 +61,7 @@ protobuf-src = { version = "2.1", optional = true }
 
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
+sql_store = ["dep:sqlx"]
 protoc = ["dep:protobuf-src"]
 
 [package.metadata.docs.rs]

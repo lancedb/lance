@@ -1503,6 +1503,10 @@ async fn resolve_commit_handler(
                 Err(Error::invalid_input(
                     "`s3+ddb://` scheme and custom commit handler are mutually exclusive",
                 ))
+            } else if uri.starts_with("s3+sql") {
+                Err(Error::invalid_input(
+                    "`s3+sql://` scheme and custom commit handler are mutually exclusive",
+                ))
             } else {
                 Ok(commit_handler)
             }

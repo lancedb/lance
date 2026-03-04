@@ -48,6 +48,8 @@ use url::Url;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod external_manifest;
+#[cfg(feature = "sql_store")]
+pub mod sql;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
@@ -1153,6 +1155,24 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
+        #[cfg(not(feature = "sql_store"))]
+        "s3+sql" => Err(Error::invalid_input(
+            "`s3+sql://` scheme requires `sql_store` feature to be enabled",
+        )),
+        #[cfg(feature = "sql_store")]
+        "s3+sql" => {
+            let (conn_str, table_name, bucket_name, pool_config) = parse_sql_url_params(&url)?;
+            let store = sql::SqlExternalManifestStore::new_external_store(
+                &conn_str,
+                &table_name,
+                &bucket_name,
+                pool_config,
+            )
+            .await?;
+            Ok(Arc::new(external_manifest::ExternalManifestCommitHandler {
+                external_manifest_store: store,
+            }))
+        }
         _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }
@@ -1164,6 +1184,78 @@ fn get_dynamodb_endpoint(storage_options: &StorageOptions) -> Option<String> {
     } else {
         std::env::var("DYNAMODB_ENDPOINT").ok()
     }
+}
+
+/// Parse SQL-related query parameters from an `s3+sql://` URL.
+///
+/// URL format: `s3+sql://{bucket}/{path}?sqlConnStr={db_url}[&sqlTableName=...][&sqlMaxConnections=...][&...]`
+///
+/// Returns `(conn_str, table_name, bucket_name, SqlPoolConfig)`.
+#[cfg(feature = "sql_store")]
+fn parse_sql_url_params(url: &Url) -> Result<(String, String, String, sql::SqlPoolConfig)> {
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
+
+    let conn_str = params
+        .get("sqlConnStr")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "`s3+sql://` scheme requires a non-empty `sqlConnStr` query parameter",
+            )
+        })?
+        .clone();
+
+    let table_name = match params.get("sqlTableName") {
+        Some(t) if t.is_empty() => {
+            return Err(Error::invalid_input(
+                "`sqlTableName` must not be empty if specified",
+            ));
+        }
+        Some(t) => t.clone(),
+        None => "external_manifest".to_string(),
+    };
+
+    let bucket_name = url
+        .host_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::invalid_input("`s3+sql://` scheme requires a non-empty bucket name as host")
+        })?
+        .to_string();
+
+    let mut config = sql::SqlPoolConfig::default();
+
+    if let Some(v) = params.get("sqlMaxConnections") {
+        config.max_connections = v
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid sqlMaxConnections value: {}", v)))?;
+    }
+    if let Some(v) = params.get("sqlMinConnections") {
+        config.min_connections = v
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid sqlMinConnections value: {}", v)))?;
+    }
+    if let Some(v) = params.get("sqlAcquireTimeout") {
+        let secs: u64 = v
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid sqlAcquireTimeout value: {}", v)))?;
+        config.acquire_timeout = std::time::Duration::from_secs(secs);
+    }
+    if let Some(v) = params.get("sqlIdleTimeout") {
+        let secs: u64 = v
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid sqlIdleTimeout value: {}", v)))?;
+        config.idle_timeout = std::time::Duration::from_secs(secs);
+    }
+    if let Some(v) = params.get("sqlMaxLifetime") {
+        let secs: u64 = v
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid sqlMaxLifetime value: {}", v)))?;
+        config.max_lifetime = std::time::Duration::from_secs(secs);
+    }
+
+    Ok((conn_str, table_name, bucket_name, config))
 }
 
 /// Errors that can occur when committing a manifest.
