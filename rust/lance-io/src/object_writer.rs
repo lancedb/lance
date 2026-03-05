@@ -253,6 +253,13 @@ impl ObjectWriter {
                                 if mut_self.connection_resets < max_conn_reset_retries() {
                                     // Retry, but only up to max_conn_reset_retries of them.
                                     mut_self.connection_resets += 1;
+                                    tracing::warn!(
+                                        target: "lance_io::writer::connection_reset",
+                                        path = %mut_self.path,
+                                        reset_count = mut_self.connection_resets,
+                                        part_idx,
+                                        "connection reset by peer, retrying upload part"
+                                    );
 
                                     // Resubmit with random jitter
                                     let sleep_time_ms = rand::rng().random_range(2_000..8_000);

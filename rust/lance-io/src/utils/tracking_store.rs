@@ -13,6 +13,7 @@ use std::ops::Range;
 #[cfg(feature = "test-util")]
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -86,6 +87,18 @@ impl IOTracker {
             range: None,
         });
     }
+
+    /// Record a read error.
+    pub fn record_read_error(&self) {
+        let mut stats = self.0.lock().unwrap();
+        stats.read_errors += 1;
+    }
+
+    /// Record a write error.
+    pub fn record_write_error(&self) {
+        let mut stats = self.0.lock().unwrap();
+        stats.write_errors += 1;
+    }
 }
 
 impl WrappingObjectStore for IOTracker {
@@ -100,6 +113,14 @@ pub struct IoStats {
     pub read_bytes: u64,
     pub write_iops: u64,
     pub written_bytes: u64,
+    /// Cumulative read latency in microseconds.
+    pub read_latency_us: u64,
+    /// Cumulative write latency in microseconds.
+    pub write_latency_us: u64,
+    /// Number of failed read operations.
+    pub read_errors: u64,
+    /// Number of failed write operations.
+    pub write_errors: u64,
     // This is only really meaningful in tests where there isn't any concurrent IO.
     #[cfg(feature = "test-util")]
     /// Number of disjoint periods where at least one IO is in-flight.
@@ -252,10 +273,12 @@ impl IoTrackingStore {
         path: Path,
         num_bytes: u64,
         range: Option<Range<u64>>,
+        latency_us: u64,
     ) {
         let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
+        stats.read_latency_us += latency_us;
         #[cfg(feature = "test-util")]
         stats.requests.push(IoRequestRecord {
             method,
@@ -266,10 +289,11 @@ impl IoTrackingStore {
         let _ = (method, path, range); // Suppress unused variable warnings
     }
 
-    fn record_write(&self, method: &'static str, path: Path, num_bytes: u64) {
+    fn record_write(&self, method: &'static str, path: Path, num_bytes: u64, latency_us: u64) {
         let mut stats = self.stats.lock().unwrap();
         stats.write_iops += 1;
         stats.written_bytes += num_bytes;
+        stats.write_latency_us += latency_us;
         #[cfg(feature = "test-util")]
         stats.requests.push(IoRequestRecord {
             method,
@@ -278,6 +302,16 @@ impl IoTrackingStore {
         });
         #[cfg(not(feature = "test-util"))]
         let _ = (method, path); // Suppress unused variable warnings
+    }
+
+    fn record_read_error(&self) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.read_errors += 1;
+    }
+
+    fn record_write_error(&self) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.write_errors += 1;
     }
 
     #[cfg(feature = "test-util")]
@@ -296,8 +330,16 @@ impl IoTrackingStore {
 impl ObjectStore for IoTrackingStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         let _guard = self.stage_guard();
-        self.record_write("put", location.to_owned(), bytes.content_length() as u64);
-        self.target.put(location, bytes).await
+        let num_bytes = bytes.content_length() as u64;
+        let start = Instant::now();
+        let result = self.target.put(location, bytes).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("put", location.to_owned(), num_bytes, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     async fn put_opts(
@@ -307,12 +349,16 @@ impl ObjectStore for IoTrackingStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         let _guard = self.stage_guard();
-        self.record_write(
-            "put_opts",
-            location.to_owned(),
-            bytes.content_length() as u64,
-        );
-        self.target.put_opts(location, bytes, opts).await
+        let num_bytes = bytes.content_length() as u64;
+        let start = Instant::now();
+        let result = self.target.put_opts(location, bytes, opts).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("put_opts", location.to_owned(), num_bytes, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
@@ -347,10 +393,15 @@ impl ObjectStore for IoTrackingStore {
 
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
+        let start = Instant::now();
         let result = self.target.get(location).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-            self.record_read("get", location.to_owned(), num_bytes, None);
+        let latency_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(r) => {
+                let num_bytes = r.range.end - r.range.start;
+                self.record_read("get", location.to_owned(), num_bytes, None, latency_us);
+            }
+            Err(_) => self.record_read_error(),
         }
         result
     }
@@ -361,53 +412,83 @@ impl ObjectStore for IoTrackingStore {
             Some(GetRange::Bounded(range)) => Some(range.clone()),
             _ => None, // TODO: fill in other options.
         };
+        let start = Instant::now();
         let result = self.target.get_opts(location, options).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-
-            self.record_read("get_opts", location.to_owned(), num_bytes, range);
+        let latency_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(r) => {
+                let num_bytes = r.range.end - r.range.start;
+                self.record_read("get_opts", location.to_owned(), num_bytes, range, latency_us);
+            }
+            Err(_) => self.record_read_error(),
         }
         result
     }
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         let _guard = self.stage_guard();
+        let start = Instant::now();
         let result = self.target.get_range(location, range.clone()).await;
-        if let Ok(result) = &result {
-            self.record_read(
-                "get_range",
-                location.to_owned(),
-                result.len() as u64,
-                Some(range),
-            );
+        let latency_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(r) => {
+                self.record_read(
+                    "get_range",
+                    location.to_owned(),
+                    r.len() as u64,
+                    Some(range),
+                    latency_us,
+                );
+            }
+            Err(_) => self.record_read_error(),
         }
         result
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         let _guard = self.stage_guard();
+        let start = Instant::now();
         let result = self.target.get_ranges(location, ranges).await;
-        if let Ok(result) = &result {
-            self.record_read(
-                "get_ranges",
-                location.to_owned(),
-                result.iter().map(|b| b.len() as u64).sum(),
-                None,
-            );
+        let latency_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(r) => {
+                self.record_read(
+                    "get_ranges",
+                    location.to_owned(),
+                    r.iter().map(|b| b.len() as u64).sum(),
+                    None,
+                    latency_us,
+                );
+            }
+            Err(_) => self.record_read_error(),
         }
         result
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         let _guard = self.stage_guard();
-        self.record_read("head", location.to_owned(), 0, None);
-        self.target.head(location).await
+        let start = Instant::now();
+        let result = self.target.head(location).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_read("head", location.to_owned(), 0, None, latency_us);
+        } else {
+            self.record_read_error();
+        }
+        result
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
         let _guard = self.stage_guard();
-        self.record_write("delete", location.to_owned(), 0);
-        self.target.delete(location).await
+        let start = Instant::now();
+        let result = self.target.delete(location).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("delete", location.to_owned(), 0, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     fn delete_stream<'a>(
@@ -419,7 +500,7 @@ impl ObjectStore for IoTrackingStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let _guard = self.stage_guard();
-        self.record_read("list", prefix.cloned().unwrap_or_default(), 0, None);
+        self.record_read("list", prefix.cloned().unwrap_or_default(), 0, None, 0);
         self.target.list(prefix)
     }
 
@@ -433,43 +514,80 @@ impl ObjectStore for IoTrackingStore {
             prefix.cloned().unwrap_or_default(),
             0,
             None,
+            0,
         );
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         let _guard = self.stage_guard();
-        self.record_read(
-            "list_with_delimiter",
-            prefix.cloned().unwrap_or_default(),
-            0,
-            None,
-        );
-        self.target.list_with_delimiter(prefix).await
+        let start = Instant::now();
+        let result = self.target.list_with_delimiter(prefix).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_read(
+                "list_with_delimiter",
+                prefix.cloned().unwrap_or_default(),
+                0,
+                None,
+                latency_us,
+            );
+        } else {
+            self.record_read_error();
+        }
+        result
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.stage_guard();
-        self.record_write("copy", from.to_owned(), 0);
-        self.target.copy(from, to).await
+        let start = Instant::now();
+        let result = self.target.copy(from, to).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("copy", from.to_owned(), 0, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.stage_guard();
-        self.record_write("rename", from.to_owned(), 0);
-        self.target.rename(from, to).await
+        let start = Instant::now();
+        let result = self.target.rename(from, to).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("rename", from.to_owned(), 0, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.stage_guard();
-        self.record_write("rename_if_not_exists", from.to_owned(), 0);
-        self.target.rename_if_not_exists(from, to).await
+        let start = Instant::now();
+        let result = self.target.rename_if_not_exists(from, to).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("rename_if_not_exists", from.to_owned(), 0, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.stage_guard();
-        self.record_write("copy_if_not_exists", from.to_owned(), 0);
-        self.target.copy_if_not_exists(from, to).await
+        let start = Instant::now();
+        let result = self.target.copy_if_not_exists(from, to).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.record_write("copy_if_not_exists", from.to_owned(), 0, latency_us);
+        } else {
+            self.record_write_error();
+        }
+        result
     }
 }
 

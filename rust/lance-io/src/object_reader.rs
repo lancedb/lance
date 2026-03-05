@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
@@ -60,6 +61,7 @@ pub struct CloudObjectReader {
 
     block_size: usize,
     download_retry_count: usize,
+    retry_stats: Option<Arc<RetryStats>>,
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -84,7 +86,41 @@ impl CloudObjectReader {
             size: OnceCell::new_with(known_size),
             block_size,
             download_retry_count,
+            retry_stats: None,
         })
+    }
+
+    /// Attach retry statistics tracking to this reader.
+    pub fn with_retry_stats(mut self, stats: Arc<RetryStats>) -> Self {
+        self.retry_stats = Some(stats);
+        self
+    }
+}
+
+/// Tracks retry behavior for cloud object reads.
+#[derive(Debug, Default)]
+pub struct RetryStats {
+    /// Total number of retries across all requests.
+    pub total_retries: AtomicU64,
+    /// Total number of permanent failures (all retries exhausted).
+    pub total_failures: AtomicU64,
+}
+
+/// A point-in-time snapshot of retry statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetrySnapshot {
+    pub total_retries: u64,
+    pub total_failures: u64,
+}
+
+impl RetryStats {
+    /// Take a consistent snapshot of the current retry statistics.
+    pub fn snapshot(&self) -> RetrySnapshot {
+        RetrySnapshot {
+            total_retries: self.total_retries.load(Ordering::Relaxed),
+            total_failures: self.total_failures.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -117,6 +153,7 @@ async fn do_get_with_outer_retry(
     download_retry_count: usize,
     get_request: Arc<GetRequest>,
     desc: impl Fn() -> String,
+    retry_stats: Option<Arc<RetryStats>>,
 ) -> OSResult<Bytes> {
     let mut retries = download_retry_count;
     loop {
@@ -126,21 +163,27 @@ async fn do_get_with_outer_retry(
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 if retries == 0 {
-                    log::warn!(
-                        "Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}",
-                        desc(),
-                        get_request.path(),
-                        download_retry_count,
-                        err
+                    if let Some(stats) = &retry_stats {
+                        stats.total_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::warn!(
+                        target: "lance_io::retry",
+                        path = %get_request.path(),
+                        attempts = download_retry_count,
+                        desc = %desc(),
+                        "download failed after all retries, cloud storage may be overloaded or timeout settings too restrictive"
                     );
                     return Err(err);
                 }
-                log::debug!(
-                    "Retrying {} from {} (remaining retries: {}).  Error details: {:?}",
-                    desc(),
-                    get_request.path(),
-                    retries,
-                    err
+                if let Some(stats) = &retry_stats {
+                    stats.total_retries.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::debug!(
+                    target: "lance_io::retry",
+                    path = %get_request.path(),
+                    remaining_retries = retries,
+                    desc = %desc(),
+                    "retrying download"
                 );
                 retries -= 1;
             }
@@ -190,10 +233,12 @@ impl Reader for CloudObjectReader {
                 ..Default::default()
             },
         });
+        let retry_stats = self.retry_stats.clone();
         Box::pin(do_get_with_outer_retry(
             self.download_retry_count,
             get_request,
             move || format!("range {:?}", range),
+            retry_stats,
         ))
     }
 
@@ -204,10 +249,11 @@ impl Reader for CloudObjectReader {
             path: self.path.clone(),
             options: GetOptions::default(),
         });
+        let retry_stats = self.retry_stats.clone();
         Box::pin(async move {
             do_get_with_outer_retry(self.download_retry_count, get_request, || {
                 "read_all".to_string()
-            })
+            }, retry_stats)
             .await
         })
     }

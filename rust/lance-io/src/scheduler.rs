@@ -201,10 +201,12 @@ struct IoQueueState {
     start: Instant,
     // Last time we warned about backpressure
     last_warn: AtomicU64,
+    // Shared counter for backpressure events (owned by StatsCollector)
+    backpressure_counter: Arc<AtomicU64>,
 }
 
 impl IoQueueState {
-    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+    fn new(io_capacity: u32, io_buffer_size: u64, backpressure_counter: Arc<AtomicU64>) -> Self {
         Self {
             iops_avail: io_capacity,
             bytes_avail: io_buffer_size as i64,
@@ -213,6 +215,7 @@ impl IoQueueState {
             done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
+            backpressure_counter,
         }
     }
 
@@ -231,6 +234,8 @@ impl IoQueueState {
             );
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
+            self.backpressure_counter
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -279,9 +284,13 @@ struct IoQueue {
 }
 
 impl IoQueue {
-    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+    fn new(io_capacity: u32, io_buffer_size: u64, backpressure_counter: Arc<AtomicU64>) -> Self {
         Self {
-            state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
+            state: Mutex::new(IoQueueState::new(
+                io_capacity,
+                io_buffer_size,
+                backpressure_counter,
+            )),
             notify: Notify::new(),
         }
     }
@@ -530,6 +539,9 @@ struct StatsCollector {
     iops: AtomicU64,
     requests: AtomicU64,
     bytes_read: AtomicU64,
+    coalesced_iops: AtomicU64,
+    split_iops: AtomicU64,
+    backpressure_events: Arc<AtomicU64>,
 }
 
 impl StatsCollector {
@@ -538,6 +550,9 @@ impl StatsCollector {
             iops: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
+            coalesced_iops: AtomicU64::new(0),
+            split_iops: AtomicU64::new(0),
+            backpressure_events: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -551,6 +566,18 @@ impl StatsCollector {
 
     fn requests(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    fn coalesced_iops(&self) -> u64 {
+        self.coalesced_iops.load(Ordering::Relaxed)
+    }
+
+    fn split_iops(&self) -> u64 {
+        self.split_iops.load(Ordering::Relaxed)
+    }
+
+    fn backpressure_events(&self) -> u64 {
+        self.backpressure_events.load(Ordering::Relaxed)
     }
 
     fn record_request(&self, request: &[Range<u64>]) {
@@ -567,6 +594,9 @@ pub struct ScanStats {
     pub iops: u64,
     pub requests: u64,
     pub bytes_read: u64,
+    pub coalesced_iops: u64,
+    pub split_iops: u64,
+    pub backpressure_events: u64,
 }
 
 impl ScanStats {
@@ -575,6 +605,9 @@ impl ScanStats {
             iops: stats.iops(),
             requests: stats.requests(),
             bytes_read: stats.bytes_read(),
+            coalesced_iops: stats.coalesced_iops(),
+            split_iops: stats.split_iops(),
+            backpressure_events: stats.backpressure_events(),
         }
     }
 }
@@ -662,6 +695,7 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
+        let stats = Arc::new(StatsCollector::new());
         let io_queue = if config.use_lite_scheduler {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
@@ -672,6 +706,7 @@ impl ScanScheduler {
             let io_queue = Arc::new(IoQueue::new(
                 io_capacity as u32,
                 config.io_buffer_size_bytes,
+                stats.backpressure_events.clone(),
             ));
             let io_queue_clone = io_queue.clone();
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
@@ -683,7 +718,7 @@ impl ScanScheduler {
         Arc::new(Self {
             object_store,
             io_queue,
-            stats: Arc::new(StatsCollector::new()),
+            stats,
         })
     }
 
@@ -936,7 +971,14 @@ impl FileScheduler {
             merged_requests.push(curr_interval);
         }
 
-        let mut updated_requests = Vec::with_capacity(merged_requests.len());
+        let coalesced = request.len().saturating_sub(merged_requests.len());
+        self.root
+            .stats
+            .coalesced_iops
+            .fetch_add(coalesced as u64, Ordering::Relaxed);
+
+        let merged_len = merged_requests.len();
+        let mut updated_requests = Vec::with_capacity(merged_len);
         for req in merged_requests {
             if req.is_empty() {
                 updated_requests.push(req);
@@ -955,6 +997,12 @@ impl FileScheduler {
                 }
             }
         }
+
+        let split = updated_requests.len().saturating_sub(merged_len);
+        self.root
+            .stats
+            .split_iops
+            .fetch_add(split as u64, Ordering::Relaxed);
 
         self.root.stats.record_request(&updated_requests);
 
