@@ -74,11 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics =
         lance::dataset::optimize::compact_files(&mut ds, Default::default(), None).await?;
     println!(
-        "Compaction: removed={}, added={}, bytes_rewritten={}, elapsed_ms={}",
+        "Compaction: removed={}, added={}, bytes_rewritten={}, elapsed_ms_sum={}",
         metrics.fragments_removed,
         metrics.fragments_added,
         metrics.bytes_rewritten,
-        metrics.elapsed_ms,
+        metrics.elapsed_ms_sum,
     );
 
     Ok(())

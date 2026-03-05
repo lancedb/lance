@@ -788,12 +788,15 @@ impl IvfSubIndex for HNSW {
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
         let progress = Arc::new(AtomicU64::new(0));
+        const LOG_INTERVAL: u64 = 10_000;
         (1..len).into_par_iter().for_each_init(
-            || VisitedGenerator::new(len),
-            |visited_generator, node| {
+            || (VisitedGenerator::new(len), 0u64),
+            |(visited_generator, local_count), node| {
                 hnsw.inner.insert(node as u32, visited_generator, storage);
-                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if done.is_multiple_of(10_000) {
+                *local_count += 1;
+                if *local_count >= LOG_INTERVAL {
+                    let done = progress.fetch_add(*local_count, Ordering::Relaxed) + *local_count;
+                    *local_count = 0;
                     tracing::info!(
                         target: "lance_index::hnsw::build",
                         done,

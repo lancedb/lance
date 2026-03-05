@@ -499,8 +499,14 @@ impl ObjectStore for IoTrackingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        // Note: list() returns a stream — we cannot measure latency or bytes
+        // without consuming it. We only count read_iops here; callers should
+        // track stream-level errors and timing externally.
         let _guard = self.stage_guard();
-        self.record_read("list", prefix.cloned().unwrap_or_default(), 0, None, 0);
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.read_iops += 1;
+        }
         self.target.list(prefix)
     }
 
@@ -509,13 +515,11 @@ impl ObjectStore for IoTrackingStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.record_read(
-            "list_with_offset",
-            prefix.cloned().unwrap_or_default(),
-            0,
-            None,
-            0,
-        );
+        // Same as list() — only count the IOPS, not bytes or latency.
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.read_iops += 1;
+        }
         self.target.list_with_offset(prefix, offset)
     }
 

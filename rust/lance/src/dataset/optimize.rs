@@ -411,9 +411,11 @@ pub struct CompactionMetrics {
     /// Total bytes binary-copied (fast path) during compaction.
     #[serde(default)]
     pub bytes_binary_copied: u64,
-    /// Elapsed wall-clock time in milliseconds.
-    #[serde(default)]
-    pub elapsed_ms: u64,
+    /// Cumulative worker wall-clock time in milliseconds.
+    /// When tasks run in parallel this is the sum of per-task durations,
+    /// not overall wall-clock time.
+    #[serde(default, alias = "elapsed_ms")]
+    pub elapsed_ms_sum: u64,
 }
 
 impl AddAssign for CompactionMetrics {
@@ -424,7 +426,7 @@ impl AddAssign for CompactionMetrics {
         self.files_added += rhs.files_added;
         self.bytes_rewritten += rhs.bytes_rewritten;
         self.bytes_binary_copied += rhs.bytes_binary_copied;
-        self.elapsed_ms += rhs.elapsed_ms;
+        self.elapsed_ms_sum += rhs.elapsed_ms_sum;
     }
 }
 
@@ -1162,14 +1164,14 @@ async fn rewrite_files(
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
 
-    metrics.elapsed_ms = start.elapsed().as_millis() as u64;
+    metrics.elapsed_ms_sum = start.elapsed().as_millis() as u64;
 
     info!(
         target: "lance::compaction",
         task_id = %task_id,
         bytes_rewritten = metrics.bytes_rewritten,
         bytes_binary_copied = metrics.bytes_binary_copied,
-        elapsed_ms = metrics.elapsed_ms,
+        elapsed_ms = metrics.elapsed_ms_sum,
         "compaction task completed"
     );
 
@@ -4022,7 +4024,7 @@ mod tests {
             files_added: 4,
             bytes_rewritten: 100,
             bytes_binary_copied: 200,
-            elapsed_ms: 50,
+            elapsed_ms_sum: 50,
         };
         let b = CompactionMetrics {
             fragments_removed: 10,
@@ -4031,7 +4033,7 @@ mod tests {
             files_added: 40,
             bytes_rewritten: 1000,
             bytes_binary_copied: 2000,
-            elapsed_ms: 500,
+            elapsed_ms_sum: 500,
         };
         a += b;
         assert_eq!(a.fragments_removed, 11);
@@ -4040,6 +4042,6 @@ mod tests {
         assert_eq!(a.files_added, 44);
         assert_eq!(a.bytes_rewritten, 1100);
         assert_eq!(a.bytes_binary_copied, 2200);
-        assert_eq!(a.elapsed_ms, 550);
+        assert_eq!(a.elapsed_ms_sum, 550);
     }
 }

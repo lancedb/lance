@@ -70,7 +70,7 @@ Available via `ScanScheduler::stats()`:
 | `bytes_read` | u64 | Total bytes read |
 | `coalesced_iops` | u64 | IOPs saved by coalescing adjacent ranges |
 | `split_iops` | u64 | IOPs added by splitting large ranges |
-| `backpressure_events` | u64 | Times backpressure throttle activated |
+| `backpressure_warnings` | u64 | Debounced backpressure warning emissions (coarse indicator) |
 
 ### Cache Stats
 
@@ -107,7 +107,7 @@ Returned by `compact_files()`:
 | `files_added` | usize | Files created |
 | `bytes_rewritten` | u64 | Bytes re-encoded |
 | `bytes_binary_copied` | u64 | Bytes binary-copied (fast path) |
-| `elapsed_ms` | u64 | Wall-clock time |
+| `elapsed_ms_sum` | u64 | Cumulative worker time (sum of per-task durations) |
 
 ### Fragment Distribution (`FragmentDistributionStats`)
 

@@ -541,7 +541,7 @@ struct StatsCollector {
     bytes_read: AtomicU64,
     coalesced_iops: AtomicU64,
     split_iops: AtomicU64,
-    backpressure_events: Arc<AtomicU64>,
+    backpressure_warnings: Arc<AtomicU64>,
 }
 
 impl StatsCollector {
@@ -552,7 +552,7 @@ impl StatsCollector {
             bytes_read: AtomicU64::new(0),
             coalesced_iops: AtomicU64::new(0),
             split_iops: AtomicU64::new(0),
-            backpressure_events: Arc::new(AtomicU64::new(0)),
+            backpressure_warnings: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -576,8 +576,8 @@ impl StatsCollector {
         self.split_iops.load(Ordering::Relaxed)
     }
 
-    fn backpressure_events(&self) -> u64 {
-        self.backpressure_events.load(Ordering::Relaxed)
+    fn backpressure_warnings(&self) -> u64 {
+        self.backpressure_warnings.load(Ordering::Relaxed)
     }
 
     fn record_request(&self, request: &[Range<u64>]) {
@@ -596,7 +596,9 @@ pub struct ScanStats {
     pub bytes_read: u64,
     pub coalesced_iops: u64,
     pub split_iops: u64,
-    pub backpressure_events: u64,
+    /// Number of debounced backpressure warning log lines emitted (not 1:1 with
+    /// actual backpressure activations; use as a coarse indicator).
+    pub backpressure_warnings: u64,
 }
 
 impl ScanStats {
@@ -607,7 +609,7 @@ impl ScanStats {
             bytes_read: stats.bytes_read(),
             coalesced_iops: stats.coalesced_iops(),
             split_iops: stats.split_iops(),
-            backpressure_events: stats.backpressure_events(),
+            backpressure_warnings: stats.backpressure_warnings(),
         }
     }
 }
@@ -706,7 +708,7 @@ impl ScanScheduler {
             let io_queue = Arc::new(IoQueue::new(
                 io_capacity as u32,
                 config.io_buffer_size_bytes,
-                stats.backpressure_events.clone(),
+                stats.backpressure_warnings.clone(),
             ));
             let io_queue_clone = io_queue.clone();
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
