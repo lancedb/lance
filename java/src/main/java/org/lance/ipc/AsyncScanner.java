@@ -193,7 +193,7 @@ public class AsyncScanner implements AutoCloseable {
         }
         pendingTasks.clear();
 
-        releaseNativeScanner(nativeAsyncScannerHandle);
+        releaseNativeScanner();
         nativeAsyncScannerHandle = 0;
       }
     }
@@ -201,10 +201,6 @@ public class AsyncScanner implements AutoCloseable {
 
   private native void nativeCancelTask(long taskId);
 
-  /**
-   * Native method to release the async scanner resources associated with the given handle.
-   *
-   * @param handle The native handle to the scanner resource.
-   */
-  private native void releaseNativeScanner(long handle);
+  /** Native method to release the async scanner resources. */
+  private native void releaseNativeScanner();
 }

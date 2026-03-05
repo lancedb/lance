@@ -10,6 +10,7 @@ pub type TaskId = u64;
 
 /// Information about an in-flight async task
 pub struct TaskInfo {
+    #[allow(dead_code)] // Used for cleanup when task is cancelled
     pub scanner_global_ref: GlobalRef,
     pub cancel_handle: tokio::task::JoinHandle<()>,
 }

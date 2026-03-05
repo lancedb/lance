@@ -58,7 +58,16 @@ impl BlockingScanner {
     }
 }
 
-fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> Result<FtsQuery> {
+///////////////////
+// Shared Helpers //
+///////////////////
+
+/// Build FTS query from Java FullTextQuery object
+/// Made pub(crate) to be reused by async_scanner
+pub(crate) fn build_full_text_search_query<'a>(
+    env: &mut JNIEnv<'a>,
+    java_obj: JObject,
+) -> Result<FtsQuery> {
     let type_obj = env
         .call_method(
             &java_obj,
