@@ -5022,6 +5022,7 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
