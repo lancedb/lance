@@ -269,6 +269,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_async_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,

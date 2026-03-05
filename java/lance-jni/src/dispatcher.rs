@@ -60,7 +60,7 @@ impl Dispatcher {
                             Ok(error_jstr) => {
                                 let result = unsafe {
                                     env.call_method_unchecked(
-                                        &scanner_obj,
+                                        scanner_obj,
                                         fail_method,
                                         jni::signature::ReturnType::Primitive(
                                             jni::signature::Primitive::Void,
@@ -87,7 +87,7 @@ impl Dispatcher {
                         // Success path
                         let result = unsafe {
                             env.call_method_unchecked(
-                                &scanner_obj,
+                                scanner_obj,
                                 complete_method,
                                 jni::signature::ReturnType::Primitive(
                                     jni::signature::Primitive::Void,
