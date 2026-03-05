@@ -800,6 +800,11 @@ pub struct UpdateCriteria {
 }
 
 /// Filter used when merging existing scalar-index rows during update.
+///
+/// The caller must pick a filter mode that matches the row-id semantics of the
+/// dataset:
+/// - address-style row IDs: fragment filtering is valid
+/// - stable row IDs: use exact row-id membership instead
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
     /// Keep old rows whose row-address fragment is in this bitmap.

@@ -1304,6 +1304,9 @@ impl BTreeIndex {
 
         let new_input = Arc::new(OneShotExec::new(new_data));
         let old_stream = self.into_data_stream().await?;
+        // Two filtering strategies:
+        // - Fragments: fast path for address-style row IDs (fragment id is encoded in row_id)
+        // - RowIds: exact allow-list for stable row IDs (row_id bits are opaque)
         let old_stream = match old_data_filter {
             Some(OldIndexDataFilter::Fragments(valid_frags)) => {
                 filter_row_ids_by_fragments(old_stream, valid_frags)
@@ -1345,6 +1348,8 @@ impl BTreeIndex {
 /// Filter a stream of record batches to only include rows whose row address
 /// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
 /// ID in the upper 32 bits.
+///
+/// Do not use this for stable row IDs because those IDs are not address-encoded.
 fn filter_row_ids_by_fragments(
     stream: SendableRecordBatchStream,
     valid_fragments: RoaringBitmap,
@@ -1367,6 +1372,9 @@ fn filter_row_ids_by_fragments(
 
 /// Filter a stream of record batches to only include rows whose row ID is in
 /// `valid_row_ids`.
+///
+/// This is the correct path for stable row IDs where we must preserve exact
+/// logical-row membership across compaction/remap operations.
 fn filter_row_ids_by_exact_set(
     stream: SendableRecordBatchStream,
     valid_row_ids: RowAddrTreeMap,

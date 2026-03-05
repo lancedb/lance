@@ -39,6 +39,11 @@ async fn build_stable_row_id_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
 ) -> Result<RowAddrTreeMap> {
+    // For stable row IDs we cannot derive fragment ownership from row_id bits.
+    // Instead, we:
+    // 1) keep only fragments still considered "effective" for the old index, and
+    // 2) load their persisted row-id sequences from dataset metadata, then
+    // 3) build one exact allow-list used to retain only still-valid old rows.
     let retained_frags = dataset
         .manifest
         .fragments
@@ -61,6 +66,7 @@ async fn build_stable_row_id_filter(
         .collect::<Vec<_>>();
     let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
 
+    // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
@@ -213,6 +219,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
                     Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
                 } else {
+                    // Address-style row IDs encode fragment_id in high 32 bits.
+                    // Fragment bitmap filtering is valid and cheaper in this mode.
                     Some(OldIndexDataFilter::Fragments(effective_old_frags))
                 };
                 index
