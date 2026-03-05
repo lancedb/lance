@@ -10,8 +10,7 @@ use tokio::sync::mpsc;
 pub struct DispatcherMessage {
     pub scanner_global_ref: GlobalRef,
     pub task_id: u64,
-    pub result_ptr: i64, // >0: stream pointer, 0: EOF, <0: error
-    pub error_msg: Option<String>,
+    pub result: Result<i64, String>, // Ok(stream_ptr) or Err(error_msg)
 }
 
 /// Global dispatcher instance initialized in JNI_OnLoad
@@ -54,16 +53,16 @@ impl Dispatcher {
                 while let Some(msg) = rx.blocking_recv() {
                     let scanner_obj = msg.scanner_global_ref.as_obj();
 
-                    match msg.error_msg {
-                        Some(error) => {
+                    match msg.result {
+                        Err(error) => {
                             handle_error(&mut env, scanner_obj, fail_method, msg.task_id, &error)
                         }
-                        None => handle_success(
+                        Ok(result_ptr) => handle_success(
                             &mut env,
                             scanner_obj,
                             complete_method,
                             msg.task_id,
-                            msg.result_ptr,
+                            result_ptr,
                         ),
                     }
                 }

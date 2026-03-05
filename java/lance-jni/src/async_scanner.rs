@@ -45,12 +45,12 @@ impl AsyncScanner {
                     match to_ffi_arrow_array_stream(stream, RT.handle().clone()) {
                         Ok(ffi_stream) => {
                             let ptr = Box::into_raw(Box::new(ffi_stream)) as i64;
-                            (ptr, None)
+                            Ok(ptr)
                         }
-                        Err(e) => (-1, Some(e.to_string())),
+                        Err(e) => Err(e.to_string()),
                     }
                 }
-                Err(e) => (-1, Some(e.to_string())),
+                Err(e) => Err(e.to_string()),
             };
 
             // Remove from task tracker (for cleanup) and send to dispatcher
@@ -62,8 +62,7 @@ impl AsyncScanner {
             let _ = dispatcher.send(DispatcherMessage {
                 scanner_global_ref: global_ref_for_task,
                 task_id,
-                result_ptr: result.0,
-                error_msg: result.1,
+                result,
             });
         });
 
