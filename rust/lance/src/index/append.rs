@@ -213,7 +213,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
                     Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
                 } else {
-                    Some(OldIndexDataFilter::Fragments(effective_old_frags.clone()))
+                    Some(OldIndexDataFilter::Fragments(effective_old_frags))
                 };
                 index
                     .update(new_data_stream, &new_store, old_data_filter)
