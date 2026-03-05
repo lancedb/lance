@@ -22,6 +22,7 @@ Rust workspace with Python and Java bindings:
 - `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
 - `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
 - `rust/lance-tools/` - CLI and developer tooling
+- `rust/examples/` - Sample binaries and demonstrations
 - `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
 - `rust/lance-datafusion/` - DataFusion integration (built separately)
 - `python/` - Python bindings (PyO3/maturin)
@@ -87,6 +88,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 ### Dependencies
 
+- Prefer implementing functionality with the standard library or existing workspace dependencies before adding new external crates.
 - Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
 - Gate optional/domain-specific deps behind Cargo feature flags. Prefer separate crates for domain functionality (geo, NLP).
 
@@ -95,7 +97,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - **All bugfixes and features must have corresponding tests. We do not merge code without tests.**
 - Use `rstest` (Rust) or `@pytest.mark.parametrize` (Python) for tests that differ only in inputs. Use `#[case::{name}(...)]` for readable case names.
 - Replace `print()` in tests with `assert` — prints don't catch regressions.
-- Extend existing tests instead of adding overlapping new ones. Add to existing `test_{module}.py` files.
+- Extend existing tests instead of adding overlapping new ones. Add to existing test files.
 - Link a GitHub issue when skipping a test — never bare `@pytest.mark.skip` or `@Ignore` without a tracking URL.
 - Include multi-fragment scenarios for dataset operations (reads, indexes, scans).
 - Cover NULL edge cases in index tests: null items, all-null collections, empty collections, null columns.

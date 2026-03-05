@@ -31,8 +31,7 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 - Keep traits minimal — only core abstraction methods. Move helpers to standalone functions and config to struct fields.
 - Get column/field types from schema metadata — never materialize data rows just to inspect types.
 - Use stable, versioned serialization formats for persistent storage (e.g., index files) — avoid unstable cross-version formats.
-- Convert `LargeBinary`, `LargeUtf8`, `Utf8View`, `BinaryView` to `Large*` variants, never to `Utf8`/`Binary` (i32 offset overflow risk).
-- Use Arrow's type-safe access (`ArrayAccessor` trait bounds, `as_*_array` helpers) instead of `arrow::compute::cast` + `downcast_ref`.
+- Use Arrow's type-safe access (`ArrayAccessor` trait bounds, `as_*_array` helpers) instead of `arrow::compute::cast` + `downcast_ref`. Prefer `_opt` variants (e.g., `as_string_opt`) unless the data type has already been verified.
 - In `lance-io/`, use single-syscall writes for local filesystem I/O — don't reuse cloud multipart upload machinery.
 
 ## Error Handling
@@ -82,7 +81,6 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 Performance-critical encoding/decoding paths have additional requirements:
 
 - Hoist loop-invariant conditionals out of hot loops — branch once outside, then use separate loop bodies or monomorphized variants.
-- Pre-allocate single contiguous buffers; prefer `Vec::with_capacity` + `unsafe { set_len() }` over `extend` with dummy values when the buffer will be immediately overwritten.
+- Pre-allocate single contiguous buffers. Default to `buf.resize(len, 0)` for safe initialization; reserve `Vec::with_capacity` + `unsafe { set_len() }` for measured hot paths only, with a `// SAFETY:` comment explaining why the buffer will be fully initialized before read (e.g., immediately followed by `read_exact`).
 - Use `spawn_cpu()` only at the async-to-CPU boundary (e.g., FSST, decompression, batch materialization) — never nest redundant `spawn_cpu()` calls.
-- Use `OffsetView` instead of `borrow_to_typed_slice` for typed access to byte buffers — avoids cloning the entire buffer.
 - Use `expect_next()` and similar utility methods instead of inlining `None`-checks with error returns.
