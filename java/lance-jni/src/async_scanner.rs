@@ -5,20 +5,16 @@ use std::sync::Arc;
 
 use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
-use crate::blocking_scanner::build_full_text_search_query;
+use crate::blocking_scanner::{build_scanner_with_options, ScannerOptions};
 use crate::dispatcher::{DISPATCHER, DispatcherMessage};
-use crate::error::{Error, Result};
-use crate::ffi::JNIEnvExt;
+use crate::error::Result;
 use crate::task_tracker::{TASK_TRACKER, TaskInfo};
-use arrow::array::Float32Array;
 use arrow::ffi::FFI_ArrowSchema;
 use jni::JNIEnv;
 use jni::objects::JObject;
-use jni::sys::{JNI_TRUE, jboolean, jint, jlong};
-use lance::dataset::scanner::{AggregateExpr, ColumnOrdering, Scanner};
-use lance_index::scalar::FullTextSearchQuery;
+use jni::sys::{jboolean, jint, jlong};
+use lance::dataset::scanner::Scanner;
 use lance_io::ffi::to_ffi_arrow_array_stream;
-use lance_linalg::distance::DistanceType;
 
 pub const NATIVE_ASYNC_SCANNER: &str = "nativeAsyncScannerHandle";
 
@@ -91,23 +87,23 @@ impl AsyncScanner {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local>(
     mut env: JNIEnv<'local>,
-    _class: JObject,
-    jdataset: JObject,
-    fragment_ids_obj: JObject,
-    columns_obj: JObject,
-    substrait_filter_obj: JObject,
-    filter_obj: JObject,
-    batch_size_obj: JObject,
-    limit_obj: JObject,
-    offset_obj: JObject,
-    query_obj: JObject,
-    fts_query_obj: JObject,
+    _class: JObject<'local>,
+    jdataset: JObject<'local>,
+    fragment_ids_obj: JObject<'local>,
+    columns_obj: JObject<'local>,
+    substrait_filter_obj: JObject<'local>,
+    filter_obj: JObject<'local>,
+    batch_size_obj: JObject<'local>,
+    limit_obj: JObject<'local>,
+    offset_obj: JObject<'local>,
+    query_obj: JObject<'local>,
+    fts_query_obj: JObject<'local>,
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
-    column_orderings: JObject,
+    column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
-    substrait_aggregate_obj: JObject,
+    substrait_aggregate_obj: JObject<'local>,
 ) -> JObject<'local> {
     crate::ok_or_throw!(
         env,
@@ -136,151 +132,47 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
 #[allow(clippy::too_many_arguments)]
 fn inner_create_async_scanner<'local>(
     env: &mut JNIEnv<'local>,
-    jdataset: JObject,
-    fragment_ids_obj: JObject,
-    columns_obj: JObject,
-    substrait_filter_obj: JObject,
-    filter_obj: JObject,
-    batch_size_obj: JObject,
-    limit_obj: JObject,
-    offset_obj: JObject,
-    query_obj: JObject,
-    fts_query_obj: JObject,
+    jdataset: JObject<'local>,
+    fragment_ids_obj: JObject<'local>,
+    columns_obj: JObject<'local>,
+    substrait_filter_obj: JObject<'local>,
+    filter_obj: JObject<'local>,
+    batch_size_obj: JObject<'local>,
+    limit_obj: JObject<'local>,
+    offset_obj: JObject<'local>,
+    query_obj: JObject<'local>,
+    fts_query_obj: JObject<'local>,
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
-    column_orderings: JObject,
+    column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
-    substrait_aggregate_obj: JObject,
+    substrait_aggregate_obj: JObject<'local>,
 ) -> Result<JObject<'local>> {
-    // Reuse scanner building logic from blocking_scanner.rs
-    let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-
-    let mut scanner = dataset_guard.inner.scan();
-
-    // handle fragment_ids
-    if let Some(fragment_ids) = fragment_ids_opt {
-        let mut fragments = Vec::with_capacity(fragment_ids.len());
-        for fragment_id in fragment_ids {
-            let Some(fragment) = dataset_guard.inner.get_fragment(fragment_id as usize) else {
-                return Err(Error::input_error(format!(
-                    "Fragment {fragment_id} not found"
-                )));
-            };
-            fragments.push(fragment.metadata().clone());
-        }
-        scanner.with_fragments(fragments);
-    }
+    let dataset = dataset_guard.inner.clone();
     drop(dataset_guard);
 
-    let columns_opt = env.get_strings_opt(&columns_obj)?;
-    if let Some(columns) = columns_opt {
-        scanner.project(&columns)?;
+    let options = ScannerOptions {
+        fragment_ids_obj,
+        columns_obj,
+        substrait_filter_obj,
+        filter_obj,
+        batch_size_obj,
+        limit_obj,
+        offset_obj,
+        query_obj,
+        fts_query_obj,
+        with_row_id,
+        with_row_address,
+        batch_readahead,
+        column_orderings,
+        use_scalar_index,
+        substrait_aggregate_obj,
     };
 
-    let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
-    if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait) })?;
-    }
-
-    let filter_opt = env.get_string_opt(&filter_obj)?;
-    if let Some(filter) = filter_opt {
-        scanner.filter(filter.as_str())?;
-    }
-
-    let batch_size_opt = env.get_long_opt(&batch_size_obj)?;
-    if let Some(batch_size) = batch_size_opt {
-        scanner.batch_size(batch_size as usize);
-    }
-
-    let limit_opt = env.get_long_opt(&limit_obj)?;
-    let offset_opt = env.get_long_opt(&offset_obj)?;
-    scanner
-        .limit(limit_opt, offset_opt)
-        .map_err(|err| Error::input_error(err.to_string()))?;
-
-    if with_row_id == JNI_TRUE {
-        scanner.with_row_id();
-    }
-
-    if with_row_address == JNI_TRUE {
-        scanner.with_row_address();
-    }
-
-    scanner.use_scalar_index(use_scalar_index == JNI_TRUE);
-
-    env.get_optional(&query_obj, |env, java_obj| {
-        // Set column and key for nearest search
-        let column = env.get_string_from_method(&java_obj, "getColumn")?;
-        let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
-        let key = Float32Array::from(key_array);
-        let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        let _ = scanner.nearest(&column, &key, k);
-
-        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
-        scanner.minimum_nprobes(minimum_nprobes);
-
-        let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
-        if let Some(maximum_nprobes) = maximum_nprobes {
-            scanner.maximum_nprobes(maximum_nprobes);
-        }
-
-        if let Some(ef) = env.get_optional_usize_from_method(&java_obj, "getEf")? {
-            scanner.ef(ef);
-        }
-
-        if let Some(refine_factor) =
-            env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?
-        {
-            scanner.refine(refine_factor);
-        }
-
-        if let Some(distance_type_str) =
-            env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
-        {
-            let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
-            scanner.distance_metric(distance_type);
-        }
-
-        let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
-        scanner.use_index(use_index);
-        Ok(())
-    })?;
-
-    env.get_optional(&fts_query_obj, |env, java_obj| {
-        let fts_query = build_full_text_search_query(env, java_obj)?;
-        let full_text_query = FullTextSearchQuery::new_query(fts_query);
-        scanner.full_text_search(full_text_query)?;
-        Ok(())
-    })?;
-
-    scanner.batch_readahead(batch_readahead as usize);
-
-    env.get_optional(&column_orderings, |env, java_obj| {
-        let list = env.get_list(&java_obj)?;
-        let mut iter = list.iter(env)?;
-        let mut results = Vec::with_capacity(list.size(env)? as usize);
-        while let Some(elem) = iter.next(env)? {
-            let column_name = env.get_string_from_method(&elem, "getColumnName")?;
-            let nulls_first = env.get_boolean_from_method(&elem, "isNullFirst")?;
-            let ascending = env.get_boolean_from_method(&elem, "isAscending")?;
-            let col_order = ColumnOrdering {
-                ascending,
-                nulls_first,
-                column_name,
-            };
-            results.push(col_order)
-        }
-        scanner.order_by(Some(results))?;
-        Ok(())
-    })?;
-
-    let substrait_aggregate_opt = env.get_bytes_opt(&substrait_aggregate_obj)?;
-    if let Some(substrait_aggregate) = substrait_aggregate_opt {
-        scanner.aggregate(AggregateExpr::substrait(substrait_aggregate))?;
-    }
+    let scanner = build_scanner_with_options(env, &dataset, options)?;
 
     let async_scanner = AsyncScanner::create(scanner);
 
