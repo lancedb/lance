@@ -214,6 +214,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Once, OnceLock};
+use std::time::Instant;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -2676,6 +2677,7 @@ pub async fn decode_batch(
     version: LanceFileVersion,
     cache: Option<Arc<LanceCache>>,
 ) -> Result<RecordBatch> {
+    let start = Instant::now();
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
     // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
     // polled twice.
@@ -2715,7 +2717,14 @@ pub async fn decode_batch(
         spawn_structural_batch_decode_tasks,
         rx,
     )?;
-    decode_stream.next().await.unwrap().task.await
+    let result = decode_stream.next().await.unwrap().task.await;
+    tracing::debug!(
+        target: "lance_encoding::decode",
+        elapsed_us = start.elapsed().as_micros() as u64,
+        num_rows = batch.num_rows,
+        "batch decoded"
+    );
+    result
 }
 
 #[cfg(test)]
