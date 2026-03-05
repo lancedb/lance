@@ -883,6 +883,33 @@ def test_create_ivf_rq_requires_dim_divisible_by_8():
         )
 
 
+def test_create_ivf_rq_mostly_null():
+    ndim = 128
+    nvec = 100
+    nnull = 9900
+    vectors = np.random.randn(nvec, ndim).astype(np.float32).tolist()
+    vectors += [None] * nnull
+    tbl = pa.table(
+        {
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), ndim)),
+            "id": pa.array(range(nvec + nnull), type=pa.int32()),
+        }
+    )
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    q = np.random.randn(ndim).astype(np.float32)
+    result = ds.to_table(
+        nearest={"column": "vector", "q": q, "k": 10},
+    )
+    assert result.num_rows == 10
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
