@@ -620,7 +620,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use log::warn;
+    use tracing::warn;
     use std::sync::Arc;
 
     /// Check if an index type is supported and log warning if not.

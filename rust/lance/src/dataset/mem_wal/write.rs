@@ -25,7 +25,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use object_store::path::Path;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;

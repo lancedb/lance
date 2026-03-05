@@ -13,7 +13,7 @@ use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
-use log::info;
+use tracing::info;
 use object_store::path::Path;
 use uuid::Uuid;
 

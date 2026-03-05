@@ -19,6 +19,9 @@ All tracing events use the `target:` field for filtering. Key targets:
 | Target | Level | Description |
 |--------|-------|-------------|
 | `lance::compaction` | INFO | Compaction task lifecycle and byte/timing metrics |
+| `lance::commit` | WARN | Commit conflict retries and permanent failures |
+| `lance::write` | INFO/WARN | Write operations (insert mode, schema validation) |
+| `lance::write::retry` | WARN | Write retry loop: conflict retries and exhaustion |
 | `lance_io::retry` | WARN/DEBUG | Download retries and permanent failures |
 | `lance_io::writer::connection_reset` | WARN | Upload connection reset retries |
 | `lance_encoding::decode` | DEBUG | Batch decode timing (elapsed_us, num_rows) |

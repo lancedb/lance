@@ -411,7 +411,7 @@ impl MemTableScanner {
             q.nprobes = n;
             q.maximum_nprobes = Some(n);
         } else {
-            log::warn!("nprobes is not set because nearest has not been called yet");
+            tracing::warn!("nprobes is not set because nearest has not been called yet");
         }
         self
     }
@@ -424,7 +424,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.nearest {
             q.nprobes = n;
         } else {
-            log::warn!("minimum_nprobes is not set because nearest has not been called yet");
+            tracing::warn!("minimum_nprobes is not set because nearest has not been called yet");
         }
         self
     }
@@ -436,7 +436,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.nearest {
             q.maximum_nprobes = Some(n);
         } else {
-            log::warn!("maximum_nprobes is not set because nearest has not been called yet");
+            tracing::warn!("maximum_nprobes is not set because nearest has not been called yet");
         }
         self
     }
@@ -448,7 +448,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.nearest {
             q.distance_type = Some(metric);
         } else {
-            log::warn!("distance_metric is not set because nearest has not been called yet");
+            tracing::warn!("distance_metric is not set because nearest has not been called yet");
         }
         self
     }
@@ -461,7 +461,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.nearest {
             q.ef = Some(ef);
         } else {
-            log::warn!("ef is not set because nearest has not been called yet");
+            tracing::warn!("ef is not set because nearest has not been called yet");
         }
         self
     }
@@ -474,7 +474,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.nearest {
             q.refine_factor = Some(factor);
         } else {
-            log::warn!("refine is not set because nearest has not been called yet");
+            tracing::warn!("refine is not set because nearest has not been called yet");
         }
         self
     }
@@ -488,7 +488,7 @@ impl MemTableScanner {
             q.distance_lower_bound = lower;
             q.distance_upper_bound = upper;
         } else {
-            log::warn!("distance_range is not set because nearest has not been called yet");
+            tracing::warn!("distance_range is not set because nearest has not been called yet");
         }
         self
     }
@@ -603,7 +603,7 @@ impl MemTableScanner {
         if let Some(ref mut q) = self.full_text_query {
             q.wand_factor = wand_factor.clamp(0.0, 1.0);
         } else {
-            log::warn!(
+            tracing::warn!(
                 "fts_wand_factor is not set because full_text_query has not been called yet"
             );
         }

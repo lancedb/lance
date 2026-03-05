@@ -36,7 +36,7 @@ use lance_core::{Error, Result};
 use lance_index::mem_wal::RegionManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
-use log::{info, warn};
+use tracing::{info, warn};
 use object_store::PutMode;
 use object_store::PutOptions;
 use object_store::path::Path;
