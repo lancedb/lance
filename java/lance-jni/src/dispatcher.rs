@@ -54,54 +54,12 @@ impl Dispatcher {
                 while let Some(msg) = rx.blocking_recv() {
                     let scanner_obj = msg.scanner_global_ref.as_obj();
 
-                    if let Some(error) = msg.error_msg {
-                        // Error path
-                        match env.new_string(&error) {
-                            Ok(error_jstr) => {
-                                let result = unsafe {
-                                    env.call_method_unchecked(
-                                        scanner_obj,
-                                        fail_method,
-                                        jni::signature::ReturnType::Primitive(
-                                            jni::signature::Primitive::Void,
-                                        ),
-                                        &[
-                                            jni::sys::jvalue {
-                                                j: msg.task_id as i64,
-                                            },
-                                            jni::sys::jvalue {
-                                                l: error_jstr.as_raw(),
-                                            },
-                                        ],
-                                    )
-                                };
-                                if let Err(e) = result {
-                                    log::error!("Failed to call failTask: {:?}", e);
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to create JString for error: {:?}", e);
-                            }
+                    match msg.error_msg {
+                        Some(error) => {
+                            handle_error(&mut env, scanner_obj, fail_method, msg.task_id, &error)
                         }
-                    } else {
-                        // Success path
-                        let result = unsafe {
-                            env.call_method_unchecked(
-                                scanner_obj,
-                                complete_method,
-                                jni::signature::ReturnType::Primitive(
-                                    jni::signature::Primitive::Void,
-                                ),
-                                &[
-                                    jni::sys::jvalue {
-                                        j: msg.task_id as i64,
-                                    },
-                                    jni::sys::jvalue { j: msg.result_ptr },
-                                ],
-                            )
-                        };
-                        if let Err(e) = result {
-                            log::error!("Failed to call completeTask: {:?}", e);
+                        None => {
+                            handle_success(&mut env, scanner_obj, complete_method, msg.task_id, msg.result_ptr)
                         }
                     }
                 }
@@ -118,5 +76,69 @@ impl Dispatcher {
         self.tx
             .send(msg)
             .map_err(|e| format!("Failed to send message to dispatcher: {}", e))
+    }
+}
+
+/// Handle error completion by calling failTask on Java side
+fn handle_error(
+    env: &mut jni::JNIEnv,
+    scanner_obj: &jni::objects::JObject,
+    fail_method: jni::objects::JMethodID,
+    task_id: u64,
+    error: &str,
+) {
+    let error_jstr = match env.new_string(error) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to create JString for error: {:?}", e);
+            return;
+        }
+    };
+
+    let result = unsafe {
+        env.call_method_unchecked(
+            scanner_obj,
+            fail_method,
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
+            &[
+                jni::sys::jvalue {
+                    j: task_id as i64,
+                },
+                jni::sys::jvalue {
+                    l: error_jstr.as_raw(),
+                },
+            ],
+        )
+    };
+
+    if let Err(e) = result {
+        log::error!("Failed to call failTask: {:?}", e);
+    }
+}
+
+/// Handle success completion by calling completeTask on Java side
+fn handle_success(
+    env: &mut jni::JNIEnv,
+    scanner_obj: &jni::objects::JObject,
+    complete_method: jni::objects::JMethodID,
+    task_id: u64,
+    result_ptr: i64,
+) {
+    let result = unsafe {
+        env.call_method_unchecked(
+            scanner_obj,
+            complete_method,
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
+            &[
+                jni::sys::jvalue {
+                    j: task_id as i64,
+                },
+                jni::sys::jvalue { j: result_ptr },
+            ],
+        )
+    };
+
+    if let Err(e) = result {
+        log::error!("Failed to call completeTask: {:?}", e);
     }
 }
