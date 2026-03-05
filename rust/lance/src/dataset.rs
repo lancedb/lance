@@ -2926,6 +2926,70 @@ impl Dataset {
     }
 }
 
+/// Distribution statistics for fragments in a dataset.
+///
+/// Provides a quick O(n) summary of fragment sizes and deletion state,
+/// useful for compaction planning and operational monitoring.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FragmentDistributionStats {
+    /// Number of fragments in the dataset.
+    pub count: usize,
+    /// Total physical rows across all fragments.
+    pub total_physical_rows: u64,
+    /// Minimum physical rows in any single fragment.
+    pub min_physical_rows: u64,
+    /// Maximum physical rows in any single fragment.
+    pub max_physical_rows: u64,
+    /// Average physical rows per fragment.
+    pub avg_physical_rows: f64,
+    /// Number of fragments that have an associated deletion file.
+    pub fragments_with_deletions: usize,
+}
+
+impl Dataset {
+    /// Compute distribution statistics over the dataset's fragments.
+    ///
+    /// This is an O(n) scan over in-memory fragment metadata (no I/O).
+    pub fn fragment_distribution_stats(&self) -> FragmentDistributionStats {
+        let fragments = &self.manifest.fragments;
+        if fragments.is_empty() {
+            return FragmentDistributionStats {
+                count: 0,
+                total_physical_rows: 0,
+                min_physical_rows: 0,
+                max_physical_rows: 0,
+                avg_physical_rows: 0.0,
+                fragments_with_deletions: 0,
+            };
+        }
+
+        let mut total: u64 = 0;
+        let mut min_rows = u64::MAX;
+        let mut max_rows = 0u64;
+        let mut with_deletions = 0usize;
+
+        for frag in fragments.iter() {
+            let rows = frag.physical_rows.unwrap_or(0) as u64;
+            total += rows;
+            min_rows = min_rows.min(rows);
+            max_rows = max_rows.max(rows);
+            if frag.deletion_file.is_some() {
+                with_deletions += 1;
+            }
+        }
+
+        FragmentDistributionStats {
+            count: fragments.len(),
+            total_physical_rows: total,
+            min_physical_rows: min_rows,
+            max_physical_rows: max_rows,
+            avg_physical_rows: total as f64 / fragments.len() as f64,
+            fragments_with_deletions: with_deletions,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl DatasetTakeRows for Dataset {
     fn schema(&self) -> &Schema {

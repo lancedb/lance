@@ -85,6 +85,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
@@ -404,6 +405,15 @@ pub struct CompactionMetrics {
     /// The number of files that have been added, which is always equal to the
     /// number of fragments.
     pub files_added: usize,
+    /// Total bytes rewritten (re-encoded) during compaction.
+    #[serde(default)]
+    pub bytes_rewritten: u64,
+    /// Total bytes binary-copied (fast path) during compaction.
+    #[serde(default)]
+    pub bytes_binary_copied: u64,
+    /// Elapsed wall-clock time in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl AddAssign for CompactionMetrics {
@@ -412,6 +422,9 @@ impl AddAssign for CompactionMetrics {
         self.fragments_added += rhs.fragments_added;
         self.files_removed += rhs.files_removed;
         self.files_added += rhs.files_added;
+        self.bytes_rewritten += rhs.bytes_rewritten;
+        self.bytes_binary_copied += rhs.bytes_binary_copied;
+        self.elapsed_ms += rhs.elapsed_ms;
     }
 }
 
@@ -965,6 +978,7 @@ async fn rewrite_files(
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
+    let start = Instant::now();
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -995,7 +1009,7 @@ async fn rewrite_files(
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
-    log::info!(
+    info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
         task_id,
         num_rows,
@@ -1026,7 +1040,7 @@ async fn rewrite_files(
         let schema = prepared_reader.schema();
         let reader_with_progress = prepared_reader.inspect_ok(move |batch| {
             rows_read += batch.num_rows();
-            log::info!(
+            info!(
                 "Compaction task {}: Read progress {}/{}",
                 task_id,
                 rows_read,
@@ -1086,6 +1100,12 @@ async fn rewrite_files(
             let _ = tx.send(captured);
             row_ids_rx = Some(rx);
         }
+
+        metrics.bytes_binary_copied = new_fragments
+            .iter()
+            .flat_map(|f| &f.files)
+            .filter_map(|df| df.file_size_bytes.get().map(|v| v.get()))
+            .sum();
     } else {
         let (frags, _) = write_fragments_internal(
             Some(dataset.as_ref()),
@@ -1098,9 +1118,15 @@ async fn rewrite_files(
         )
         .await?;
         new_fragments = frags;
+
+        metrics.bytes_rewritten = new_fragments
+            .iter()
+            .flat_map(|f| &f.files)
+            .filter_map(|df| df.file_size_bytes.get().map(|v| v.get()))
+            .sum();
     }
 
-    log::info!("Compaction task {}: file written", task_id);
+    info!("Compaction task {}: file written", task_id);
 
     let row_addrs = if let Some(row_ids_rx) = row_ids_rx {
         let captured_ids = row_ids_rx
@@ -1112,7 +1138,7 @@ async fn rewrite_files(
         Some(serialized)
     } else {
         if dataset.manifest.uses_stable_row_ids() {
-            log::info!("Compaction task {}: rechunking stable row ids", task_id);
+            info!("Compaction task {}: rechunking stable row ids", task_id);
             rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
             recalc_versions_for_rewritten_fragments(
                 dataset.as_ref(),
@@ -1136,7 +1162,16 @@ async fn rewrite_files(
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
 
-    log::info!("Compaction task {}: completed", task_id);
+    metrics.elapsed_ms = start.elapsed().as_millis() as u64;
+
+    info!(
+        target: "lance::compaction",
+        task_id = %task_id,
+        bytes_rewritten = metrics.bytes_rewritten,
+        bytes_binary_copied = metrics.bytes_binary_copied,
+        elapsed_ms = metrics.elapsed_ms,
+        "compaction task completed"
+    );
 
     Ok(RewriteResult {
         metrics,
@@ -3976,5 +4011,35 @@ mod tests {
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
         assert!(!plan.options.materialize_deletions);
+    }
+
+    #[test]
+    fn test_compaction_metrics_add_assign() {
+        let mut a = CompactionMetrics {
+            fragments_removed: 1,
+            fragments_added: 2,
+            files_removed: 3,
+            files_added: 4,
+            bytes_rewritten: 100,
+            bytes_binary_copied: 200,
+            elapsed_ms: 50,
+        };
+        let b = CompactionMetrics {
+            fragments_removed: 10,
+            fragments_added: 20,
+            files_removed: 30,
+            files_added: 40,
+            bytes_rewritten: 1000,
+            bytes_binary_copied: 2000,
+            elapsed_ms: 500,
+        };
+        a += b;
+        assert_eq!(a.fragments_removed, 11);
+        assert_eq!(a.fragments_added, 22);
+        assert_eq!(a.files_removed, 33);
+        assert_eq!(a.files_added, 44);
+        assert_eq!(a.bytes_rewritten, 1100);
+        assert_eq!(a.bytes_binary_copied, 2200);
+        assert_eq!(a.elapsed_ms, 550);
     }
 }
