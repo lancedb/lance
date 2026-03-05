@@ -24,7 +24,7 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
 use crate::{Error, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::WriteDestination;
 use super::WriteMode;
@@ -270,7 +270,7 @@ impl<'a> InsertBuilder<'a> {
                 return Err(Error::dataset_already_exists(ds.uri.clone()));
             }
             (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
-                log::warn!("No existing dataset at {uri}, it will be created");
+                warn!(target: "lance::write", uri = %uri, "No existing dataset, it will be created");
                 context.params.mode = WriteMode::Create;
             }
             _ => {}
@@ -283,10 +283,11 @@ impl<'a> InsertBuilder<'a> {
             // If the dataset is already using (or not using) stable row ids, we need to match
             // and ignore whatever the user provided as input
             if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
-                log::info!(
-                    "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
-                    context.params.enable_stable_row_ids,
-                    dataset.manifest.uses_stable_row_ids()
+                info!(
+                    target: "lance::write",
+                    user_setting = context.params.enable_stable_row_ids,
+                    dataset_setting = dataset.manifest.uses_stable_row_ids(),
+                    "Ignoring user provided stable row ids setting, dataset already has it set"
                 );
                 context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }

@@ -97,7 +97,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
-use log::info;
+use tracing::info;
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 use std::{

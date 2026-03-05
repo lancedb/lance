@@ -10,6 +10,7 @@ use futures::TryFutureExt;
 use futures::future::FutureExt;
 use lance_core::utils::backoff::SlotBackoff;
 use lance_core::{Error, Result};
+use tracing::warn;
 
 use crate::Dataset;
 
@@ -95,6 +96,13 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         match commit_future.await? {
             Ok(result) => return Ok(result),
             Err(Error::RetryableCommitConflict { .. }) => {
+                warn!(
+                    target: "lance::write::retry",
+                    attempt = backoff.attempt(),
+                    max_retries = config.max_retries,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "commit conflict, retrying write operation"
+                );
                 // Check whether we have exhausted our retries *before* we sleep.
                 if backoff.attempt() >= config.max_retries {
                     break;
@@ -123,6 +131,12 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         }
     }
 
+    warn!(
+        target: "lance::write::retry",
+        max_retries = config.max_retries,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "write operation failed after all retries exhausted"
+    );
     Err(Error::too_much_write_contention(format!(
         "Attempted {} retries.",
         config.max_retries
