@@ -511,7 +511,7 @@ impl ScalarIndex for NGramIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         let spill_files = builder.train(new_data).await?;

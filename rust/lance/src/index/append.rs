@@ -3,21 +3,26 @@
 
 use std::sync::Arc;
 
-use futures::FutureExt;
-use lance_core::{Error, Result};
-use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::NoopIndexBuildProgress;
-use lance_index::scalar::CreatedIndex;
-use lance_index::scalar::lance_format::LanceIndexStore;
+use futures::{FutureExt, TryStreamExt};
+use lance_core::{
+    utils::mask::{RowAddrTreeMap, RowSetOps},
+    Error, Result,
+};
+use lance_index::{
+    metrics::NoOpMetricsCollector,
+    optimize::OptimizeOptions,
+    progress::NoopIndexBuildProgress,
+    scalar::{lance_format::LanceIndexStore, CreatedIndex, OldIndexDataFilter},
+};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
 use super::vector::ivf::optimize_vector_indices;
-use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::Dataset;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
@@ -28,6 +33,35 @@ pub struct IndexMergeResults<'a> {
     pub new_fragment_bitmap: RoaringBitmap,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
+}
+
+async fn build_stable_row_id_filter(
+    dataset: &Dataset,
+    effective_old_frags: &RoaringBitmap,
+) -> Result<RowAddrTreeMap> {
+    let retained_frags = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|frag| effective_old_frags.contains(frag.id as u32))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if retained_frags.is_empty() {
+        return Ok(RowAddrTreeMap::new());
+    }
+
+    let row_id_sequences = load_row_id_sequences(dataset, &retained_frags)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let row_id_maps = row_id_sequences
+        .iter()
+        .map(|(_, seq)| RowAddrTreeMap::from(seq.as_ref()))
+        .collect::<Vec<_>>();
+    let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
+
+    Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -171,8 +205,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             } else {
                 let new_store =
                     LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                    // Stable row IDs are opaque IDs, so fragment-bit filtering on
+                    // (row_id >> 32) is invalid. Build an exact allow-list from retained
+                    // fragments' row-id sequences and use precise filtering.
+                    let valid_old_row_ids =
+                        build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
+                    Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                } else {
+                    Some(OldIndexDataFilter::Fragments(effective_old_frags.clone()))
+                };
                 index
-                    .update(new_data_stream, &new_store, Some(&effective_old_frags))
+                    .update(new_data_stream, &new_store, old_data_filter)
                     .await?
             };
 
@@ -252,7 +296,7 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
@@ -262,14 +306,16 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        scalar::ScalarIndexParams,
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::compact_files;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -638,5 +684,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let ids = StringArray::from_iter_values((0..256).map(|i| format!("song-{i}")));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+
+        compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 512,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frags = dataset.get_fragments();
+        assert!(!frags.is_empty());
+        assert!(frags.iter().all(|frag| frag.id() > 0));
+        assert!(dataset
+            .unindexed_fragments("id_idx")
+            .await
+            .unwrap()
+            .is_empty());
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
     }
 }

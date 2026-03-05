@@ -799,6 +799,20 @@ pub struct UpdateCriteria {
     pub data_criteria: TrainingCriteria,
 }
 
+/// Filter used when merging existing scalar-index rows during update.
+#[derive(Debug, Clone)]
+pub enum OldIndexDataFilter {
+    /// Keep old rows whose row-address fragment is in this bitmap.
+    ///
+    /// This is valid for address-style row IDs.
+    Fragments(RoaringBitmap),
+    /// Keep old rows whose row IDs are in this exact allow-list.
+    ///
+    /// This is required for stable row IDs, where row IDs are opaque and
+    /// should not be interpreted as encoded row addresses.
+    RowIds(RowAddrTreeMap),
+}
+
 impl UpdateCriteria {
     pub fn requires_old_data(data_criteria: TrainingCriteria) -> Self {
         Self {
@@ -839,13 +853,13 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     ///
-    /// If `valid_old_fragments` is provided, old index data for fragments not in the bitmap
-    /// will be filtered out during the merge.
+    /// If `old_data_filter` is provided, old index data will be filtered before
+    /// merge according to the chosen filter mode.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index

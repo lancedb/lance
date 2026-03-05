@@ -137,11 +137,11 @@ impl ScalarIndex for JsonIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let target_created = self
             .target_index
-            .update(new_data, dest_store, valid_old_fragments)
+            .update(new_data, dest_store, old_data_filter)
             .await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),

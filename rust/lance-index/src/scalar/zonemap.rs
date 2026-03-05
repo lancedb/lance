@@ -536,7 +536,7 @@ impl ScalarIndex for ZoneMapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Train new zones for the incoming data stream
         let schema = new_data.schema();

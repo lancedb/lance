@@ -559,7 +559,7 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let tmpdir = Arc::new(TempDir::default());
