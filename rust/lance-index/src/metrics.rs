@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A trait used by the index to report metrics
 ///
@@ -43,6 +43,21 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Record bytes loaded from storage during index operations
+    ///
+    /// This tracks the total number of bytes read from disk/object store
+    /// for index-related data (partition data, posting lists, graph nodes, etc.).
+    fn record_bytes_loaded(&self, _num_bytes: u64) {}
+
+    /// Record the number of partitions probed during a search
+    fn record_partitions_probed(&self, _count: usize) {}
+
+    /// Record the number of candidate vectors evaluated during a search
+    fn record_candidates_evaluated(&self, _count: usize) {}
+
+    /// Record the wall-clock duration of a search operation in microseconds
+    fn record_search_duration_us(&self, _duration: u64) {}
 }
 
 /// A no-op metrics collector that does nothing
@@ -59,6 +74,10 @@ pub struct LocalMetricsCollector {
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
+    pub bytes_loaded: AtomicU64,
+    pub partitions_probed: AtomicUsize,
+    pub candidates_evaluated: AtomicUsize,
+    pub search_duration_us: AtomicU64,
 }
 
 impl LocalMetricsCollector {
@@ -66,6 +85,10 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_bytes_loaded(self.bytes_loaded.load(Ordering::Relaxed));
+        other.record_partitions_probed(self.partitions_probed.load(Ordering::Relaxed));
+        other.record_candidates_evaluated(self.candidates_evaluated.load(Ordering::Relaxed));
+        other.record_search_duration_us(self.search_duration_us.load(Ordering::Relaxed));
     }
 }
 
@@ -81,5 +104,99 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
+    }
+
+    fn record_bytes_loaded(&self, num_bytes: u64) {
+        self.bytes_loaded.fetch_add(num_bytes, Ordering::Relaxed);
+    }
+
+    fn record_partitions_probed(&self, count: usize) {
+        self.partitions_probed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_candidates_evaluated(&self, count: usize) {
+        self.candidates_evaluated
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_search_duration_us(&self, duration: u64) {
+        self.search_duration_us
+            .fetch_add(duration, Ordering::Relaxed);
+    }
+}
+
+/// A point-in-time snapshot of index metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MetricsSnapshot {
+    pub parts_loaded: usize,
+    pub index_loads: usize,
+    pub comparisons: usize,
+    pub bytes_loaded: u64,
+    pub partitions_probed: usize,
+    pub candidates_evaluated: usize,
+    pub search_duration_us: u64,
+}
+
+impl LocalMetricsCollector {
+    /// Take a consistent snapshot of the current metrics.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            parts_loaded: self.parts_loaded.load(Ordering::Relaxed),
+            index_loads: self.index_loads.load(Ordering::Relaxed),
+            comparisons: self.comparisons.load(Ordering::Relaxed),
+            bytes_loaded: self.bytes_loaded.load(Ordering::Relaxed),
+            partitions_probed: self.partitions_probed.load(Ordering::Relaxed),
+            candidates_evaluated: self.candidates_evaluated.load(Ordering::Relaxed),
+            search_duration_us: self.search_duration_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_metrics_new_fields() {
+        let collector = LocalMetricsCollector::default();
+        collector.record_partitions_probed(5);
+        collector.record_candidates_evaluated(100);
+        collector.record_search_duration_us(42);
+        collector.record_bytes_loaded(8192);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.partitions_probed, 5);
+        assert_eq!(snap.candidates_evaluated, 100);
+        assert_eq!(snap.search_duration_us, 42);
+        assert_eq!(snap.bytes_loaded, 8192);
+    }
+
+    #[test]
+    fn test_dump_into_new_fields() {
+        let local = LocalMetricsCollector::default();
+        local.record_partitions_probed(3);
+        local.record_candidates_evaluated(50);
+        local.record_search_duration_us(99);
+        local.record_parts_loaded(2);
+
+        let target = LocalMetricsCollector::default();
+        local.dump_into(&target);
+
+        let snap = target.snapshot();
+        assert_eq!(snap.partitions_probed, 3);
+        assert_eq!(snap.candidates_evaluated, 50);
+        assert_eq!(snap.search_duration_us, 99);
+        assert_eq!(snap.parts_loaded, 2);
+    }
+
+    #[test]
+    fn test_default_impls_noop() {
+        let noop = NoOpMetricsCollector;
+        // These should not panic — default no-op impls
+        noop.record_bytes_loaded(4096);
+        noop.record_partitions_probed(10);
+        noop.record_candidates_evaluated(200);
+        noop.record_search_duration_us(500);
     }
 }

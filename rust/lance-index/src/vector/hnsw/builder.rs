@@ -20,7 +20,7 @@ use std::fmt::Debug;
 use std::iter;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
@@ -729,7 +729,17 @@ impl IvfSubIndex for HNSW {
             .as_ref()
             .map(|b| b.count_ones())
             .unwrap_or(storage.len());
-        let results = if remained < self.len() * 10 / 100 {
+        let use_flat = remained < self.len() * 10 / 100;
+        tracing::debug!(
+            target: "lance_index::hnsw::search",
+            remained,
+            total = self.len(),
+            use_flat,
+            k,
+            ef = params.ef,
+            "search strategy selected"
+        );
+        let results = if use_flat {
             let prefilter_bitset =
                 prefilter_bitset.expect("the prefilter bitset must be set for flat search");
             self.flat_search(storage, query, k, prefilter_bitset, &params)
@@ -761,13 +771,14 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::debug!(
-            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
-            storage.len(),
-            hnsw.inner.params.max_level,
-            hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction,
-            storage.distance_type(),
+        tracing::debug!(
+            target: "lance_index::hnsw::build",
+            num = storage.len(),
+            max_levels = hnsw.inner.params.max_level,
+            m = hnsw.inner.params.m,
+            ef_construction = hnsw.inner.params.ef_construction,
+            distance_type = %storage.distance_type(),
+            "building HNSW graph"
         );
 
         if storage.is_empty() {
@@ -776,10 +787,20 @@ impl IvfSubIndex for HNSW {
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
+        let progress = Arc::new(AtomicU64::new(0));
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
                 hnsw.inner.insert(node as u32, visited_generator, storage);
+                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                if done.is_multiple_of(10_000) {
+                    tracing::info!(
+                        target: "lance_index::hnsw::build",
+                        done,
+                        total = len,
+                        "HNSW build progress"
+                    );
+                }
             },
         );
 
