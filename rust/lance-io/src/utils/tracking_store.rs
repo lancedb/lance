@@ -678,3 +678,150 @@ impl Drop for StageGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn test_list_stream_errors_increment_read_errors() {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        let store = IoTrackingStore::new(inner, stats.clone());
+
+        // Put a file so list returns at least one Ok item
+        store
+            .put(&Path::from("a.txt"), PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+
+        // Normal list — no errors
+        let items: Vec<_> = store.list(None).collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_ok());
+        {
+            let s = stats.lock().unwrap();
+            assert_eq!(s.read_iops, 1);
+            assert_eq!(s.read_errors, 0);
+        }
+    }
+
+    /// An ObjectStore wrapper that injects errors into `list()` streams.
+    #[derive(Debug)]
+    struct ErrorInjectingStore {
+        inner: Arc<dyn ObjectStore>,
+        /// Number of Err items to append to list streams.
+        errors_to_inject: usize,
+    }
+
+    impl std::fmt::Display for ErrorInjectingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ErrorInjectingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ErrorInjectingStore {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let real = self.inner.list(prefix);
+            let errors = stream::iter((0..self.errors_to_inject).map(|_| {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "injected".into(),
+                })
+            }));
+            real.chain(errors).boxed()
+        }
+
+        async fn put(&self, l: &Path, b: PutPayload) -> OSResult<PutResult> {
+            self.inner.put(l, b).await
+        }
+        async fn put_opts(
+            &self,
+            l: &Path,
+            b: PutPayload,
+            o: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(l, b, o).await
+        }
+        async fn get(&self, l: &Path) -> OSResult<GetResult> {
+            self.inner.get(l).await
+        }
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(l, o).await
+        }
+        async fn head(&self, l: &Path) -> OSResult<ObjectMeta> {
+            self.inner.head(l).await
+        }
+        async fn delete(&self, l: &Path) -> OSResult<()> {
+            self.inner.delete(l).await
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &Path, t: &Path) -> OSResult<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(&self, f: &Path, t: &Path) -> OSResult<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+        async fn put_multipart(&self, l: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(l).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_error_items_counted_as_read_errors() {
+        let mem = Arc::new(InMemory::new());
+        // Put a file so list yields at least one Ok
+        mem.put(&Path::from("a.txt"), PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+
+        let injecting = Arc::new(ErrorInjectingStore {
+            inner: mem,
+            errors_to_inject: 3,
+        }) as Arc<dyn ObjectStore>;
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        let store = IoTrackingStore::new(injecting, stats.clone());
+
+        let items: Vec<_> = store.list(None).collect().await;
+        // 1 Ok + 3 Err
+        assert_eq!(items.len(), 4);
+        assert!(items[0].is_ok());
+        assert!(items[1].is_err());
+        {
+            let s = stats.lock().unwrap();
+            assert_eq!(s.read_iops, 1);
+            assert_eq!(s.read_errors, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_with_offset_error_items_counted() {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        let store = IoTrackingStore::new(inner, stats.clone());
+
+        // list_with_offset on empty store — no errors, just verifies IOPS counted
+        let items: Vec<_> = store
+            .list_with_offset(None, &Path::from(""))
+            .collect()
+            .await;
+        assert!(items.is_empty());
+        {
+            let s = stats.lock().unwrap();
+            assert_eq!(s.read_iops, 1);
+            assert_eq!(s.read_errors, 0);
+        }
+    }
+}
