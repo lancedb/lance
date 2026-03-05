@@ -3438,12 +3438,10 @@ impl Scanner {
                     if user_metric == index_metric {
                         true
                     } else {
-                        log::warn!(
-                            "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                            user_metric,
-                            index_metric
-                        );
-                        false
+                        return Err(Error::invalid_input(format!(
+                            "Requested metric {:?} is incompatible with index metric {:?}.  Pass `use_index=false` to use flat search.",
+                            user_metric, index_metric
+                        )));
                     }
                 }
                 None => true, // No preference, use index's metric
@@ -5782,6 +5780,18 @@ mod test {
         scan.nearest("vec", &key, 5).unwrap();
         scan.distance_metric(DistanceType::Dot);
 
+        // This should fail
+        let err = scan.explain_plan(false).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let message = err.to_string();
+        assert!(
+            message.contains("Dot") && message.contains("L2"),
+            "unexpected message: {message}"
+        );
+
+        // Should be ok to do a flat search with use_index=false
+        scan.use_index(false);
+
         // Verify the explain plan does NOT show ANNSubIndex (should use flat search)
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
@@ -5802,6 +5812,7 @@ mod test {
             .nearest("vec", &key, 5)
             .unwrap()
             .distance_metric(DistanceType::Dot)
+            .use_index(false)
             .try_into_batch()
             .await
             .unwrap();
