@@ -59,6 +59,7 @@ use lance_core::{Error, Result};
 use lance_index::{DatasetIndexExt, is_system_index};
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+use tracing::warn;
 use object_store::path::Path;
 use prost::Message;
 
@@ -946,6 +947,13 @@ pub(crate) async fn commit_transaction(
             }
             Err(CommitError::CommitConflict) => {
                 let next_attempt_i = backoff.attempt() + 1;
+                warn!(
+                    target: "lance::commit",
+                    attempt = backoff.attempt(),
+                    target_version,
+                    num_attempts,
+                    "commit conflict, will retry"
+                );
 
                 if backoff.attempt() == 0 {
                     // We add 10% buffer here, to allow concurrent writes to complete.
@@ -963,12 +971,25 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                // If other error, return
+                warn!(
+                    target: "lance::commit",
+                    attempt = backoff.attempt(),
+                    target_version,
+                    %err,
+                    "commit failed with non-conflict error"
+                );
                 return Err(err);
             }
         }
     }
 
+    warn!(
+        target: "lance::commit",
+        target_version,
+        attempts = backoff.attempt(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "commit failed after all retries exhausted"
+    );
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(

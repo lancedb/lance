@@ -409,3 +409,45 @@ impl DeepSizeOf for SmallReader {
         size
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_retry_stats_default() {
+        let stats = RetryStats::default();
+        let snap = stats.snapshot();
+        assert_eq!(snap.total_retries, 0);
+        assert_eq!(snap.total_failures, 0);
+    }
+
+    #[test]
+    fn test_retry_stats_increment_and_snapshot() {
+        let stats = RetryStats::default();
+        stats.total_retries.fetch_add(3, Ordering::Relaxed);
+        stats.total_failures.fetch_add(1, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.total_retries, 3);
+        assert_eq!(snap.total_failures, 1);
+    }
+
+    #[test]
+    fn test_retry_snapshot_equality() {
+        let a = RetrySnapshot {
+            total_retries: 5,
+            total_failures: 2,
+        };
+        let b = RetrySnapshot {
+            total_retries: 5,
+            total_failures: 2,
+        };
+        let c = RetrySnapshot {
+            total_retries: 5,
+            total_failures: 3,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+}

@@ -646,6 +646,7 @@ pub trait UnsizedCacheKey {
 /// Returned by [`LanceCache::hit_miss_counts`] and [`WeakLanceCache::hit_miss_counts`].
 /// Counters are cumulative and monotonic (reset only via [`LanceCache::clear`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheHitMiss {
     /// Cumulative cache hits.
     pub hits: u64,
@@ -678,6 +679,7 @@ impl CacheHitMiss {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CacheStats {
     /// Number of times `get`, `get_unsized`, or `get_or_insert` found an item in the cache.
     pub hits: u64,

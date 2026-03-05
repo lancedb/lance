@@ -220,7 +220,6 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::CacheHitMiss;
     use lance_index::vector::VectorIndex;
 
     #[tokio::test]
@@ -238,14 +237,15 @@ mod tests {
     #[test]
     fn test_session_cache_hit_miss_sync() {
         let session = Session::default();
-        let zero = CacheHitMiss {
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-        };
+        let index_hm = session.index_cache_hit_miss();
+        assert_eq!(index_hm.hits, 0);
+        assert_eq!(index_hm.misses, 0);
+        assert_eq!(index_hm.evictions, 0);
 
-        assert_eq!(session.index_cache_hit_miss(), zero);
-        assert_eq!(session.metadata_cache_hit_miss(), zero);
+        let meta_hm = session.metadata_cache_hit_miss();
+        assert_eq!(meta_hm.hits, 0);
+        assert_eq!(meta_hm.misses, 0);
+        assert_eq!(meta_hm.evictions, 0);
 
         // Convenience methods on the struct
         assert_eq!(session.index_cache_hit_miss().hit_ratio(), 0.0);
