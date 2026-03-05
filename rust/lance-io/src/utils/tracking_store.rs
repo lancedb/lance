@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -499,15 +500,20 @@ impl ObjectStore for IoTrackingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        // Note: list() returns a stream — we cannot measure latency or bytes
-        // without consuming it. We only count read_iops here; callers should
-        // track stream-level errors and timing externally.
         let _guard = self.stage_guard();
         {
             let mut stats = self.stats.lock().unwrap();
             stats.read_iops += 1;
         }
-        self.target.list(prefix)
+        let stats = self.stats.clone();
+        self.target
+            .list(prefix)
+            .inspect(move |item| {
+                if item.is_err() {
+                    stats.lock().unwrap().read_errors += 1;
+                }
+            })
+            .boxed()
     }
 
     fn list_with_offset(
@@ -515,12 +521,19 @@ impl ObjectStore for IoTrackingStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        // Same as list() — only count the IOPS, not bytes or latency.
         {
             let mut stats = self.stats.lock().unwrap();
             stats.read_iops += 1;
         }
-        self.target.list_with_offset(prefix, offset)
+        let stats = self.stats.clone();
+        self.target
+            .list_with_offset(prefix, offset)
+            .inspect(move |item| {
+                if item.is_err() {
+                    stats.lock().unwrap().read_errors += 1;
+                }
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
