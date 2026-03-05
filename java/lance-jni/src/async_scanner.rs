@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
-use crate::blocking_scanner::{build_scanner_with_options, ScannerOptions};
+use crate::blocking_scanner::{ScannerOptions, build_scanner_with_options};
 use crate::dispatcher::{DISPATCHER, DispatcherMessage};
 use crate::error::Result;
 use crate::task_tracker::{TASK_TRACKER, TaskInfo};

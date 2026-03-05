@@ -58,9 +58,13 @@ impl Dispatcher {
                         Some(error) => {
                             handle_error(&mut env, scanner_obj, fail_method, msg.task_id, &error)
                         }
-                        None => {
-                            handle_success(&mut env, scanner_obj, complete_method, msg.task_id, msg.result_ptr)
-                        }
+                        None => handle_success(
+                            &mut env,
+                            scanner_obj,
+                            complete_method,
+                            msg.task_id,
+                            msg.result_ptr,
+                        ),
                     }
                 }
 
@@ -101,9 +105,7 @@ fn handle_error(
             fail_method,
             jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
             &[
-                jni::sys::jvalue {
-                    j: task_id as i64,
-                },
+                jni::sys::jvalue { j: task_id as i64 },
                 jni::sys::jvalue {
                     l: error_jstr.as_raw(),
                 },
@@ -130,9 +132,7 @@ fn handle_success(
             complete_method,
             jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
             &[
-                jni::sys::jvalue {
-                    j: task_id as i64,
-                },
+                jni::sys::jvalue { j: task_id as i64 },
                 jni::sys::jvalue { j: result_ptr },
             ],
         )
