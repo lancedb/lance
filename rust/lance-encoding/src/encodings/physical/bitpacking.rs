@@ -20,7 +20,6 @@ use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use byteorder::{ByteOrder, LittleEndian};
 use lance_bitpacking::BitPacking;
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -32,9 +31,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
-use crate::format::{pb21, ProtobufUtils21};
+use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
-use bytemuck::{cast_slice, AnyBitPattern};
+use bytemuck::{AnyBitPattern, cast_slice};
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
 const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -219,14 +218,13 @@ impl MiniBlockCompressor for InlineBitpacking {
     fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with BitpackMiniBlockEncoder",
                     chunk.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -528,14 +526,14 @@ impl BlockDecompressor for OutOfLineBitpacking {
 mod test {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, Int64Array, Int8Array};
+    use arrow_array::{Array, Int8Array, Int64Array};
     use arrow_schema::DataType;
 
-    use super::{bitpack_out_of_line, unpack_out_of_line, ELEMS_PER_CHUNK};
+    use super::{ELEMS_PER_CHUNK, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

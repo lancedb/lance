@@ -73,6 +73,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.isWithRowAddress(),
             options.getBatchReadahead(),
             options.getColumnOrderings(),
+            options.isUseScalarIndex(),
             options.getSubstraitAggregate());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
@@ -95,6 +96,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       boolean withRowAddress,
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
       Optional<ByteBuffer> substraitAggregate);
 
   /**

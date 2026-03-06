@@ -42,6 +42,10 @@ public class CleanupTest {
         RemovalStats stats =
             dataset.cleanupWithPolicy(CleanupPolicy.builder().withBeforeVersion(3L).build());
         assertEquals(2L, stats.getOldVersions());
+        assertEquals(0L, stats.getDataFilesRemoved());
+        assertEquals(2L, stats.getTransactionFilesRemoved());
+        assertEquals(0L, stats.getIndexFilesRemoved());
+        assertEquals(0L, stats.getDeletionFilesRemoved());
       }
     }
   }

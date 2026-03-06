@@ -18,8 +18,8 @@ mod deduplicate;
 mod filter_stale;
 mod generation_tag;
 
-pub use bloom_guard::{compute_pk_hash_from_scalars, BloomFilterGuardExec};
+pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
 pub use deduplicate::{DeduplicateExec, ROW_ADDRESS_COLUMN};
 pub use filter_stale::{FilterStaleExec, GenerationBloomFilter};
-pub use generation_tag::{MemtableGenTagExec, MEMTABLE_GEN_COLUMN};
+pub use generation_tag::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec};

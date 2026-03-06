@@ -6,9 +6,9 @@ use arrow::array::UInt32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::StreamExt;
+use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::io::ObjectStore;
-use lance::Dataset;
 use lance_core::utils::tempfile::TempStrDir;
 use std::sync::Arc;
 

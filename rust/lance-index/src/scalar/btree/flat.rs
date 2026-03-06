@@ -6,7 +6,7 @@ use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
+    ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
 };
 
 use datafusion_common::DFSchema;
@@ -14,9 +14,9 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
+use lance_core::Result;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use lance_core::Result;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -243,7 +243,7 @@ mod tests {
     use super::*;
     use arrow_array::{record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen_batch, RowCount};
+    use lance_datagen::{RowCount, array, gen_batch};
 
     fn example_index() -> FlatIndex {
         let batch = gen_batch()

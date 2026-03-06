@@ -9,7 +9,6 @@ use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
-use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -134,30 +133,25 @@ impl Session {
                     .index_extensions
                     .contains_key(&(IndexType::Vector, name.clone()))
                 {
-                    return Err(Error::invalid_input(
-                        format!("{name} is already registered"),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "{name} is already registered"
+                    )));
                 }
 
                 if let Some(ext) = extension.to_vector() {
                     self.index_extensions
                         .insert((IndexType::Vector, name), ext.to_generic());
                 } else {
-                    return Err(Error::invalid_input(
-                        format!("{name} is not a vector index extension"),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "{name} is not a vector index extension"
+                    )));
                 }
             }
             _ => {
-                return Err(Error::invalid_input(
-                    format!(
-                        "scalar index extension is not support yet: {}",
-                        extension.index_type()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "scalar index extension is not support yet: {}",
+                    extension.index_type()
+                )));
             }
         }
 
@@ -217,10 +211,12 @@ mod tests {
     #[tokio::test]
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
-        assert!(no_cache
-            .index_cache
-            .get_unsized::<dyn VectorIndex>("abc")
-            .await
-            .is_none());
+        assert!(
+            no_cache
+                .index_cache
+                .get_unsized::<dyn VectorIndex>("abc")
+                .await
+                .is_none()
+        );
     }
 }

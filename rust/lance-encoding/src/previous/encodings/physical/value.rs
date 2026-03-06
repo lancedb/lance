@@ -3,9 +3,8 @@
 
 use arrow_schema::DataType;
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use log::trace;
-use snafu::location;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -17,9 +16,9 @@ use crate::encodings::physical::block::{
 use crate::encodings::physical::value::ValueEncoder;
 use crate::format::ProtobufUtils;
 use crate::{
+    EncodingsIo,
     decoder::{PageScheduler, PrimitivePageDecoder},
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 use lance_core::{Error, Result};
@@ -231,14 +230,13 @@ impl ArrayEncoder for ValueEncoder {
                 index,
                 None,
             )),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot encode a data block of type {} with ValueEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }?;
         Ok(EncodedArray { data, encoding })
     }

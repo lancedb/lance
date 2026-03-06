@@ -4,7 +4,6 @@
 use crate::dataset::refs::Branches;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::location;
 
 pub const BRANCH_DIR: &str = "tree";
 
@@ -45,26 +44,20 @@ impl BranchLocation {
                 }
             })
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Can not find the root location of branch {} by uri {}",
-                        branch_name, path_str,
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Can not find the root location of branch {} by uri {}",
+                    branch_name, path_str,
+                ))
             })?;
         let root_path_str = if root_path_str.ends_with('/') {
             root_path_str.trim_end_matches('/').to_string()
         } else if cfg!(windows) {
             root_path_str.trim_end_matches('\\').to_string()
         } else {
-            return Err(Error::invalid_input(
-                format!(
-                    "Invalid dataset root uri {} for branch {}",
-                    root_path_str, path_str,
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Invalid dataset root uri {} for branch {}",
+                root_path_str, path_str,
+            )));
         };
         Ok(root_path_str)
     }

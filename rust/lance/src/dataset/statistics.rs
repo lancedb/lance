@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::Result;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-use super::{fragment::FileFragment, Dataset};
+use super::{Dataset, fragment::FileFragment};
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {

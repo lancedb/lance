@@ -5297,6 +5297,10 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
+        compaction_mode: Optional[
+            Literal["reencode", "try_binary_copy", "force_binary_copy"]
+        ] = None,
+        binary_copy_read_batch_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -5344,6 +5348,19 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
+        compaction_mode: str, optional
+            The compaction mode. Valid values:
+
+            - ``"reencode"``: Decode and re-encode data (default).
+            - ``"try_binary_copy"``: Try binary copy if fragments are
+              compatible, fall back to reencode otherwise.
+            - ``"force_binary_copy"``: Use binary copy or fail if fragments
+              are not compatible.
+        binary_copy_read_batch_bytes: int, optional
+            The batch size in bytes for reading during binary copy operations.
+            Controls how much data is read at once when performing binary copy.
+            Defaults to 16MB.
+
         Returns
         -------
         CompactionMetrics
@@ -5361,6 +5378,8 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
             batch_size=batch_size,
+            compaction_mode=compaction_mode,
+            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
         )
         return Compaction.execute(self._dataset, opts)
 
@@ -5631,7 +5650,7 @@ def write_dataset(
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
     data_storage_version: Optional[
-        Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
+        Literal["stable", "2.0", "2.1", "2.2", "2.3", "next", "legacy", "0.1"]
     ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = True,
@@ -5641,6 +5660,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    allow_external_blob_outside_bases: bool = False,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -5735,6 +5755,9 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to the dataset root or a registered
+        base path. If True, external blob URIs outside registered bases are allowed.
     namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -5778,12 +5801,11 @@ def write_dataset(
 
         # Implement write_into_namespace logic in Python
         # This follows the same pattern as the Rust implementation:
-        # - CREATE mode: calls namespace.create_empty_table()
+        # - CREATE mode: calls namespace.declare_table()
         # - APPEND/OVERWRITE mode: calls namespace.describe_table()
         # - Both modes: create storage options provider and merge storage options
 
         from .namespace import (
-            CreateEmptyTableRequest,
             DeclareTableRequest,
             DescribeTableRequest,
             LanceNamespaceStorageOptionsProvider,
@@ -5791,37 +5813,8 @@ def write_dataset(
 
         # Determine which namespace method to call based on mode
         if mode == "create":
-            # Try declare_table first, fall back to deprecated create_empty_table
-            # for backward compatibility with older namespace implementations.
-            # create_empty_table support will be removed in 3.0.0.
-            if hasattr(namespace, "declare_table"):
-                try:
-                    from lance_namespace.errors import UnsupportedOperationError
-
-                    declare_request = DeclareTableRequest(id=table_id, location=None)
-                    response = namespace.declare_table(declare_request)
-                except (UnsupportedOperationError, NotImplementedError):
-                    # Fall back to deprecated create_empty_table
-                    warnings.warn(
-                        "create_empty_table is deprecated, use declare_table instead. "
-                        "Support will be removed in 3.0.0.",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
-                    fallback_request = CreateEmptyTableRequest(
-                        id=table_id, location=None
-                    )
-                    response = namespace.create_empty_table(fallback_request)
-            else:
-                # Namespace doesn't have declare_table, fall back to create_empty_table
-                warnings.warn(
-                    "create_empty_table is deprecated, use declare_table instead. "
-                    "Support will be removed in 3.0.0.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                fallback_request = CreateEmptyTableRequest(id=table_id, location=None)
-                response = namespace.create_empty_table(fallback_request)
+            declare_request = DeclareTableRequest(id=table_id, location=None)
+            response = namespace.declare_table(declare_request)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
             response = namespace.describe_table(request)
@@ -5897,6 +5890,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
     }
 
     # Add storage_options_provider if created from namespace

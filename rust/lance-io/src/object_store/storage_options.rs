@@ -21,9 +21,8 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use lance_namespace::models::DescribeTableRequest;
 use lance_namespace::LanceNamespace;
-use snafu::location;
+use lance_namespace::models::DescribeTableRequest;
 use tokio::sync::RwLock;
 
 use crate::{Error, Result};
@@ -133,17 +132,12 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
             ..Default::default()
         };
 
-        let response = self
-            .namespace
-            .describe_table(request)
-            .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to fetch storage options: {}",
-                    e
-                ))),
-                location: location!(),
-            })?;
+        let response = self.namespace.describe_table(request).await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to fetch storage options: {}",
+                e
+            ))))
+        })?;
 
         Ok(response.storage_options)
     }
@@ -309,10 +303,10 @@ impl StorageOptionsAccessor {
         // Check if we have valid cached options with read lock
         {
             let cached = self.cache.read().await;
-            if !self.needs_refresh(&cached) {
-                if let Some(cached_opts) = &*cached {
-                    return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-                }
+            if !self.needs_refresh(&cached)
+                && let Some(cached_opts) = &*cached
+            {
+                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
             }
         }
 
@@ -321,10 +315,9 @@ impl StorageOptionsAccessor {
             return if let Some(initial) = &self.initial_options {
                 Ok(Some(super::StorageOptions(initial.clone())))
             } else {
-                Err(Error::IO {
-                    source: Box::new(std::io::Error::other("No storage options available")),
-                    location: location!(),
-                })
+                Err(Error::io_source(Box::new(std::io::Error::other(
+                    "No storage options available",
+                ))))
             };
         };
 
@@ -335,10 +328,10 @@ impl StorageOptionsAccessor {
 
         // Double-check if options are still stale after acquiring write lock
         // (another thread might have refreshed them)
-        if !self.needs_refresh(&cache) {
-            if let Some(cached_opts) = &*cache {
-                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-            }
+        if !self.needs_refresh(&cache)
+            && let Some(cached_opts) = &*cache
+        {
+            return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
         }
 
         log::debug!(
@@ -346,29 +339,21 @@ impl StorageOptionsAccessor {
             provider.provider_id()
         );
 
-        let storage_options_map =
-            provider
-                .fetch_storage_options()
-                .await
-                .map_err(|e| Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to fetch storage options: {}",
-                        e
-                    ))),
-                    location: location!(),
-                })?;
+        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to fetch storage options: {}",
+                e
+            ))))
+        })?;
 
         let Some(options) = storage_options_map else {
             // Provider returned None, fall back to initial options
             if let Some(initial) = &self.initial_options {
                 return Ok(Some(super::StorageOptions(initial.clone())));
             }
-            return Err(Error::IO {
-                source: Box::new(std::io::Error::other(
-                    "Provider returned no storage options",
-                )),
-                location: location!(),
-            });
+            return Err(Error::io_source(Box::new(std::io::Error::other(
+                "Provider returned no storage options",
+            ))));
         };
 
         let expires_at_millis = options
@@ -593,7 +578,7 @@ mod tests {
         MockClock::set_system_time(Duration::from_secs(100_000));
 
         let mock_provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000))); // 10 min expiry
-                                                                                      // Use with_initial_and_provider to set custom refresh_offset_millis (5 min = 300000ms)
+        // Use with_initial_and_provider to set custom refresh_offset_millis (5 min = 300000ms)
         let now_ms = MockClock::system_time().as_millis() as u64;
         let expires_at = now_ms + 600_000; // 10 minutes from now
         let initial = HashMap::from([

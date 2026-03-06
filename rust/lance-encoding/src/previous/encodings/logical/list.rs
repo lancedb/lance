@@ -4,20 +4,20 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
     cast::AsArray,
     new_empty_array,
     types::{Int32Type, Int64Type, UInt64Type},
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
-use futures::{future::BoxFuture, FutureExt};
-use lance_core::{cache::LanceCache, Error, Result};
+use futures::{FutureExt, future::BoxFuture};
+use lance_core::{Error, Result, cache::LanceCache};
 use log::trace;
-use snafu::location;
 use tokio::task::JoinHandle;
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
@@ -33,7 +33,6 @@ use crate::{
     },
     repdef::RepDefBuilder,
     utils::accumulation::AccumulationQueue,
-    EncodingsIo,
 };
 
 // Scheduling lists is tricky.  Imagine the following scenario:
@@ -295,8 +294,7 @@ fn decode_offsets(
             );
         trace!(
             "List offsets range of {} lists maps to item range {:?}",
-            num_lists,
-            items_range
+            num_lists, items_range
         );
         offsets_offset += num_offsets_to_norm as u32;
         if !items_range.is_empty() {
@@ -434,15 +432,16 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
         trace!(
             "Scheduled {} offsets which maps to list requests: {:?}",
-            offsets_scheduled,
-            list_reqs
+            offsets_scheduled, list_reqs
         );
         let null_offset_adjustment = list_reqs[0].null_offset_adjustment;
         // It shouldn't be possible for `list_reqs` to span more than one offsets page and so it shouldn't
         // be possible for the null_offset_adjustment to change
-        debug_assert!(list_reqs
-            .iter()
-            .all(|req| req.null_offset_adjustment == null_offset_adjustment));
+        debug_assert!(
+            list_reqs
+                .iter()
+                .all(|req| req.null_offset_adjustment == null_offset_adjustment)
+        );
         let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
         let next_offsets_decoder = next_offsets
@@ -761,7 +760,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             // shrink the read batch size if we detect the batches are going to be huge (maybe
             // even achieve this with a read_batch_bytes parameter, though some estimation may
             // still be required)
-            return Err(Error::NotSupported { source: format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into(), location: location!() });
+            return Err(Error::not_supported_source(format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into()));
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]

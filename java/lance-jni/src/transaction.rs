@@ -1,35 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::blocking_dataset::{extract_namespace_info, BlockingDataset, NATIVE_DATASET};
-use crate::error::Result;
-use crate::storage_options::JavaStorageOptionsProvider;
-use crate::traits::{
-    export_vec, import_vec_from_method, FromJObjectWithEnv, FromJString, IntoJava, JLance,
-};
-use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::RT;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::error::Result;
+use crate::storage_options::JavaStorageOptionsProvider;
+use crate::traits::{
+    FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
+};
+use crate::utils::{to_java_map, to_rust_map};
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jint};
-use jni::JNIEnv;
+use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
-use lance::dataset::CommitBuilder;
-use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::ObjectStoreParams;
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
+use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::StorageOptionsProvider;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -277,7 +278,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeReadTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -606,7 +607,7 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
@@ -728,7 +729,20 @@ fn inner_commit_to_dataset<'local>(
             &[],
         )?
         .l()?;
-    let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_allocator))?;
+
+    // BlockingDataset from java dataset.
+    let mut java_blocking_ds = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        BlockingDataset::new(dataset_guard.inner.clone())
+    };
+    let transaction = convert_to_rust_transaction(
+        env,
+        java_transaction,
+        Some(&java_allocator),
+        Some(&mut java_blocking_ds),
+    )?;
+
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
@@ -750,6 +764,7 @@ fn convert_to_rust_transaction(
     env: &mut JNIEnv,
     java_transaction: JObject,
     allocator: Option<&JObject>,
+    dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
@@ -761,7 +776,7 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, &op, allocator)?;
+    let op = convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
 
     let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
         let tag_str = JString::from(tag_obj);
@@ -787,6 +802,8 @@ fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
     java_allocator: &JObject,
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
 ) -> Result<LanceSchema> {
     let schema_ptr = env
         .call_method(
@@ -798,19 +815,163 @@ fn convert_schema_from_operation(
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-    LanceSchema::try_from(&schema).map_err(|e| {
-        Error::input_error(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
-    })
+
+    if let Some(dataset) = dataset {
+        let arrow_schema = Schema::try_from(&c_schema)?;
+
+        // Derive field ids based on the transaction read dataset schema.
+        let read_schema = {
+            if dataset.inner.version().version == read_version {
+                dataset.inner.schema().clone()
+            } else {
+                let read_dataset = dataset.checkout_version(read_version)?;
+                read_dataset.inner.schema().clone()
+            }
+        };
+
+        let max_field_id = dataset.inner.manifest().max_field_id();
+        let schema =
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(read_schema), Some(max_field_id))?;
+        Ok(schema)
+    } else {
+        let schema = Schema::try_from(&c_schema)?;
+        LanceSchema::try_from(&schema).map_err(|e| {
+            Error::input_error(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })
+    }
+}
+
+trait SchemaExt {
+    /// Walk through the fields and assign a new field id to each field that does not have one
+    /// (e.g. is set to -1)
+    ///
+    /// If this schema is on an existing dataset, pass the schema of the dataset to `base_schema`
+    /// and the result of `Manifest::max_field_id` to `max_existing_id`.
+    ///
+    /// If this schema is not associated with a dataset, pass `None` to `base_schema` and
+    /// `max_existing_id`.
+    ///
+    /// The rule of assigning id is:
+    /// 1. If a lance field with same name exists in `base_schema` (including nested field), id is
+    ///    derived from the field.
+    /// 2. Otherwise, set field id based on max id, which is computed from `max_existing_id`,
+    ///    `base_schema` max id and self max id.
+    fn set_field_id_from_schema(
+        &mut self,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<()>;
+
+    /// Create schema from `arrow_schema`, with field id priority below:
+    /// 1. arrow metadata field id.
+    /// 2. field id from `base_schema`.
+    /// 3. field id from `max_existing_id`.
+    fn from_arrow_schema(
+        arrow_schema: &Schema,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<LanceSchema>;
+}
+
+impl SchemaExt for LanceSchema {
+    fn set_field_id_from_schema(
+        &mut self,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<()> {
+        // Set id from base_schema
+        if let Some(base_schema) = &base_schema {
+            for field in self.fields.iter_mut() {
+                if let Some(base_field) = base_schema.field(&field.name) {
+                    field.set_field_id_from_field(-1, base_field)?;
+                }
+            }
+        };
+
+        // Set id from max_id
+        let max_id = base_schema
+            .map(|s| s.max_field_id().unwrap_or(-1))
+            .unwrap_or(-1);
+        let max_id = max_id.max(max_existing_id.unwrap_or(-1));
+        self.set_field_id(Some(max_id));
+        Ok(())
+    }
+
+    fn from_arrow_schema(
+        arrow_schema: &Schema,
+        base_schema: Option<LanceSchema>,
+        max_existing_id: Option<i32>,
+    ) -> Result<LanceSchema> {
+        let mut schema = Self {
+            fields: arrow_schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<lance_core::Result<_>>()?,
+            metadata: arrow_schema.metadata.clone(),
+        };
+        schema.set_field_id_from_schema(base_schema, max_existing_id)?;
+        schema.validate()?;
+        schema.verify_primary_key()?;
+
+        Ok(schema)
+    }
+}
+
+trait FieldExt {
+    /// Recursively set field ID and parent ID for this field and all its children.
+    fn set_field_id_from_field(
+        &mut self,
+        parent_id: i32,
+        base_field: &Field,
+    ) -> lance_core::Result<()>;
+}
+
+impl FieldExt for Field {
+    fn set_field_id_from_field(
+        &mut self,
+        parent_id: i32,
+        base_field: &Field,
+    ) -> lance_core::Result<()> {
+        self.parent_id = parent_id;
+
+        if self.name != base_field.name {
+            return Ok(());
+        }
+
+        if self.logical_type != base_field.logical_type {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "Expecting logical type {} but got {} for field {}",
+                    base_field.logical_type, self.logical_type, self.name
+                )
+                .into(),
+            ));
+        }
+
+        if self.id < 0 {
+            // use id from base
+            self.id = base_field.id;
+        }
+
+        for child in &mut self.children {
+            if let Some(base_child) = base_field.children.iter().find(|f| f.name == child.name) {
+                child.set_field_id_from_field(self.id, base_child)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
     allocator: Option<&JObject<'_>>,
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
@@ -823,6 +984,8 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Project operations".to_string(),
                     )
                 })?,
+                dataset,
+                read_version,
             )?,
         },
         "UpdateConfig" => {
@@ -952,6 +1115,8 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Overwrite operations".to_string(),
                     )
                 })?,
+                dataset,
+                read_version,
             )?;
             Operation::Overwrite {
                 fragments,
@@ -1054,6 +1219,8 @@ fn convert_to_rust_operation(
                             "BufferAllocator is required for Merge operations".to_string(),
                         )
                     })?,
+                    dataset,
+                    read_version,
                 )?,
             }
         }
@@ -1169,7 +1336,7 @@ fn export_update_map<'a>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     mut env: JNIEnv<'local>,
@@ -1259,19 +1426,21 @@ fn inner_commit_to_uri<'local>(
         .get_optional(&storage_options_provider_obj, |env, provider_obj| {
             JavaStorageOptionsProvider::new(env, provider_obj)
         })?;
+    let storage_options_provider =
+        storage_options_provider.map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
 
-    let accessor = match (write_param.is_empty(), storage_options_provider) {
+    // Keep a copy of initial options for opening the read dataset.
+    let initial_storage_options = write_param.clone();
+
+    let accessor = match (write_param.is_empty(), storage_options_provider.clone()) {
         (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(
-                write_param,
-                Arc::new(provider) as Arc<dyn StorageOptionsProvider>,
-            ),
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(write_param, provider),
         )),
         (false, None) => Some(Arc::new(
             lance::io::StorageOptionsAccessor::with_static_options(write_param),
         )),
         (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            Arc::new(provider) as Arc<dyn StorageOptionsProvider>,
+            provider,
         ))),
         (true, None) => None,
     };
@@ -1281,13 +1450,37 @@ fn inner_commit_to_uri<'local>(
         ..Default::default()
     };
 
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let (open_namespace, open_table_id) = match &namespace_info {
+        Some((ns, tid)) => (Some(ns.clone()), Some(tid.clone())),
+        None => (None, None),
+    };
+
+    // Open the read dataset using the same storage options (and provider, if any) so that
+    // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
+    let mut ds = BlockingDataset::open(
+        &uri_str,
+        None,
+        None,
+        6 * 1024 * 1024,
+        1024 * 1024,
+        initial_storage_options,
+        None,
+        storage_options_provider,
+        None,
+        open_namespace,
+        open_table_id,
+    )
+    .ok();
+
     // Convert Java transaction to Rust
     let allocator_ref = if allocator_obj.is_null() {
         None
     } else {
         Some(allocator_obj)
     };
-    let transaction = convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref())?;
+    let transaction =
+        convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
 
     // Build CommitBuilder with URI
     let mut builder = CommitBuilder::new(&*uri_str)
@@ -1309,7 +1502,6 @@ fn inner_commit_to_uri<'local>(
     }
 
     // Set namespace commit handler if provided
-    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     if let Some((ns, tid)) = namespace_info {
         let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
@@ -1321,4 +1513,263 @@ fn inner_commit_to_uri<'local>(
     let dataset = RT.block_on(builder.execute(transaction))?;
     let blocking_ds = BlockingDataset { inner: dataset };
     blocking_ds.into_java(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::{
+        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+        Schema as ArrowSchema,
+    };
+    use std::{collections::HashMap, sync::Arc};
+
+    use super::*;
+
+    pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
+    #[test]
+    fn test_create_schema_from_arrow() {
+        // base_schema has an existing field id
+        let mut base_a = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
+        base_a.set_id(-1, &mut 10);
+        let mut base_b = Field::new_arrow("b", ArrowDataType::Int32, false).unwrap();
+        base_b.set_id(-1, &mut 11);
+
+        // base struct: s{x,y}
+        let mut base_s = Field::try_from(&ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("x", ArrowDataType::Int32, false),
+                ArrowField::new("y", ArrowDataType::Int32, false),
+            ])),
+            false,
+        ))
+        .unwrap();
+        base_s.set_id(-1, &mut 20);
+        let base_s_x = base_s.children.iter_mut().find(|c| c.name == "x").unwrap();
+        base_s_x.set_id(20, &mut 21);
+        let base_s_y = base_s.children.iter_mut().find(|c| c.name == "y").unwrap();
+        base_s_y.set_id(20, &mut 22);
+
+        // base list: l<item>
+        let mut base_l = Field::try_from(&ArrowField::new(
+            "l",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        ))
+        .unwrap();
+        base_l.set_id(-1, &mut 30);
+        let base_l_item = base_l
+            .children
+            .iter_mut()
+            .find(|c| c.name == "item")
+            .unwrap();
+        base_l_item.set_id(30, &mut 31);
+
+        // base map: m<entries{key,value}>
+        let base_map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut base_m = Field::try_from(&ArrowField::new(
+            "m",
+            ArrowDataType::Map(Arc::new(base_map_entries), false),
+            true,
+        ))
+        .unwrap();
+        base_m.set_id(-1, &mut 40);
+
+        let base_m_entries = base_m
+            .children
+            .iter_mut()
+            .find(|c| c.name == "entries")
+            .unwrap();
+        base_m_entries.set_id(40, &mut 41);
+
+        let base_m_key = base_m_entries
+            .children
+            .iter_mut()
+            .find(|c| c.name == "key")
+            .unwrap();
+        base_m_key.set_id(41, &mut 42);
+
+        let base_m_val = base_m_entries
+            .children
+            .iter_mut()
+            .find(|c| c.name == "value")
+            .unwrap();
+        base_m_val.set_id(41, &mut 43);
+
+        let base_schema = LanceSchema {
+            fields: vec![base_a, base_b, base_s, base_l, base_m],
+            metadata: HashMap::from([("base_schema_k".to_string(), "base_schema_v".to_string())]),
+        };
+
+        // new_schema specifies:
+        // - field a: manual field id
+        // - field b: no id -> should inherit from base_schema
+        // - field c: new field -> should be assigned based on max_field_id
+        // - struct s: parent+child(x) manual, child(y) inherit, child(z) max_field_id
+        // - list l: parent manual, child(item) inherit
+        // - list l2: parent manual, child(item) max_field_id
+        // - map m: parent manual, child(entries/key/value) inherit
+        // - map m2: parent manual, child(entries/key/value) max_field_id
+        let mut a_meta = HashMap::new();
+        a_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "5".to_string());
+        let arrow_a = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(a_meta);
+        let arrow_b = ArrowField::new("b", ArrowDataType::Int32, false);
+        let arrow_c = ArrowField::new("c", ArrowDataType::Int32, false);
+
+        // struct s: manual parent + manual child x
+        let mut s_meta = HashMap::new();
+        s_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "50".to_string());
+        let mut x_meta = HashMap::new();
+        x_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "51".to_string());
+        let arrow_s = ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("x", ArrowDataType::Int32, false).with_metadata(x_meta),
+                ArrowField::new("y", ArrowDataType::Int32, false),
+                ArrowField::new("z", ArrowDataType::Int32, true),
+            ])),
+            false,
+        )
+        .with_metadata(s_meta);
+
+        // list l: parent manual, item inherit
+        let mut l_meta = HashMap::new();
+        l_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "60".to_string());
+        let arrow_l = ArrowField::new(
+            "l",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        )
+        .with_metadata(l_meta);
+
+        // list l2: parent manual, item max_field_id (no base match)
+        let mut l2_meta = HashMap::new();
+        l2_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "61".to_string());
+        let arrow_l2 = ArrowField::new(
+            "l2",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        )
+        .with_metadata(l2_meta);
+
+        // map m: parent manual, entries/key/value inherit
+        let map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut m_meta = HashMap::new();
+        m_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "70".to_string());
+        let arrow_m = ArrowField::new("m", ArrowDataType::Map(Arc::new(map_entries), false), true)
+            .with_metadata(m_meta);
+
+        // map m2: parent manual, entries/key/value max_field_id (no base match)
+        let map_entries = ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            false,
+        );
+        let mut m2_meta = HashMap::new();
+        m2_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "71".to_string());
+        let arrow_m2 =
+            ArrowField::new("m2", ArrowDataType::Map(Arc::new(map_entries), false), true)
+                .with_metadata(m2_meta);
+
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            vec![
+                arrow_a, arrow_b, arrow_c, arrow_s, arrow_l, arrow_l2, arrow_m, arrow_m2,
+            ],
+            HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())]),
+        );
+
+        let schema =
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(100)).unwrap();
+
+        // 1. Manually specified field id
+        let got_a = schema.field("a").unwrap();
+        assert_eq!(got_a.id, 5);
+        assert!(!got_a.metadata.contains_key(LANCE_FIELD_ID_KEY));
+
+        // 2. Inherit field id + metadata from base_schema (field b)
+        let got_b = schema.field("b").unwrap();
+        assert_eq!(got_b.id, 11);
+
+        // 3. Assign a new field id using max_field_id (field c)
+        let got_c = schema.field("c").unwrap();
+        assert_eq!(got_c.id, 101);
+
+        // 4. struct: parent+child(x) manual, child(y) inherit, child(z) max_field_id
+        let got_s = schema.field("s").unwrap();
+        assert_eq!(got_s.id, 50);
+        let got_sx = schema.field("s.x").unwrap();
+        assert_eq!(got_sx.id, 51);
+        let got_sy = schema.field("s.y").unwrap();
+        assert_eq!(got_sy.id, 22);
+        let got_sz = schema.field("s.z").unwrap();
+        assert_eq!(got_sz.id, 102);
+
+        // 5. list l: parent manual, item inherit
+        let got_l = schema.field("l").unwrap();
+        assert_eq!(got_l.id, 60);
+        let got_li = schema.field("l.item").unwrap();
+        assert_eq!(got_li.id, 31);
+
+        // 6. list l2: parent manual, item max_field_id
+        let got_l2 = schema.field("l2").unwrap();
+        assert_eq!(got_l2.id, 61);
+        let got_l2i = schema.field("l2.item").unwrap();
+        assert_eq!(got_l2i.id, 103);
+
+        // 7. map m: parent manual, entries/key/value inherit
+        let got_m = schema.field("m").unwrap();
+        assert_eq!(got_m.id, 70);
+        let got_me = schema.field("m.entries").unwrap();
+        assert_eq!(got_me.id, 41);
+        let got_mk = schema.field("m.entries.key").unwrap();
+        assert_eq!(got_mk.id, 42);
+        let got_mv = schema.field("m.entries.value").unwrap();
+        assert_eq!(got_mv.id, 43);
+
+        // 8. map m2: parent manual, entries/key/value max_field_id
+        let got_m2 = schema.field("m2").unwrap();
+        assert_eq!(got_m2.id, 71);
+        let got_m2e = schema.field("m2.entries").unwrap();
+        assert_eq!(got_m2e.id, 104);
+        let got_m2k = schema.field("m2.entries.key").unwrap();
+        assert_eq!(got_m2k.id, 105);
+        let got_m2v = schema.field("m2.entries.value").unwrap();
+        assert_eq!(got_m2v.id, 106);
+
+        // 9. Schema metadata: when new_schema.metadata is non-empty, use new_schema metadata
+        assert_eq!(
+            schema.metadata,
+            HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
+        );
+    }
 }

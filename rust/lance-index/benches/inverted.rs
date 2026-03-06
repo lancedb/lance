@@ -8,12 +8,12 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
+use lance_core::cache::LanceCache;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::lance_tokenizer::DocType;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
@@ -26,7 +26,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::Zipf;
 
 fn bench_inverted(c: &mut Criterion) {

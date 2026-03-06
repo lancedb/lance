@@ -50,13 +50,13 @@ fn install_panic_handler() {
         eprintln!("\n\x1b[31mPANIC{}: {}\x1b[0m", location, msg);
 
         // Print backtrace if available
-        if let Ok(var) = std::env::var("RUST_BACKTRACE") {
-            if var != "0" {
-                eprintln!(
-                    "\nBacktrace:\n{:?}",
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
+        if let Ok(var) = std::env::var("RUST_BACKTRACE")
+            && var != "0"
+        {
+            eprintln!(
+                "\nBacktrace:\n{:?}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
     }));
 }
@@ -64,7 +64,6 @@ fn install_panic_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snafu::location;
 
     #[test]
     fn test_ok_lance_result_to_ok_std_result() {
@@ -73,9 +72,11 @@ mod tests {
 
     #[test]
     fn test_error_lance_result_to_error_std_result() {
-        assert!(lance_result_to_std_result::<()>(lance_core::Result::Err(
-            lance_core::Error::invalid_input("bad input", location!())
-        ))
-        .is_err());
+        assert!(
+            lance_result_to_std_result::<()>(lance_core::Result::Err(
+                lance_core::Error::invalid_input("bad input")
+            ))
+            .is_err()
+        );
     }
 }

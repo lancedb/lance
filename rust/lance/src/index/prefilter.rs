@@ -13,11 +13,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
-use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::spawn_cpu;
@@ -26,14 +26,14 @@ use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
-use tracing::instrument;
 use tracing::Instrument;
+use tracing::instrument;
 
+use crate::Dataset;
+use crate::Result;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::utils::future::SharedPrerequisite;
-use crate::Dataset;
-use crate::Result;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
@@ -150,12 +150,12 @@ impl DatasetPreFilter {
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
-                        Ok(row_ids_and_deletions.into_iter().fold(
+                        Result::Ok(row_ids_and_deletions.into_iter().fold(
                             RowAddrTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {
                                     let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.iter()).unwrap();
+                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
                                     Cow::<RowIdSequence>::Owned(row_ids)
                                 } else {
                                     Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
@@ -319,10 +319,12 @@ mod test {
 
         dataset.delete("x >= 3").await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
-        assert!(dataset.get_fragments()[0]
-            .metadata()
-            .deletion_file
-            .is_none());
+        assert!(
+            dataset.get_fragments()[0]
+                .metadata()
+                .deletion_file
+                .is_none()
+        );
         let only_missing_frags = Arc::new(dataset.clone());
 
         TestDatasets {

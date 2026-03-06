@@ -12,8 +12,8 @@ ROWS_TO_SAMPLE = 10
 
 @pytest.mark.parametrize(
     "version",
-    ["2.0", "2.1"],
-    ids=["2_0", "2_1"],
+    ["2.0", "2.1", "2.2"],
+    ids=["2_0", "2_1", "2_2"],
 )
 @pytest.mark.benchmark(group="scan_single_column")
 def test_scan_integer(tmp_path: Path, benchmark, version):
@@ -47,8 +47,8 @@ def test_scan_integer(tmp_path: Path, benchmark, version):
 
 @pytest.mark.parametrize(
     "version",
-    ["2.0", "2.1"],
-    ids=["2_0", "2_1"],
+    ["2.0", "2.1", "2.2"],
+    ids=["2_0", "2_1", "2_2"],
 )
 @pytest.mark.benchmark(group="scan_single_column")
 def test_scan_nullable_integer(tmp_path: Path, benchmark, version):
@@ -133,8 +133,8 @@ def test_scan_nested_integer(tmp_path: Path, benchmark):
 
 @pytest.mark.parametrize(
     "version",
-    ["2.0", "2.1"],
-    ids=["2_0", "2_1"],
+    ["2.0", "2.1", "2.2"],
+    ids=["2_0", "2_1", "2_2"],
 )
 @pytest.mark.benchmark(group="sample_single_column")
 def test_sample_integer(tmp_path: Path, benchmark, version):

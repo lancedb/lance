@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatchReader;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{stream::RecordBatchStreamAdapter, ExecutionPlan},
+    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
 };
 use datafusion_common::DataFusionError;
 use futures::TryStreamExt;

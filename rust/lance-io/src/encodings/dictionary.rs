@@ -9,22 +9,21 @@ use std::sync::Arc;
 
 use arrow_array::cast::{as_dictionary_array, as_primitive_array};
 use arrow_array::types::{
-    ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use snafu::location;
 
 use crate::{
-    traits::{Reader, Writer},
     ReadBatchParams,
+    traits::{Reader, Writer},
 };
 use lance_core::{Error, Result};
 
-use super::plain::PlainEncoder;
 use super::AsyncIndex;
+use super::plain::PlainEncoder;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 
@@ -75,13 +74,10 @@ impl Encoder for DictionaryEncoder<'_> {
             Int16 => self.write_typed_array::<Int16Type>(array).await,
             Int32 => self.write_typed_array::<Int32Type>(array).await,
             Int64 => self.write_typed_array::<Int64Type>(array).await,
-            _ => Err(Error::Schema {
-                message: format!(
-                    "DictionaryEncoder: unsupported key type: {:?}",
-                    self.key_type
-                ),
-                location: location!(),
-            }),
+            _ => Err(Error::schema(format!(
+                "DictionaryEncoder: unsupported key type: {:?}",
+                self.key_type
+            ))),
         }
     }
 }
@@ -133,10 +129,10 @@ impl<'a> DictionaryDecoder<'a> {
             assert!(key_type.as_ref().is_dictionary_key_type());
             key_type.as_ref()
         } else {
-            return Err(Error::Arrow {
-                message: format!("Not a dictionary type: {}", self.data_type),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Not a dictionary type: {}",
+                self.data_type
+            )));
         };
 
         let decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
@@ -151,10 +147,9 @@ impl<'a> DictionaryDecoder<'a> {
             DataType::UInt16 => self.make_dict_array::<UInt16Type>(keys).await,
             DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys).await,
             DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
-            _ => Err(Error::Arrow {
-                message: format!("Dictionary encoding does not support index type: {index_type}",),
-                location: location!(),
-            }),
+            _ => Err(Error::arrow(format!(
+                "Dictionary encoding does not support index type: {index_type}",
+            ))),
         }
     }
 
@@ -186,12 +181,11 @@ impl AsyncIndex<usize> for DictionaryDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
-        Err(Error::NotSupported {
-            source: "DictionaryDecoder does not support get()"
+        Err(Error::not_supported_source(
+            "DictionaryDecoder does not support get()"
                 .to_string()
                 .into(),
-            location: location!(),
-        })
+        ))
     }
 }
 

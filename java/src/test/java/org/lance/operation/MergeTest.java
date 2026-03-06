@@ -20,14 +20,18 @@ import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
+import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -37,7 +41,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MergeTest extends OperationTestBase {
 
@@ -131,6 +137,218 @@ public class MergeTest extends OperationTestBase {
   }
 
   @Test
+  void testMergeNewColumnWithNonContiguousFieldId(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMergeNewColumnWithNonContiguousFieldId").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      int rowCount = 15;
+      try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
+        LanceSchema initialLanceSchema = initialDataset.getLanceSchema();
+        int idFieldId =
+            initialLanceSchema.fields().stream()
+                .filter(f -> f.getName().equals("id"))
+                .findFirst()
+                .map(LanceField::getId)
+                .orElseThrow(() -> new IllegalStateException("field 'id' not found"));
+        int nameFieldId =
+            initialLanceSchema.fields().stream()
+                .filter(f -> f.getName().equals("name"))
+                .findFirst()
+                .map(LanceField::getId)
+                .orElseThrow(() -> new IllegalStateException("field 'name' not found"));
+        int maxFieldId =
+            initialLanceSchema.fields().stream().mapToInt(LanceField::getId).max().orElse(-1);
+
+        // Use Arrow field metadata to manually assign a non-contiguous field id for the new column.
+        // This aligns with Rust's `lance:field_id` metadata key.
+        int ageFieldId = maxFieldId + 10;
+        int addressFieldId = maxFieldId + 20;
+        int cityFieldId = maxFieldId + 30;
+        int countryFieldId = maxFieldId + 40;
+
+        Field idField =
+            new Field(
+                "id",
+                new FieldType(true, new ArrowType.Int(32, true), null, fieldMeta(idFieldId)),
+                null);
+        Field nameField =
+            new Field(
+                "name",
+                new FieldType(true, new ArrowType.Utf8(), null, fieldMeta(nameFieldId)),
+                null);
+        Field ageField =
+            new Field(
+                "age",
+                new FieldType(true, new ArrowType.Int(32, true), null, fieldMeta(ageFieldId)),
+                null);
+        Field cityField =
+            new Field(
+                "city",
+                new FieldType(true, new ArrowType.Utf8(), null, fieldMeta(cityFieldId)),
+                null);
+        Field countryField =
+            new Field(
+                "country",
+                new FieldType(true, new ArrowType.Utf8(), null, fieldMeta(countryFieldId)),
+                null);
+        Field addressField =
+            new Field(
+                "address",
+                new FieldType(true, new ArrowType.Struct(), null, fieldMeta(addressFieldId)),
+                Arrays.asList(cityField, countryField));
+
+        Schema evolvedSchema =
+            new Schema(Arrays.asList(idField, nameField, ageField, addressField), null);
+
+        // Write data files for the new columns with the manually specified field id.
+        VectorSchemaRoot ageRoot = null;
+        VectorSchemaRoot addressRoot = null;
+        try {
+          // Age data file
+          ageRoot =
+              VectorSchemaRoot.create(
+                  new Schema(Collections.singletonList(ageField), null), allocator);
+          ageRoot.allocateNew();
+          IntVector ageVector = (IntVector) ageRoot.getVector("age");
+
+          for (int i = 0; i < rowCount; i++) {
+            ageVector.setSafe(i, 20 + i);
+          }
+          ageRoot.setRowCount(rowCount);
+
+          DataFile ageDataFile =
+              writeLanceDataFile(
+                  dataset.allocator(), datasetPath, ageRoot, new int[] {ageFieldId}, new int[] {0});
+
+          // Address data file
+          addressRoot =
+              VectorSchemaRoot.create(
+                  new Schema(Collections.singletonList(addressField), null), allocator);
+
+          addressRoot.allocateNew();
+          StructVector addressVector = (StructVector) addressRoot.getVector("address");
+          VarCharVector cityVector = (VarCharVector) addressVector.getChild("city");
+          VarCharVector countryVector = (VarCharVector) addressVector.getChild("country");
+
+          for (int i = 0; i < rowCount; i++) {
+            addressVector.setIndexDefined(i);
+            cityVector.setSafe(i, ("city_" + i).getBytes(StandardCharsets.UTF_8));
+            countryVector.setSafe(i, ("country_" + i).getBytes(StandardCharsets.UTF_8));
+          }
+          addressRoot.setRowCount(rowCount);
+
+          // New fragments from age and address
+          DataFile addressDataFile =
+              writeLanceDataFile(
+                  dataset.allocator(),
+                  datasetPath,
+                  addressRoot,
+                  new int[] {addressFieldId, cityFieldId, countryFieldId},
+                  new int[] {0, 1, 2});
+
+          FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
+          List<DataFile> dataFiles = fragmentMeta.getFiles();
+          dataFiles.add(ageDataFile);
+          dataFiles.add(addressDataFile);
+          FragmentMetadata evolvedFragment =
+              new FragmentMetadata(
+                  fragmentMeta.getId(),
+                  dataFiles,
+                  fragmentMeta.getPhysicalRows(),
+                  fragmentMeta.getDeletionFile(),
+                  fragmentMeta.getRowIdMeta());
+
+          // Commit Merge
+          try (Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
+                  .operation(
+                      Merge.builder()
+                          .fragments(Collections.singletonList(evolvedFragment))
+                          .schema(evolvedSchema)
+                          .build())
+                  .build()) {
+            try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
+              Assertions.assertEquals(3, evolvedDataset.version());
+
+              // Verify field id.
+              LanceField evolvedAgeField =
+                  findField(evolvedDataset.getLanceSchema().fields(), "age");
+              Assertions.assertEquals(ageFieldId, evolvedAgeField.getId());
+
+              LanceField evolvedAddressField =
+                  findField(evolvedDataset.getLanceSchema().fields(), "address");
+              Assertions.assertEquals(addressFieldId, evolvedAddressField.getId());
+
+              LanceField evolvedCityField = findField(evolvedAddressField.getChildren(), "city");
+              Assertions.assertEquals(cityFieldId, evolvedCityField.getId());
+
+              LanceField evolvedCountryField =
+                  findField(evolvedAddressField.getChildren(), "country");
+              Assertions.assertEquals(countryFieldId, evolvedCountryField.getId());
+
+              // Verify merged data
+              try (LanceScanner scanner = evolvedDataset.newScan()) {
+                try (ArrowReader resultReader = scanner.scanBatches()) {
+                  Assertions.assertTrue(resultReader.loadNextBatch());
+                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                  Assertions.assertEquals(rowCount, batch.getRowCount());
+                  Assertions.assertEquals(4, batch.getSchema().getFields().size());
+
+                  IntVector ageResultVector = (IntVector) batch.getVector("age");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(20 + i, ageResultVector.get(i));
+                  }
+
+                  StructVector addressResultVector = (StructVector) batch.getVector("address");
+                  VarCharVector cityResultVector =
+                      (VarCharVector) addressResultVector.getChild("city");
+                  VarCharVector countryResultVector =
+                      (VarCharVector) addressResultVector.getChild("country");
+                  for (int i = 0; i < rowCount; i++) {
+                    String city = new String(cityResultVector.get(i), StandardCharsets.UTF_8);
+                    String country = new String(countryResultVector.get(i), StandardCharsets.UTF_8);
+                    Assertions.assertEquals("city_" + i, city);
+                    Assertions.assertEquals("country_" + i, country);
+                  }
+
+                  IntVector idResultVector = (IntVector) batch.getVector("id");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertEquals(i, idResultVector.get(i));
+                  }
+                }
+              }
+            }
+          }
+        } finally {
+          if (ageRoot != null) {
+            ageRoot.close();
+          }
+          if (addressRoot != null) {
+            addressRoot.close();
+          }
+        }
+      }
+    }
+  }
+
+  private Map<String, String> fieldMeta(int fieldId) {
+    Map<String, String> idMeta = new HashMap<>();
+    idMeta.put("lance:field_id", String.valueOf(fieldId));
+    return idMeta;
+  }
+
+  private LanceField findField(List<LanceField> fields, String fieldName) {
+    return fields.stream()
+        .filter(f -> f.getName().equals(fieldName))
+        .findFirst()
+        .orElseThrow(
+            () -> new IllegalStateException(String.format("field '%s' not found", fieldName)));
+  }
+
+  @Test
   void testReplaceAsDiffColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testReplaceAsDiffColumns").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -157,9 +375,24 @@ public class MergeTest extends OperationTestBase {
           }
           ageRoot.setRowCount(rowCount);
 
+          LanceSchema initialLanceSchema = initialDataset.getLanceSchema();
+          int idFieldId =
+              initialLanceSchema.fields().stream()
+                  .filter(f -> f.getName().equals("id"))
+                  .findFirst()
+                  .map(LanceField::getId)
+                  .orElseThrow(() -> new IllegalStateException("field 'id' not found"));
+          int maxFieldId =
+              initialLanceSchema.fields().stream().mapToInt(LanceField::getId).max().orElse(-1);
+          int ageFieldId = maxFieldId + 1;
+
           DataFile ageDataFile =
               writeLanceDataFile(
-                  dataset.allocator(), datasetPath, ageRoot, new int[] {0, 1}, new int[] {0, 1});
+                  dataset.allocator(),
+                  datasetPath,
+                  ageRoot,
+                  new int[] {idFieldId, ageFieldId},
+                  new int[] {0, 1});
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
           FragmentMetadata evolvedFragment =

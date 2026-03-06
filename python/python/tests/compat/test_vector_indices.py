@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -199,6 +200,65 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         """Verify can insert vectors and rebuild index."""
         ds = lance.dataset(self.path)
         # Add new vectors
+        data = pa.table(
+            {
+                "id": pa.array([1000]),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(32).cast(pa.float32()), 32
+                ),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+
+@compat_test(min_version="0.39.0")
+class IvfRqVectorIndex(UpgradeDowngradeTest):
+    """Test IVF_RQ vector index compatibility."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with IVF_RQ vector index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        ndims = 32
+        nvecs = 512
+
+        data = pa.table(
+            {
+                "id": pa.array(range(nvecs)),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(ndims * nvecs).cast(pa.float32()), ndims
+                ),
+            }
+        )
+
+        dataset = lance.write_dataset(data, self.path)
+        dataset.create_index(
+            "vec",
+            "IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+        )
+
+    def check_read(self):
+        """Verify vector query can run (indexed or brute-force fallback)."""
+        ds = lance.dataset(self.path)
+        q = np.random.random(32).astype(np.float32)
+        result = ds.to_table(
+            nearest={
+                "q": q,
+                "k": 4,
+                "column": "vec",
+            }
+        )
+        assert result.num_rows == 4
+
+    def check_write(self):
+        """Verify can insert vectors and run optimize workflows."""
+        ds = lance.dataset(self.path)
         data = pa.table(
             {
                 "id": pa.array([1000]),

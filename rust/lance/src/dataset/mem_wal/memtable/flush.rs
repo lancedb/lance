@@ -8,21 +8,20 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
+use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
-use lance_index::IndexType;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
 use object_store::path::Path;
-use snafu::location;
 use uuid::Uuid;
 
 use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
+use crate::Dataset;
 use crate::dataset::mem_wal::manifest::RegionManifestStore;
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
-use crate::Dataset;
 
 #[derive(Debug, Clone)]
 pub struct FlushResult {
@@ -82,16 +81,12 @@ impl MemTableFlusher {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
-            return Err(Error::invalid_input(
-                "Cannot flush empty MemTable",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
         if !memtable.all_flushed_to_wal() {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
-                location!(),
             ));
         }
 
@@ -180,7 +175,7 @@ impl MemTableFlusher {
             .inner
             .put(path, Bytes::from(data).into())
             .await
-            .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e), location!()))?;
+            .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e)))?;
         Ok(())
     }
 
@@ -194,16 +189,12 @@ impl MemTableFlusher {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
-            return Err(Error::invalid_input(
-                "Cannot flush empty MemTable",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
         if !memtable.all_flushed_to_wal() {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
-                location!(),
             ));
         }
 
@@ -240,47 +231,47 @@ impl MemTableFlusher {
             let mut dataset = Dataset::open(&uri).await?;
 
             for config in index_configs {
-                if let MemIndexConfig::IvfPq(ivf_pq_config) = config {
-                    if let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name) {
-                        let mut index_meta = self
-                            .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
-                            .await?;
+                if let MemIndexConfig::IvfPq(ivf_pq_config) = config
+                    && let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name)
+                {
+                    let mut index_meta = self
+                        .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
+                        .await?;
 
-                        // Fix up the index metadata with correct field index
-                        let schema = dataset.schema();
-                        let field_idx = schema
-                            .field(&ivf_pq_config.column)
-                            .map(|f| f.id)
-                            .unwrap_or(0);
-                        index_meta.fields = vec![field_idx];
-                        index_meta.dataset_version = dataset.version().version;
-                        // Calculate fragment_bitmap from dataset fragments
-                        let fragment_ids: roaring::RoaringBitmap = dataset
-                            .get_fragments()
-                            .iter()
-                            .map(|f| f.id() as u32)
-                            .collect();
-                        index_meta.fragment_bitmap = Some(fragment_ids);
+                    // Fix up the index metadata with correct field index
+                    let schema = dataset.schema();
+                    let field_idx = schema
+                        .field(&ivf_pq_config.column)
+                        .map(|f| f.id)
+                        .unwrap_or(0);
+                    index_meta.fields = vec![field_idx];
+                    index_meta.dataset_version = dataset.version().version;
+                    // Calculate fragment_bitmap from dataset fragments
+                    let fragment_ids: roaring::RoaringBitmap = dataset
+                        .get_fragments()
+                        .iter()
+                        .map(|f| f.id() as u32)
+                        .collect();
+                    index_meta.fragment_bitmap = Some(fragment_ids);
 
-                        // Commit the index to the dataset
-                        use crate::dataset::transaction::{Operation, Transaction};
-                        let transaction = Transaction::new(
-                            index_meta.dataset_version,
-                            Operation::CreateIndex {
-                                new_indices: vec![index_meta],
-                                removed_indices: vec![],
-                            },
-                            None,
-                        );
-                        dataset
-                            .apply_commit(transaction, &Default::default(), &Default::default())
-                            .await?;
+                    // Commit the index to the dataset
+                    use crate::dataset::transaction::{Operation, Transaction};
+                    let transaction = Transaction::new(
+                        index_meta.dataset_version,
+                        Operation::CreateIndex {
+                            new_indices: vec![index_meta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    );
+                    dataset
+                        .apply_commit(transaction, &Default::default(), &Default::default())
+                        .await?;
 
-                        info!(
-                            "Created IVF-PQ index '{}' on flushed generation {}",
-                            ivf_pq_config.name, generation
-                        );
-                    }
+                    info!(
+                        "Created IVF-PQ index '{}' on flushed generation {}",
+                        ivf_pq_config.name, generation
+                    );
                 }
             }
 
@@ -359,18 +350,18 @@ impl MemTableFlusher {
             )
             .name(btree_cfg.name.clone());
 
-            if let Some(registry) = mem_indexes {
-                if let Some(btree_index) = registry.get_btree(&btree_cfg.name) {
-                    // Use reversed training batches since the flushed data is in reverse order.
-                    // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
-                    let training_batches =
-                        btree_index.to_training_batches_reversed(8192, total_rows)?;
-                    if !training_batches.is_empty() {
-                        let schema = training_batches[0].schema();
-                        let reader =
-                            RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
-                        builder = builder.preprocessed_data(Box::new(reader));
-                    }
+            if let Some(registry) = mem_indexes
+                && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
+            {
+                // Use reversed training batches since the flushed data is in reverse order.
+                // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
+                let training_batches =
+                    btree_index.to_training_batches_reversed(8192, total_rows)?;
+                if !training_batches.is_empty() {
+                    let schema = training_batches[0].schema();
+                    let reader =
+                        RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
+                    builder = builder.preprocessed_data(Box::new(reader));
                 }
             }
 
@@ -470,12 +461,8 @@ impl MemTableFlusher {
 
             // Create index metadata for commit
             let details = pbold::InvertedIndexDetails::try_from(&fts_cfg.params)?;
-            let index_details = prost_types::Any::from_msg(&details).map_err(|e| {
-                Error::io(
-                    format!("Failed to serialize index details: {}", e),
-                    location!(),
-                )
-            })?;
+            let index_details = prost_types::Any::from_msg(&details)
+                .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
 
             let schema = dataset.schema();
             let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
@@ -591,8 +578,8 @@ impl MemTableFlusher {
         use lance_index::vector::v3::subindex::IvfSubIndex;
         use lance_index::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN};
         use lance_index::{
-            IndexMetadata as IndexMetaSchema, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
-            INDEX_METADATA_SCHEMA_KEY,
+            INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+            IndexMetadata as IndexMetaSchema,
         };
         use prost::Message;
         use std::sync::Arc;
@@ -646,7 +633,7 @@ impl MemTableFlusher {
         let centroids = ivf_model
             .centroids
             .clone()
-            .ok_or_else(|| Error::io("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::io("IVF model has no centroids"))?;
         let mut index_ivf = lance_index::vector::ivf::storage::IvfModel::new(centroids, None);
         let mut partition_index_metadata = Vec::with_capacity(ivf_model.num_partitions());
 
@@ -784,21 +771,21 @@ fn transpose_pq_batch(
     batch: &arrow_array::RecordBatch,
     pq_code_len: usize,
 ) -> Result<arrow_array::RecordBatch> {
-    use arrow_array::cast::AsArray;
     use arrow_array::FixedSizeListArray;
+    use arrow_array::cast::AsArray;
     use arrow_schema::Field;
     use lance_core::ROW_ID;
-    use lance_index::vector::pq::storage::transpose;
     use lance_index::vector::PQ_CODE_COLUMN;
+    use lance_index::vector::pq::storage::transpose;
     use std::sync::Arc;
 
     let row_ids = batch
         .column_by_name(ROW_ID)
-        .ok_or_else(|| Error::io("Missing _rowid column in partition batch", location!()))?;
+        .ok_or_else(|| Error::io("Missing _rowid column in partition batch"))?;
 
     let pq_codes = batch
         .column_by_name(PQ_CODE_COLUMN)
-        .ok_or_else(|| Error::io("Missing __pq_code column in partition batch", location!()))?;
+        .ok_or_else(|| Error::io("Missing __pq_code column in partition batch"))?;
 
     let pq_codes_fsl = pq_codes.as_fixed_size_list();
     let codes_flat = pq_codes_fsl
@@ -811,21 +798,11 @@ fn transpose_pq_batch(
     let inner_field = Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false));
     let transposed_fsl = Arc::new(
         FixedSizeListArray::try_new(inner_field, pq_code_len as i32, Arc::new(transposed), None)
-            .map_err(|e| {
-                Error::io(
-                    format!("Failed to create transposed PQ array: {}", e),
-                    location!(),
-                )
-            })?,
+            .map_err(|e| Error::io(format!("Failed to create transposed PQ array: {}", e)))?,
     );
 
     arrow_array::RecordBatch::try_new(batch.schema(), vec![row_ids.clone(), transposed_fsl])
-        .map_err(|e| {
-            Error::io(
-                format!("Failed to create transposed batch: {}", e),
-                location!(),
-            )
-        })
+        .map_err(|e| Error::io(format!("Failed to create transposed batch: {}", e)))
 }
 
 /// Message to trigger flush of a frozen memtable to Lance storage.
@@ -909,10 +886,12 @@ mod tests {
         let result = flusher.flush(&memtable, epoch).await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unflushed fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unflushed fragments")
+        );
     }
 
     #[tokio::test]
@@ -1088,10 +1067,10 @@ mod tests {
         use super::super::super::index::{IndexStore, IvfPqIndexConfig};
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::vector::ivf::storage::IvfModel;
-        use lance_index::vector::kmeans::{train_kmeans, KMeansParams};
-        use lance_index::vector::pq::PQBuildParams;
         use lance_index::DatasetIndexExt;
+        use lance_index::vector::ivf::storage::IvfModel;
+        use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
+        use lance_index::vector::pq::PQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

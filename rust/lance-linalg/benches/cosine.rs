@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     Float32Array,
+    types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray};
-use lance_linalg::distance::cosine::{cosine_distance_batch, Cosine};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
+use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]

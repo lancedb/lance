@@ -4,10 +4,10 @@
 use std::iter::repeat_with;
 
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     Float32Array,
+    types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use num_traits::{AsPrimitive, Float};
 use rand::Rng;
 
@@ -15,7 +15,7 @@ use rand::Rng;
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::{l2::l2, l2_distance_batch, l2_distance_uint_scalar, L2};
+use lance_linalg::distance::{L2, l2::l2, l2_distance_batch, l2_distance_uint_scalar};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 const DIMENSION: usize = 1024;

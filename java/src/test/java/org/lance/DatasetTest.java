@@ -17,6 +17,7 @@ import org.lance.compaction.CompactionOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
@@ -26,6 +27,7 @@ import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
+import org.lance.operation.CreateIndex;
 import org.lance.operation.Overwrite;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
@@ -69,6 +71,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -114,6 +117,33 @@ public class DatasetTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
+    }
+  }
+
+  @Test
+  void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Test default version (V2_0)
+      String defaultPath = tempDir.resolve("default_version").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, defaultPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_0, dataset.getLanceFileFormatVersion());
+      }
+
+      // Test LEGACY version
+      String legacyPath = tempDir.resolve("legacy_version").toString();
+      try (Dataset legacyDataset =
+          Dataset.write()
+              .allocator(allocator)
+              .uri(legacyPath)
+              .schema(testDataset.getSchema())
+              .mode(WriteParams.WriteMode.CREATE)
+              .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_LEGACY)
+              .execute()) {
+        assertEquals(
+            LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
+      }
     }
   }
 
@@ -1894,6 +1924,117 @@ public class DatasetTest {
           assertFalse(indexDesc.getMetadata().isEmpty(), "Metadata list should not be empty");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
         }
+      }
+    }
+  }
+
+  @Test
+  void testDropIndex(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("drop_index").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // 1. write two fragments
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, dataset.getFragments().size());
+
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        UUID uuid = UUID.randomUUID();
+
+        // 2. partially create index
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
+                .withIndexUUID(uuid.toString())
+                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                .build());
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
+                .withIndexUUID(uuid.toString())
+                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                .build());
+
+        // then no index should have been created
+        assertFalse(
+            dataset.listIndexes().contains("test_index"),
+            "Partially created index should not present");
+
+        // 3. merge metadata, which will still not be committed
+        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
+
+        // 4. commit the index
+        int fieldId =
+            dataset.getLanceSchema().fields().stream()
+                .filter(f -> f.getName().equals("name"))
+                .findAny()
+                .orElseThrow(() -> new RuntimeException("Cannot find 'name' field for TestDataset"))
+                .getId();
+
+        long datasetVersion = dataset.version();
+
+        Index index =
+            Index.builder()
+                .uuid(uuid)
+                .name("test_index")
+                .fields(Collections.singletonList(fieldId))
+                .datasetVersion(datasetVersion)
+                .indexVersion(0)
+                .fragments(fragments.stream().map(Fragment::getId).collect(Collectors.toList()))
+                .build();
+
+        CreateIndex createIndexOp =
+            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
+
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(datasetVersion)
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            // new dataset should contain that index
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains("test_index"));
+
+            List<Index> indexes = newDataset.getIndexes();
+            assertTrue(indexes.stream().anyMatch(idx -> idx.name().equals("test_index")));
+
+            newDataset.dropIndex("test_index");
+
+            List<String> indexNamesAfterDrop = newDataset.listIndexes();
+            assertFalse(indexNamesAfterDrop.contains("test_index"));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDropIndexNonExistent(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("drop_index_nonexistent").toString();
+
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      try (Dataset dataset =
+          Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
+        assertEquals(1, dataset.version());
+
+        assertThrows(RuntimeException.class, () -> dataset.dropIndex("nonexistent"));
+
+        assertEquals(1, dataset.version());
+        assertTrue(dataset.listIndexes().isEmpty());
+        assertTrue(dataset.getIndexes().isEmpty());
       }
     }
   }

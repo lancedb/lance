@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array};
-use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
+use lance::dataset::scanner::ColumnOrdering;
 use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};

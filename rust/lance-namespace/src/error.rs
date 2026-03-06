@@ -25,7 +25,6 @@
 //! let lance_err: lance_core::Error = err.into();
 //! ```
 
-use lance_core::error::ToSnafuLocation;
 use snafu::Snafu;
 
 /// Lance Namespace error codes.
@@ -336,10 +335,7 @@ impl NamespaceError {
 impl From<NamespaceError> for lance_core::Error {
     #[track_caller]
     fn from(err: NamespaceError) -> Self {
-        Self::Namespace {
-            source: Box::new(err),
-            location: std::panic::Location::caller().to_snafu_location(),
-        }
+        Self::namespace_source(Box::new(err))
     }
 }
 

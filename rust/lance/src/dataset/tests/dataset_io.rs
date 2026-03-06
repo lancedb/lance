@@ -6,10 +6,10 @@ use std::vec;
 
 use super::dataset_common::{create_file, require_send};
 
-use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
@@ -19,19 +19,19 @@ use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
+    ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
+    RecordBatchIterator, StringArray,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
-    ArrayRef, BooleanArray, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
-    RecordBatchIterator, StringArray,
 };
-use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
@@ -226,11 +226,13 @@ async fn test_create_and_fill_empty_dataset(
             .clone()
             .with_metadata([("key".to_string(), "value".to_string())].into()),
     );
-    let batches = vec![RecordBatch::try_new(
-        schema_with_meta,
-        vec![Arc::new(Int32Array::from_iter_values(0..10))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema_with_meta,
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap(),
+    ];
     write_params.mode = WriteMode::Append;
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     Dataset::write(batches, &test_uri, Some(write_params))
@@ -410,11 +412,13 @@ async fn test_write_params(
         false,
     )]));
     let num_rows: usize = 1_000;
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )
+        .unwrap(),
+    ];
 
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
@@ -464,11 +468,13 @@ async fn test_write_manifest(
         DataType::Int32,
         false,
     )]));
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     let write_fut = Dataset::write(
@@ -558,11 +564,13 @@ async fn test_write_manifest(
     assert!(matches!(read_result, Err(Error::NotSupported { .. })));
 
     // Check it rejects writing to it.
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     let write_result = Dataset::write(
         batches,
@@ -591,11 +599,13 @@ async fn append_dataset(
         DataType::Int32,
         false,
     )]));
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let mut write_params = WriteParams {
         max_rows_per_file: 40,
@@ -608,11 +618,13 @@ async fn append_dataset(
         .await
         .unwrap();
 
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(20..40))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(20..40))],
+        )
+        .unwrap(),
+    ];
     write_params.mode = WriteMode::Append;
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     Dataset::write(batches, &test_uri, Some(write_params.clone()))
@@ -1071,11 +1083,13 @@ async fn test_self_dataset_append(
         DataType::Int32,
         false,
     )]));
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let mut write_params = WriteParams {
         max_rows_per_file: 40,
@@ -1088,11 +1102,13 @@ async fn test_self_dataset_append(
         .await
         .unwrap();
 
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(20..40))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(20..40))],
+        )
+        .unwrap(),
+    ];
     write_params.mode = WriteMode::Append;
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
@@ -1156,22 +1172,26 @@ async fn test_self_dataset_append_schema_different(
         DataType::Int32,
         false,
     )]));
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let other_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "i",
         DataType::Int64,
         false,
     )]));
-    let other_batches = vec![RecordBatch::try_new(
-        other_schema.clone(),
-        vec![Arc::new(Int64Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let other_batches = vec![
+        RecordBatch::try_new(
+            other_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let mut write_params = WriteParams {
         max_rows_per_file: 40,
@@ -1209,13 +1229,15 @@ async fn append_dictionary(
     )]));
     let dictionary = Arc::new(StringArray::from(vec!["a", "b"]));
     let indices = Int8Array::from(vec![0, 1, 0]);
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(
-            Int8DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
-        )],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
+            )],
+        )
+        .unwrap(),
+    ];
 
     let test_uri = TempStrDir::default();
     let mut write_params = WriteParams {
@@ -1231,13 +1253,15 @@ async fn append_dictionary(
 
     // create a new one with same dictionary
     let indices = Int8Array::from(vec![1, 0, 1]);
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(
-            Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
-        )],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
+            )],
+        )
+        .unwrap(),
+    ];
 
     // Write to dataset (successful)
     write_params.mode = WriteMode::Append;
@@ -1249,13 +1273,15 @@ async fn append_dictionary(
     // Create a new one with *different* dictionary
     let dictionary = Arc::new(StringArray::from(vec!["d", "c"]));
     let indices = Int8Array::from(vec![1, 0, 1]);
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(
-            Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
-        )],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
+            )],
+        )
+        .unwrap(),
+    ];
 
     // Try write to dataset (fails with legacy format)
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1280,11 +1306,13 @@ async fn overwrite_dataset(
         DataType::Int32,
         false,
     )]));
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..20))],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap(),
+    ];
 
     let mut write_params = WriteParams {
         max_rows_per_file: 40,
@@ -1306,13 +1334,15 @@ async fn overwrite_dataset(
         DataType::Utf8,
         false,
     )]));
-    let new_batches = vec![RecordBatch::try_new(
-        new_schema.clone(),
-        vec![Arc::new(StringArray::from_iter_values(
-            (20..40).map(|v| v.to_string()),
-        ))],
-    )
-    .unwrap()];
+    let new_batches = vec![
+        RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (20..40).map(|v| v.to_string()),
+            ))],
+        )
+        .unwrap(),
+    ];
     write_params.mode = Overwrite;
     let new_batch_reader =
         RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
@@ -1536,13 +1566,15 @@ async fn test_manifest_partially_fits() {
         (0..1000).map(|i| i.to_string()),
     ));
     let indices = Int16Array::from_iter_values(0..1000);
-    let batches = vec![RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(
-            Int16DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
-        )],
-    )
-    .unwrap()];
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int16DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
+            )],
+        )
+        .unwrap(),
+    ];
 
     let test_uri = TempStrDir::default();
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());

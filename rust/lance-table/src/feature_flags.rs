@@ -3,8 +3,6 @@
 
 //! Feature flags
 
-use snafu::location;
-
 use crate::format::Manifest;
 use lance_core::{Error, Result};
 
@@ -56,10 +54,7 @@ pub fn apply_feature_flags(
             .iter()
             .all(|frag| frag.row_id_meta.is_some())
         {
-            return Err(Error::invalid_input(
-                "All fragments must have row ids",
-                location!(),
-            ));
+            return Err(Error::invalid_input("All fragments must have row ids"));
         }
         manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
         manifest.writer_feature_flags |= FLAG_STABLE_ROW_IDS;

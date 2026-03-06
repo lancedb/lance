@@ -14,21 +14,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
-use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
-#[cfg(feature = "aws")]
-use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
 use object_store::Error as ObjectStoreError;
-use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
+use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
@@ -66,8 +65,8 @@ pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
-    LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor, StorageOptionsProvider,
-    EXPIRES_AT_MILLIS_KEY, REFRESH_OFFSET_MILLIS_KEY,
+    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 
 #[async_trait]
@@ -346,10 +345,10 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
-    if let Some(s) = expanded_path.as_path().to_str() {
-        if s.is_empty() {
-            expanded_path = std::env::current_dir()?;
-        }
+    if let Some(s) = expanded_path.as_path().to_str()
+        && s.is_empty()
+    {
+        expanded_path = std::env::current_dir()?;
     }
 
     Ok(expanded_path)
@@ -374,9 +373,8 @@ fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
 fn local_path_to_url(str_path: &str) -> Result<Url> {
     let expanded_path = expand_path(str_path)?;
 
-    Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
-        source: format!("Invalid table location: '{}'", str_path).into(),
-        location: location!(),
+    Url::from_directory_path(expanded_path).map_err(|_| {
+        Error::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
     })
 }
 
@@ -397,7 +395,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
     if segments.len() < 2 {
         return Err(Error::invalid_input(
             "Huggingface URL must contain at least owner and repo",
-            location!(),
         ));
     }
 
@@ -406,7 +403,6 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
         if segments.len() < 3 {
             return Err(Error::invalid_input(
                 "Huggingface URL missing owner/repo after repo type",
-                location!(),
             ));
         }
         (segments[1].as_str(), segments[2].as_str())
@@ -496,9 +492,9 @@ impl ObjectStore {
     /// The extracted path component
     pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
         let url = uri_to_url(uri)?;
-        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
-            Error::invalid_input(format!("Unknown scheme: {}", url.scheme()), location!())
-        })?;
+        let provider = registry
+            .get_provider(url.scheme())
+            .ok_or_else(|| Error::invalid_input(format!("Unknown scheme: {}", url.scheme())))?;
         provider.extract_path(&url)
     }
 
@@ -679,9 +675,7 @@ impl ObjectStore {
                 let named_temp =
                     tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
                         .await
-                        .map_err(|e| {
-                            Error::io(format!("spawn_blocking failed: {}", e), location!())
-                        })??;
+                        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(LocalWriter::new(
@@ -825,10 +819,9 @@ impl FromStr for LanceConfigKey {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "download_retry_count" => Ok(Self::DownloadRetryCount),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid LanceConfigKey: {}", s).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid LanceConfigKey: {}", s).into(),
+            )),
         }
     }
 }
@@ -911,16 +904,10 @@ impl StorageOptions {
                 let name = header_name
                     .parse::<http::header::HeaderName>()
                     .map_err(|e| {
-                        Error::invalid_input(
-                            format!("invalid header name '{header_name}': {e}"),
-                            location!(),
-                        )
+                        Error::invalid_input(format!("invalid header name '{header_name}': {e}"))
                     })?;
                 let val = HeaderValue::from_str(value).map_err(|e| {
-                    Error::invalid_input(
-                        format!("invalid header value for '{header_name}': {e}"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("invalid header value for '{header_name}': {e}"))
                 })?;
                 headers.insert(name, val);
             }
@@ -970,7 +957,10 @@ impl ObjectStore {
                 .unwrap(),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
-                log::warn!("Guessing that object store prefix is {}, since object store scheme is not found in registry.", store_prefix);
+                log::warn!(
+                    "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
+                    store_prefix
+                );
                 store_prefix
             }
         };

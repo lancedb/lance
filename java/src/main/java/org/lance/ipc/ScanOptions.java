@@ -35,6 +35,7 @@ public class ScanOptions {
   private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
+  private final boolean useScalarIndex;
   private final Optional<ByteBuffer> substraitAggregate;
 
   /**
@@ -54,6 +55,7 @@ public class ScanOptions {
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
    * @param columnOrderings (Optional) Column orderings for result sorting.
+   * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
    * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
    */
   public ScanOptions(
@@ -70,6 +72,7 @@ public class ScanOptions {
       boolean withRowAddress,
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
       Optional<ByteBuffer> substraitAggregate) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
@@ -87,6 +90,7 @@ public class ScanOptions {
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
+    this.useScalarIndex = useScalarIndex;
     this.substraitAggregate = substraitAggregate;
   }
 
@@ -203,6 +207,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to use scalar indices for the scan.
+   *
+   * @return true if scalar indices should be used, false otherwise.
+   */
+  public boolean isUseScalarIndex() {
+    return useScalarIndex;
+  }
+
+  /**
    * Get the substrait aggregate expression.
    *
    * @return Optional containing the substrait aggregate if specified, otherwise empty.
@@ -229,6 +242,7 @@ public class ScanOptions {
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
+        .add("useScalarIndex", useScalarIndex)
         .add(
             "substraitAggregate",
             substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
@@ -250,6 +264,7 @@ public class ScanOptions {
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
+    private boolean useScalarIndex = true;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
 
     public Builder() {}
@@ -273,6 +288,7 @@ public class ScanOptions {
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
+      this.useScalarIndex = options.isUseScalarIndex();
       this.substraitAggregate = options.getSubstraitAggregate();
     }
 
@@ -414,6 +430,21 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to use scalar indices for the scan.
+     *
+     * <p>Scans will use scalar indices, when available, to optimize queries with filters. However,
+     * in some corner cases, scalar indices may make performance worse. This parameter allows users
+     * to disable scalar indices in these cases.
+     *
+     * @param useScalarIndex true to use scalar indices, false otherwise. Default is true.
+     * @return Builder instance for method chaining.
+     */
+    public Builder useScalarIndex(boolean useScalarIndex) {
+      this.useScalarIndex = useScalarIndex;
+      return this;
+    }
+
+    /**
      * Set the substrait aggregate expression.
      *
      * @param substraitAggregate Substrait aggregate expression.
@@ -444,6 +475,7 @@ public class ScanOptions {
           withRowAddress,
           batchReadahead,
           columnOrderings,
+          useScalarIndex,
           substraitAggregate);
     }
   }

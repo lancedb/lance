@@ -4,10 +4,10 @@
 use std::sync::Arc;
 use std::vec;
 
-use crate::dataset::optimize::{compact_files, CompactionOptions};
-use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::WriteDestination;
 use crate::dataset::ROW_ID;
+use crate::dataset::WriteDestination;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest};
 use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
@@ -20,16 +20,16 @@ use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use arrow_array::{
-    types::Int32Type, ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator,
-    StringArray,
-};
 use arrow_array::{Array, LargeBinaryArray, StructArray};
+use arrow_array::{
+    ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
+    types::Int32Type,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::utils::CachedFileSize;

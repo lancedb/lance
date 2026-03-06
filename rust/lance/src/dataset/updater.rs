@@ -5,17 +5,16 @@ use arrow_array::{RecordBatch, UInt32Array};
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_table::format::Fragment;
 use lance_table::utils::stream::ReadBatchFutStream;
-use snafu::location;
 
+use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{open_writer, GenericWriter};
-use super::Dataset;
-use crate::dataset::utils::SchemaAdapter;
+use super::write::{GenericWriter, open_writer};
 use crate::dataset::FileFragment;
+use crate::dataset::utils::SchemaAdapter;
 
 /// Update or insert a new column.
 ///
@@ -120,10 +119,7 @@ impl Updater {
                 if !self.deletion_restorer.is_exhausted() {
                     // This can happen only if there is a batch size (e.g. v1 file) and the
                     // last batch(es) are entirely deleted.
-                    return Err(Error::NotSupported {
-                        source: "Missing too many rows in merge, run compaction to materialize deletions first".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source("Missing too many rows in merge, run compaction to materialize deletions first".into()));
                 }
                 self.finished = true;
                 Ok(None)
@@ -164,19 +160,15 @@ impl Updater {
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::invalid_input(
                 "Fragment Updater: no input data is available before update".to_string(),
-                location!(),
             ));
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Fragment Updater: new batch has different size with the source batch: {} != {}",
-                    last.num_rows(),
-                    batch.num_rows()
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Fragment Updater: new batch has different size with the source batch: {} != {}",
+                last.num_rows(),
+                batch.num_rows()
+            )));
         };
 
         // Add back in deleted rows
@@ -355,14 +347,11 @@ impl DeletionRestorer {
             // output should have the same fixed batch size (except the last batch)
             let is_last = self.is_exhausted();
             if batch.num_rows() != batch_size as usize && !is_last {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Fragment Updater: batch size mismatch: {} != {}",
-                        batch.num_rows(),
-                        batch_size
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Fragment Updater: batch size mismatch: {} != {}",
+                    batch.num_rows(),
+                    batch_size
+                )));
             }
         }
 
@@ -381,11 +370,9 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
     if batch.num_rows() == 0 {
         // TODO: implement adding blanks for an empty batch.
         // This is difficult because we need to create a batch for arbitrary schemas.
-        return Err(Error::NotSupported {
-            source: "Missing too many rows in merge, run compaction to materialize deletions first"
-                .into(),
-            location: location!(),
-        });
+        return Err(Error::not_supported_source(
+            "Missing too many rows in merge, run compaction to materialize deletions first".into(),
+        ));
     }
 
     let mut selection_vector = Vec::<u32>::with_capacity(batch.num_rows() + batch_offsets.len());
@@ -407,12 +394,8 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
         .columns()
         .iter()
         .map(|array| {
-            arrow::compute::take(array.as_ref(), &selection_vector, None).map_err(|e| {
-                Error::Arrow {
-                    message: format!("Failed to add blanks: {}", e),
-                    location: location!(),
-                }
-            })
+            arrow::compute::take(array.as_ref(), &selection_vector, None)
+                .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))
         })
         .collect::<Result<Vec<_>>>()?;
 

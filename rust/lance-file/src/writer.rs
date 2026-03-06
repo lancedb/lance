@@ -3,22 +3,22 @@
 
 use core::panic;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arrow_array::RecordBatch;
 
 use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::stream::FuturesOrdered;
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
-    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
+    BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
+    FieldEncodingStrategy, OutOfLineBuffers, default_encoding_strategy,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
@@ -28,16 +28,15 @@ use log::{debug, warn};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::location;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use crate::datatypes::FieldsWithMeta;
+use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
-use crate::format::MAGIC;
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -150,9 +149,11 @@ impl PageMetadataSpill {
         page: &pbfile::column_metadata::Page,
     ) -> Result<()> {
         page.encode_length_delimited(&mut self.column_buffers[column_idx])
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                location: location!(),
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
             })?;
         if self.column_buffers[column_idx].len() >= self.per_column_limit {
             self.flush_column(column_idx).await?;
@@ -188,10 +189,10 @@ fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Pag
     while cursor.has_remaining() {
         let page =
             pbfile::column_metadata::Page::decode_length_delimited(&mut cursor).map_err(|e| {
-                Error::IO {
-                    source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                    location: location!(),
-                }
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
             })?;
         pages.push(page);
     }
@@ -245,19 +246,20 @@ impl FileWriter {
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: Box<dyn Writer>, options: FileWriterOptions) -> Self {
-        if let Some(format_version) = options.format_version {
-            if format_version.is_unstable()
-                && WARNED_ON_UNSTABLE_API
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
-                warn!("You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data.");
-            }
+        if let Some(format_version) = options.format_version
+            && format_version.is_unstable()
+            && WARNED_ON_UNSTABLE_API
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
+            );
         }
         Self {
             writer: object_writer,
@@ -392,7 +394,10 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -483,16 +488,16 @@ impl FileWriter {
             .iter()
             .zip(self.column_writers.iter_mut())
             .map(|(field, column_writer)| {
-                let array = batch
-                    .column_by_name(&field.name)
-                    .ok_or(Error::InvalidInput {
-                        source: format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                        location: location!(),
-                    })?;
+                let array =
+                    batch
+                        .column_by_name(&field.name)
+                        .ok_or(Error::invalid_input_source(
+                            format!(
+                                "Cannot write batch.  The batch was missing the column `{}`",
+                                field.name
+                            )
+                            .into(),
+                        ))?;
                 let repdef = RepDefBuilder::default();
                 let num_rows = array.len() as u64;
                 column_writer.maybe_encode(
@@ -524,10 +529,9 @@ impl FileWriter {
             return Ok(());
         }
         if num_rows > u32::MAX as u64 {
-            return Err(Error::InvalidInput {
-                source: "cannot write Lance files with more than 2^32 rows".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "cannot write Lance files with more than 2^32 rows".into(),
+            ));
         }
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
@@ -547,7 +551,7 @@ impl FileWriter {
         self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
             Some(rows_written) => rows_written,
             None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
+                return Err(Error::invalid_input_source(format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into()));
             }
         };
 
@@ -592,10 +596,7 @@ impl FileWriter {
                     let data = reader
                         .get_range(offset as usize..(offset as usize + len as usize))
                         .await
-                        .map_err(|e| Error::IO {
-                            source: Box::new(e),
-                            location: location!(),
-                        })?;
+                        .map_err(|e| Error::io_source(Box::new(e)))?;
                     pages.extend(decode_spilled_chunk(&data)?);
                 }
                 metadata.pages = pages;
@@ -621,7 +622,7 @@ impl FileWriter {
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
+        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created"))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
         // Use descriptor layout for blob v2 in the footer to avoid exposing logical child fields.
         //
@@ -743,6 +744,7 @@ impl FileWriter {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
             LanceFileVersion::V2_2 => (2, 2),
+            LanceFileVersion::V2_3 => (2, 3),
             _ => panic!("Unsupported version: {}", version),
         }
     }
@@ -963,17 +965,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::reader::{describe_encoding, FileReader, FileReaderOptions};
+    use crate::reader::{FileReader, FileReaderOptions, describe_encoding};
     use crate::testing::FsFixture;
-    use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
+    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
     use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{RecordBatchReader, StringArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
@@ -1114,7 +1116,9 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
         // 2MiB
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        }
 
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
@@ -1160,7 +1164,9 @@ mod tests {
             }
         }
 
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        }
     }
 
     #[tokio::test]
@@ -1468,12 +1474,9 @@ mod tests {
             "off".to_string(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "status",
-            DataType::Int32,
-            false,
-        )
-        .with_metadata(metadata)]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("status", DataType::Int32, false).with_metadata(metadata),
+        ]));
 
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 

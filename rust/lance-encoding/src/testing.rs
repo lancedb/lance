@@ -7,36 +7,36 @@ use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
     format::pb21::{
-        compressive_encoding::Compression, BufferCompression, CompressiveEncoding, PageLayout,
+        BufferCompression, CompressiveEncoding, PageLayout, compressive_encoding::Compression,
     },
 };
 
-use arrow_array::{make_array, Array, StructArray, UInt64Array};
+use arrow_array::{Array, StructArray, UInt64Array, make_array};
 use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
-use futures::{future::BoxFuture, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{utils::bit::pad_bytes, Result};
-use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
+use lance_core::{Result, utils::bit::pad_bytes};
+use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::{
-        create_decode_stream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins,
-        FilterExpression, PageInfo,
+        ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins, FilterExpression,
+        PageInfo, create_decode_stream,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
+        ColumnIndexSequence, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
+        MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers, default_encoding_strategy,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
-    EncodingsIo,
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -245,14 +245,14 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
-                            i,
-                            offset,
-                            expected,
-                            actual,
-                            expected.slice(i, 1),
-                            actual.slice(i, 1)
-                        );
+                                "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                                i,
+                                offset,
+                                expected,
+                                actual,
+                                expected.slice(i, 1),
+                                actual.slice(i, 1)
+                            );
                         }
                     }
                 } else {
@@ -485,15 +485,15 @@ impl TestCases {
     fn get_versions(&self) -> Vec<LanceFileVersion> {
         LanceFileVersion::iter_non_legacy()
             .filter(|v| {
-                if let Some(min_file_version) = &self.min_file_version {
-                    if v < min_file_version {
-                        return false;
-                    }
+                if let Some(min_file_version) = &self.min_file_version
+                    && v < min_file_version
+                {
+                    return false;
                 }
-                if let Some(max_file_version) = &self.max_file_version {
-                    if v > max_file_version {
-                        return false;
-                    }
+                if let Some(max_file_version) = &self.max_file_version
+                    && v > max_file_version
+                {
+                    return false;
                 }
                 true
             })
@@ -679,7 +679,6 @@ fn verify_page_encoding(
 ) -> Result<()> {
     use crate::decoder::PageEncoding;
     use lance_core::Error;
-    use snafu::location;
 
     let mut actual_chain = Vec::new();
 
@@ -690,14 +689,13 @@ fn verify_page_encoding(
             // All-null structural pages may legitimately contain no encodings to verify.
             // This can happen even when compression is configured because there is no value data
             // (and rep/def compression is not currently described in the page layout).
-            if actual_chain.is_empty() && page.data.is_empty() {
-                if let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+            if actual_chain.is_empty()
+                && page.data.is_empty()
+                && let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
                     layout.layout.as_ref()
-                {
-                    if cl.inline_value.is_none() {
-                        return Ok(());
-                    }
-                }
+                && cl.inline_value.is_none()
+            {
+                return Ok(());
             }
         }
         PageEncoding::Legacy(_) => {
@@ -708,14 +706,13 @@ fn verify_page_encoding(
     // Check that all expected encodings appear in the actual chain
     for expected in expected_chain {
         if !actual_chain.iter().any(|actual| actual.contains(expected)) {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Column {} expected encoding chain {:?} but got {:?}",
                     col_idx, expected_chain, actual_chain
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
     }
     Ok(())
@@ -888,11 +885,11 @@ async fn check_round_trip_encoding_inner(
             log_page(&encoded_page);
 
             // For V2.1, verify encoding in the page if expected
-            if file_version >= LanceFileVersion::V2_1 {
-                if let Some(ref expected) = test_cases.expected_encoding {
-                    verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                        .unwrap();
-                }
+            if file_version >= LanceFileVersion::V2_1
+                && let Some(ref expected) = test_cases.expected_encoding
+            {
+                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                    .unwrap();
             }
 
             writer.write_page(encoded_page);
@@ -910,11 +907,11 @@ async fn check_round_trip_encoding_inner(
         log_page(&encoded_page);
 
         // For V2.1, verify encoding in the page if expected
-        if file_version >= LanceFileVersion::V2_1 {
-            if let Some(ref expected) = test_cases.expected_encoding {
-                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
-                    .unwrap();
-            }
+        if file_version >= LanceFileVersion::V2_1
+            && let Some(ref expected) = test_cases.expected_encoding
+        {
+            verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                .unwrap();
         }
 
         writer.write_page(encoded_page);

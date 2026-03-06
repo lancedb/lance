@@ -15,8 +15,8 @@
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionOptions,
-        CompactionPlan, CompactionTask, RewriteResult,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
+        RewriteResult, commit_compaction, compact_files, plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -50,6 +50,18 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             }
             "batch_size" => {
                 opts.batch_size = value.extract()?;
+            }
+            "compaction_mode" => {
+                let mode_str: Option<String> = value.extract()?;
+                if let Some(mode_str) = mode_str {
+                    opts.compaction_mode = Some(
+                        CompactionMode::try_from(mode_str.as_str())
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                    );
+                }
+            }
+            "binary_copy_read_batch_bytes" => {
+                opts.binary_copy_read_batch_bytes = value.extract()?;
             }
             _ => {
                 return Err(PyValueError::new_err(format!(

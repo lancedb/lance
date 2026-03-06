@@ -144,7 +144,7 @@ impl SIMD<i32, 8> for i32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let sum = vaddq_s32(self.0 .0, self.0 .1);
+            let sum = vaddq_s32(self.0.0, self.0.1);
             vaddvq_s32(sum)
         }
         #[cfg(target_arch = "loongarch64")]
@@ -165,8 +165,8 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
-                vminq_s32(self.0 .0, rhs.0 .0),
-                vminq_s32(self.0 .1, rhs.0 .1),
+                vminq_s32(self.0.0, rhs.0.0),
+                vminq_s32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -188,8 +188,8 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             let tgt = vdupq_n_s32(val);
             let mut arr = [0; 8];
-            let mask1 = vceqq_s32(self.0 .0, tgt);
-            let mask2 = vceqq_s32(self.0 .1, tgt);
+            let mask1 = vceqq_s32(self.0.0, tgt);
+            let mask2 = vceqq_s32(self.0.1, tgt);
             vst1q_u32(arr.as_mut_ptr(), mask1);
             vst1q_u32(arr.as_mut_ptr().add(4), mask2);
             for i in 0..8 {
@@ -222,8 +222,8 @@ impl Add for i32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
-                vaddq_s32(self.0 .0, rhs.0 .0),
-                vaddq_s32(self.0 .1, rhs.0 .1),
+                vaddq_s32(self.0.0, rhs.0.0),
+                vaddq_s32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -242,8 +242,8 @@ impl AddAssign for i32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vaddq_s32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vaddq_s32(self.0 .1, rhs.0 .1);
+            self.0.0 = vaddq_s32(self.0.0, rhs.0.0);
+            self.0.1 = vaddq_s32(self.0.1, rhs.0.1);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -264,8 +264,8 @@ impl Sub for i32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
-                vsubq_s32(self.0 .0, rhs.0 .0),
-                vsubq_s32(self.0 .1, rhs.0 .1),
+                vsubq_s32(self.0.0, rhs.0.0),
+                vsubq_s32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -284,8 +284,8 @@ impl SubAssign for i32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vsubq_s32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vsubq_s32(self.0 .1, rhs.0 .1);
+            self.0.0 = vsubq_s32(self.0.0, rhs.0.0);
+            self.0.1 = vsubq_s32(self.0.1, rhs.0.1);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -306,8 +306,8 @@ impl Mul for i32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
-                vmulq_s32(self.0 .0, rhs.0 .0),
-                vmulq_s32(self.0 .1, rhs.0 .1),
+                vmulq_s32(self.0.0, rhs.0.0),
+                vmulq_s32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]

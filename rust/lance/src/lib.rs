@@ -85,7 +85,7 @@ pub mod session;
 pub mod table;
 pub mod utils;
 
-pub use blob::{blob_field, BlobArrayBuilder};
+pub use blob::{BlobArrayBuilder, blob_field};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
 

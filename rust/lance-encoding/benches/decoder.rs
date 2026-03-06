@@ -5,15 +5,15 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::{
     decoder::{
-        create_decode_stream, DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression,
+        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression, create_decode_stream,
     },
-    encoder::{default_encoding_strategy, encode_batch, EncodingOptions},
+    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
     version::LanceFileVersion,
 };
 use tokio::sync::mpsc::unbounded_channel;
@@ -95,7 +95,11 @@ fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_fsl");
     const NUM_BYTES: u64 = 1024 * 1024 * 128;
-    for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+    for version in [
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ] {
         for data_type in PRIMITIVE_TYPES_FOR_FSL {
             for dimension in [4, 16, 32, 64, 128] {
                 let nullable_choices: &[bool] = if version == LanceFileVersion::V2_0 {

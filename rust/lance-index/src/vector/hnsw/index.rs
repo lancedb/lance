@@ -15,31 +15,30 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::location;
 use tracing::instrument;
 
 use crate::vector::ivf::storage::IvfModel;
 use crate::vector::quantizer::QuantizationType;
 use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
-use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 use crate::{
+    Index, IndexType,
     vector::{
+        Query, VectorIndex,
         graph::NEIGHBORS_FIELD,
-        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        hnsw::{HNSW, HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
         storage::VectorStore,
-        Query, VectorIndex,
     },
-    Index, IndexType,
 };
+use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndexOptions {
@@ -103,10 +102,7 @@ impl<Q: Quantization> HNSWIndex<Q> {
     fn get_partition_metadata(&self, partition_id: usize) -> Result<HnswMetadata> {
         match self.partition_metadata {
             Some(ref metadata) => Ok(metadata[partition_id].clone()),
-            None => Err(Error::Index {
-                message: "No partition metadata found".to_string(),
-                location: location!(),
-            }),
+            None => Err(Error::index("No partition metadata found".to_string())),
         }
     }
 }
@@ -164,15 +160,15 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
-            message: "HNSW index not loaded".to_string(),
-            location: location!(),
-        })?;
+        let hnsw = self
+            .hnsw
+            .as_ref()
+            .ok_or(Error::index("HNSW index not loaded".to_string()))?;
 
-        let storage = self.storage.as_ref().ok_or(Error::Index {
-            message: "vector storage not loaded".to_string(),
-            location: location!(),
-        })?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or(Error::index("vector storage not loaded".to_string()))?;
 
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
@@ -281,10 +277,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
-        let store = self.storage.as_ref().ok_or(Error::Index {
-            message: "vector storage not loaded".to_string(),
-            location: location!(),
-        })?;
+        let store = self
+            .storage
+            .as_ref()
+            .ok_or(Error::index("vector storage not loaded".to_string()))?;
 
         let schema = if with_vector {
             store.schema().clone()
@@ -317,10 +313,9 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        Err(Error::Index {
-            message: "Remapping HNSW in this way not supported".to_string(),
-            location: location!(),
-        })
+        Err(Error::index(
+            "Remapping HNSW in this way not supported".to_string(),
+        ))
     }
 
     fn ivf_model(&self) -> &IvfModel {

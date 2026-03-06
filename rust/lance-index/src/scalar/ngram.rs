@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::LanceOptionExt;
@@ -38,13 +38,12 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{utils::mask::RowAddrTreeMap, Error};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Error, utils::mask::RowAddrTreeMap};
+use lance_core::{ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
-use snafu::location;
 use tantivy::tokenizer::TextAnalyzer;
 use tracing::instrument;
 
@@ -179,11 +178,8 @@ impl NGramPostingList {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let mut bitmap =
-            RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
-                message: format!("Error deserializing ngram list: {}", e),
-                location: location!(),
-            })?;
+        let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
+            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
         }
@@ -390,20 +386,17 @@ impl Index for NGramIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::InvalidInput {
-            source: "NGramIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "NGramIndex is not a vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let ngram_stats = NGramStatistics {
             num_ngrams: self.tokens.len(),
         };
-        serde_json::to_value(ngram_stats).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
-            location: location!(),
-        })
+        serde_json::to_value(ngram_stats)
+            .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -439,14 +432,10 @@ impl ScalarIndex for NGramIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query =
-            query
-                .as_any()
-                .downcast_ref::<TextQuery>()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "Query is not a TextQuery".into(),
-                    location: location!(),
-                })?;
+        let query = query
+            .as_any()
+            .downcast_ref::<TextQuery>()
+            .ok_or_else(|| Error::invalid_input_source("Query is not a TextQuery".into()))?;
         match query {
             TextQuery::StringContains(substr) => {
                 if substr.len() < NGRAM_N {
@@ -610,10 +599,8 @@ impl NGramIndexSpillState {
         let bitmaps = postings
             .into_iter()
             .map(|bytes| {
-                RoaringTreemap::deserialize_from(bytes.expect_ok()?).map_err(|e| Error::Internal {
-                    message: format!("Error deserializing ngram list: {}", e),
-                    location: location!(),
-                })
+                RoaringTreemap::deserialize_from(bytes.expect_ok()?)
+                    .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -731,26 +718,23 @@ impl NGramIndexBuilder {
 
     fn validate_schema(schema: &Schema) -> Result<()> {
         if schema.fields().len() != 2 {
-            return Err(Error::InvalidInput {
-                source: "Ngram index schema must have exactly two fields".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Ngram index schema must have exactly two fields".into(),
+            ));
         }
         let values_field = schema.field_with_name(VALUE_COLUMN_NAME)?;
         if *values_field.data_type() != DataType::Utf8
             && *values_field.data_type() != DataType::LargeUtf8
         {
-            return Err(Error::InvalidInput {
-                source: "First field in ngram index schema must be of type Utf8/LargeUtf8".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "First field in ngram index schema must be of type Utf8/LargeUtf8".into(),
+            ));
         }
         let row_id_field = schema.field_with_name(ROW_ID)?;
         if *row_id_field.data_type() != DataType::UInt64 {
-            return Err(Error::InvalidInput {
-                source: "Second field in ngram index schema must be of type UInt64".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Second field in ngram index schema must be of type UInt64".into(),
+            ));
         }
         Ok(())
     }
@@ -1261,14 +1245,11 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "A ngram index can only be created on a Utf8 or LargeUtf8 field.  Column has type {:?}",
-                    field.data_type()
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(format!(
+                "A ngram index can only be created on a Utf8 or LargeUtf8 field.  Column has type {:?}",
+                field.data_type()
+            )
+            .into()));
         }
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
@@ -1300,10 +1281,9 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "NGram index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "NGram index does not support fragment training".into(),
+            ));
         }
 
         Self::train_ngram_index(data, index_store).await?;
@@ -1339,25 +1319,25 @@ mod tests {
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
     };
     use datafusion_common::DataFusionError;
-    use futures::{stream, TryStreamExt};
+    use futures::{TryStreamExt, stream};
     use itertools::Itertools;
     use lance_core::{
+        ROW_ID,
         cache::LanceCache,
         utils::{mask::RowAddrTreeMap, tempfile::TempDir},
-        ROW_ID,
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use tantivy::tokenizer::TextAnalyzer;
 
     use crate::scalar::{
+        ScalarIndex, SearchResult, TextQuery,
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
-        ScalarIndex, SearchResult, TextQuery,
     };
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
-    use super::{ngram_to_token, tokenize_visitor, NGRAM_TOKENIZER};
+    use super::{NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);

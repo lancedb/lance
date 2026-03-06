@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{
+    InvertedIndexParams,
     index::*,
     merger::{Merger, PartitionSource, SizeBasedMerger},
-    InvertedIndexParams,
 };
+use crate::scalar::IndexStore;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
-use crate::{progress::noop_progress, progress::IndexBuildProgress};
+use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -22,15 +22,14 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
-use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
+use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use smallvec::SmallVec;
-use snafu::location;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -551,30 +550,31 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
-                let batch =
-                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches.clone());
-                let is_err = batch.is_err();
-                if tx.blocking_send(batch).is_err() {
-                    break;
-                }
-                if is_err {
-                    break;
+                let batch = posting_list
+                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
+                if let Err(err) = tx.send(batch) {
+                    return Err(Error::execution(format!(
+                        "failed to send posting list batch to writer: {err}"
+                    )));
                 }
             }
-            Ok(())
+            Result::Ok(())
         });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         while let Some(batch) = rx.recv().await {
-            let batch = batch?;
             num_posting_lists += 1;
             let start = std::time::Instant::now();
-            writer.write_record_batch(batch).await?;
+            if let Err(err) = writer.write_record_batch(batch).await {
+                drop(rx);
+                // Wait for producer to stop; preserve the write error as the primary failure.
+                let _ = producer.await;
+                return Err(err);
+            }
             write_duration += start.elapsed();
 
             if num_posting_lists % 500_000 == 0 {
@@ -586,10 +586,9 @@ impl InnerBuilder {
                 );
             }
         }
-
-        // Errors from batch generation are sent through the channel and surfaced via `batch?`.
-        // Awaiting the producer here is just to propagate panics/cancellation.
+        drop(rx);
         producer.await?;
+
         writer.finish().await?;
         Ok(())
     }
@@ -1037,13 +1036,10 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     let docs = match docs.value_type() {
         datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
         _ => {
-            return Err(Error::Index {
-                message: format!(
-                    "expect data type String or LargeString but got {}",
-                    docs.value_type()
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "expect data type String or LargeString but got {}",
+                docs.value_type()
+            )));
         }
     };
 
@@ -1108,14 +1104,13 @@ async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Re
     }
 
     if part_metadata_files.is_empty() {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "No partition metadata files found in index directory: {}",
                 index_dir
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
 
     Ok(part_metadata_files)
@@ -1135,38 +1130,30 @@ async fn merge_metadata_files(
         let reader = store.open_index_file(file_name).await?;
         let metadata = &reader.schema().metadata;
 
-        let partitions_str = metadata.get("partitions").ok_or(Error::Index {
-            message: format!("partitions not found in {}", file_name),
-            location: location!(),
-        })?;
+        let partitions_str = metadata.get("partitions").ok_or(Error::index(format!(
+            "partitions not found in {}",
+            file_name
+        )))?;
 
-        let partition_ids: Vec<u64> =
-            serde_json::from_str(partitions_str).map_err(|e| Error::Index {
-                message: format!("Failed to parse partitions: {}", e),
-                location: location!(),
-            })?;
+        let partition_ids: Vec<u64> = serde_json::from_str(partitions_str)
+            .map_err(|e| Error::index(format!("Failed to parse partitions: {}", e)))?;
 
         all_partitions.extend(partition_ids);
 
         if params.is_none() {
-            let params_str = metadata.get("params").ok_or(Error::Index {
-                message: format!("params not found in {}", file_name),
-                location: location!(),
-            })?;
+            let params_str = metadata
+                .get("params")
+                .ok_or(Error::index(format!("params not found in {}", file_name)))?;
             params = Some(
-                serde_json::from_str::<InvertedIndexParams>(params_str).map_err(|e| {
-                    Error::Index {
-                        message: format!("Failed to parse params: {}", e),
-                        location: location!(),
-                    }
-                })?,
+                serde_json::from_str::<InvertedIndexParams>(params_str)
+                    .map_err(|e| Error::index(format!("Failed to parse params: {}", e)))?,
             );
         }
 
-        if token_set_format.is_none() {
-            if let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY) {
-                token_set_format = Some(TokenSetFormat::from_str(name)?);
-            }
+        if token_set_format.is_none()
+            && let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY)
+        {
+            token_set_format = Some(TokenSetFormat::from_str(name)?);
         }
     }
 
@@ -1203,13 +1190,10 @@ async fn merge_metadata_files(
                     for (temp_name, old_name, _) in temp_files.iter().rev() {
                         let _ = store.rename_index_file(temp_name, old_name).await;
                     }
-                    return Err(Error::Index {
-                        message: format!(
-                            "Failed to move {} to temp {}: {}",
-                            old_path, temp_path, e
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "Failed to move {} to temp {}: {}",
+                        old_path, temp_path, e
+                    )));
                 }
                 temp_files.push((temp_path, old_path, new_path));
             }
@@ -1231,10 +1215,10 @@ async fn merge_metadata_files(
                     let _ = store.rename_index_file(temp_name, orig_name).await;
                 }
             }
-            return Err(Error::Index {
-                message: format!("Failed to rename {} to {}: {}", temp_path, final_path, e),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Failed to rename {} to {}: {}",
+                temp_path, final_path, e
+            )));
         }
         completed_renames.push((final_path.clone(), temp_path.clone()));
     }
@@ -1287,20 +1271,18 @@ pub fn document_input(
             Some(name) if name.as_str() == JSON_EXT_NAME => {
                 Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
             }
-            _ => Err(Error::InvalidInput {
-                source: format!("column {} is not json", column).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("column {} is not json", column).into(),
+            )),
         },
-        _ => Err(Error::InvalidInput {
-            source: format!(
+        _ => Err(Error::invalid_input_source(
+            format!(
                 "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
                 column,
                 field.data_type()
             )
             .into(),
-            location: location!(),
-        }),
+        )),
     }
 }
 
@@ -1315,10 +1297,9 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
-    use lance_core::ROW_ID;
-    use snafu::location;
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
@@ -1399,28 +1380,24 @@ mod tests {
         async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn IndexReader>> {
             Err(Error::not_supported(
                 "CountingStore does not support reading",
-                location!(),
             ))
         }
 
         async fn copy_index_file(&self, _name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support copying",
-                location!(),
             ))
         }
 
         async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support renaming",
-                location!(),
             ))
         }
 
         async fn delete_index_file(&self, _name: &str) -> Result<()> {
             Err(Error::not_supported(
                 "CountingStore does not support deleting",
-                location!(),
             ))
         }
     }

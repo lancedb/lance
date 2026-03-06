@@ -21,19 +21,18 @@ use crate::{
     format::pb,
     repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray, cast::AsArray};
 use arrow_schema::{DataType, Fields};
 use futures::{
+    FutureExt, StreamExt, TryStreamExt,
     future::BoxFuture,
     stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::{Error, Result};
 use log::trace;
-use snafu::location;
 
 #[derive(Debug)]
 struct StructuralSchedulingJobWithStatus<'a> {
@@ -146,8 +145,7 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
             let child_scan = next_child.ready_scan_lines.pop_front().unwrap();
             trace!(
                 "Scheduled {} rows for child {}",
-                child_scan.rows_scheduled,
-                next_child.col_idx
+                child_scan.rows_scheduled, next_child.col_idx
             );
             next_child.rows_scheduled += child_scan.rows_scheduled;
             next_child.rows_remaining -= child_scan.rows_scheduled;
@@ -287,12 +285,11 @@ impl StructuralStructDecoder {
             }
             DataType::Map(entries_field, keys_sorted) => {
                 if *keys_sorted {
-                    return Err(Error::NotSupported {
-                        source: "Map data type with keys_sorted=true is not supported yet"
+                    return Err(Error::not_supported_source(
+                        "Map data type with keys_sorted=true is not supported yet"
                             .to_string()
                             .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
                 let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
                 Ok(Box::new(StructuralMapDecoder::new(
@@ -389,12 +386,8 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::try_new(self.child_fields, children, validity).map_err(|e| {
-            Error::InvalidInput {
-                source: e.to_string().into(),
-                location: location!(),
-            }
-        })?;
+        let array = StructArray::try_new(self.child_fields, children, validity)
+            .map_err(|e| Error::invalid_input_source(e.to_string().into()))?;
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,
@@ -598,14 +591,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
         Array, ArrayRef, Int32Array, ListArray, StructArray,
+        builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
     use crate::{
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

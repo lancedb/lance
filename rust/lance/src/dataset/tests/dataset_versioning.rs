@@ -4,20 +4,20 @@
 use std::sync::Arc;
 use std::vec;
 
+use crate::Dataset;
+use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::UpdateBuilder;
 use crate::datatypes::Schema;
-use crate::Dataset;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
-use arrow_array::{types::Int32Type, RecordBatchIterator, UInt32Array};
+use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 
 use crate::dataset::refs::branch_contents_path;

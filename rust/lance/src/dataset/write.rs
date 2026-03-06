@@ -3,8 +3,8 @@
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{
@@ -13,9 +13,9 @@ use lance_core::datatypes::{
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
+use lance_datafusion::spill::{SpillReceiver, SpillSender, create_replay_spill};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::{
     FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
@@ -24,25 +24,26 @@ use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
-use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
+use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::location;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
-use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
-use crate::session::Session;
 use crate::Dataset;
+use crate::dataset::blob::{
+    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, preprocess_blob_batches,
+};
+use crate::session::Session;
 
+use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
-use super::DATA_DIR;
 
 mod commit;
 pub mod delete;
@@ -123,10 +124,10 @@ impl TryFrom<&str> for WriteMode {
             "create" => Ok(Self::Create),
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
-            _ => Err(Error::invalid_input(
-                format!("Invalid write mode: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid write mode: {}",
+                value
+            ))),
         }
     }
 }
@@ -245,6 +246,10 @@ pub struct WriteParams {
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// Allow writing external blob URIs that cannot be mapped to any registered
+    /// non-dataset-root base path. When disabled, such rows are rejected.
+    pub allow_external_blob_outside_bases: bool,
 }
 
 impl Default for WriteParams {
@@ -269,6 +274,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            allow_external_blob_outside_bases: false,
         }
     }
 }
@@ -347,6 +353,14 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Configure whether external blobs outside registered bases are allowed.
+    pub fn with_allow_external_blob_outside_bases(self, allow: bool) -> Self {
+        Self {
+            allow_external_blob_outside_bases: allow,
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -371,6 +385,7 @@ pub async fn write_fragments(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn do_write_fragments(
+    dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -393,12 +408,24 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
+    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
+        && schema.fields.iter().any(|field| field.is_blob_v2())
+    {
+        Some(Arc::new(
+            build_external_base_resolver(dataset, &params).await?,
+        ))
+    } else {
+        None
+    };
+
     let writer_generator = WriterGenerator::new(
         object_store,
         base_dir,
         schema,
         storage_version,
         target_bases_info,
+        external_base_resolver,
+        params.allow_external_blob_outside_bases,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -450,19 +477,15 @@ pub async fn validate_and_resolve_target_bases(
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
     // Step 1: Validations
     if !matches!(params.mode, WriteMode::Create) && params.initial_bases.is_some() {
-        return Err(Error::invalid_input(
-            format!(
-                "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
-                params.mode
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
+            params.mode
+        )));
     }
 
     if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
         return Err(Error::invalid_input(
             "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
-            location!(),
         ));
     }
 
@@ -493,10 +516,10 @@ pub async fn validate_and_resolve_target_bases(
                 })
                 .map(|(&id, _)| id)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!("Base reference '{}' not found in available bases", ref_str),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "Base reference '{}' not found in available bases",
+                        ref_str
+                    ))
                 })?;
 
             resolved_ids.push(id);
@@ -519,13 +542,10 @@ pub async fn validate_and_resolve_target_bases(
 
         for &target_base_id in target_bases {
             let base_path = all_bases.get(&target_base_id).ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Target base ID {} not found in available bases",
-                        target_base_id
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Target base ID {} not found in available bases",
+                    target_base_id
+                ))
             })?;
 
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
@@ -547,6 +567,98 @@ pub async fn validate_and_resolve_target_bases(
     } else {
         Ok(None)
     }
+}
+
+fn append_external_base_candidate(
+    base_path: &BasePath,
+    store_prefix: String,
+    extracted_path: Path,
+    candidates: &mut Vec<ExternalBaseCandidate>,
+    seen_base_ids: &mut HashSet<u32>,
+) {
+    if base_path.is_dataset_root {
+        return;
+    }
+    if seen_base_ids.insert(base_path.id) {
+        candidates.push(ExternalBaseCandidate {
+            base_id: base_path.id,
+            store_prefix,
+            base_path: extracted_path,
+        });
+    }
+}
+
+async fn append_external_initial_bases(
+    initial_bases: Option<&Vec<BasePath>>,
+    store_registry: Arc<ObjectStoreRegistry>,
+    store_params: &ObjectStoreParams,
+    candidates: &mut Vec<ExternalBaseCandidate>,
+    seen_base_ids: &mut HashSet<u32>,
+) -> Result<()> {
+    if let Some(initial_bases) = initial_bases {
+        for base_path in initial_bases {
+            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+                store_registry.clone(),
+                &base_path.path,
+                store_params,
+            )
+            .await?;
+            append_external_base_candidate(
+                base_path,
+                store.store_prefix.clone(),
+                extracted_path,
+                candidates,
+                seen_base_ids,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn build_external_base_resolver(
+    dataset: Option<&Dataset>,
+    params: &WriteParams,
+) -> Result<ExternalBaseResolver> {
+    let store_registry = dataset
+        .map(|ds| ds.session.store_registry())
+        .unwrap_or_else(|| params.store_registry());
+    let store_params = params.store_params.clone().unwrap_or_default();
+
+    let mut seen_base_ids = HashSet::new();
+    let mut candidates = vec![];
+
+    if let Some(dataset) = dataset {
+        for base_path in dataset.manifest.base_paths.values() {
+            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+                store_registry.clone(),
+                &base_path.path,
+                &store_params,
+            )
+            .await?;
+            append_external_base_candidate(
+                base_path,
+                store.store_prefix.clone(),
+                extracted_path,
+                &mut candidates,
+                &mut seen_base_ids,
+            );
+        }
+    }
+
+    append_external_initial_bases(
+        params.initial_bases.as_ref(),
+        store_registry.clone(),
+        &store_params,
+        &mut candidates,
+        &mut seen_base_ids,
+    )
+    .await?;
+
+    Ok(ExternalBaseResolver::new(
+        candidates,
+        store_registry,
+        store_params,
+    ))
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -633,14 +745,10 @@ pub async fn write_fragments_internal(
     };
 
     if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "Blob v2 requires file version >= 2.2 (got {:?})",
-                storage_version
-            )
-            .into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input(format!(
+            "Blob v2 requires file version >= 2.2 (got {:?})",
+            storage_version
+        )));
     }
 
     if storage_version >= LanceFileVersion::V2_2
@@ -649,16 +757,13 @@ pub async fn write_fragments_internal(
             .iter()
             .any(|f| f.metadata.contains_key(BLOB_META_KEY))
     {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
-            )
-            .into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input(format!(
+            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
+        )));
     }
 
     let fragments = do_write_fragments(
+        dataset,
         object_store,
         base_dir,
         &schema,
@@ -781,17 +886,41 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
-    open_writer_with_options(object_store, schema, base_dir, storage_version, true, None).await
+    open_writer_with_options(
+        object_store,
+        schema,
+        base_dir,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-pub async fn open_writer_with_options(
+#[derive(Default)]
+struct WriterOptions {
+    add_data_dir: bool,
+    base_id: Option<u32>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
+}
+
+async fn open_writer_with_options(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
-    add_data_dir: bool,
-    base_id: Option<u32>,
+    options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
+    let WriterOptions {
+        add_data_dir,
+        base_id,
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    } = options;
+
     let data_file_key = generate_random_filename();
     let filename = format!("{}.lance", data_file_key);
 
@@ -832,6 +961,8 @@ pub async fn open_writer_with_options(
                 data_dir.clone(),
                 data_file_key.clone(),
                 schema,
+                external_base_resolver,
+                allow_external_blob_outside_bases,
             ))
         } else {
             None
@@ -869,6 +1000,8 @@ struct WriterGenerator {
     storage_version: LanceFileVersion,
     /// Target base information (if writing to specific bases)
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    allow_external_blob_outside_bases: bool,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -880,6 +1013,8 @@ impl WriterGenerator {
         schema: &Schema,
         storage_version: LanceFileVersion,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
     ) -> Self {
         Self {
             object_store,
@@ -887,6 +1022,8 @@ impl WriterGenerator {
             schema: schema.clone(),
             storage_version,
             target_bases_info,
+            external_base_resolver,
+            allow_external_blob_outside_bases,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -912,16 +1049,26 @@ impl WriterGenerator {
                 &self.schema,
                 &base_info.base_dir,
                 self.storage_version,
-                base_info.is_dataset_root,
-                Some(base_info.base_id),
+                WriterOptions {
+                    add_data_dir: base_info.is_dataset_root,
+                    base_id: Some(base_info.base_id),
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         } else {
-            open_writer(
+            open_writer_with_options(
                 &self.object_store,
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
+                WriterOptions {
+                    add_data_dir: true,
+                    base_id: None,
+                    external_base_resolver: self.external_base_resolver.clone(),
+                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                },
             )
             .await?
         };
@@ -944,17 +1091,17 @@ async fn resolve_commit_handler(
                 .map(|opts| opts.object_store.is_some())
                 .unwrap_or_default()
             {
-                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: Default::default() });
+                return Err(Error::invalid_input(
+                    "when creating a dataset with a custom object store the commit_handler must also be specified",
+                ));
             }
             commit_handler_from_url(uri, store_options).await
         }
         Some(commit_handler) => {
             if uri.starts_with("s3+ddb") {
-                Err(Error::InvalidInput {
-                    source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                        .into(),
-                    location: Default::default(),
-                })
+                Err(Error::invalid_input(
+                    "`s3+ddb://` scheme and custom commit handler are mutually exclusive",
+                ))
             } else {
                 Ok(commit_handler)
             }
@@ -1017,10 +1164,8 @@ impl SpillStreamIter {
         memory_limit: usize,
     ) -> Result<Self> {
         let tmp_dir = tokio::task::spawn_blocking(|| {
-            TempDir::try_new().map_err(|e| Error::InvalidInput {
-                source: format!("Failed to create temp dir: {}", e).into(),
-                location: location!(),
-            })
+            TempDir::try_new()
+                .map_err(|e| Error::invalid_input(format!("Failed to create temp dir: {}", e)))
         })
         .await
         .ok()
@@ -1077,7 +1222,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_io::traits::Reader;
 
@@ -1391,6 +1536,7 @@ mod tests {
             LanceFileVersion::Legacy,
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Stable,
             LanceFileVersion::Next,
         ];
@@ -1555,6 +1701,8 @@ mod tests {
             &schema,
             LanceFileVersion::Stable,
             Some(target_bases),
+            None,
+            false,
         );
 
         // Create a writer
@@ -1598,8 +1746,10 @@ mod tests {
             &schema,
             &base_dir,
             LanceFileVersion::Stable,
-            false, // Don't add /data
-            None,
+            WriterOptions {
+                add_data_dir: false, // Don't add /data
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1665,6 +1815,8 @@ mod tests {
             &schema,
             LanceFileVersion::Stable,
             Some(target_bases),
+            None,
+            false,
         );
 
         // Create test batch
@@ -1744,34 +1896,27 @@ mod tests {
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
         // Replicate the validation logic from the main write function
-        if matches!(params.mode, WriteMode::Create) {
-            if let Some(target_bases) = &params.target_bases {
-                if target_bases.len() != 1 {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "target_bases with {} elements is not supported",
-                            target_bases.len()
-                        ),
-                        Default::default(),
-                    ));
+        if matches!(params.mode, WriteMode::Create)
+            && let Some(target_bases) = &params.target_bases
+        {
+            if target_bases.len() != 1 {
+                return Err(Error::invalid_input(format!(
+                    "target_bases with {} elements is not supported",
+                    target_bases.len()
+                )));
+            }
+            let target_base_id = target_bases[0];
+            if let Some(initial_bases) = &params.initial_bases {
+                if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
+                    return Err(Error::invalid_input(format!(
+                        "target_base_id {} must be one of the initial_bases in CREATE mode",
+                        target_base_id
+                    )));
                 }
-                let target_base_id = target_bases[0];
-                if let Some(initial_bases) = &params.initial_bases {
-                    if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
-                        return Err(Error::invalid_input(
-                            format!(
-                                "target_base_id {} must be one of the initial_bases in CREATE mode",
-                                target_base_id
-                            ),
-                            Default::default(),
-                        ));
-                    }
-                } else {
-                    return Err(Error::invalid_input(
-                        "initial_bases must be provided when target_bases is specified in CREATE mode",
-                        Default::default(),
-                    ));
-                }
+            } else {
+                return Err(Error::invalid_input(
+                    "initial_bases must be provided when target_bases is specified in CREATE mode",
+                ));
             }
         }
         Ok(())
@@ -1821,26 +1966,32 @@ mod tests {
 
         // Verify base_paths are registered in manifest
         assert_eq!(dataset.manifest.base_paths.len(), 2);
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base1".to_string())));
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base2".to_string())));
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base1".to_string()))
+        );
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base2".to_string()))
+        );
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
         assert!(!fragments.is_empty());
         for fragment in fragments {
-            assert!(fragment
-                .metadata
-                .files
-                .iter()
-                .any(|file| file.base_id == Some(1)));
+            assert!(
+                fragment
+                    .metadata
+                    .files
+                    .iter()
+                    .any(|file| file.base_id == Some(1))
+            );
         }
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
@@ -1866,10 +2017,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot specify both target_base_names_or_paths and target_bases"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot specify both target_base_names_or_paths and target_bases")
+        );
     }
 
     #[tokio::test]
@@ -1937,24 +2090,28 @@ mod tests {
 
         // Verify base_paths were inherited (still base1 and base2)
         assert_eq!(dataset.manifest.base_paths.len(), 2);
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base1".to_string())));
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base2".to_string())));
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base1".to_string()))
+        );
+        assert!(
+            dataset
+                .manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.name == Some("base2".to_string()))
+        );
 
         // Verify data was written to base2 (ID 2)
         let fragments = dataset.get_fragments();
-        assert!(fragments.iter().all(|f| f
-            .metadata
-            .files
-            .iter()
-            .all(|file| file.base_id == Some(2))));
+        assert!(
+            fragments
+                .iter()
+                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
+        );
 
         // Test validation: cannot specify initial_bases in OVERWRITE mode
         let mut data_gen3 =
@@ -1978,10 +2135,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot register new bases in Overwrite mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot register new bases in Overwrite mode")
+        );
     }
 
     #[tokio::test]
@@ -2099,10 +2258,12 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot register new bases in Append mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot register new bases in Append mode")
+        );
     }
 
     #[tokio::test]
@@ -2301,11 +2462,11 @@ mod tests {
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
-        assert!(fragments.iter().all(|f| f
-            .metadata
-            .files
-            .iter()
-            .all(|file| file.base_id == Some(1))));
+        assert!(
+            fragments
+                .iter()
+                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(1)))
+        );
 
         // Now append using the path URI instead of name
         let mut data_gen2 =
