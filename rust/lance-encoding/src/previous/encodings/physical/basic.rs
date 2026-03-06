@@ -4,15 +4,15 @@
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
 use crate::{
+    EncodingsIo,
     data::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     format::ProtobufUtils,
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 use lance_core::Result;

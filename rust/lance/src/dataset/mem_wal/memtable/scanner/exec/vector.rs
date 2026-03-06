@@ -7,7 +7,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -23,7 +23,6 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
-use snafu::location;
 
 use super::super::builder::VectorQuery;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -97,10 +96,10 @@ impl VectorIndexExec {
         // Verify the index exists for this column
         let column = &query.column;
         if indexes.get_ivf_pq_by_column(column).is_none() {
-            return Err(Error::invalid_input(
-                format!("No IVF-PQ index found for column '{}'", column),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "No IVF-PQ index found for column '{}'",
+                column
+            )));
         }
 
         // Build output schema: base fields + _distance + optional _rowid

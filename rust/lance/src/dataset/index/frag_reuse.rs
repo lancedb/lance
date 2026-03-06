@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use crate::Dataset;
 use lance_core::Error;
-use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion};
 use lance_index::is_system_index;
 use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
-use snafu::location;
 
 /// Cleanup a fragment reuse index based on the current condition of the indices.
 /// If all the indices currently available are already caught up to as a specific reuse version,
@@ -126,10 +125,10 @@ fn is_index_remap_caught_up(
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    group.old_frags),
-                            location!()));
+                        return Err(Error::invalid_input(format!(
+                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                            group.old_frags
+                        )));
                     }
                     return Ok(false);
                 }
@@ -149,7 +148,7 @@ fn is_index_remap_caught_up(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::optimize::{compact_files, remapping, CompactionOptions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::{assert_false, assert_true};
     use arrow_array::types::{Float32Type, Int32Type};

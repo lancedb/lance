@@ -4,8 +4,8 @@
 use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
 
 use arrow_array::{
-    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
+    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
 };
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
@@ -14,13 +14,12 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
+use crate::{ReadBatchParams, traits::Reader};
 use crate::{
-    encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
+    encodings::{AsyncIndex, Decoder, binary::BinaryDecoder, plain::PlainDecoder},
     traits::ProtoStruct,
 };
-use crate::{traits::Reader, ReadBatchParams};
 use lance_core::{Error, Result};
 
 pub mod tracking_store;
@@ -50,10 +49,10 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            return Err(Error::invalid_input(
-                format!("Unsupported binary type: {}", data_type),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Unsupported binary type: {}",
+                data_type
+            )));
         }
     };
     let fut = decoder.as_ref().get(params.into());
@@ -70,10 +69,9 @@ pub async fn read_fixed_stride_array(
     params: impl Into<ReadBatchParams>,
 ) -> Result<ArrayRef> {
     if !data_type.is_fixed_stride() {
-        return Err(Error::Schema {
-            message: format!("{data_type} is not a fixed stride type"),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "{data_type} is not a fixed stride type"
+        )));
     }
     // TODO: support more than plain encoding here.
     let decoder = PlainDecoder::new(reader, data_type, position, length)?;
@@ -87,7 +85,7 @@ pub async fn read_fixed_stride_array(
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        return Err(Error::io("file size is too small".to_string(), location!()));
+        return Err(Error::io("file size is too small".to_string()));
     }
 
     let range = pos..min(pos + reader.block_size(), file_size);
@@ -128,13 +126,10 @@ pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes>
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
-        return Err(Error::io(
-            format!(
-                "does not have sufficient data, len: {}, bytes: {:?}",
-                len, bytes
-            ),
-            location!(),
-        ));
+        return Err(Error::io(format!(
+            "does not have sufficient data, len: {}, bytes: {:?}",
+            len, bytes
+        )));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
@@ -144,13 +139,10 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
     let len = bytes.len();
     if len < 8 {
-        return Err(Error::io(
-            format!(
-                "does not have sufficient data, len: {}, bytes: {:?}",
-                len, bytes
-            ),
-            location!(),
-        ));
+        return Err(Error::io(format!(
+            "does not have sufficient data, len: {}, bytes: {:?}",
+            len, bytes
+        )));
     }
 
     let major_version = LittleEndian::read_u16(bytes.slice(len - 8..len - 6).as_ref());
@@ -265,12 +257,12 @@ mod tests {
     use object_store::path::Path;
 
     use crate::{
+        Error, Result,
         object_reader::CloudObjectReader,
-        object_store::{ObjectStore, DEFAULT_DOWNLOAD_RETRY_COUNT},
+        object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
-        Error, Result,
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we

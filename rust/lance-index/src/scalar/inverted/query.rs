@@ -6,8 +6,7 @@ use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -84,10 +83,7 @@ impl TryFrom<&str> for Operator {
         match value.to_ascii_uppercase().as_str() {
             "AND" => Ok(Self::And),
             "OR" => Ok(Self::Or),
-            _ => Err(Error::invalid_input(
-                format!("Invalid operator: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!("Invalid operator: {}", value))),
         }
     }
 }
@@ -514,7 +510,6 @@ impl MultiMatchQuery {
         if columns.is_empty() {
             return Err(Error::invalid_input(
                 "Cannot create MultiMatchQuery with no columns".to_string(),
-                location!(),
             ));
         }
 
@@ -529,7 +524,6 @@ impl MultiMatchQuery {
         if boosts.len() != self.match_queries.len() {
             return Err(Error::invalid_input(
                 "The number of boosts must match the number of queries".to_string(),
-                location!(),
             ));
         }
 
@@ -570,10 +564,10 @@ impl TryFrom<&str> for Occur {
             "SHOULD" => Ok(Self::Should),
             "MUST" => Ok(Self::Must),
             "MUST_NOT" => Ok(Self::MustNot),
-            _ => Err(Error::invalid_input(
-                format!("Invalid occur value: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid occur value: {}",
+                value
+            ))),
         }
     }
 }
@@ -725,22 +719,22 @@ impl FtsQueryNode for BooleanQuery {
 #[derive(Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
-    tokens_set: HashSet<String>,
+    tokens_map: HashMap<String, usize>,
     token_type: DocType,
 }
 
 impl Tokens {
     pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
         let mut tokens_vec = vec![];
-        let mut tokens_set = HashSet::new();
-        for token in tokens.into_iter() {
+        let mut tokens_map = HashMap::new();
+        for (idx, token) in tokens.into_iter().enumerate() {
             tokens_vec.push(token.clone());
-            tokens_set.insert(token);
+            tokens_map.insert(token, idx);
         }
 
         Self {
             tokens: tokens_vec,
-            tokens_set,
+            tokens_map,
             token_type,
         }
     }
@@ -758,7 +752,15 @@ impl Tokens {
     }
 
     pub fn contains(&self, token: &str) -> bool {
-        self.tokens_set.contains(token)
+        self.tokens_map.contains_key(token)
+    }
+
+    pub fn token_index(&self, token: &str) -> Option<usize> {
+        self.tokens_map.get(token).copied()
+    }
+
+    pub fn get_token(&self, index: usize) -> &str {
+        &self.tokens[index]
     }
 }
 
@@ -780,42 +782,28 @@ impl<'a> IntoIterator for &'a Tokens {
     }
 }
 
-pub fn collect_query_tokens(
-    text: &str,
-    tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&HashSet<String>>,
-) -> Tokens {
+pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
-        }
         tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }
 
-pub fn collect_doc_tokens(
+pub fn has_query_token(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&Tokens>,
-) -> Tokens {
-    let token_type = tokenizer.doc_type();
+    query_tokens: &Tokens,
+) -> bool {
     let mut stream = tokenizer.token_stream_for_doc(text);
-    let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
+        if query_tokens.contains(&token.text) {
+            return true;
         }
-        tokens.push(token.text.clone());
     }
-    Tokens::new(tokens, token_type)
+    false
 }
 
 pub fn fill_fts_query_column(
@@ -830,10 +818,7 @@ pub fn fill_fts_query_column(
         FtsQuery::Match(match_query) => {
             match columns.len() {
                 0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
                 }
                 1 => {
                     let column = columns[0].clone();
@@ -851,10 +836,7 @@ pub fn fill_fts_query_column(
         FtsQuery::Phrase(phrase_query) => {
             match columns.len() {
                 0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
                 }
                 1 => {
                     let column = columns[0].clone();
@@ -862,10 +844,7 @@ pub fn fill_fts_query_column(
                     Ok(FtsQuery::Phrase(query))
                 }
                 _ => {
-                    Err(Error::invalid_input(
-                        "the column must be specified in the query".to_string(),
-                        location!(),
-                    ))
+                    Err(Error::invalid_input("the column must be specified in the query".to_string()))
                 }
             }
         }

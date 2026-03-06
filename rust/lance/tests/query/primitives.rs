@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use lance::Dataset;
 
-use lance_datagen::{array, gen_batch, ArrayGeneratorExt, RowCount};
+use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
 
 use super::{test_filter, test_scan, test_take};
@@ -95,6 +95,42 @@ async fn test_query_integer(#[case] data_type: DataType) {
             .await;
         })
         .await
+}
+
+/// Regression test: BTree OR on nullable column with value not in index.
+///
+/// When all non-null values are far from the equality value (e.g. all > 100,
+/// query `!= 0`), the BTree's page lookup finds no pages containing that value.
+/// Previously, null pages were not consulted for non-IsNull queries, so the
+/// null set was empty and `NOT(x = 0)` would incorrectly pass all rows
+/// (including NULLs). See also test_search_tracks_nulls_for_absent_value in
+/// lance-index for a direct unit test of the BTree fix.
+#[tokio::test]
+async fn test_btree_nullable_or_with_absent_value() {
+    // All non-null values are in [100..160], so value 0 never appears in the index.
+    // ~33% of rows are NULL (every 3rd row).
+    let value_array: Int32Array = (0..60)
+        .map(|i| if i % 3 == 0 { None } else { Some(100 + i) })
+        .collect();
+    let id_array = Int32Array::from((0..60).collect::<Vec<i32>>());
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(id_array) as ArrayRef),
+        ("value", Arc::new(value_array) as ArrayRef),
+    ])
+    .unwrap();
+
+    DatasetTestCases::from_data(batch)
+        .with_index_types("value", [Some(IndexType::BTree)])
+        .run(|ds: Dataset, original: RecordBatch| async move {
+            test_filter(&original, &ds, "(value != 0) OR (value < 5)").await;
+            test_filter(&original, &ds, "NOT ((value != 0) OR (value < 5))").await;
+            test_filter(&original, &ds, "value != 0").await;
+            test_filter(&original, &ds, "NOT (value = 0)").await;
+            test_filter(&original, &ds, "value is null").await;
+            test_filter(&original, &ds, "value is not null").await;
+        })
+        .await;
 }
 
 #[tokio::test]

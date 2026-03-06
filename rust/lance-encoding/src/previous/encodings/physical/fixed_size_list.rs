@@ -4,16 +4,16 @@
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
+    EncodingsIo,
     data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     format::ProtobufUtils,
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 /// A scheduler for fixed size lists of primitive values
@@ -133,13 +133,13 @@ impl ArrayEncoder for FslEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{types::Int32Type, FixedSizeListArray, Int32Array};
+    use arrow_array::{FixedSizeListArray, Int32Array, types::Int32Type};
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field};
-    use lance_datagen::{array, gen_array, ArrayGeneratorExt, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_array};
 
     use crate::{
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

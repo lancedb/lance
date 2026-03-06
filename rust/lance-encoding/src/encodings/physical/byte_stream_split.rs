@@ -64,12 +64,11 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
+use crate::format::pb21::CompressiveEncoding;
 use crate::statistics::{GetStat, Stat};
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use lance_core::Result;
-use snafu::location;
 
 /// Byte Stream Split encoder for floating point values
 ///
@@ -183,10 +182,9 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                     encoding,
                 ))
             }
-            _ => Err(lance_core::Error::InvalidInput {
-                source: "ByteStreamSplit encoding only supports FixedWidth data blocks".into(),
-                location: location!(),
-            }),
+            _ => Err(lance_core::Error::invalid_input_source(
+                "ByteStreamSplit encoding only supports FixedWidth data blocks".into(),
+            )),
         }
     }
 }
@@ -226,28 +224,26 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
         let total_bytes = num_values as usize * bytes_per_value;
 
         if data.len() != 1 {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
                     "ByteStreamSplit decompression expects 1 buffer, but got {}",
                     data.len()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
 
         let input_buffer = &data[0];
 
         if input_buffer.len() != total_bytes {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
                     "Expected {} bytes for decompression, but got {}",
                     total_bytes,
                     input_buffer.len()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
 
         let mut output = vec![0u8; total_bytes];

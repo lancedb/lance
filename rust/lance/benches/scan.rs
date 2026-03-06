@@ -19,7 +19,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::stream::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]

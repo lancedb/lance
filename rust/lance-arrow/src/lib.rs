@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
-    cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericListArray, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StructArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
+    LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
-    new_null_array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
@@ -35,6 +35,7 @@ pub mod json;
 pub mod list;
 pub mod memory;
 pub mod scalar;
+pub mod stream;
 pub mod r#struct;
 
 /// Arrow extension metadata key for extension name
@@ -1558,8 +1559,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
     use arrow_array::{Float32Array, Int32Array, StructArray};
+    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
 
     #[test]

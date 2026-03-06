@@ -323,6 +323,53 @@ def test_struct_field_order(tmp_path):
         assert result == expected
 
 
+def test_filter_on_column_beside_struct_with_extension_type(tmp_path):
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), (3,))
+    tensor_arr = pa.ExtensionArray.from_storage(
+        tensor_type,
+        pa.FixedSizeListArray.from_arrays(pa.array([1.0, 2.0, 3.0], pa.float32()), 3),
+    )
+    struct_arr = pa.StructArray.from_arrays([tensor_arr], names=["vec"])
+
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "checkpoint": pa.array([None], pa.int64()),
+            "items": struct_arr,
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [1]
+
+
+def test_filter_on_column_beside_root_extension_type(tmp_path):
+    """Filtering should work when the schema has a top-level extension type column.
+
+    fixed_shape_tensor at the root level cannot be converted to a substrait type,
+    so it must also be replaced with a placeholder.
+    """
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), (3,))
+    tensor_arr = pa.ExtensionArray.from_storage(
+        tensor_type,
+        pa.FixedSizeListArray.from_arrays(pa.array([1.0, 2.0, 3.0], pa.float32()), 3),
+    )
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "checkpoint": pa.array([None], pa.int64()),
+            "vec": tensor_arr,
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [1]
+
+
 @pytest.mark.skip(
     reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
     " as it requires release mode"

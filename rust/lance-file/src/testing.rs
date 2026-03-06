@@ -9,10 +9,10 @@ use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, datatypes::Schema, utils::tempfile::TempObjFile};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
+    ReadBatchParams,
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
-    ReadBatchParams,
 };
 
 use crate::reader::{FileReader, FileReaderOptions};

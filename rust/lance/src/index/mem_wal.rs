@@ -16,32 +16,25 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MemWalIndex, MemWalIndexDetails, MergedGeneration, MEM_WAL_INDEX_NAME};
-use lance_table::format::{pb, IndexMetadata};
-use snafu::location;
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration};
+use lance_table::format::{IndexMetadata, pb};
 use uuid::Uuid;
 
 /// Load MemWalIndexDetails from an IndexMetadata.
 pub(crate) fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalIndexDetails> {
     if let Some(details_any) = index.index_details.as_ref() {
         if !details_any.type_url.ends_with("MemWalIndexDetails") {
-            return Err(Error::Index {
-                message: format!(
-                    "Index details is not for the MemWAL index, but {}",
-                    details_any.type_url
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index details is not for the MemWAL index, but {}",
+                details_any.type_url
+            )));
         }
 
         Ok(MemWalIndexDetails::try_from(
             details_any.to_msg::<pb::MemWalIndexDetails>()?,
         )?)
     } else {
-        Err(Error::Index {
-            message: "Index details not found for the MemWAL index".into(),
-            location: location!(),
-        })
+        Err(Error::index("Index details not found for the MemWAL index"))
     }
 }
 

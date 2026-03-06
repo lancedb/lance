@@ -4,9 +4,9 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
-use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
+use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
+use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -16,14 +16,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
+use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
-use snafu::location;
 
 /// Manifest of a dataset
 ///
@@ -254,10 +253,10 @@ impl Manifest {
                     }
                 }
 
-                if let Some(deletion) = &mut cloned_fragment.deletion_file {
-                    if deletion.base_id.is_none() {
-                        deletion.base_id = Some(ref_base_id);
-                    }
+                if let Some(deletion) = &mut cloned_fragment.deletion_file
+                    && deletion.base_id.is_none()
+                {
+                    deletion.base_id = Some(ref_base_id);
                 }
                 cloned_fragment
             })
@@ -366,13 +365,10 @@ impl Manifest {
             field.metadata = new_metadata;
             Ok(())
         } else {
-            Err(Error::invalid_input(
-                format!(
-                    "Field with id {} does not exist for replace_field_metadata",
-                    field_id
-                ),
-                location!(),
-            ))
+            Err(Error::invalid_input(format!(
+                "Field with id {} does not exist for replace_field_metadata",
+                field_id
+            )))
         }
     }
 
@@ -441,13 +437,10 @@ impl Manifest {
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::invalid_input(
-                format!(
-                    "fragments_since: given version {} is newer than manifest version {}",
-                    since.version, self.version
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "fragments_since: given version {} is newer than manifest version {}",
+                since.version, self.version
+            )));
         }
         let start = since.max_fragment_id();
         Ok(self
@@ -544,10 +537,10 @@ impl Manifest {
                         summary.total_deletion_files += 1;
                     }
                     // Sum the number of deleted rows from the deletion file (if available)
-                    if let Some(deletion_file) = &f.deletion_file {
-                        if let Some(num_deleted) = deletion_file.num_deleted_rows {
-                            summary.total_deletion_file_rows += num_deleted as u64;
-                        }
+                    if let Some(deletion_file) = &f.deletion_file
+                        && let Some(num_deleted) = deletion_file.num_deleted_rows
+                    {
+                        summary.total_deletion_file_rows += num_deleted as u64;
                     }
                     summary
                 });
@@ -885,10 +878,7 @@ impl TryFrom<pb::Manifest> for Manifest {
         if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
         {
-            return Err(Error::Internal {
-                message: "All fragments must have row ids".into(),
-                location: location!(),
-            });
+            return Err(Error::internal("All fragments must have row ids"));
         }
 
         let data_storage_format = match p.data_format {
@@ -1042,13 +1032,10 @@ impl SelfDescribingFileReader for PreviousFileReader {
         cache: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
-        let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
-            message: format!(
-                "Attempt to open file at {} as self-describing but it did not contain a manifest",
-                reader.path(),
-            ),
-            location: location!(),
-        })?;
+        let manifest_position = metadata.manifest_position.ok_or(Error::internal(format!(
+            "Attempt to open file at {} as self-describing but it did not contain a manifest",
+            reader.path(),
+        )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         if manifest.should_use_legacy_format() {
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;

@@ -1,135 +1,109 @@
 # AGENTS.md
 
-This file provides guidance to coding agents collaborating on this repository.
+Lance is a modern columnar data format optimized for ML workflows and datasets, providing high-performance random access, vector search, zero-copy automatic versioning, and ecosystem integrations. The vision is to become the de facto standard columnar data format for machine learning and large language models.
 
-## Project Overview
-
-Lance is a modern columnar data format optimized for ML workflows and datasets. It provides:
-
-- High-performance random access
-- Vector search
-- Zero-copy, automatic versioning
-- Ecosystem integrations
-
-## Project Vision
-
-The de facto standard columnar data format for machine learning and large language models.
-
-## Project Requirements
-
-- Always use English in code, examples, and comments.
-- Features should be implemented concisely, maintainably, and efficiently.
-- Code is not just for execution, but also for readability.
-- Only add meaningful comments and tests.
+Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
 
 ## Architecture
 
-The project is organized as a Rust workspace with Python and Java bindings. Rust crates (workspace members unless noted) include:
+Rust workspace with Python and Java bindings:
 
-- `rust/examples/` - Sample binaries and demonstrations.
-- `rust/lance/` - Main Lance library implementing the columnar format.
-- `rust/lance-arrow/` - Apache Arrow integration layer.
-- `rust/lance-core/` - Core types, traits, and utilities.
-- `rust/lance-datagen/` - Data generation helpers for tests and benchmarks.
-- `rust/lance-encoding/` - Data encoding and compression algorithms.
-- `rust/lance-file/` - File format reading/writing.
-- `rust/lance-geo/` - Geospatial data support.
-- `rust/lance-index/` - Vector and scalar indexing implementations.
-- `rust/lance-io/` - I/O operations and object store integration.
-- `rust/lance-linalg/` - Linear algebra operations for vector search.
-- `rust/lance-namespace/` - Namespace/catalog interfaces.
-- `rust/lance-namespace-impls/` - Concrete namespace/catalog implementations.
-- `rust/lance-table/` - Table format and operations.
-- `rust/lance-test-macros/` - Procedural macros for testing.
-- `rust/lance-testing/` - Shared test utilities.
-- `rust/lance-tools/` - CLI and developer tooling.
-- `rust/compression/bitpacking/` - Bit-packing codec implementation.
-- `rust/compression/fsst/` - Fast string compression (FSST).
-- `rust/lance-datafusion/` - DataFusion integration helpers (present in repo; built separately from the default workspace).
-- `python/` - Python bindings using PyO3/maturin.
-- `java/` - Java bindings using JNI.
+- `rust/lance/` - Main library implementing the columnar format
+- `rust/lance-core/` - Core types, traits, and utilities
+- `rust/lance-arrow/` - Apache Arrow integration layer
+- `rust/lance-encoding/` - Data encoding and compression algorithms
+- `rust/lance-file/` - File format reading/writing
+- `rust/lance-index/` - Vector and scalar indexing
+- `rust/lance-io/` - I/O operations and object store integration
+- `rust/lance-linalg/` - Linear algebra for vector search
+- `rust/lance-table/` - Table format and operations
+- `rust/lance-geo/` - Geospatial data support
+- `rust/lance-datagen/` - Data generation for tests and benchmarks
+- `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
+- `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
+- `rust/lance-tools/` - CLI and developer tooling
+- `rust/examples/` - Sample binaries and demonstrations
+- `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
+- `rust/lance-datafusion/` - DataFusion integration (built separately)
+- `python/` - Python bindings (PyO3/maturin)
+- `java/` - Java bindings (JNI)
 
-## Common Development Commands
+Key technical traits: async-first (tokio), Arrow-native, versioned writes with manifest tracking, custom ML-optimized encodings, unified object store interface (local/S3/Azure/GCS).
 
-### Rust Development
+## Development Commands
 
-* Check for build errors: `cargo check --workspace --tests --benches`
-* Run tests: `cargo test --workspace`
-* Run specific test: `cargo test -p <package> <test_name>`
+### Rust
+
+* Check: `cargo check --workspace --tests --benches`
+* Test: `cargo test --workspace` or `cargo test -p <package> <test_name>`
 * Lint: `cargo clippy --all --tests --benches -- -D warnings`
 * Format: `cargo fmt --all`
-* Output code coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch`
-* Create HTML coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch --html`
-* Print lines in file missing coverage: `cargo +nightly llvm-cov -q -p lance-core --show-missing-lines | grep rust/lance-core/src/datatypes/schema.rs`
-* Show detailed coverage for a file: `python ci/coverage.py -p lance-core -f rust/lance-core/src/datatypes/schema.rs`
+* Coverage: `cargo +nightly llvm-cov -q -p <crate> --branch`
+* Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
+* Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
 
-### Python Development
+### Python / Java
 
-Use the makefile for most actions:
-
-* Build: `maturin develop`
-* Test: `make test`
-* Run single test: `pytest python/tests/<test_file>.py::<test_name>`
-* Doctest: `make doctest`
-* Lint: `make lint`
-* Format: `make format`
+See [python/AGENTS.md](python/AGENTS.md) and [java/AGENTS.md](java/AGENTS.md).
 
 ### Integration Testing
 
 ```bash
-# Start required services
 cd test_data && docker compose up -d
-
-# Run S3/DynamoDB tests
 AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.py
-
-# Performance profiling
-maturin develop --release -m python/Cargo.toml -E benchmarks
-python python/benchmarks/test_knn.py --iterations 100
 ```
 
-## Key Technical Details
+## Coding Standards
 
-1. **Async-first Architecture**: Heavy use of tokio and async/await throughout Rust codebase
-2. **Arrow-native**: All data operations work directly with Apache Arrow arrays
-3. **Version Control**: Every write creates a new version with manifest tracking
-4. **Indexing**: Supports both vector indices (for similarity search) and scalar indices (BTree, inverted)
-5. **Encoding**: Custom encodings optimized for ML data patterns
-6. **Object Store**: Unified interface for local, S3, Azure, GCS storage
+### General
 
-## Development Notes
+- Always use English in code, examples, and comments.
+- Code is for readability, not just execution. Only add meaningful comments and tests.
+- Comments should explain non-obvious "why" reasoning, not restate what the code does.
+- Remove debug prints (`println!`, `dbg!`, `print()`) before merging — use `tracing` or logging frameworks.
+- Extract logic repeated in 2+ places into a shared helper; inline single-use logic at its call site.
+- Keep PRs focused — no drive-by refactors, reformatting, or cosmetic changes.
+- Be mindful of memory use: avoid collecting streams of `RecordBatch` into memory; use `RoaringBitmap` instead of `HashSet<u32>`.
 
-- All public APIs should have comprehensive documentation with examples
-- Performance-critical code uses SIMD optimizations where available
-- Always rebuild Python extension after Rust changes using `maturin develop`
-- Integration tests require Docker for local S3/DynamoDB emulation
-- Use feature flags to control dependencies (e.g., `datafusion` for SQL support)
+### Cross-Language Bindings
 
-## Development tips
+- Keep Python and Java bindings as thin wrappers — centralize validation and logic in the Rust core.
+- Keep parameter names consistent across all bindings (Rust, Python, Java) — rename everywhere or nowhere.
+- Never break public API signatures — deprecate with `#[deprecated]`/`@deprecated` and add a new method.
+- Replace mutually exclusive boolean flags with a single enum/mode parameter.
 
-Code standards:
-* Be mindful of memory use:
-  * When dealing with streams of `RecordBatch`, avoid collecting all data into
-    memory whenever possible.
-  * Use `RoaringBitmap` instead `HashSet<u32>`.
+### Naming
 
-Tests:
-* When writing unit tests, prefer using the `memory://` URI instead of creating
-  a temporary directory.
-* Use rstest to generate parameterized tests to cover more cases with fewer lines
-  of code.
-    * Use syntax `#[case::{name}(...)]` to provide human-readable names for each case.
-* For backwards compatibility, use the `test_data` directory to check in datasets
-  written with older library version.
-    * Check in a `datagen.py` that creates the test data. It should assert the
-      version of Lance used as part of the script.
-    * Use `pip install pylance=={version}` and then run `python datagen.py` to
-      create the dataset. The data files should be checked into git.
-    * Use `copy_test_data_to_tmp` to read this data in Lance
-* Avoid using `ignore` in doctests. For APIs with complex inputs, like methods on
-  `Dataset`, instead write Rust doctests that just compile a function. This
-  guarantees that the example code compiles and is in sync with the API. For example:
+- Name variables after what the value *is* (e.g., `partition_id` not `mask`) — precise names act as inline docs.
+- Drop redundant prefixes when the struct/module already implies the domain.
+- Use `indices` (not `indexes`) consistently in all APIs and docs.
+- Use storage-agnostic terms in API names (e.g., `base` not `bucket`).
+- When renaming a type/struct/enum, update all references (methods, fields, variables, test names).
 
+### Error Handling
+
+- Validate inputs and reject invalid values with descriptive errors at API boundaries — never silently clamp or adjust.
+- Validate mutually exclusive options in builders/configs — throw a clear error if both are set.
+- Include full context in error messages: variable names, values, sizes, types.
+
+### Dependencies
+
+- Prefer implementing functionality with the standard library or existing workspace dependencies before adding new external crates.
+- Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
+- Gate optional/domain-specific deps behind Cargo feature flags. Prefer separate crates for domain functionality (geo, NLP).
+
+## Testing Standards
+
+- **All bugfixes and features must have corresponding tests. We do not merge code without tests.**
+- Use `rstest` (Rust) or `@pytest.mark.parametrize` (Python) for tests that differ only in inputs. Use `#[case::{name}(...)]` for readable case names.
+- Replace `print()` in tests with `assert` — prints don't catch regressions.
+- Extend existing tests instead of adding overlapping new ones. Add to existing test files.
+- Link a GitHub issue when skipping a test — never bare `@pytest.mark.skip` or `@Ignore` without a tracking URL.
+- Include multi-fragment scenarios for dataset operations (reads, indexes, scans).
+- Cover NULL edge cases in index tests: null items, all-null collections, empty collections, null columns.
+- Vector index tests must assert recall metrics (>=0.5 threshold), not just verify creation succeeds.
+- For backwards compatibility, use the `test_data` directory with checked-in datasets from older versions. Include a `datagen.py` that asserts the Lance version used. Use `copy_test_data_to_tmp` to read this data.
+- Avoid `ignore` in doctests — write Rust doctests that compile a function instead:
   ```
   /// ```
   /// # use lance::{Dataset, Result};
@@ -139,34 +113,20 @@ Tests:
   /// # }
   /// ```
   ```
-* Code coverage can be skipped for test utilities and non-critical paths using
-  `#[cfg_attr(coverage, coverage(off))]`.
+- Skip coverage for test utilities using `#[cfg_attr(coverage, coverage(off))]`.
+
+## Documentation Standards
+
+- All public APIs must have documentation with examples. Link to relevant structs and methods.
+- Use ASCII tree diagrams for hierarchical structures (encoding layers, file formats, storage layouts).
+- Keep doc examples in sync with actual API signatures — update when refactoring.
+- Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
+- Proofread comments and docs for typos before committing.
 
 ## Review Guidelines
 
-Please note that the attention of contributors and maintainers is the MOST valuable resource.
-Less is more: focus on the most important aspects.
+Contributor and maintainer attention is the most valuable resource. Less is more.
 
-- Your review output SHOULD be concise and clear.
-- You SHOULD only highlight P0 and P1 level issues, such as severe bugs, performance degradation, or security concerns.
-- You MUST not reiterate detailed changes in your review.
-- You MUST not repeat aspects of the PR that are already well done.
-            
-Please consider the following when reviewing code contributions.
-
-### Rust API design
-* Design public APIs so they can be evolved easily in the future without breaking
-  changes. Often this means using builder patterns or options structs instead of
-  long argument lists.
-* For public APIs, prefer inputs that use `Into<T>` or `AsRef<T>` traits to allow
-  more flexible inputs. For example, use `name: Into<String>` instead of `name: String`,
-  so we don't have to write `func("my_string".to_string())`.
-
-### Testing
-* Ensure all new public APIs have documentation and examples.
-* Ensure that all bugfixes and features have corresponding tests. **We do not merge
-  code without tests.**
-
-### Documentation
-* New features must include updates to the rust documentation comments. Link to
-  relevant structs and methods to increase the value of documentation.
+- Be concise and clear. Focus on P0/P1 issues: severe bugs, performance degradation, security concerns.
+- Do not reiterate detailed changes or repeat what's already well done.
+- Check naming consistency, error handling patterns, and test coverage.

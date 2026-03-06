@@ -12,10 +12,10 @@ use arrow_schema::SortOptions;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
 
@@ -122,9 +122,9 @@ impl LsmVectorSearchPlanner {
         mut self,
         bloom_filters: impl IntoIterator<Item = (u64, Arc<Sbbf>)>,
     ) -> Self {
-        for (gen, bf) in bloom_filters {
+        for (generation, bf) in bloom_filters {
             self.bloom_filters.push(GenerationBloomFilter {
-                generation: gen,
+                generation,
                 bloom_filter: bf,
             });
         }
@@ -181,10 +181,10 @@ impl LsmVectorSearchPlanner {
         };
 
         let distance_idx = filtered.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
-            lance_core::Error::invalid_input(
-                format!("Column '{}' not found in schema", DISTANCE_COLUMN),
-                snafu::location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Column '{}' not found in schema",
+                DISTANCE_COLUMN
+            ))
         })?;
 
         let sort_expr = vec![PhysicalSortExpr {
@@ -195,11 +195,9 @@ impl LsmVectorSearchPlanner {
             },
         }];
 
-        let lex_ordering =
-            LexOrdering::new(sort_expr).ok_or_else(|| lance_core::Error::Internal {
-                message: "Failed to create LexOrdering".to_string(),
-                location: snafu::location!(),
-            })?;
+        let lex_ordering = LexOrdering::new(sort_expr).ok_or_else(|| {
+            lance_core::Error::internal("Failed to create LexOrdering".to_string())
+        })?;
 
         let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, filtered));
         let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sorted, 0, Some(k)));
@@ -319,7 +317,7 @@ mod tests {
     use super::*;
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::{
-        builder::FixedSizeListBuilder, Int32Array, RecordBatch, RecordBatchIterator,
+        Int32Array, RecordBatch, RecordBatchIterator, builder::FixedSizeListBuilder,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use std::collections::HashMap;

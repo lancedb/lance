@@ -13,13 +13,12 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
-use snafu::location;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{
-    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD,
-    ROW_ID, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD,
-    ROW_OFFSET, ROW_OFFSET_FIELD, WILDCARD,
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD, ROW_ID,
+    ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD, ROW_OFFSET,
+    ROW_OFFSET_FIELD, Result, WILDCARD,
 };
 
 /// Lance Schema.
@@ -46,10 +45,9 @@ impl FieldRef<'_> {
         match self {
             FieldRef::ById(id) => {
                 if schema.field_by_id(id).is_none() {
-                    return Err(Error::InvalidInput {
-                        source: format!("Field ID {} not found in schema", id).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Field ID {} not found in schema", id).into(),
+                    ));
                 }
                 Ok(id)
             }
@@ -150,12 +148,11 @@ impl Schema {
         let mut differences =
             explain_fields_difference(&self.fields, &expected.fields, options, None);
 
-        if options.compare_metadata {
-            if let Some(difference) =
+        if options.compare_metadata
+            && let Some(difference) =
                 explain_metadata_difference(&self.metadata, &expected.metadata)
-            {
-                differences.push(difference);
-            }
+        {
+            differences.push(difference);
         }
 
         if differences.is_empty() {
@@ -172,11 +169,10 @@ impl Schema {
     pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);
-            Err(Error::SchemaMismatch {
-                // unknown reason is messy but this shouldn't happen.
-                difference: difference.unwrap_or("unknown reason".to_string()),
-                location: location!(),
-            })
+            // unknown reason is messy but this shouldn't happen.
+            Err(Error::schema_mismatch(
+                difference.unwrap_or("unknown reason".to_string()),
+            ))
         } else {
             Ok(())
         }
@@ -256,13 +252,10 @@ impl Schema {
                         candidates
                             .push(Field::try_from(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?);
                     } else {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "System column {} is currently not supported in projection",
-                                first
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(format!(
+                            "System column {} is currently not supported in projection",
+                            first
+                        )));
                     }
                 }
             } else if err_on_missing {
@@ -304,10 +297,10 @@ impl Schema {
 
         for field in self.fields.iter() {
             if field.name.contains('.') {
-                return Err(Error::Schema{message:format!(
+                return Err(Error::schema(format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
-                ), location: location!(),});
+                )));
             }
 
             let column_path = self
@@ -318,13 +311,10 @@ impl Schema {
                 .collect::<Vec<_>>()
                 .join(".");
             if !seen_names.insert(column_path.clone()) {
-                return Err(Error::Schema {
-                    message: format!(
-                        "Duplicate field name \"{}\" in schema:\n {:#?}",
-                        column_path, self
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Duplicate field name \"{}\" in schema:\n {:#?}",
+                    column_path, self
+                )));
             }
         }
 
@@ -332,16 +322,16 @@ impl Schema {
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
             if field.id < 0 {
-                return Err(Error::Schema {
-                    message: format!("Field {} has a negative id {}", field.name, field.id),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Field {} has a negative id {}",
+                    field.name, field.id
+                )));
             }
             if !seen_ids.insert(field.id) {
-                return Err(Error::Schema {
-                    message: format!("Duplicate field id {} in schema {:?}", field.id, self),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Duplicate field id {} in schema {:?}",
+                    field.id, self
+                )));
             }
         }
 
@@ -448,23 +438,17 @@ impl Schema {
         for field in projection.fields.iter() {
             // Ensure the field is a top-level field (no dots in the name)
             if field.name.contains('.') {
-                return Err(Error::Schema {
-                    message: format!(
-                        "Field '{}' contains dots. project_by_schema only accepts top-level fields. \
-                         Use project() method for nested field paths.",
-                        field.name
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Field '{}' contains dots. project_by_schema only accepts top-level fields. \
+                     Use project() method for nested field paths.",
+                    field.name
+                )));
             }
 
             if let Some(self_field) = self.field(&field.name) {
                 new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
             } else if matches!(on_missing, OnMissing::Error) {
-                return Err(Error::Schema {
-                    message: format!("Field {} not found", field.name),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!("Field {} not found", field.name)));
             }
         }
         Ok(Self {
@@ -475,17 +459,16 @@ impl Schema {
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
-        let other = schema.try_into().map_err(|_| Error::Schema {
-            message: "The other schema is not compatible with this schema".to_string(),
-            location: location!(),
+        let other = schema.try_into().map_err(|_| {
+            Error::schema("The other schema is not compatible with this schema".to_string())
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_nested() {
-                    if let Some(f) = field.exclude(other_field) {
-                        fields.push(f)
-                    }
+                if field.data_type().is_nested()
+                    && let Some(f) = field.exclude(other_field)
+                {
+                    fields.push(f)
                 }
             } else {
                 fields.push(field.clone());
@@ -563,10 +546,7 @@ impl Schema {
     pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
             .map(|f| f.id)
-            .ok_or_else(|| Error::Schema {
-                message: "Vector column not in schema".to_string(),
-                location: location!(),
-            })
+            .ok_or_else(|| Error::schema("Vector column not in schema".to_string()))
     }
 
     pub fn top_level_field_ids(&self) -> Vec<i32> {
@@ -650,12 +630,12 @@ impl Schema {
     // TODO: pub(crate)
     pub fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.fields.as_mut_slice() {
-            let column = batch
-                .column_by_name(&field.name)
-                .ok_or_else(|| Error::Schema {
-                    message: format!("column '{}' does not exist in the record batch", field.name),
-                    location: location!(),
-                })?;
+            let column = batch.column_by_name(&field.name).ok_or_else(|| {
+                Error::schema(format!(
+                    "column '{}' does not exist in the record batch",
+                    field.name
+                ))
+            })?;
             field.set_dictionary(column);
         }
         Ok(())
@@ -694,13 +674,10 @@ impl Schema {
         // Validate this addition does not create any duplicate field names
         let field_names = self.fields.iter().map(|f| &f.name).collect::<HashSet<_>>();
         if field_names.len() != self.fields.len() {
-            Err(Error::Internal {
-                message: format!(
-                    "Attempt to add fields [{:?}] would lead to duplicate field names",
-                    fields.iter().map(|f| f.name()).collect::<Vec<_>>()
-                ),
-                location: location!(),
-            })
+            Err(Error::internal(format!(
+                "Attempt to add fields [{:?}] would lead to duplicate field names",
+                fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+            )))
         } else {
             Ok(())
         }
@@ -755,10 +732,47 @@ impl Schema {
                 let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
                 format_field_path(&field_refs)
             })
-            .ok_or_else(|| Error::Index {
-                message: format!("Could not find field ancestry for id {}", field_id),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::index(format!("Could not find field ancestry for id {}", field_id))
             })
+    }
+
+    pub fn verify_primary_key(&self) -> Result<()> {
+        let pk = self.unenforced_primary_key();
+        for pk_col in pk.into_iter() {
+            if !pk_col.is_leaf() {
+                return Err(Error::schema(format!(
+                    "Primary key column must be a leaf: {}",
+                    pk_col
+                )));
+            }
+
+            if let Some(ancestors) = self.field_ancestry_by_id(pk_col.id) {
+                for ancestor in ancestors {
+                    if ancestor.nullable {
+                        return Err(Error::schema(format!(
+                            "Primary key column and all its ancestors must not be nullable: {}",
+                            ancestor
+                        )));
+                    }
+
+                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
+                        return Err(Error::schema(format!(
+                            "Primary key column must not be in a list type: {}",
+                            ancestor
+                        )));
+                    }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::schema(format!(
+                            "Primary key column must not be in a map type: {}",
+                            ancestor
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -793,49 +807,7 @@ impl TryFrom<&ArrowSchema> for Schema {
         schema.set_field_id(None);
         schema.validate()?;
 
-        let pk = schema.unenforced_primary_key();
-        for pk_col in pk.into_iter() {
-            if !pk_col.is_leaf() {
-                return Err(Error::Schema {
-                    message: format!("Primary key column must be a leaf: {}", pk_col),
-                    location: location!(),
-                });
-            }
-
-            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
-                for ancestor in ancestors {
-                    if ancestor.nullable {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Primary key column and all its ancestors must not be nullable: {}",
-                                ancestor
-                            ),
-                            location: location!(),
-                        });
-                    }
-
-                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Primary key column must not be in a list type: {}",
-                                ancestor
-                            ),
-                            location: location!(),
-                        });
-                    }
-
-                    if ancestor.logical_type.is_map() {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Primary key column must not be in a map type: {}",
-                                ancestor
-                            ),
-                            location: location!(),
-                        });
-                    }
-                }
-            }
-        }
+        schema.verify_primary_key()?;
 
         Ok(schema)
     }
@@ -1199,10 +1171,9 @@ impl Projection {
                 Self::add_field_children(&mut self.field_ids, last_field);
             }
         } else if matches!(on_missing, OnMissing::Error) {
-            return Err(Error::InvalidInput {
-                source: format!("Column {} does not exist", column).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                format!("Column {} does not exist", column).into(),
+            ));
         }
         Ok(self)
     }
@@ -1479,10 +1450,7 @@ impl Projection {
 /// The result is guaranteed to contain at least one element.
 pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     if path.is_empty() {
-        return Err(Error::Schema {
-            message: "Field path cannot be empty".to_string(),
-            location: location!(),
-        });
+        return Err(Error::schema("Field path cannot be empty".to_string()));
     }
 
     let mut result = Vec::new();
@@ -1503,13 +1471,13 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
                         // End of quoted field
                         in_quotes = false;
                         // After closing quote, we should either see a dot or end of string
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch != '.' {
-                                return Err(Error::Schema {
-                                    message: format!("Invalid field path '{}': expected '.' or end of string after closing quote", path),
-                                    location: location!(),
-                                });
-                            }
+                        if let Some(&next_ch) = chars.peek()
+                            && next_ch != '.'
+                        {
+                            return Err(Error::schema(format!(
+                                "Invalid field path '{}': expected '.' or end of string after closing quote",
+                                path
+                            )));
                         }
                     }
                 } else if current.is_empty() {
@@ -1517,21 +1485,18 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
                     in_quotes = true;
                 } else {
                     // Quote in the middle of unquoted field name
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Invalid field path '{}': unexpected quote in the middle of field name",
-                            path
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': unexpected quote in the middle of field name",
+                        path
+                    )));
                 }
             }
             '.' if !in_quotes => {
                 if current.is_empty() {
-                    return Err(Error::Schema {
-                        message: format!("Invalid field path '{}': empty field name", path),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': empty field name",
+                        path
+                    )));
                 }
                 result.push(current);
                 current = String::new();
@@ -1543,28 +1508,25 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     }
 
     if in_quotes {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}': unclosed quote", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': unclosed quote",
+            path
+        )));
     }
 
     if !current.is_empty() {
         result.push(current);
     } else if !result.is_empty() {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}': trailing dot", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': trailing dot",
+            path
+        )));
     }
 
     // This check is now redundant since we check for empty input at the beginning,
     // but keeping it for extra safety
     if result.is_empty() {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}'", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!("Invalid field path '{}'", path)));
     }
 
     Ok(result)
@@ -1787,9 +1749,10 @@ mod tests {
         let schema_result = Schema::try_from(&arrow_schema_with_dots);
         assert!(schema_result.is_err());
         let err = schema_result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Top level field field.with.dots cannot contain `.`"));
+        assert!(
+            err.to_string()
+                .contains("Top level field field.with.dots cannot contain `.`")
+        );
 
         // Test that nested fields with dots are allowed
         let arrow_schema = ArrowSchema::new(vec![
@@ -2494,44 +2457,50 @@ mod tests {
             ),
             (
                 // check nested schema, parent is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
-                        false,
-                    )])),
-                    true,
-                )
-                .unwrap()],
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            false,
+                        )])),
+                        true,
+                    )
+                    .unwrap(),
+                ],
                 false,
             ),
             (
                 // check nested schema, child is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
-                        true,
-                    )])),
-                    false,
-                )
-                .unwrap()],
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            true,
+                        )])),
+                        false,
+                    )
+                    .unwrap(),
+                ],
                 false,
             ),
             (
                 // check nested schema, all is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            true,
+                        )])),
                         true,
-                    )])),
-                    true,
-                )
-                .unwrap()],
+                    )
+                    .unwrap(),
+                ],
                 true,
             ),
         ];
@@ -2549,15 +2518,16 @@ mod tests {
     fn test_schema_unenforced_primary_key() {
         let cases = vec![
             ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]),
-            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)
-                .with_metadata(
+            ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, false).with_metadata(
                     vec![(
                         "lance-schema:unenforced-primary-key".to_owned(),
                         "true".to_owned(),
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )]),
+                ),
+            ]),
             ArrowSchema::new(vec![
                 ArrowField::new("a", DataType::Int32, false).with_metadata(
                     vec![(
@@ -2569,19 +2539,16 @@ mod tests {
                 ),
                 ArrowField::new(
                     "b",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "f1",
-                        DataType::Utf8,
-                        false,
-                    )
-                    .with_metadata(
-                        vec![(
-                            "lance-schema:unenforced-primary-key".to_owned(),
-                            "true".to_owned(),
-                        )]
-                        .into_iter()
-                        .collect::<HashMap<_, _>>(),
-                    )])),
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("f1", DataType::Utf8, false).with_metadata(
+                            vec![(
+                                "lance-schema:unenforced-primary-key".to_owned(),
+                                "true".to_owned(),
+                            )]
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                        ),
+                    ])),
                     false,
                 ),
             ]),
@@ -2608,37 +2575,24 @@ mod tests {
     #[test]
     fn test_schema_unenforced_primary_key_failures() {
         let cases = vec![
-            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)
-                .with_metadata(
+            ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, true).with_metadata(
                     vec![(
                         "lance-schema:unenforced-primary-key".to_owned(),
                         "true".to_owned(),
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )]),
-            ArrowSchema::new(vec![ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
-                    false,
-                )])),
-                false,
-            )
-            .with_metadata(
-                vec![(
-                    "lance-schema:unenforced-primary-key".to_owned(),
-                    "true".to_owned(),
-                )]
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-            )]),
-            ArrowSchema::new(vec![ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
+                ),
+            ]),
+            ArrowSchema::new(vec![
+                ArrowField::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "f1",
+                        DataType::Utf8,
+                        false,
+                    )])),
                     false,
                 )
                 .with_metadata(
@@ -2648,7 +2602,20 @@ mod tests {
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )])),
+                ),
+            ]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, false).with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_owned(),
+                            "true".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    ),
+                ])),
                 true,
             )]),
             ArrowSchema::new(vec![ArrowField::new(
@@ -2676,10 +2643,12 @@ mod tests {
         for (idx, case) in cases.into_iter().enumerate() {
             let result = Schema::try_from(&case);
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains(error_message_contains[idx]));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(error_message_contains[idx])
+            );
         }
     }
 

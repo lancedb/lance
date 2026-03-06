@@ -6,13 +6,13 @@
 use std::fmt::Formatter;
 use std::slice;
 
-use arrow_array::{builder::BooleanBufferBuilder, Array, FixedSizeBinaryArray};
+use arrow_array::{Array, FixedSizeBinaryArray, builder::BooleanBufferBuilder};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 use half::bf16;
 
-use crate::{FloatArray, ARROW_EXT_NAME_KEY};
+use crate::{ARROW_EXT_NAME_KEY, FloatArray};
 
 /// The name of the bfloat16 extension in Arrow metadata
 pub const BFLOAT16_EXT_NAME: &str = "lance.bfloat16";

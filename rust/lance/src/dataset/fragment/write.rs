@@ -4,8 +4,8 @@
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
 use lance_core::Error;
+use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
@@ -14,14 +14,13 @@ use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
-use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
-use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
-use crate::Result;
+use crate::dataset::{DATA_DIR, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
 ///
@@ -168,7 +167,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         fragment.physical_rows = Some(writer.finish().await? as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
-            return Err(Error::invalid_input("Input data was empty.", location!()));
+            return Err(Error::invalid_input("Input data was empty."));
         }
 
         let field_ids = writer
@@ -206,6 +205,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
         do_write_fragments(
+            None,
             object_store,
             &base_path,
             &schema,
@@ -262,7 +262,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
 
         if writer.is_empty() {
-            return Err(Error::invalid_input("Input data was empty.", location!()));
+            return Err(Error::invalid_input("Input data was empty."));
         }
 
         fragment.physical_rows = Some(writer.finish().await?);
@@ -278,10 +278,10 @@ impl<'a> FragmentCreateBuilder<'a> {
     ) -> Result<(SendableRecordBatchStream, Schema)> {
         if let Some(schema) = self.schema {
             return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
-            if let Some(schema) = self.existing_dataset_schema().await? {
-                return Ok((source.into_stream(), schema));
-            }
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
+            && let Some(schema) = self.existing_dataset_schema().await?
+        {
+            return Ok((source.into_stream(), schema));
         }
         source.into_stream_and_schema().await
     }
@@ -312,10 +312,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
         if actual.fields().is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot write with an empty schema.",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot write with an empty schema."));
         }
         let actual_lance = Schema::try_from(actual)?;
         actual_lance.check_compatible(expected, &Default::default())?;
@@ -539,6 +536,7 @@ mod tests {
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Legacy,
             LanceFileVersion::Stable
         )]
@@ -570,6 +568,7 @@ mod tests {
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
             LanceFileVersion::Legacy,
             LanceFileVersion::Stable
         )]

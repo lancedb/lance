@@ -5,8 +5,8 @@ use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use tracing::Instrument;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
+use tracing_subscriber::layer::SubscriberExt;
 use tracking_allocator::{
     AllocationGroupId, AllocationGroupToken, AllocationLayer, AllocationRegistry,
     AllocationTracker, Allocator,

@@ -4,16 +4,16 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::namespace::{
-    create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+    BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
 };
 use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
+use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
     get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
-use crate::{traits::IntoJava, RT};
+use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
@@ -27,10 +27,10 @@ use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
-use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
+use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
@@ -45,16 +45,16 @@ use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::btree::BTreeParameters;
 use lance_index::DatasetIndexExt;
 use lance_index::IndexCriteria as RustIndexCriteria;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
 use lance_namespace::LanceNamespace;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -130,6 +130,10 @@ impl BlockingDataset {
     ) -> Result<Self> {
         let inner = RT.block_on(Dataset::write(reader, uri, params))?;
         Ok(Self { inner })
+    }
+
+    pub fn new(dataset: Dataset) -> Self {
+        Self { inner: dataset }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -382,7 +386,7 @@ impl BlockingDataset {
 ///////////////////
 // Write Methods //
 ///////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -459,7 +463,7 @@ fn inner_create_with_ffi_schema<'local>(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -473,7 +477,7 @@ pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
     JObject::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeMigrateManifestPathsV2(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -491,7 +495,7 @@ fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObjec
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -531,7 +535,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'local>(
     mut env: JNIEnv<'local>,
@@ -731,7 +735,7 @@ fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
     Ok(object)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_commitAppend<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -772,7 +776,7 @@ pub fn inner_commit_append<'local>(
     dataset.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_commitOverwrite<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -827,7 +831,7 @@ pub fn inner_commit_overwrite<'local>(
     dataset.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_releaseNativeDataset(mut env: JNIEnv, obj: JObject) {
     ok_or_throw_without_return!(env, inner_release_native_dataset(&mut env, obj))
 }
@@ -838,7 +842,7 @@ fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> Result<()> {
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject<'local>,
@@ -986,6 +990,23 @@ fn inner_create_index<'local>(
     (&index_metadata).into_java(env)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeDropIndex(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    name: JString,
+) {
+    ok_or_throw_without_return!(env, inner_drop_index(&mut env, java_dataset, name))
+}
+
+fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> Result<()> {
+    let name = name.extract(env)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_index(&name))?;
+    Ok(())
+}
+
 fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
     match index_type {
         IndexType::BTree => {
@@ -1000,7 +1021,7 @@ fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Res
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadata<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1045,7 +1066,7 @@ fn inner_merge_index_metadata(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1096,7 +1117,7 @@ fn inner_optimize_indices(
 //////////////////
 // Read Methods //
 //////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -1247,7 +1268,7 @@ pub(crate) fn extract_namespace_info(
     Ok(Some((namespace, table_id)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_getFragmentsNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
@@ -1271,7 +1292,7 @@ fn inner_get_fragments<'local>(
     export_vec(env, &fragments)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_getFragmentNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
@@ -1297,7 +1318,7 @@ fn inner_get_fragment<'local>(
     Ok(obj)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceSchema<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1317,7 +1338,7 @@ fn inner_get_lance_schema<'local>(
     schema.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_importFfiSchema(
     mut env: JNIEnv,
     jdataset: JObject,
@@ -1345,7 +1366,7 @@ fn inner_import_ffi_schema(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeUri<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1368,7 +1389,7 @@ fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<
     Ok(jstring_uri)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListVersions<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1404,7 +1425,7 @@ fn inner_list_versions<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1424,7 +1445,7 @@ fn inner_get_version<'local>(
     version.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestVersionId(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1438,7 +1459,7 @@ fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u6
     dataset_guard.latest_version()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetInitialStorageOptions<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1464,7 +1485,7 @@ fn inner_get_initial_storage_options<'local>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestStorageOptions<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1490,7 +1511,7 @@ fn inner_get_latest_storage_options<'local>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutLatest(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1504,7 +1525,7 @@ fn inner_checkout_latest(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> 
     dataset_guard.checkout_latest()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1527,7 +1548,7 @@ fn inner_checkout_version<'local>(
     new_dataset.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutTag<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1551,7 +1572,7 @@ fn inner_checkout_tag<'local>(
     new_dataset.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeRestore(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1565,7 +1586,7 @@ fn inner_restore(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
     dataset_guard.restore()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeShallowClone<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1608,7 +1629,7 @@ fn inner_shallow_clone<'local>(
     BlockingDataset { inner: new_ds }.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1632,7 +1653,7 @@ fn inner_count_rows(
     dataset_guard.count_rows(filter)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetDataStatistics<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1669,7 +1690,7 @@ fn inner_get_data_statistics<'local>(
     Ok(data_stats)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListIndexes<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1706,7 +1727,7 @@ fn inner_list_indexes<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetConfig<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -1748,7 +1769,39 @@ fn inner_get_config<'local>(
     Ok(java_hashmap)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_lance_file_format_version(&mut env, java_dataset),
+        JObject::null().into()
+    )
+}
+
+fn inner_get_lance_file_format_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JString<'local>> {
+    let version_string = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let version = dataset_guard
+            .inner
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
+        version.to_string()
+    };
+
+    Ok(env
+        .new_string(&version_string)
+        .expect("Failed to create Java String"))
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeTake(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1801,7 +1854,7 @@ fn inner_take(
     Ok(**byte_array)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDelete(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1818,7 +1871,7 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeTruncateTable(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1836,7 +1889,7 @@ fn inner_truncate_table(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
 //////////////////////////////
 // Schema evolution Methods //
 //////////////////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDropColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1858,7 +1911,7 @@ fn inner_drop_columns(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeAlterColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1963,7 +2016,7 @@ fn inner_alter_columns(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsBySqlExpressions(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2025,7 +2078,7 @@ fn inner_add_columns_by_sql_expressions(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsByReader(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2067,7 +2120,7 @@ fn inner_add_columns_by_reader(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsBySchema(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2101,7 +2154,7 @@ fn inner_add_columns_by_schema(
 //////////////////////////////
 // Tag operation Methods    //
 //////////////////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListTags<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2146,7 +2199,7 @@ fn inner_list_tags<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCreateTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2173,7 +2226,7 @@ fn inner_create_tag(
     Ok(())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDeleteTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2189,7 +2242,7 @@ fn inner_delete_tag(env: &mut JNIEnv, java_dataset: JObject, jtag_name: JString)
     dataset_guard.delete_tag(tag.as_str())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2215,7 +2268,7 @@ fn inner_update_tag(
     dataset_guard.update_tag(tag.as_str(), reference)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionByTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2242,7 +2295,7 @@ fn inner_get_version_by_tag(
 //////////////////////////////
 // Branch operation Methods  //
 //////////////////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListBranches<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2289,7 +2342,7 @@ fn inner_list_branches<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCreateBranch<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2358,7 +2411,7 @@ fn transform_jstorage_options(
         .unwrap_or(None))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDeleteBranch(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2374,7 +2427,7 @@ fn inner_delete_branch(env: &mut JNIEnv, java_dataset: JObject, jbranch: JString
     dataset_guard.delete_branch(branch_name.as_str())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCheckout<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2426,7 +2479,7 @@ fn inner_checkout_ref<'local>(
 
 // Unified metadata API JNI methods
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetTableMetadata<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2471,7 +2524,7 @@ fn inner_get_table_metadata<'local>(
 //////////////////////////////
 // Compaction Methods       //
 //////////////////////////////
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCompact(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2558,6 +2611,22 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let compaction_mode = env
+        .call_method(
+            &java_options,
+            "getCompactionMode",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let binary_copy_read_batch_bytes = env
+        .call_method(
+            &java_options,
+            "getBinaryCopyReadBatchBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -2569,10 +2638,12 @@ fn convert_java_compaction_options_to_rust(
         &num_threads,
         &batch_size,
         &defer_index_remap,
+        &compaction_mode,
+        &binary_copy_read_batch_bytes,
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
@@ -2629,10 +2700,14 @@ fn inner_cleanup_with_policy<'local>(
 
     let jstats = env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJ)V",
+        "(JJJJJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
+            JValue::Long(stats.data_files_removed as i64),
+            JValue::Long(stats.transaction_files_removed as i64),
+            JValue::Long(stats.index_files_removed as i64),
+            JValue::Long(stats.deletion_files_removed as i64),
         ],
     )?;
 
@@ -2643,7 +2718,7 @@ fn inner_cleanup_with_policy<'local>(
 // Index operation Methods   //
 //////////////////////////////
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexes<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2676,7 +2751,7 @@ fn inner_get_indexes<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexStatistics<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2704,7 +2779,7 @@ fn inner_get_index_statistics<'local>(
     Ok(jstats)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDescribeIndices<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2746,7 +2821,7 @@ fn inner_describe_indices<'local>(
     export_vec(env, &descriptions)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2839,7 +2914,7 @@ fn inner_count_indexed_rows(
 
 /// Returns the session handle from a dataset.
 /// The returned handle can be used to create a Java Session object.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetSessionHandle(
     mut env: JNIEnv,
     java_dataset: JObject,

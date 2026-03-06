@@ -10,12 +10,12 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router, ServiceExt,
     body::Bytes,
     extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router, ServiceExt,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -24,8 +24,8 @@ use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
-use lance_namespace::models::*;
 use lance_namespace::LanceNamespace;
+use lance_namespace::models::*;
 
 /// Configuration for the REST server
 #[derive(Debug, Clone)]
@@ -84,7 +84,6 @@ impl RestAdapter {
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
-            .route("/v1/table/:id/create-empty", post(create_empty_table))
             .route("/v1/table/:id/declare", post(declare_table))
             .route("/v1/table/:id/insert", post(insert_into_table))
             .route("/v1/table/:id/merge_insert", post(merge_insert_into_table))
@@ -150,10 +149,7 @@ impl RestAdapter {
 
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
-            Error::IO {
-                source: Box::new(e),
-                location: snafu::location!(),
-            }
+            Error::io_source(Box::new(e))
         })?;
 
         // Get the actual port (important when port 0 was specified)
@@ -531,23 +527,6 @@ async fn create_table(
     };
 
     match backend.create_table(request, body).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
-        Err(e) => error_to_response(e),
-    }
-}
-
-#[allow(deprecated)]
-async fn create_empty_table(
-    State(backend): State<Arc<dyn LanceNamespace>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
-    Json(mut request): Json<CreateEmptyTableRequest>,
-) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
-    request.identity = extract_identity(&headers);
-
-    match backend.create_empty_table(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -1651,8 +1630,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[allow(deprecated)]
-        async fn test_empty_table_exists_in_child_namespace() {
+        async fn test_declared_table_exists_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
             // Create child namespace
@@ -1668,14 +1646,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Create empty table
-            let mut create_req = CreateEmptyTableRequest::new();
-            create_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
-            fixture
-                .namespace
-                .create_empty_table(create_req)
-                .await
-                .unwrap();
+            // Declare table
+            let declare_req = DeclareTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                ..Default::default()
+            };
+            fixture.namespace.declare_table(declare_req).await.unwrap();
 
             // Check table exists
             let mut exists_req = TableExistsRequest::new();
@@ -1683,7 +1659,7 @@ mod tests {
             let result = fixture.namespace.table_exists(exists_req).await;
             assert!(
                 result.is_ok(),
-                "Empty table should exist in child namespace"
+                "Declared table should exist in child namespace"
             );
         }
 
@@ -1829,8 +1805,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[allow(deprecated)]
-        async fn test_create_empty_table_in_child_namespace() {
+        async fn test_describe_declared_table_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
             // Create child namespace
@@ -1846,79 +1821,21 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Create empty table
-            let mut create_req = CreateEmptyTableRequest::new();
-            create_req.id = Some(vec![
-                "test_namespace".to_string(),
-                "empty_table".to_string(),
-            ]);
-
-            let result = fixture.namespace.create_empty_table(create_req).await;
-            assert!(
-                result.is_ok(),
-                "Failed to create empty table in child namespace: {:?}",
-                result.err()
-            );
-
-            // Check response details
-            let response = result.unwrap();
-            assert!(
-                response.location.is_some(),
-                "Response should include location"
-            );
-            assert!(
-                response.location.unwrap().contains("empty_table"),
-                "Location should contain table name"
-            );
-
-            // Verify the empty table exists
-            let mut exists_req = TableExistsRequest::new();
-            exists_req.id = Some(vec![
-                "test_namespace".to_string(),
-                "empty_table".to_string(),
-            ]);
-            let exists_result = fixture.namespace.table_exists(exists_req).await;
-            assert!(
-                exists_result.is_ok(),
-                "Empty table should exist in child namespace"
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[allow(deprecated)]
-        async fn test_describe_empty_table_in_child_namespace() {
-            let fixture = RestServerFixture::new().await;
-
-            // Create child namespace
-            let create_ns_req = CreateNamespaceRequest {
-                id: Some(vec!["test_namespace".to_string()]),
-                properties: None,
-                mode: None,
+            // Declare table
+            let declare_req = DeclareTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
                 ..Default::default()
             };
-            fixture
-                .namespace
-                .create_namespace(create_ns_req)
-                .await
-                .unwrap();
+            fixture.namespace.declare_table(declare_req).await.unwrap();
 
-            // Create empty table
-            let mut create_req = CreateEmptyTableRequest::new();
-            create_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
-            fixture
-                .namespace
-                .create_empty_table(create_req)
-                .await
-                .unwrap();
-
-            // Describe the empty table
+            // Describe the declared table
             let mut describe_req = DescribeTableRequest::new();
             describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
             let result = fixture.namespace.describe_table(describe_req).await;
 
             assert!(
                 result.is_ok(),
-                "Failed to describe empty table in child namespace: {:?}",
+                "Failed to describe declared table in child namespace: {:?}",
                 result.err()
             );
             let response = result.unwrap();
@@ -1934,16 +1851,15 @@ mod tests {
                 "Location should contain table name"
             );
 
-            // Empty tables don't have a version until data is written
-            // (version is None for empty tables)
+            // Declared tables don't have a version until data is written
+            // (version is None for declared tables)
 
-            // Empty tables don't have a schema initially
+            // Declared tables don't have a schema initially
             // (schema is None until data is added)
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[allow(deprecated)]
-        async fn test_drop_empty_table_in_child_namespace() {
+        async fn test_drop_declared_table_in_child_namespace() {
             let fixture = RestServerFixture::new().await;
 
             // Create child namespace
@@ -1959,14 +1875,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Create empty table
-            let mut create_req = CreateEmptyTableRequest::new();
-            create_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
-            fixture
-                .namespace
-                .create_empty_table(create_req)
-                .await
-                .unwrap();
+            // Declare table
+            let declare_req = DeclareTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                ..Default::default()
+            };
+            fixture.namespace.declare_table(declare_req).await.unwrap();
 
             // Drop the empty table
             let drop_req = DropTableRequest {
@@ -1984,14 +1898,16 @@ mod tests {
             let mut exists_req = TableExistsRequest::new();
             exists_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
             let result = fixture.namespace.table_exists(exists_req).await;
-            assert!(result.is_err(), "Empty table should not exist after drop");
+            assert!(
+                result.is_err(),
+                "Declared table should not exist after drop"
+            );
             // After drop, accessing the table should fail
             // (error message varies depending on implementation details)
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[allow(deprecated)]
-        async fn test_deeply_nested_namespace_with_empty_table() {
+        async fn test_deeply_nested_namespace_with_declared_table() {
             let fixture = RestServerFixture::new().await;
 
             // Create deeply nested namespace hierarchy
@@ -2035,20 +1951,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Create empty table in deeply nested namespace
-            let mut create_req = CreateEmptyTableRequest::new();
-            create_req.id = Some(vec![
-                "level1".to_string(),
-                "level2".to_string(),
-                "level3".to_string(),
-                "deep_table".to_string(),
-            ]);
+            // Declare table in deeply nested namespace
+            let declare_req = DeclareTableRequest {
+                id: Some(vec![
+                    "level1".to_string(),
+                    "level2".to_string(),
+                    "level3".to_string(),
+                    "deep_table".to_string(),
+                ]),
+                ..Default::default()
+            };
 
-            let result = fixture.namespace.create_empty_table(create_req).await;
+            let result = fixture.namespace.declare_table(declare_req).await;
 
             assert!(
                 result.is_ok(),
-                "Failed to create empty table in deeply nested namespace"
+                "Failed to declare table in deeply nested namespace"
             );
 
             // Verify table exists
@@ -2062,7 +1980,7 @@ mod tests {
             let result = fixture.namespace.table_exists(exists_req).await;
             assert!(
                 result.is_ok(),
-                "Empty table should exist in deeply nested namespace"
+                "Declared table should exist in deeply nested namespace"
             );
         }
 
@@ -2557,11 +2475,13 @@ mod tests {
             // Verify table exists
             let mut exists_req = TableExistsRequest::new();
             exists_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
-            assert!(fixture
-                .namespace
-                .table_exists(exists_req.clone())
-                .await
-                .is_ok());
+            assert!(
+                fixture
+                    .namespace
+                    .table_exists(exists_req.clone())
+                    .await
+                    .is_ok()
+            );
 
             // Deregister the table
             let deregister_req = DeregisterTableRequest {

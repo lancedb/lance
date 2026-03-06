@@ -14,9 +14,9 @@
 
 use lance_namespace::error::NamespaceError;
 use pyo3::{
+    BoundObject, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyNotImplementedError, PyRuntimeError, PyValueError},
     types::{PyAnyMethods, PyModule},
-    BoundObject, PyErr, PyResult, Python,
 };
 
 use lance::Error as LanceError;

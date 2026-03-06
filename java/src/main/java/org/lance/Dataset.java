@@ -996,6 +996,21 @@ public class Dataset implements Closeable {
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
 
+  /**
+   * Drop an index by name.
+   *
+   * @param name the index name to drop
+   */
+  public void dropIndex(String name) {
+    Preconditions.checkArgument(name != null && !name.isEmpty(), "name cannot be null or empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropIndex(name);
+    }
+  }
+
+  private native void nativeDropIndex(String name);
+
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
     innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
@@ -1264,6 +1279,22 @@ public class Dataset implements Closeable {
   }
 
   private native Map<String, String> nativeGetConfig();
+
+  /**
+   * Get the Lance file format version of this dataset.
+   *
+   * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".
+   *
+   * @return the Lance file format version string
+   */
+  public String getLanceFileFormatVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceFileFormatVersion();
+    }
+  }
+
+  private native String nativeGetLanceFileFormatVersion();
 
   /**
    * Compact the dataset to improve performance.

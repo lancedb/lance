@@ -18,7 +18,6 @@ use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use snafu::location;
 
 pub async fn determine_file_version(
     store: &ObjectStore,
@@ -30,26 +29,24 @@ pub async fn determine_file_version(
         Some(size) => size,
     };
     if size < 8 {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "the file {} does not appear to be a lance file (too small)",
                 path
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
     let reader = store.open_with_size(path, size).await?;
     let footer = reader.get_range((size - 8)..size).await?;
     if &footer[4..] != MAGIC {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "the file {} does not appear to be a lance file (magic mismatch)",
                 path
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
     let major_version = u16::from_le_bytes([footer[0], footer[1]]);
     let minor_version = u16::from_le_bytes([footer[2], footer[3]]);

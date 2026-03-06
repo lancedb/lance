@@ -1272,6 +1272,23 @@ def test_fts_deleted_rows(tmp_path):
     assert results.num_rows == 2
 
 
+def test_fts_deleted_rows_with_stable_row_ids(tmp_path):
+    # Regression test: stable-row-id prefiltering must not leak deleted rows.
+    data = pa.table(
+        {
+            "text": [f"dup_{i}" for i in range(200)],
+            "category": [["A", "B", "C", "D", "E"][i % 5] for i in range(200)],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, enable_stable_row_ids=True)
+    ds.create_scalar_index("text", "INVERTED")
+
+    assert ds.to_table(full_text_query="dup", prefilter=True).num_rows == 200
+
+    ds.delete("category = 'A'")
+    assert ds.to_table(full_text_query="dup", prefilter=True).num_rows == 160
+
+
 def test_index_after_merge_insert(tmp_path):
     # This regresses a defect where a horizontal merge insert was not taking modified
     # fragments out of the index if the column is modified.
@@ -4461,8 +4478,8 @@ def test_vector_filter_fts_search(tmp_path):
         nearest=vector_query,
         filter=PhraseQuery("text", "text"),
     )
-    result = scanner.to_table()
-    assert [299, 300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()
 
     # Case 6: search with prefilter=false, search_filter=phrase("text")
     scanner = ds.scanner(
@@ -4473,5 +4490,5 @@ def test_vector_filter_fts_search(tmp_path):
             "search_filter": PhraseQuery("text", "text"),
         },
     )
-    result = scanner.to_table()
-    assert [300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()

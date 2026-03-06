@@ -20,21 +20,21 @@ use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
-use lance_core::{cache::LanceCache, Result};
+use lance_core::{Result, cache::LanceCache};
+pub use scorer::MemBM25Scorer;
 use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
 use lance_core::Error;
-use snafu::location;
 
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
-        CreatedIndex, ScalarIndex,
     },
 };
 
@@ -122,14 +122,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
             DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
 
-            _ => return Err(Error::InvalidInput {
-                source: format!(
-                    "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
-                    field.data_type()
-                )
-                    .into(),
-                location: location!(),
-            })
+            _ => return Err(Error::invalid_input_source(format!(
+                "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
+                field.data_type()
+            )
+                .into()))
         }
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
@@ -180,9 +177,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
         Self::train_inverted_index(
             data,

@@ -7,7 +7,6 @@ use std::{
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{PrimitiveArray, UInt32Array};
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -154,14 +153,13 @@ impl ReadBatchParams {
     /// return an error.
     pub fn slice(&self, start: usize, length: usize) -> Result<Self> {
         let out_of_bounds = |size: usize| {
-            Err(Error::InvalidInput {
-                source: format!(
+            Err(Error::invalid_input_source(
+                format!(
                     "Cannot slice from {} with length {} given a selection of size {}",
                     start, length, size
                 )
                 .into(),
-                location: location!(),
-            })
+            ))
         };
 
         match self {
@@ -239,15 +237,9 @@ impl ReadBatchParams {
                 }
                 Ok(UInt32Array::from(offsets))
             }
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(UInt32Array::from(Vec::from_iter(0..r.end as u32))),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 
@@ -260,15 +252,9 @@ impl ReadBatchParams {
             Self::Ranges(ranges) => Ok(Box::new(
                 ranges.iter().map(|r| r.start as u32..r.end as u32),
             )),
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(Box::new(std::iter::once(0..r.end as u32))),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 
@@ -282,15 +268,9 @@ impl ReadBatchParams {
                 .collect()),
             Self::Range(r) => Ok(vec![r.start as u64..r.end as u64]),
             Self::Ranges(ranges) => Ok(ranges.to_vec()),
-            Self::RangeFull => Err(Error::invalid_input(
-                "cannot materialize RangeFull",
-                location!(),
-            )),
+            Self::RangeFull => Err(Error::invalid_input("cannot materialize RangeFull")),
             Self::RangeTo(r) => Ok(vec![0..r.end as u64]),
-            Self::RangeFrom(_) => Err(Error::invalid_input(
-                "cannot materialize RangeFrom",
-                location!(),
-            )),
+            Self::RangeFrom(_) => Err(Error::invalid_input("cannot materialize RangeFrom")),
         }
     }
 
@@ -395,8 +375,10 @@ mod test {
         check_error(ReadBatchParams::RangeTo(RangeTo { end: 10 }), 5, 6);
 
         assert!(ReadBatchParams::RangeFull.to_offsets().is_err());
-        assert!(ReadBatchParams::RangeFrom(RangeFrom { start: 10 })
-            .to_offsets()
-            .is_err());
+        assert!(
+            ReadBatchParams::RangeFrom(RangeFrom { start: 10 })
+                .to_offsets()
+                .is_err()
+        );
     }
 }

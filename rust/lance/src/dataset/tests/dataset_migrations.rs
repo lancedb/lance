@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::vec;
 
-use crate::dataset::optimize::{compact_files, CompactionOptions};
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
 use lance_table::format::IndexMetadata;

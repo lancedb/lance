@@ -20,8 +20,6 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.namespace import (
-    CreateEmptyTableRequest,
-    CreateEmptyTableResponse,
     DeclareTableRequest,
     DeclareTableResponse,
     DescribeTableRequest,
@@ -132,20 +130,6 @@ class TrackingNamespace(LanceNamespace):
         modified["refresh_offset_millis"] = "1000"
 
         return modified
-
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        with self.lock:
-            self.create_call_count += 1
-            count = self.create_call_count
-
-        response = self.inner.create_empty_table(request)
-        response.storage_options = self._modify_storage_options(
-            response.storage_options, count
-        )
-
-        return response
 
     def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
         with self.lock:

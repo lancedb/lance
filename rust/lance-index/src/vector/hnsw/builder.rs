@@ -14,33 +14,32 @@ use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use snafu::location;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::iter;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
+use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
-use crate::vector::graph::{greedy_search, Visited};
 use crate::vector::graph::{
-    Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode, VisitedGenerator,
 };
+use crate::vector::graph::{Visited, greedy_search};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
+use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
@@ -604,22 +603,17 @@ impl IvfSubIndex for HNSW {
             return Ok(Self::empty());
         }
 
-        let hnsw_metadata =
-            data.schema_ref()
-                .metadata()
-                .get(HNSW_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", HNSW_METADATA_KEY),
-                    location: location!(),
-                })?;
-        let hnsw_metadata: HnswMetadata =
-            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
-                message: format!(
-                    "Failed to decode HNSW metadata: {}, json: {}",
-                    e, hnsw_metadata
-                ),
-                location: location!(),
-            })?;
+        let hnsw_metadata = data
+            .schema_ref()
+            .metadata()
+            .get(HNSW_METADATA_KEY)
+            .ok_or(Error::index(format!("{} not found", HNSW_METADATA_KEY)))?;
+        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {}, json: {}",
+                e, hnsw_metadata
+            ))
+        })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -705,10 +699,9 @@ impl IvfSubIndex for HNSW {
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
-            return Err(Error::Index {
-                message: "ef must be greater than or equal to k".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "ef must be greater than or equal to k".to_string(),
+            ));
         }
 
         let schema = VECTOR_RESULT_SCHEMA.clone();
@@ -879,8 +872,8 @@ mod tests {
         flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{
-            builder::{HnswBuildParams, HnswQueryParams},
             HNSW, VECTOR_ID_FIELD,
+            builder::{HnswBuildParams, HnswQueryParams},
         },
     };
 

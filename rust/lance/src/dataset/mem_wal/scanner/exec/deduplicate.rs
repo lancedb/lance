@@ -25,7 +25,6 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 use lance_core::{Error, Result};
-use snafu::location;
 
 use super::generation_tag::MEMTABLE_GEN_COLUMN;
 
@@ -116,31 +115,25 @@ impl DeduplicateExec {
         // Validate that required columns exist
         for col in &pk_columns {
             if input_schema.column_with_name(col).is_none() {
-                return Err(Error::invalid_input(
-                    format!("Primary key column '{}' not found in input schema", col),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Primary key column '{}' not found in input schema",
+                    col
+                )));
             }
         }
 
         if input_schema.column_with_name(MEMTABLE_GEN_COLUMN).is_none() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Generation column '{}' not found in input schema",
-                    MEMTABLE_GEN_COLUMN
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Generation column '{}' not found in input schema",
+                MEMTABLE_GEN_COLUMN
+            )));
         }
 
         if input_schema.column_with_name(ROW_ADDRESS_COLUMN).is_none() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Row address column '{}' not found in input schema",
-                    ROW_ADDRESS_COLUMN
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Row address column '{}' not found in input schema",
+                ROW_ADDRESS_COLUMN
+            )));
         }
 
         // Build output schema (may exclude internal columns)
@@ -203,32 +196,26 @@ impl DeduplicateExec {
         // Validate that required columns exist
         for col in &pk_columns {
             if input_schema.column_with_name(col).is_none() {
-                return Err(Error::invalid_input(
-                    format!("Primary key column '{}' not found in input schema", col),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Primary key column '{}' not found in input schema",
+                    col
+                )));
             }
         }
 
         // _memtable_gen column is only required if with_memtable_gen=true
         if with_memtable_gen && input_schema.column_with_name(MEMTABLE_GEN_COLUMN).is_none() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Generation column '{}' not found in input schema (required when with_memtable_gen=true)",
-                    MEMTABLE_GEN_COLUMN
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Generation column '{}' not found in input schema (required when with_memtable_gen=true)",
+                MEMTABLE_GEN_COLUMN
+            )));
         }
 
         if input_schema.column_with_name(ROW_ADDRESS_COLUMN).is_none() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Row address column '{}' not found in input schema",
-                    ROW_ADDRESS_COLUMN
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Row address column '{}' not found in input schema",
+                ROW_ADDRESS_COLUMN
+            )));
         }
 
         // Build output schema (may exclude internal columns)

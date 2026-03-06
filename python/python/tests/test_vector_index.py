@@ -184,6 +184,28 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):
+    # Keep this before other distributed vector merge tests so the process-level
+    # lazy window size initialization reads this override.
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT", "2")
+
+    data = create_table(nvec=3000, ndim=128)
+    q = np.random.randn(128).astype(np.float32)
+    assert_distributed_vector_consistency(
+        data,
+        "vector",
+        index_type="IVF_PQ",
+        index_params={"num_partitions": 10, "num_sub_vectors": 16},
+        queries=[q],
+        topk=10,
+        world=2,
+        tmp_path=tmp_path,
+        similarity_metric="recall",
+        similarity_threshold=0.80,
+    )
+
+
 @pytest.mark.parametrize(
     "fixture_name,index_type,index_params,similarity_threshold",
     [
@@ -2876,9 +2898,8 @@ def test_fts_filter_vector_search(tmp_path):
         filter=PhraseQuery("text", "text"),
     )
 
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [299, 300] == ids_result
+    with pytest.raises(ValueError):
+        scanner.to_table()
 
     # Case 6: search with prefilter=false, search_filter=phrase("text")
     scanner = dataset.scanner(
@@ -2890,6 +2911,5 @@ def test_fts_filter_vector_search(tmp_path):
         },
     )
 
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300] == ids_result
+    with pytest.raises(ValueError):
+        scanner.to_table()

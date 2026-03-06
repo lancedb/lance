@@ -1,36 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use jni::{
-    objects::{JByteArray, JMap, JObject, JValue, JValueGen},
-    sys::jlong,
     JNIEnv,
+    objects::{JByteArray, JObject, JValueGen},
+    sys::jlong,
 };
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        commit_compaction, plan_compaction, CompactionMetrics, CompactionOptions, CompactionPlan,
-        CompactionTask, IndexRemapperOptions, RewriteResult, TaskData,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
+        IndexRemapperOptions, RewriteResult, TaskData, commit_compaction, plan_compaction,
     },
 };
 
 use crate::{
+    RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::{
-        export_vec, import_vec_from_method, import_vec_to_rust, FromJObjectWithEnv, IntoJava,
+        FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
     },
     utils::{
         build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_long_obj,
         to_java_optional,
     },
-    RT,
 };
 
 use crate::error::Result;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -43,6 +43,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -56,7 +58,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             materialize_deletions_threshold,
             num_threads,
             batch_size,
-            defer_index_remap
+            defer_index_remap,
+            compaction_mode,
+            binary_copy_read_batch_bytes
         ),
         JObject::null()
     )
@@ -74,6 +78,8 @@ fn inner_plan_compaction<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let compaction_options = build_compaction_options(
         env,
@@ -85,6 +91,8 @@ fn inner_plan_compaction<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
+        &compaction_mode,
+        &binary_copy_read_batch_bytes,
     )?;
 
     let plan = {
@@ -95,7 +103,7 @@ fn inner_plan_compaction<'local>(
     plan.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -109,6 +117,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -124,6 +134,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
             num_threads,
             batch_size,
             defer_index_remap,
+            compaction_mode,
+            binary_copy_read_batch_bytes,
         ),
         JObject::null()
     )
@@ -142,6 +154,8 @@ fn inner_commit_compaction<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let compaction_options = build_compaction_options(
         env,
@@ -153,6 +167,8 @@ fn inner_commit_compaction<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
+        &compaction_mode,
+        &binary_copy_read_batch_bytes,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
         rewrite_result.extract_object(env)
@@ -171,7 +187,7 @@ fn inner_commit_compaction<'local>(
     committed_metrics.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,                            // CompactionTask itself
@@ -186,6 +202,8 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -201,7 +219,9 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             materialize_deletions_threshold,
             num_threads,
             batch_size,
-            defer_index_remap
+            defer_index_remap,
+            compaction_mode,
+            binary_copy_read_batch_bytes
         ),
         JObject::null()
     )
@@ -221,6 +241,8 @@ fn inner_execute_task<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let compaction_options = build_compaction_options(
@@ -233,6 +255,8 @@ fn inner_execute_task<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
+        &compaction_mode,
+        &binary_copy_read_batch_bytes,
     )?;
     let compaction_task = CompactionTask {
         task: task_data,
@@ -256,10 +280,9 @@ const COMPACTION_PLAN_CONSTRUCTOR_SIG: &str =
     "(Ljava/util/List;JLorg/lance/compaction/CompactionOptions;)V";
 const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;JLjava/util/Map;[B)V";
+    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str =
-    "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -308,6 +331,19 @@ impl IntoJava for &CompactionOptions {
         let batch_size_opt = to_java_optional(env, batch_size)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
+        let compaction_mode_str = self.compaction_mode.as_ref().map(|mode| match mode {
+            CompactionMode::Reencode => "reencode",
+            CompactionMode::TryBinaryCopy => "try_binary_copy",
+            CompactionMode::ForceBinaryCopy => "force_binary_copy",
+        });
+        let compaction_mode_obj = match compaction_mode_str {
+            Some(s) => env.new_string(s)?.into(),
+            None => JObject::null(),
+        };
+        let compaction_mode_opt = to_java_optional(env, compaction_mode_obj)?;
+        let binary_copy_read_batch_bytes =
+            to_java_long_obj(env, self.binary_copy_read_batch_bytes.map(|v| v as i64))?;
+        let binary_copy_read_batch_bytes_opt = to_java_optional(env, binary_copy_read_batch_bytes)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -321,6 +357,8 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&num_threads_opt),
                 JValueGen::Object(&batch_size_opt),
                 JValueGen::Object(&defer_index_remap_opt),
+                JValueGen::Object(&compaction_mode_opt),
+                JValueGen::Object(&binary_copy_read_batch_bytes_opt),
             ],
         )?)
     }
@@ -347,25 +385,8 @@ impl IntoJava for &RewriteResult {
         let metrics = self.metrics.into_java(env)?;
         let new_fragments = export_vec(env, &self.new_fragments)?;
         let original_fragments = export_vec(env, &self.original_fragments)?;
-        let changed_row_addrs: JObject<'_> =
-            if let Some(changed_row_addrs) = &self.changed_row_addrs {
-                env.byte_array_from_slice(changed_row_addrs)?.into()
-            } else {
-                JObject::null()
-            };
-        let row_id_map = if let Some(row_id_map) = &self.row_id_map {
-            let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
-            for (k, v) in row_id_map {
-                let k_obj = to_java_long_obj(env, Some(*k as i64))?;
-                let v_obj = to_java_long_obj(env, v.map(|val| val as i64))?;
-                env.call_method(
-                    &java_map,
-                    "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[JValue::Object(&k_obj), JValue::Object(&v_obj)],
-                )?;
-            }
-            java_map
+        let row_addrs: JObject<'_> = if let Some(row_addrs) = &self.row_addrs {
+            env.byte_array_from_slice(row_addrs)?.into()
         } else {
             JObject::null()
         };
@@ -377,8 +398,7 @@ impl IntoJava for &RewriteResult {
                 JValueGen::Object(&new_fragments),
                 JValueGen::Object(&original_fragments),
                 JValueGen::Long(self.read_version as i64),
-                JValueGen::Object(&row_id_map),
-                JValueGen::Object(&changed_row_addrs),
+                JValueGen::Object(&row_addrs),
             ],
         )?)
     }
@@ -434,38 +454,21 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             import_vec_from_method(env, self, "getOriginalFragments", |env, fragment| {
                 fragment.extract_object(env)
             })?;
-        let changed_row_addrs_obj: JByteArray<'_> = env
-            .call_method(self, "getChangedRowAddrs", "()[B", &[])?
+        let row_addrs_obj: JByteArray<'_> = env
+            .call_method(self, "getRowAddrs", "()[B", &[])?
             .l()?
             .into();
-        let changed_row_addrs = if changed_row_addrs_obj.is_null() {
+        let row_addrs = if row_addrs_obj.is_null() {
             None
         } else {
-            Some(env.convert_byte_array(changed_row_addrs_obj)?)
-        };
-        let row_id_map_obj = env
-            .call_method(self, "getRowIdMap", "()Ljava/util/Map;", &[])?
-            .l()?;
-        let row_id_map = if row_id_map_obj.is_null() {
-            None
-        } else {
-            let row_id_jmap = JMap::from_env(env, &row_id_map_obj)?;
-            let mut map = HashMap::new();
-            let mut iter = row_id_jmap.iter(env)?;
-            while let Some((key, value)) = iter.next(env)? {
-                let key: Option<i64> = key.extract_object(env)?;
-                let value: Option<i64> = value.extract_object(env)?;
-                map.insert(key.unwrap() as u64, value.map(|v| v as u64));
-            }
-            Some(map)
+            Some(env.convert_byte_array(row_addrs_obj)?)
         };
         Ok(RewriteResult {
             metrics,
             new_fragments,
             read_version,
             original_fragments,
-            row_id_map,
-            changed_row_addrs,
+            row_addrs,
         })
     }
 }

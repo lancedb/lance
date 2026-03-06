@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{MergeInsertParams, WhenNotMatchedBySource};
-use crate::{dataset::WhenMatched, Result};
+use crate::{Result, dataset::WhenMatched};
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::{col, Case, Expr};
-use snafu::location;
+use datafusion_expr::{Case, Expr, col};
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
 // dynamic to support multiple merge insert update clauses like:
@@ -37,10 +36,10 @@ impl TryFrom<u8> for Action {
             2 => Ok(Self::Insert),
             3 => Ok(Self::Delete),
             4 => Ok(Self::Fail),
-            _ => Err(crate::Error::InvalidInput {
-                source: format!("Invalid action code: {}", value).into(),
-                location: location!(),
-            }),
+            _ => Err(crate::Error::invalid_input(format!(
+                "Invalid action code: {}",
+                value
+            ))),
         }
     }
 }
@@ -107,18 +106,17 @@ pub fn merge_insert_action(
                 ))
                 .with_enable_relations(true);
                 let condition = planner.parse_filter(condition_str).map_err(|e| {
-                    crate::Error::InvalidInput {
-                        source: format!("Failed to parse UpdateIf condition: {}", e).into(),
-                        location: location!(),
-                    }
+                    crate::Error::invalid_input(format!(
+                        "Failed to parse UpdateIf condition: {}",
+                        e
+                    ))
                 })?;
                 cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
             } else {
                 // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::Internal {
-                    message: "Schema required for UpdateIf parsing".into(),
-                    location: location!(),
-                });
+                return Err(crate::Error::internal(
+                    "Schema required for UpdateIf parsing",
+                ));
             }
         }
         WhenMatched::DoNothing => {}

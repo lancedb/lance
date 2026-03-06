@@ -20,11 +20,11 @@ import lance.namespace
 import pyarrow as pa
 import pytest
 from lance_namespace import (
-    CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
     CreateTableVersionRequest,
     CreateTableVersionResponse,
+    DeclareTableRequest,
     DeregisterTableRequest,
     DescribeNamespaceRequest,
     DescribeTableRequest,
@@ -416,32 +416,6 @@ class TestTableOperations:
             temp_namespace.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
-    def test_create_empty_table(self, memory_namespace):
-        """Test creating an empty table."""
-        # Create parent namespace
-        create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
-
-        # Create empty table with schema
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field("name", pa.string()),
-            ]
-        )
-
-        create_req = CreateEmptyTableRequest(
-            id=["workspace", "empty_table"], schema=schema
-        )
-        response = memory_namespace.create_empty_table(create_req)
-
-        assert response is not None
-        assert response.location is not None
-
-        # Verify table exists
-        exists_req = TableExistsRequest(id=["workspace", "empty_table"])
-        memory_namespace.table_exists(exists_req)
-
 
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors Rust tests."""
@@ -491,21 +465,18 @@ class TestChildNamespaceOperations:
         with pytest.raises(Exception):
             memory_namespace.table_exists(exists_req)
 
-    def test_empty_table_in_child_namespace(self, memory_namespace):
-        """Test creating an empty table in a child namespace."""
+    def test_declared_table_in_child_namespace(self, memory_namespace):
+        """Test declaring a table in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
         memory_namespace.create_namespace(create_ns_req)
 
-        # Create empty table
-        schema = pa.schema([pa.field("id", pa.int64())])
-        create_req = CreateEmptyTableRequest(
-            id=["test_ns", "empty_table"], schema=schema
-        )
-        memory_namespace.create_empty_table(create_req)
+        # Declare table
+        declare_req = DeclareTableRequest(id=["test_ns", "declared_table"])
+        memory_namespace.declare_table(declare_req)
 
         # Verify table exists
-        exists_req = TableExistsRequest(id=["test_ns", "empty_table"])
+        exists_req = TableExistsRequest(id=["test_ns", "declared_table"])
         memory_namespace.table_exists(exists_req)
 
 

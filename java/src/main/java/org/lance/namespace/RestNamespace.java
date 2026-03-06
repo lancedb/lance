@@ -228,14 +228,6 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-    ensureInitialized();
-    String requestJson = toJson(request);
-    String responseJson = createEmptyTableNative(nativeRestNamespaceHandle, requestJson);
-    return fromJson(responseJson, CreateEmptyTableResponse.class);
-  }
-
-  @Override
   public DeclareTableResponse declareTable(DeclareTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
@@ -442,8 +434,6 @@ public class RestNamespace implements LanceNamespace, Closeable {
   private native long countTableRowsNative(long handle, String requestJson);
 
   private native String createTableNative(long handle, String requestJson, byte[] requestData);
-
-  private native String createEmptyTableNative(long handle, String requestJson);
 
   private native String declareTableNative(long handle, String requestJson);
 

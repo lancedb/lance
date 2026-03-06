@@ -180,12 +180,12 @@ mod tests {
     use std::sync::Arc;
 
     use lance_core::Error;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use rstest::rstest;
 
     use super::*;
     use arrow_array::{
-        types::Int32Type, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 

@@ -13,20 +13,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
 use crate::vector::bq::builder::RabitQuantizer;
-use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
 pub trait Quantization:
     Send
@@ -80,10 +79,7 @@ impl FromStr for QuantizationType {
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             "RABIT" => Ok(Self::Rabit),
-            _ => Err(Error::Index {
-                message: format!("Unknown quantization type: {}", s),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!("Unknown quantization type: {}", s))),
         }
     }
 }
@@ -329,18 +325,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata_str = schema
             .metadata
             .get(INDEX_METADATA_SCHEMA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading quantization storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
-                ),
-                location: location!(),
-            })?;
-        let index_metadata: IndexMetadata =
-            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "Reading quantization storage: index key {} not found",
+                INDEX_METADATA_SCHEMA_KEY
+            )))?;
+        let index_metadata: IndexMetadata = serde_json::from_str(metadata_str).map_err(|_| {
+            Error::index(format!("Failed to parse index metadata: {}", metadata_str))
+        })?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let ivf_data = IvfModel::load(&reader).await?;

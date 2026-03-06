@@ -12,6 +12,7 @@ on:
 
 jobs:
   claude-review:
+    if: github.event.pull_request.author_association != 'FIRST_TIME_CONTRIBUTOR'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
@@ -37,6 +38,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: ${{ github.event.pull_request.user.login }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}

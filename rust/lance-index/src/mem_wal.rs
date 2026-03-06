@@ -11,7 +11,6 @@ use lance_core::Error;
 use lance_table::format::pb;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use uuid::Uuid;
 
 use crate::{Index, IndexType};
@@ -81,9 +80,11 @@ impl TryFrom<pb::MergedGeneration> for MergedGeneration {
     type Error = Error;
 
     fn try_from(mg: pb::MergedGeneration) -> lance_core::Result<Self> {
-        let region_id = mg.region_id.as_ref().map(Uuid::try_from).ok_or_else(|| {
-            Error::invalid_input("Missing region_id in MergedGeneration", location!())
-        })??;
+        let region_id = mg
+            .region_id
+            .as_ref()
+            .map(Uuid::try_from)
+            .ok_or_else(|| Error::invalid_input("Missing region_id in MergedGeneration"))??;
         Ok(Self {
             region_id,
             generation: mg.generation,
@@ -187,9 +188,11 @@ impl TryFrom<pb::RegionManifest> for RegionManifest {
     type Error = Error;
 
     fn try_from(rm: pb::RegionManifest) -> lance_core::Result<Self> {
-        let region_id = rm.region_id.as_ref().map(Uuid::try_from).ok_or_else(|| {
-            Error::invalid_input("Missing region_id in RegionManifest", location!())
-        })??;
+        let region_id = rm
+            .region_id
+            .as_ref()
+            .map(Uuid::try_from)
+            .ok_or_else(|| Error::invalid_input("Missing region_id in RegionManifest"))??;
         Ok(Self {
             region_id,
             version: rm.version,
@@ -363,7 +366,7 @@ impl MemWalIndex {
         let caught_up_gen = self.index_caught_up_generation(index_name, region_id);
 
         // If not tracked in index_catchup, assumed fully caught up
-        caught_up_gen.is_none_or(|gen| gen >= merged_gen)
+        caught_up_gen.is_none_or(|generation| generation >= merged_gen)
     }
 }
 
@@ -387,10 +390,9 @@ impl Index for MemWalIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> lance_core::Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "MemWalIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "MemWalIndex is not a vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> lance_core::Result<serde_json::Value> {
@@ -401,9 +403,11 @@ impl Index for MemWalIndex {
             num_maintained_indexes: self.details.maintained_indexes.len(),
             num_index_catchup_entries: self.details.index_catchup.len(),
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize MemWAL index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize MemWAL index statistics: {}",
+                e
+            ))
         })
     }
 

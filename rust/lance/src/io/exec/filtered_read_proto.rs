@@ -27,10 +27,9 @@ use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schem
 use lance_io::object_store::StorageOptions;
 use lance_table::format::Fragment;
 use prost::Message;
-use snafu::location;
 
-use crate::dataset::builder::DatasetBuilder;
 use crate::Dataset;
+use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
@@ -135,17 +134,17 @@ pub async fn filtered_read_exec_from_proto(
     let dataset = match dataset {
         Some(ds) => ds, // dataset could be opened or cached by the caller
         None => {
-            let table_id = proto.table.as_ref().ok_or_else(|| Error::InvalidInput {
-                source: "Missing table identifier in FilteredReadExecProto".into(),
-                location: location!(),
+            let table_id = proto.table.as_ref().ok_or_else(|| {
+                Error::invalid_input_source(
+                    "Missing table identifier in FilteredReadExecProto".into(),
+                )
             })?;
             open_dataset_from_table_identifier(table_id).await?
         }
     };
 
-    let options_proto = proto.options.ok_or_else(|| Error::InvalidInput {
-        source: "Missing options in FilteredReadExecProto".into(),
-        location: location!(),
+    let options_proto = proto.options.ok_or_else(|| {
+        Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
     })?;
 
     let options = fr_options_from_proto(options_proto, &dataset, state).await?;
@@ -239,26 +238,19 @@ async fn fr_options_from_proto(
     if let Some(range) = proto.scan_range_before_filter {
         options = options
             .with_scan_range_before_filter(range_from_proto(&range))
-            .map_err(|e| Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
     if let Some(range) = proto.scan_range_after_filter {
         options = options
             .with_scan_range_after_filter(range_from_proto(&range))
-            .map_err(|e| Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
 
     // Deleted rows
     if proto.with_deleted_rows {
-        options = options.with_deleted_rows().map_err(|e| Error::Internal {
-            message: e.to_string(),
-            location: location!(),
-        })?;
+        options = options
+            .with_deleted_rows()
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
 
     // Performance tuning
@@ -281,10 +273,9 @@ async fn fr_options_from_proto(
     if has_filters {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
-                Error::InvalidInput {
-                    source: "missing filter_schema_ipc but filters are present".into(),
-                    location: location!(),
-                }
+                Error::invalid_input_source(
+                    "missing filter_schema_ipc but filters are present".into(),
+                )
             })?)?;
 
         if let Some(bytes) = &proto.refine_filter_substrait {
@@ -362,10 +353,7 @@ async fn plan_from_proto(
     if !proto.fragment_filter_ids.is_empty() {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
-                Error::InvalidInput {
-                    source: "missing filter_schema_ipc but plan has filters".into(),
-                    location: location!(),
-                }
+                Error::invalid_input_source("missing filter_schema_ipc but plan has filters".into())
             })?)?;
 
         // Decode each unique expression once, then share via Arc.
@@ -376,17 +364,16 @@ async fn plan_from_proto(
         }
 
         for (frag_id, expr_id) in &proto.fragment_filter_ids {
-            let expr = decoded
-                .get(*expr_id as usize)
-                .ok_or_else(|| Error::InvalidInput {
-                    source: format!(
+            let expr = decoded.get(*expr_id as usize).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
                         "filter expression index {} out of bounds (have {})",
                         expr_id,
                         decoded.len()
                     )
                     .into(),
-                    location: location!(),
-                })?;
+                )
+            })?;
             filters.insert(*frag_id, Arc::clone(expr));
         }
     }
@@ -450,10 +437,8 @@ fn projection_from_proto(
     proto: Option<&pb::ProjectionProto>,
     base: Arc<dyn lance_core::datatypes::Projectable>,
 ) -> Result<Projection> {
-    let proto = proto.ok_or_else(|| Error::InvalidInput {
-        source: "Missing projection in proto".into(),
-        location: location!(),
-    })?;
+    let proto =
+        proto.ok_or_else(|| Error::invalid_input_source("Missing projection in proto".into()))?;
 
     let mut projection = Projection::empty(base);
     for field_id in &proto.field_ids {
@@ -504,10 +489,9 @@ fn threading_mode_from_proto(
         Some(pb::filtered_read_threading_mode_proto::Mode::MultiplePartitions(n)) => {
             Ok(FilteredReadThreadingMode::MultiplePartitions(*n as usize))
         }
-        None => Err(Error::InvalidInput {
-            source: "Missing threading mode in proto".into(),
-            location: location!(),
-        }),
+        None => Err(Error::invalid_input_source(
+            "Missing threading mode in proto".into(),
+        )),
     }
 }
 
@@ -536,9 +520,10 @@ fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<
                 .iter()
                 .find(|f| f.id == *id)
                 .cloned()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: format!("Fragment {} not found in dataset", id).into(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!("Fragment {} not found in dataset", id).into(),
+                    )
                 })
         })
         .collect()
@@ -547,25 +532,19 @@ fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<
 fn schema_to_bytes(schema: &ArrowSchema) -> Result<Vec<u8>> {
     let options =
         arrow_ipc::writer::IpcWriteOptions::try_new(8, false, arrow_ipc::MetadataVersion::V5)
-            .map_err(|e| Error::Internal {
-                message: format!("Failed to create IPC write options: {}", e),
-                location: location!(),
-            })?;
-    let gen = arrow_ipc::writer::IpcDataGenerator::default();
+            .map_err(|e| Error::internal(format!("Failed to create IPC write options: {}", e)))?;
+    let generator = arrow_ipc::writer::IpcDataGenerator::default();
     let mut tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-    let encoded = gen.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
+    let encoded = generator.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
     Ok(encoded.ipc_message.to_vec())
 }
 
 fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
-    let message = arrow_ipc::root_as_message(bytes).map_err(|e| Error::Internal {
-        message: format!("Failed to parse IPC schema message: {}", e),
-        location: location!(),
-    })?;
-    let ipc_schema = message.header_as_schema().ok_or_else(|| Error::Internal {
-        message: "IPC message does not contain a schema".to_string(),
-        location: location!(),
-    })?;
+    let message = arrow_ipc::root_as_message(bytes)
+        .map_err(|e| Error::internal(format!("Failed to parse IPC schema message: {}", e)))?;
+    let ipc_schema = message
+        .header_as_schema()
+        .ok_or_else(|| Error::internal("IPC message does not contain a schema".to_string()))?;
     let schema = arrow_ipc::convert::fb_to_schema(ipc_schema);
     Ok(Arc::new(schema))
 }

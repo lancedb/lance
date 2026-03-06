@@ -24,12 +24,13 @@ pub mod inserted_rows;
 use assign_action::merge_insert_action;
 use inserted_rows::KeyExistenceFilter;
 
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
+    Dataset,
     datafusion::dataframe::SessionContextExt,
     dataset::{
         fragment::{FileFragment, FragReadConfig},
@@ -38,13 +39,12 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
+        AddRowAddrExec, Planner, TakeExec, project, scalar_index::MapIndexExec, utils::ReplayExec,
     },
-    Dataset,
 };
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
-    UInt32Array, UInt64Array,
+    BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
+    cast::AsArray, types::UInt64Type,
 };
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
@@ -57,13 +57,13 @@ use datafusion::{
     },
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
+        ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
         display::DisplayableExecutionPlan,
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
-        ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
@@ -71,26 +71,26 @@ use datafusion::{
 };
 use datafusion_physical_expr::expressions::Column;
 use futures::{
-    stream::{self},
     Stream, StreamExt, TryStreamExt,
+    stream::{self},
 };
-use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
 use lance_core::{
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
-    error::{box_error, InvalidInputSnafu},
+    error::{InvalidInputSnafu, box_error},
     utils::{futures::Capacity, mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
-    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::DataFrameExt,
-    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
+    exec::{LanceExecutionOptions, analyze_plan, get_session_context},
     utils::reader_to_stream,
 };
 use lance_datafusion::{
-    exec::{execute_plan, OneShotExec},
+    exec::{OneShotExec, execute_plan},
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
@@ -99,12 +99,12 @@ use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
-use snafu::{location, ResultExt};
+use snafu::ResultExt;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -192,13 +192,11 @@ pub fn create_duplicate_row_error(
     row_idx: usize,
     on_columns: &[String],
 ) -> DataFusionError {
-    DataFusionError::Execution(
-        format!(
-            "Ambiguous merge insert: multiple source rows match the same target row on ({}). \
-                                This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
-            format_key_values_on_columns(batch, row_idx, on_columns)
-        )
-    )
+    DataFusionError::External(Box::new(Error::invalid_input(format!(
+        "Ambiguous merge inserts are prohibited: multiple source rows match the same target row on ({}). \
+                    Please ensure each target row is matched by at most one source row.",
+        format_key_values_on_columns(batch, row_idx, on_columns)
+    ))))
 }
 
 /// Describes how rows should be handled when there is no matching row in the source table
@@ -229,15 +227,11 @@ impl WhenNotMatchedBySource {
         let expr = planner
             .parse_filter(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         Ok(Self::DeleteIf(expr))
     }
 }
@@ -406,7 +400,6 @@ impl MergeInsertBuilder {
             if pk_fields.is_empty() {
                 return Err(Error::invalid_input(
                     "A merge insert operation requires join keys: specify `on` columns explicitly or configure a primary key in the dataset schema",
-                    location!(),
                 ));
             }
 
@@ -424,13 +417,10 @@ impl MergeInsertBuilder {
                         .field_case_insensitive(col)
                         .map(|f| f.name.clone())
                         .ok_or_else(|| {
-                            Error::invalid_input(
-                                format!(
-                                    "Merge insert key column '{}' does not exist in schema",
-                                    col
-                                ),
-                                location!(),
-                            )
+                            Error::invalid_input(format!(
+                                "Merge insert key column '{}' does not exist in schema",
+                                col
+                            ))
                         })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -556,7 +546,6 @@ impl MergeInsertBuilder {
         {
             return Err(Error::invalid_input(
                 "The merge insert job is not configured to change the data in any way",
-                location!(),
             ));
         }
         Ok(MergeInsertJob {
@@ -871,7 +860,9 @@ impl MergeInsertJob {
                 self.create_full_table_joined_stream(source).await
             }
         } else {
-            info!("The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan");
+            info!(
+                "The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan"
+            );
             self.create_full_table_joined_stream(source).await
         }
     }
@@ -1191,17 +1182,14 @@ impl MergeInsertJob {
                             branch = ?dataset.manifest().branch,
                             "Non-existent fragment id returned from merge result",
                         );
-                        Error::Internal {
-                            message: format!(
-                                "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
-                                frag_id,
-                                dataset.uri(),
-                                dataset.manifest().version,
-                                dataset.manifest_location().path,
-                                dataset.manifest().branch.as_deref().unwrap_or("main"),
-                            ),
-                            location: location!(),
-                        }
+                        Error::internal(format!(
+                            "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
+                            frag_id,
+                            dataset.uri(),
+                            dataset.manifest().version,
+                            dataset.manifest_location().path,
+                            dataset.manifest().branch.as_deref().unwrap_or("main"),
+                        ))
                     })?;
                     let metadata = fragment.metadata.clone();
 
@@ -1226,10 +1214,10 @@ impl MergeInsertJob {
                     tasks.spawn(fut);
                 }
                 _ => {
-                    return Err(Error::Internal {
-                        message: format!("Got non-fragment id from merge result: {:?}", frag_id),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Got non-fragment id from merge result: {:?}",
+                        frag_id
+                    )));
                 }
             };
         }
@@ -1396,10 +1384,10 @@ impl MergeInsertJob {
         };
 
         if partition_count != 1 {
-            return Err(Error::invalid_input(
-                format!("Expected exactly 1 partition, got {}", partition_count),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Expected exactly 1 partition, got {}",
+                partition_count
+            )));
         }
 
         // Execute partition 0 (the only partition)
@@ -1410,13 +1398,10 @@ impl MergeInsertJob {
         if let Some(batch) = stream.next().await {
             let batch = batch?;
             if batch.num_rows() > 0 {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Expected no output from write operation, got {} rows",
-                        batch.num_rows()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Expected no output from write operation, got {} rows",
+                    batch.num_rows()
+                )));
             }
         }
 
@@ -1425,13 +1410,11 @@ impl MergeInsertJob {
             plan.as_any()
                 .downcast_ref::<exec::FullSchemaMergeInsertExec>()
         {
-            let stats = full_exec.merge_stats().ok_or_else(|| Error::Internal {
-                message: "Merge stats not available - execution may not have completed".into(),
-                location: location!(),
+            let stats = full_exec.merge_stats().ok_or_else(|| {
+                Error::internal("Merge stats not available - execution may not have completed")
             })?;
-            let transaction = full_exec.transaction().ok_or_else(|| Error::Internal {
-                message: "Transaction not available - execution may not have completed".into(),
-                location: location!(),
+            let transaction = full_exec.transaction().ok_or_else(|| {
+                Error::internal("Transaction not available - execution may not have completed")
             })?;
             let affected_rows = full_exec.affected_rows().map(RowAddrTreeMap::from);
             let inserted_rows_filter = full_exec.inserted_rows_filter();
@@ -1440,21 +1423,18 @@ impl MergeInsertJob {
             .as_any()
             .downcast_ref::<exec::DeleteOnlyMergeInsertExec>()
         {
-            let stats = delete_exec.merge_stats().ok_or_else(|| Error::Internal {
-                message: "Merge stats not available - execution may not have completed".into(),
-                location: location!(),
+            let stats = delete_exec.merge_stats().ok_or_else(|| {
+                Error::internal("Merge stats not available - execution may not have completed")
             })?;
-            let transaction = delete_exec.transaction().ok_or_else(|| Error::Internal {
-                message: "Transaction not available - execution may not have completed".into(),
-                location: location!(),
+            let transaction = delete_exec.transaction().ok_or_else(|| {
+                Error::internal("Transaction not available - execution may not have completed")
             })?;
             let affected_rows = delete_exec.affected_rows().map(RowAddrTreeMap::from);
             (stats, transaction, affected_rows, None)
         } else {
-            return Err(Error::Internal {
-                message: "Expected FullSchemaMergeInsertExec or DeleteOnlyMergeInsertExec".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected FullSchemaMergeInsertExec or DeleteOnlyMergeInsertExec",
+            ));
         };
 
         Ok((transaction, stats, affected_rows, inserted_rows_filter))
@@ -1566,8 +1546,7 @@ impl MergeInsertJob {
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
             ) {
-                return Err(Error::NotSupported { source:
-                    "Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into(), location: location!() });
+                return Err(Error::not_supported_source("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into()));
             }
 
             // We will have a different commit path here too, as we are modifying
@@ -1614,12 +1593,11 @@ impl MergeInsertJob {
                     fragment_sizes,
                     true,
                 )
-                .map_err(|e| Error::Internal {
-                    message: format!(
+                .map_err(|e| {
+                    Error::internal(format!(
                         "Captured row ids not equal to number of rows written: {}",
                         e
-                    ),
-                    location: location!(),
+                    ))
                 })?;
 
                 for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
@@ -1755,10 +1733,7 @@ impl MergeInsertJob {
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
-            return Err(Error::NotSupported {
-                source: "This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
         }
 
         // Create an empty batch with the provided schema to pass to create_plan
@@ -1798,10 +1773,7 @@ impl MergeInsertJob {
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
         // Check if we can use create_plan
         if !self.can_use_create_plan(source.schema().as_ref()).await? {
-            return Err(Error::NotSupported {
-                source: "This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
         }
 
         // Clone self since create_plan consumes the job
@@ -1946,7 +1918,10 @@ impl Merger {
             let physical_expr = planner.create_physical_expr(&expr)?;
             let data_type = physical_expr.data_type(&schema)?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!(
+                    "Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}",
+                    expr, data_type
+                )));
             }
             Some(physical_expr)
         } else {
@@ -1960,7 +1935,10 @@ impl Merger {
             let match_expr = planner.create_physical_expr(&expr)?;
             let data_type = match_expr.data_type(combined_schema.as_ref())?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!(
+                    "Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}",
+                    expr, data_type
+                )));
             }
             Some(match_expr)
         } else {
@@ -2232,38 +2210,38 @@ mod tests {
     use super::*;
     use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::write::merge_insert::inserted_rows::{
-        extract_key_value_from_batch, KeyExistenceFilter, KeyExistenceFilterBuilder,
+        KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
     };
     use crate::index::vector::VectorIndexParams;
     use crate::io::commit::read_transaction_file;
     use crate::{
-        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
+        dataset::{InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         session::Session,
         utils::test::{
-            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
-            FragmentRowCount, ThrottledStoreWrapper,
+            DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
+            assert_plan_node_equals, assert_string_matches,
         },
     };
+    use arrow_array::RecordBatch;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
-    use arrow_array::RecordBatch;
     use arrow_array::{
-        types::{Int32Type, UInt32Type},
         Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, ListArray,
         RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
+        types::{Int32Type, UInt32Type},
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
+    use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
-    use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
-    use lance_index::scalar::ScalarIndexParams;
+    use lance_datagen::{BatchCount, Dimension, RowCount, Seed, array};
     use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use mock_instant::thread_local::MockClock;
@@ -2319,13 +2297,13 @@ mod tests {
             );
         let mut left_keys = keyvals
             .clone()
-            .filter(|(_, &val)| val == 1)
+            .filter(|&(_, &val)| val == 1)
             .map(|(key, _)| key)
             .copied()
             .collect::<Vec<_>>();
         let mut right_keys = keyvals
             .clone()
-            .filter(|(_, &val)| val == 2)
+            .filter(|&(_, &val)| val == 2)
             .map(|(key, _)| key)
             .copied()
             .collect::<Vec<_>>();
@@ -2711,11 +2689,13 @@ mod tests {
             .await;
 
         // No-op (will raise an error)
-        assert!(MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_not_matched(WhenNotMatched::DoNothing)
-            .try_build()
-            .is_err());
+        assert!(
+            MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+                .unwrap()
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .is_err()
+        );
 
         // find-or-create, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -3246,8 +3226,7 @@ mod tests {
 
         if enable_stable_row_ids {
             assert_eq!(
-                initial_row_id,
-                after_merge_row_id,
+                initial_row_id, after_merge_row_id,
                 "Row ID should remain stable throughout the entire process of update and merge insert"
             );
         }
@@ -3970,12 +3949,9 @@ mod tests {
             let index_bitmap = other_value_index.fragment_bitmap.as_ref().unwrap();
             let expected_bitmap = index_bitmap & dataset.fragment_bitmap.as_ref();
             assert_eq!(
-                effective_bitmap,
-                expected_bitmap,
+                effective_bitmap, expected_bitmap,
                 "other_value index effective bitmap should be intersection. index_bitmap: {:?}, dataset_fragments: {:?}, effective_bitmap: {:?}",
-                index_bitmap,
-                dataset.fragment_bitmap,
-                effective_bitmap
+                index_bitmap, dataset.fragment_bitmap, effective_bitmap
             );
         };
 
@@ -5536,7 +5512,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     async fn test_duplicate_rowid_detection(
         #[values(false, true)] is_full_schema: bool,
         #[values(true, false)] enable_stable_row_ids: bool,
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
         data_storage_version: LanceFileVersion,
     ) {
         let test_uri = "memory://test_duplicate_rowid_multi_fragment.lance";
@@ -5591,11 +5567,10 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             "Expected merge insert to fail due to duplicate rows on key column."
         );
 
-        let error_msg = result.unwrap_err().to_string();
         assert!(
-            error_msg.contains("Ambiguous merge insert") && error_msg.contains("multiple source rows"),
-            "Expected error message to mention ambiguous merge insert and multiple source rows, got: {}",
-            error_msg
+            matches!(&result, &Err(Error::InvalidInput { ref source, .. }) if source.to_string().contains("Ambiguous merge insert") && source.to_string().contains("multiple source rows")),
+            "Expected error to be InvalidInput with message about ambiguous merge insert and multiple source rows, got: {:?}",
+            result
         );
     }
 
@@ -5604,7 +5579,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     async fn test_source_dedupe_behavior_first_seen(
         #[values(false, true)] is_full_schema: bool,
         #[values(true, false)] enable_stable_row_ids: bool,
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
         data_storage_version: LanceFileVersion,
     ) {
         let test_uri = format!(

@@ -3,8 +3,9 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
-    cmp::{min, Reverse},
+    cmp::{Reverse, min},
     collections::BinaryHeap,
 };
 use std::{collections::HashMap, ops::Range};
@@ -12,6 +13,7 @@ use std::{collections::HashMap, ops::Range};
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use arrow::array::{FixedSizeListBuilder, Float32Builder};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -21,41 +23,41 @@ use arrow::{
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait,
-    RecordBatch, UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait, RecordBatch,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
-use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
-use snafu::location;
 use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
+use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -63,7 +65,7 @@ use super::{
     iter::CompressedPostingListIterator,
 };
 use super::{encoding::compress_positions, iter::PostingListIterator};
-use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
@@ -73,7 +75,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -100,6 +101,9 @@ pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
+
+// Just a heuristic when we need to pre-allocate memory for tokens
+pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
 
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
@@ -147,10 +151,10 @@ impl FromStr for TokenSetFormat {
             "" => Ok(Self::Arrow),
             "arrow" => Ok(Self::Arrow),
             "fst" => Ok(Self::Fst),
-            other => Err(Error::Index {
-                message: format!("unsupported token set format {}", other),
-                location: location!(),
-            }),
+            other => Err(Error::index(format!(
+                "unsupported token set format {}",
+                other
+            ))),
         }
     }
 }
@@ -273,7 +277,7 @@ impl InvertedIndex {
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
                         .await?;
                     if postings.is_empty() {
-                        return Ok(PartitionCandidates::empty());
+                        return Result::Ok(PartitionCandidates::empty());
                     }
                     let mut tokens_by_position = vec![String::new(); postings.len()];
                     for posting in &postings {
@@ -427,20 +431,17 @@ impl InvertedIndex {
 
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
-                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
-                    message: "params not found in metadata".to_owned(),
-                    location: location!(),
-                })?;
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
                 let params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                let partitions =
-                    reader
-                        .schema()
-                        .metadata
-                        .get("partitions")
-                        .ok_or(Error::Index {
-                            message: "partitions not found in metadata".to_owned(),
-                            location: location!(),
-                        })?;
+                let partitions = reader
+                    .schema()
+                    .metadata
+                    .get("partitions")
+                    .ok_or(Error::index("partitions not found in metadata".to_owned()))?;
                 let partitions: Vec<u64> = serde_json::from_str(partitions)?;
                 let token_set_format = reader
                     .schema()
@@ -505,7 +506,6 @@ impl Index for InvertedIndex {
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
         Err(Error::invalid_input(
             "inverted index cannot be cast to vector index",
-            location!(),
         ))
     }
 
@@ -548,7 +548,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_query_tokens(text, &mut tokenizer, None);
+        let tokens = collect_query_tokens(text, &mut tokenizer);
 
         let (doc_ids, _) = self
             .bm25_search(
@@ -739,11 +739,8 @@ impl InvertedPartition {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
             };
-            let lev =
-                fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
-                    message: format!("failed to construct the fuzzy query: {}", e),
-                    location: location!(),
-                })?;
+            let lev = fst::automaton::Levenshtein::new(token, fuzziness)
+                .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
 
             let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
@@ -760,10 +757,9 @@ impl InvertedPartition {
                     }
                 }
             } else {
-                return Err(Error::Index {
-                    message: "tokens is not fst, which is not expected".to_owned(),
-                    location: location!(),
-                });
+                return Err(Error::index(
+                    "tokens is not fst, which is not expected".to_owned(),
+                ));
             }
         }
         Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
@@ -1036,10 +1032,7 @@ impl TokenSet {
         for (token, token_id) in entries {
             builder
                 .insert(&token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
-                    location: location!(),
-                })?;
+                .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
         }
         Ok(builder.into_map())
     }
@@ -1063,27 +1056,19 @@ impl TokenSet {
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
             for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-                let token = token.ok_or(Error::Index {
-                    message: "found null token in token set".to_owned(),
-                    location: location!(),
-                })?;
+                let token =
+                    token.ok_or(Error::index("found null token in token set".to_owned()))?;
                 next_id = next_id.max(token_id + 1);
                 total_length += token.len();
-                tokens
-                    .insert(token, token_id as u64)
-                    .map_err(|e| Error::Index {
-                        message: format!("failed to insert token {}: {}", token, e),
-                        location: location!(),
-                    })?;
+                tokens.insert(token, token_id as u64).map_err(|e| {
+                    Error::index(format!("failed to insert token {}: {}", token, e))
+                })?;
             }
 
             Ok::<_, Error>((tokens.into_map(), next_id, total_length))
         })
         .await
-        .map_err(|err| Error::Execution {
-            message: format!("failed to spawn blocking task: {}", err),
-            location: location!(),
-        })??;
+        .map_err(|err| Error::execution(format!("failed to spawn blocking task: {}", err)))??;
 
         Ok(Self {
             tokens: TokenMap::Fst(tokens),
@@ -1095,43 +1080,40 @@ impl TokenSet {
     async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         if batch.num_rows() == 0 {
-            return Err(Error::Index {
-                message: "token set batch is empty".to_owned(),
-                location: location!(),
-            });
+            return Err(Error::index("token set batch is empty".to_owned()));
         }
 
         let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
         let bytes = fst_col.value(0);
-        let map = fst::Map::new(bytes.to_vec()).map_err(|e| Error::Index {
-            message: format!("failed to load fst tokens: {}", e),
-            location: location!(),
-        })?;
+        let map = fst::Map::new(bytes.to_vec())
+            .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
         let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        let next_id = next_id_col.values().first().copied().ok_or(Error::Index {
-            message: "token next id column is empty".to_owned(),
-            location: location!(),
-        })?;
+        let next_id = next_id_col
+            .values()
+            .first()
+            .copied()
+            .ok_or(Error::index("token next id column is empty".to_owned()))?;
 
         let total_length = total_length_col
             .values()
             .first()
             .copied()
-            .ok_or(Error::Index {
-                message: "token total length column is empty".to_owned(),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(
+                "token total length column is empty".to_owned(),
+            ))?;
 
         Ok(Self {
             tokens: TokenMap::Fst(map),
             next_id,
-            total_length: usize::try_from(total_length).map_err(|_| Error::Index {
-                message: format!("token total length {} overflows usize", total_length),
-                location: location!(),
+            total_length: usize::try_from(total_length).map_err(|_| {
+                Error::index(format!(
+                    "token total length {} overflows usize",
+                    total_length
+                ))
             })?,
         })
     }
@@ -1289,10 +1271,10 @@ impl PostingListReader {
     fn load_metadata(
         schema: &lance_core::datatypes::Schema,
     ) -> Result<(Vec<usize>, Option<Vec<f32>>)> {
-        let offsets = schema.metadata.get("offsets").ok_or(Error::Index {
-            message: "offsets not found in metadata".to_owned(),
-            location: location!(),
-        })?;
+        let offsets = schema
+            .metadata
+            .get("offsets")
+            .ok_or(Error::index("offsets not found in metadata".to_owned()))?;
         let offsets = serde_json::from_str(offsets)?;
 
         let max_scores = schema
@@ -1448,10 +1430,9 @@ impl PostingListReader {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1487,10 +1468,7 @@ impl PostingListReader {
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location!(),
-                        ),
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                         e => e
                     }
                 })?;
@@ -2418,17 +2396,16 @@ pub fn flat_full_text_search(
     if is_phrase_query(query) {
         return Err(Error::invalid_input(
             "phrase query is not supported for flat full text search, try using FTS index",
-            location!(),
         ));
     }
 
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
-        data_type => Err(Error::invalid_input(
-            format!("unsupported data type {} for inverted index", data_type),
-            location!(),
-        )),
+        data_type => Err(Error::invalid_input(format!(
+            "unsupported data type {} for inverted index",
+            data_type
+        ))),
     }
 }
 
@@ -2441,16 +2418,17 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer, None);
+    let query_tokens = collect_query_tokens(query, &mut tokenizer);
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, Some(&query_tokens));
-            if !doc_tokens.is_empty() {
+            if has_query_token(doc, &mut tokenizer, &query_tokens) {
                 results.push(row_id_array.value(i));
+                // What is this assertion for?  Why would doc contain query?  Don't we reach
+                // here only if they share at least one token?  Why is it not debug_assert?
                 assert!(doc.contains(query));
             }
         }
@@ -2459,62 +2437,247 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn flat_bm25_search(
-    batch: RecordBatch,
-    doc_col: &str,
+const FLAT_ROW_ID_COL_IDX: usize = 0;
+const FLAT_ALL_TOKENS_COL_IDX: usize = 1;
+const FLAT_QUERY_TOKEN_COUNTS_COL_IDX: usize = 2;
+
+/// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
+const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
+
+/// Consumes a stream of record batches and produces token counts
+///
+/// The resulting batch will have three columns:
+/// - row_id: the row id of the document
+/// - all_tokens: the total number of tokens in the document
+/// - query_token_counts: a fixed size list of the count of each query token in the document
+///
+/// This is an unbounded accumulation, however, for most queries, the per-row
+/// growth will be fairly small.  As a result we can process millions of tokens
+/// with fairly modest memory usage.
+///
+/// However, it is unwise to do a flat search across billions of rows.  An FTS
+/// index should be created instead.
+async fn tokenize_and_count(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    doc_col_idx: usize,
+) -> DataFusionResult<RecordBatch> {
+    let output_schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("all_tokens", DataType::UInt64, false),
+        Field::new(
+            "query_token_counts",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt64, true)),
+                query_tokens.len() as i32,
+            ),
+            false,
+        ),
+    ]));
+    let output_schema_clone = output_schema.clone();
+    let bytes_accumulated = Arc::new(AtomicU64::new(0));
+    let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
+
+    let batches = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let output_schema = output_schema.clone();
+            let query_tokens = query_tokens.clone();
+            let bytes_accumulated = bytes_accumulated.clone();
+            let bytes_warning_emitted = bytes_warning_emitted.clone();
+            spawn_cpu(move || {
+                let batch = batch?;
+                let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
+                let mut query_token_counts = FixedSizeListBuilder::with_capacity(
+                    UInt64Builder::with_capacity(batch.num_rows() * query_tokens.len()),
+                    query_tokens.len() as i32,
+                    batch.num_rows(),
+                );
+                let mut temp_query_token_counts = Vec::with_capacity(query_tokens.len());
+                let doc_iter = iter_str_array(batch.column(doc_col_idx));
+                for doc in doc_iter {
+                    let Some(doc) = doc else {
+                        all_token_counts.append_value(0);
+                        query_token_counts
+                            .values()
+                            .append_value_n(0, query_tokens.len());
+                        query_token_counts.append(true);
+                        continue;
+                    };
+
+                    temp_query_token_counts.clear();
+                    temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens.len()));
+
+                    let mut stream = tokenizer.token_stream_for_doc(doc);
+                    let mut all_tokens = 0;
+                    while let Some(token) = stream.next() {
+                        all_tokens += 1;
+                        if let Some(token_index) = query_tokens.token_index(&token.text) {
+                            temp_query_token_counts[token_index] += 1;
+                        }
+                    }
+                    all_token_counts.append_value(all_tokens);
+                    for count in temp_query_token_counts.iter().copied() {
+                        query_token_counts.values().append_value(count);
+                    }
+                    query_token_counts.append(true);
+                }
+                let row_ids = batch[ROW_ID].clone();
+                let all_token_counts = all_token_counts.finish();
+                let query_token_counts = query_token_counts.finish();
+                let result_batch = RecordBatch::try_new(
+
+                    output_schema,
+                    vec![
+                        row_ids,
+                        Arc::new(all_token_counts) as ArrayRef,
+                        Arc::new(query_token_counts) as ArrayRef,
+                    ],
+                )?;
+                let bytes_accumulated = bytes_accumulated.fetch_add(result_batch.get_array_memory_size() as u64, Ordering::Relaxed);
+                if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD && !bytes_warning_emitted.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
+                }
+
+                DataFusionResult::Ok(result_batch)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus())
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    Ok(arrow::compute::concat_batches(
+        &output_schema_clone,
+        &batches,
+    )?)
+}
+
+/// Initialize the BM25 scorer
+///
+/// In order to calculate BM25 scores we need to know token counts for the entire corpus.  We extract these from the
+/// counted input of the flat search combined with any counts recorded for the indexed portion.
+fn initialize_scorer(
+    index: &Option<InvertedIndex>,
     query_tokens: &Tokens,
-    tokenizer: &mut Box<dyn LanceTokenizer>,
-    scorer: &mut MemBM25Scorer,
-    schema: SchemaRef,
-) -> std::result::Result<RecordBatch, DataFusionError> {
-    let doc_iter = iter_str_array(&batch[doc_col]);
-    let mut scores = Vec::with_capacity(batch.num_rows());
-    for doc in doc_iter {
-        let Some(doc) = doc else {
-            scores.push(0.0);
-            continue;
-        };
+    counted_input: &RecordBatch,
+) -> MemBM25Scorer {
+    let mut total_tokens = 0;
+    let mut num_docs = 0;
+    let mut all_token_counts = vec![0; query_tokens.len()];
 
-        let doc_tokens = collect_doc_tokens(doc, tokenizer, None);
-        scorer.update(&doc_tokens);
-        let doc_tokens = doc_tokens
-            .into_iter()
-            .filter(|t| query_tokens.contains(t))
-            .collect::<Vec<_>>();
-
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / scorer.avg_doc_length());
-        let mut doc_token_count = HashMap::new();
-        for token in doc_tokens {
-            doc_token_count
-                .entry(token)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
+    if let Some(index) = index {
+        let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+        for (token_index, token) in query_tokens.into_iter().enumerate() {
+            let token_nq = index_bm25_scorer.num_docs_containing_token(token);
+            all_token_counts[token_index] = token_nq as u64;
         }
+        total_tokens += index_bm25_scorer.total_tokens();
+        num_docs += index_bm25_scorer.num_docs();
+    }
+
+    num_docs += counted_input.num_rows();
+    total_tokens += arrow::compute::sum(
+        counted_input
+            .column(FLAT_ALL_TOKENS_COL_IDX)
+            .as_primitive::<UInt64Type>(),
+    )
+    .unwrap_or_default();
+
+    let mut input_token_counters = counted_input
+        .column(FLAT_QUERY_TOKEN_COUNTS_COL_IDX)
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied();
+
+    for _ in 0..counted_input.num_rows() {
+        for token_count in all_token_counts.iter_mut() {
+            *token_count += input_token_counters.next().unwrap_or_default();
+        }
+    }
+
+    let token_counts_map = all_token_counts
+        .into_iter()
+        .enumerate()
+        .map(|(token_index, count)| {
+            (
+                query_tokens.get_token(token_index).to_string(),
+                count as usize,
+            )
+        })
+        .collect::<HashMap<String, usize>>();
+    MemBM25Scorer::new(total_tokens, num_docs, token_counts_map)
+}
+
+fn flat_bm25_score(
+    query_tokens: &Tokens,
+    counted_input: &RecordBatch,
+    scorer: &MemBM25Scorer,
+) -> Result<RecordBatch> {
+    let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
+    let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
+
+    let mut row_ids_iter = counted_input
+        .column(FLAT_ROW_ID_COL_IDX)
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied();
+    let mut all_token_counts_iter = counted_input
+        .column(FLAT_ALL_TOKENS_COL_IDX)
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied();
+    let mut query_token_counts_iter = counted_input
+        .column(FLAT_QUERY_TOKEN_COUNTS_COL_IDX)
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied();
+    for _ in 0..counted_input.num_rows() {
+        let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
+        let row_id = row_ids_iter.next().expect_ok()?;
+        if num_tokens_in_doc == 0 {
+            for _ in query_tokens {
+                query_token_counts_iter.next().expect_ok()?;
+            }
+            continue;
+        }
+        let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
         for token in query_tokens {
-            let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
-
+            let freq = query_token_counts_iter.next().expect_ok()? as f32;
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
-        scores.push(score);
+        if score > 0.0 {
+            row_ids_builder.append_value(row_id);
+            scores_builder.append_value(score);
+        }
     }
 
-    let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
-    let batch = batch
-        .try_with_column(SCORE_FIELD.clone(), score_col)?
-        .project_by_schema(&schema)?;
+    let row_ids = row_ids_builder.finish();
+    let scores = scores_builder.finish();
+    let batch = RecordBatch::try_new(
+        FTS_SCHEMA.clone(),
+        vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+    )?;
     Ok(batch)
 }
 
-pub fn flat_bm25_search_stream(
+pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
     index: &Option<InvertedIndex>,
-    schema: SchemaRef,
-) -> SendableRecordBatchStream {
+    target_batch_size: usize,
+) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
         None => Box::new(TextTokenizer::new(
@@ -2524,56 +2687,48 @@ pub fn flat_bm25_search_stream(
             .build(),
         )),
     };
-    let tokens = collect_query_tokens(&query, &mut tokenizer, None);
+    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
-    let mut bm25_scorer = match index {
-        Some(index) => {
-            let index_bm25_scorer =
-                IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
-            if index_bm25_scorer.num_docs() == 0 {
-                MemBM25Scorer::new(0, 0, HashMap::new())
-            } else {
-                let mut token_docs = HashMap::with_capacity(tokens.len());
-                for token in &tokens {
-                    let token_nq = index_bm25_scorer.num_docs_containing_token(token).max(1);
-                    token_docs.insert(token.clone(), token_nq);
-                }
-                MemBM25Scorer::new(
-                    index_bm25_scorer.total_tokens(),
-                    index_bm25_scorer.num_docs(),
-                    token_docs,
-                )
-            }
-        }
-        None => MemBM25Scorer::new(0, 0, HashMap::new()),
-    };
+    let input_schema = input.schema();
+    let doc_col_idx = input_schema.index_of(&doc_col)?;
 
-    let batch_schema = schema.clone();
-    let stream = input.map(move |batch| {
-        let batch = batch?;
+    // Accumulate small batches until this threshold before dispatching a task.
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    // Slice oversized batches down to roughly this size.
+    const SLICE_BYTES: usize = 512 * 1024;
 
-        let batch = flat_bm25_search(
-            batch,
-            &doc_col,
-            &tokens,
-            &mut tokenizer,
-            &mut bm25_scorer,
-            batch_schema.clone(),
-        )?;
+    // Phase 1 - rechunk the input stream into appropriately sized chunks.  Tokenization is
+    // fairly CPU-intensive, and we don't need too much data to justify a new thread task.
+    let chunked = lance_arrow::stream::rechunk_stream_by_size(
+        input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    );
 
-        // filter out rows with score 0
-        let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
-        let mask = score_col
-            .iter()
-            .map(|score| score.is_some_and(|score| score > 0.0))
-            .collect::<Vec<_>>();
-        let mask = BooleanArray::from(mask);
-        let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
-        Ok(batch)
-    });
+    // Phase 2 - For each row we need to know the total number of tokens and the count of each
+    // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
+    // and we are tokenizing with a whitespace tokenizer, we need to know that there are 3 tokens
+    // and the token book appears once.
+    let counted_input =
+        tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
 
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
+    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
+    let scorer = initialize_scorer(index, query_tokens.as_ref(), &counted_input);
+    let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
+
+    // Finally we emit batches according to the target batch size
+    let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
+    let mut batches = Vec::with_capacity(num_out_batches);
+    for i in 0..num_out_batches {
+        let start = i * target_batch_size;
+        let len = (scores.num_rows() - start).min(target_batch_size);
+        batches.push(Ok(scores.slice(start, len)));
+    }
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        FTS_SCHEMA.clone(),
+        stream::iter(batches),
+    )))
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
@@ -2589,7 +2744,7 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2626,14 +2781,18 @@ mod tests {
                 .as_binary::<i64>(),
         )
         .unwrap();
-        assert!(doc_ids
-            .iter()
-            .zip(expected.doc_ids.iter())
-            .all(|(a, b)| a == b));
-        assert!(freqs
-            .iter()
-            .zip(expected.frequencies.iter())
-            .all(|(a, b)| a == b));
+        assert!(
+            doc_ids
+                .iter()
+                .zip(expected.doc_ids.iter())
+                .all(|(a, b)| a == b)
+        );
+        assert!(
+            freqs
+                .iter()
+                .zip(expected.frequencies.iter())
+                .all(|(a, b)| a == b)
+        );
     }
 
     #[test]

@@ -32,8 +32,7 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 100_000_000,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     let metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -55,7 +54,7 @@ async fn test_binary_copy_with_defer_remap() {
 
 async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use std::sync::Arc;
 
     let fixed_list_dt =
@@ -108,8 +107,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
 
     let options = CompactionOptions {
         defer_index_remap: true,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -211,8 +209,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 2_000,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -331,8 +328,7 @@ async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 2_000,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -397,8 +393,7 @@ async fn test_binary_copy_preserves_zonemap_queries() {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 100_000,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     compact_files(&mut dataset, options, None).await.unwrap();
@@ -466,8 +461,7 @@ async fn test_binary_copy_preserves_bloom_filter_queries() {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 100_000,
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     compact_files(&mut dataset, options, None).await.unwrap();
@@ -502,7 +496,7 @@ async fn test_binary_copy_fallback_to_common_compaction() {
 
     let options = CompactionOptions {
         target_rows_per_fragment: 100_000,
-        enable_binary_copy: true,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
         ..Default::default()
     };
 
@@ -536,8 +530,7 @@ async fn test_can_use_binary_copy_schema_consistency_ok() {
     dataset.append(reader2, Some(write_params)).await.unwrap();
 
     let options = CompactionOptions {
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     let frags: Vec<Fragment> = dataset
@@ -563,7 +556,7 @@ async fn test_can_use_binary_copy_schema_mismatch() {
         .unwrap();
 
     let options = CompactionOptions {
-        enable_binary_copy: true,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
         ..Default::default()
     };
     let mut frags: Vec<Fragment> = dataset
@@ -608,7 +601,7 @@ async fn test_can_use_binary_copy_version_mismatch() {
     dataset.append(reader_append, None).await.unwrap();
 
     let options = CompactionOptions {
-        enable_binary_copy: true,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
         ..Default::default()
     };
     let mut frags: Vec<Fragment> = dataset
@@ -647,7 +640,7 @@ async fn test_can_use_binary_copy_reject_deletions() {
     dataset.delete("a < 10").await.unwrap();
 
     let options = CompactionOptions {
-        enable_binary_copy: true,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
         ..Default::default()
     };
     let frags: Vec<Fragment> = dataset
@@ -668,7 +661,7 @@ async fn test_binary_copy_compaction_with_complex_schema() {
 async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVersion) {
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 
     let row_num = 1_000;
 
@@ -748,12 +741,11 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     .unwrap();
 
     let opt_full = CompactionOptions {
-        enable_binary_copy: false,
+        compaction_mode: Some(CompactionMode::Reencode),
         ..Default::default()
     };
     let opt_binary = CompactionOptions {
-        enable_binary_copy: true,
-        enable_binary_copy_force: true,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
 

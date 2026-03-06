@@ -16,8 +16,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
 from lance_namespace import (
-    CreateEmptyTableRequest,
-    CreateEmptyTableResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
     CreateTableRequest,
@@ -385,12 +383,6 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
-
     def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
         response_dict = self._inner.declare_table(request.model_dump())
         return DeclareTableResponse.from_dict(response_dict)
@@ -593,12 +585,6 @@ class RestNamespace(LanceNamespace):
     ) -> CreateTableResponse:
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
-
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
 
     def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
         response_dict = self._inner.declare_table(request.model_dump())

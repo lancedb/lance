@@ -6,9 +6,9 @@ use datafusion::error::Result;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use std::sync::Arc;
 
+use crate::LanceCatalogProvider;
 use crate::catalog::LanceCatalogProviderList;
 use crate::namespace_level::NamespaceLevel;
-use crate::LanceCatalogProvider;
 
 /// Builder for configuring a `SessionContext` with Lance namespaces.
 #[derive(Clone, Debug, Default)]
@@ -139,8 +139,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch};
-    use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
     use datafusion::catalog::SchemaProvider;
+    use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
     use datafusion::common::record_batch;
     use datafusion::datasource::MemTable;
     use datafusion::error::Result;
