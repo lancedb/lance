@@ -114,9 +114,9 @@ pub struct IoStats {
     pub read_bytes: u64,
     pub write_iops: u64,
     pub written_bytes: u64,
-    /// Cumulative read latency in microseconds.
+    /// Cumulative read latency in microseconds (wall-clock, includes async scheduling jitter).
     pub read_latency_us: u64,
-    /// Cumulative write latency in microseconds.
+    /// Cumulative write latency in microseconds (wall-clock, includes async scheduling jitter).
     pub write_latency_us: u64,
     /// Number of failed read operations.
     pub read_errors: u64,

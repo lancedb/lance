@@ -807,6 +807,12 @@ impl IvfSubIndex for HNSW {
             },
         );
 
+        tracing::info!(
+            target: "lance_index::hnsw::build",
+            total = len,
+            "HNSW build complete"
+        );
+
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
     }

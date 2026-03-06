@@ -24,8 +24,7 @@ All tracing events use the `target:` field for filtering. Key targets:
 | `lance::write::retry` | WARN | Write retry loop: conflict retries and exhaustion |
 | `lance_io::retry` | WARN/DEBUG | Download retries and permanent failures |
 | `lance_io::writer::connection_reset` | WARN | Upload connection reset retries |
-| `lance_encoding::decode` | DEBUG | Batch decode timing (elapsed_us, num_rows) |
-| `lance_encoding::buffer` | DEBUG | Buffer concat, zip, and misaligned copy events |
+| `lance_encoding::decode` | DEBUG | Batch decode span (num_rows) |
 | `lance_index::hnsw::build` | INFO/DEBUG | HNSW index build progress (logged every 10k vectors) |
 | `lance_index::hnsw::search` | DEBUG | Search strategy selection (flat vs graph) |
 
@@ -108,19 +107,6 @@ Returned by `compact_files()`:
 | `bytes_rewritten` | u64 | Bytes re-encoded |
 | `bytes_binary_copied` | u64 | Bytes binary-copied (fast path) |
 | `elapsed_ms_sum` | u64 | Cumulative worker time (sum of per-task durations) |
-
-### Fragment Distribution (`FragmentDistributionStats`)
-
-Available via `Dataset::fragment_distribution_stats()` (O(n) in-memory scan):
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `count` | usize | Number of fragments |
-| `total_physical_rows` | u64 | Total rows across all fragments |
-| `min_physical_rows` | u64 | Smallest fragment |
-| `max_physical_rows` | u64 | Largest fragment |
-| `avg_physical_rows` | f64 | Average rows per fragment |
-| `fragments_with_deletions` | usize | Fragments with pending deletions |
 
 ### Retry Stats (`RetrySnapshot`)
 

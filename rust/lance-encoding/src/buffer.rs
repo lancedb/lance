@@ -52,12 +52,6 @@ impl LanceBuffer {
     /// This does involve a data copy (and allocation of a new buffer)
     pub fn concat(buffers: &[Self]) -> Self {
         let total_len: usize = buffers.iter().map(|b| b.len()).sum();
-        tracing::debug!(
-            target: "lance_encoding::buffer",
-            num_buffers = buffers.len(),
-            total_bytes = total_len,
-            "concat buffers"
-        );
         let mut data = Vec::with_capacity(total_len);
         for buffer in buffers {
             data.extend_from_slice(buffer.as_ref());
@@ -169,12 +163,6 @@ impl LanceBuffer {
         if is_aligned {
             ScalarBuffer::<T>::from(self.clone().into_buffer())
         } else {
-            tracing::debug!(
-                target: "lance_encoding::buffer",
-                buffer_len = self.len(),
-                alignment = align,
-                "misaligned buffer copy in borrow_to_typed_slice"
-            );
             let num_values = self.len() / std::mem::size_of::<T>();
             let vec = Vec::<T>::with_capacity(num_values);
             let mut bytes = MutableBuffer::from(vec);
@@ -239,12 +227,6 @@ impl LanceBuffer {
     ///
     /// Unlike concat_into_one this "zips" the buffers, interleaving the values
     pub fn zip_into_one(buffers: Vec<(Self, u64)>, num_values: u64) -> Result<Self> {
-        tracing::debug!(
-            target: "lance_encoding::buffer",
-            num_buffers = buffers.len(),
-            num_values,
-            "zip buffers"
-        );
         let bytes_per_value = buffers.iter().map(|(_, bits_per_value)| {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
