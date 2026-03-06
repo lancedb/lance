@@ -9,9 +9,9 @@ use arrow_array::{
     LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
-use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::WriteParams;
 use lance::Dataset;
+use lance::dataset::WriteParams;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
