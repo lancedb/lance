@@ -4,7 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{ListArray, RecordBatch};
+use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
@@ -19,7 +19,7 @@ use datafusion_expr::Expr;
 use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -816,6 +816,22 @@ pub enum OldIndexDataFilter {
     /// This is required for stable row IDs, where row IDs are opaque and
     /// should not be interpreted as encoded row addresses.
     RowIds(RowAddrTreeMap),
+}
+
+impl OldIndexDataFilter {
+    /// Build a boolean mask that keeps only row IDs selected by this filter.
+    pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
+        match self {
+            Self::Fragments(valid_fragments) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+                .collect(),
+            Self::RowIds(valid_row_ids) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_row_ids.contains(id)))
+                .collect(),
+        }
+    }
 }
 
 impl UpdateCriteria {

@@ -47,7 +47,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps},
+        mask::NullableRowAddrSet,
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -1304,16 +1304,8 @@ impl BTreeIndex {
 
         let new_input = Arc::new(OneShotExec::new(new_data));
         let old_stream = self.into_data_stream().await?;
-        // Two filtering strategies:
-        // - Fragments: fast path for address-style row IDs (fragment id is encoded in row_id)
-        // - RowIds: exact allow-list for stable row IDs (row_id bits are opaque)
         let old_stream = match old_data_filter {
-            Some(OldIndexDataFilter::Fragments(valid_frags)) => {
-                filter_row_ids_by_fragments(old_stream, valid_frags)
-            },
-            Some(OldIndexDataFilter::RowIds(valid_row_ids)) => {
-                filter_row_ids_by_exact_set(old_stream, valid_row_ids)
-            },
+            Some(filter) => filter_row_ids(old_stream, filter),
             None => old_stream,
         };
         let old_input = Arc::new(OneShotExec::new(old_stream));
@@ -1345,14 +1337,11 @@ impl BTreeIndex {
     }
 }
 
-/// Filter a stream of record batches to only include rows whose row address
-/// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
-/// ID in the upper 32 bits.
-///
-/// Do not use this for stable row IDs because those IDs are not address-encoded.
-fn filter_row_ids_by_fragments(
+/// Filter a stream of record batches using the selection semantics encapsulated
+/// by `old_data_filter`.
+fn filter_row_ids(
     stream: SendableRecordBatchStream,
-    valid_fragments: RoaringBitmap,
+    old_data_filter: OldIndexDataFilter,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let filtered = stream.map(move |batch_result| {
@@ -1360,36 +1349,8 @@ fn filter_row_ids_by_fragments(
         let row_ids = batch[ROW_ID]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
-            .expect("expected UInt64Array for row_id column");
-        let mask: arrow_array::BooleanArray = row_ids
-            .iter()
-            .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
-            .collect();
-        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
-    });
-    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
-}
-
-/// Filter a stream of record batches to only include rows whose row ID is in
-/// `valid_row_ids`.
-///
-/// This is the correct path for stable row IDs where we must preserve exact
-/// logical-row membership across compaction/remap operations.
-fn filter_row_ids_by_exact_set(
-    stream: SendableRecordBatchStream,
-    valid_row_ids: RowAddrTreeMap,
-) -> SendableRecordBatchStream {
-    let schema = stream.schema();
-    let filtered = stream.map(move |batch_result| {
-        let batch = batch_result?;
-        let row_ids = batch[ROW_ID]
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .expect("expected UInt64Array for row_id column");
-        let mask: arrow_array::BooleanArray = row_ids
-            .iter()
-            .map(|id| id.map(|id| valid_row_ids.contains(id)))
-            .collect();
+            .ok_or_else(|| Error::internal("expected UInt64Array for row_id column"))?;
+        let mask = old_data_filter.filter_row_ids(row_ids);
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
