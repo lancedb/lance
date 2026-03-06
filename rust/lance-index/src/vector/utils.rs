@@ -80,19 +80,18 @@ impl SimpleIndex {
         }
 
         let f32_centroids = match centroids.data_type() {
-            DataType::Float16 | DataType::Float32 => cast(&centroids, &DataType::Float32)
-                .map_err(|e| Error::index(e.to_string()))?,
+            DataType::Float16 | DataType::Float32 => {
+                cast(&centroids, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?
+            }
             _ => return Ok(None),
         };
-        let fsl =
-            FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
+        let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
         let store = FlatFloatStorage::new(fsl, distance_type);
         Self::try_new(store).map(Some)
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
-        let query = cast(&query, &DataType::Float32)
-            .map_err(|e| Error::index(e.to_string()))?;
+        let query = cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
         let res = self.index.search_basic(
             query,
             1,
