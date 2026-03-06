@@ -9,6 +9,21 @@
 import pyarrow as pa
 
 
+def safe_data_storage_version(version_str):
+    """Return a data_storage_version safe for the given lance version.
+
+    Versions 0.30 and older use "2.0", newer versions use "stable".
+    """
+    parts = version_str.split(".")
+    major = int(parts[0])
+    if major > 0:
+        return "stable"
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    if minor <= 30:
+        return "2.0"
+    return "stable"
+
+
 def build_basic_types():
     schema = pa.schema(
         [

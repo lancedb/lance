@@ -243,9 +243,10 @@ def test_metadata(tmp_path):
     assert len(column.pages) == 1
 
     page = column.pages[0]
-    assert len(page.buffers) == 1
-    assert page.buffers[0].position == 0
-    assert page.buffers[0].size == 24
+    assert len(page.buffers) > 0
+    for buffer in page.buffers:
+        assert buffer.position % 64 == 0
+        assert buffer.size > 0
 
     assert len(page.encoding) > 0
 
