@@ -26,15 +26,16 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
-    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
+    DropTableResponse, Identity, InsertIntoTableRequest, InsertIntoTableResponse,
     ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
     ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
-    TableExistsRequest, TableVersion,
+    QueryTableRequest, TableExistsRequest, TableVersion,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -44,6 +45,18 @@ use lance_namespace::schema::arrow_schema_to_json;
 use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
+
+/// Helper to create a namespace error from a formatted message.
+fn ns_err(msg: String) -> Error {
+    Error::namespace_source(msg.into())
+}
+
+/// Returns a closure that wraps an error with a contextual message for use with `.map_err()`.
+macro_rules! ns_ctx {
+    ($ctx:expr) => {
+        |e| ns_err(format!("{}: {}", $ctx, e))
+    };
+}
 
 /// Result of checking table status atomically.
 ///
@@ -1807,6 +1820,224 @@ impl LanceNamespace for DirectoryNamespace {
             deleted_count: Some(deleted_count),
             transaction_id: None,
         })
+    }
+
+    async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        let open_ctx = format!("Failed to open table at '{}'", table_uri);
+        let mut dataset = builder.load().await.map_err(ns_ctx!(&open_ctx))?;
+
+        if let Some(version) = request.version {
+            let ver_ctx = format!("Failed to checkout version {} at '{}'", version, table_uri);
+            dataset = dataset
+                .checkout_version(version as u64)
+                .await
+                .map_err(ns_ctx!(&ver_ctx))?;
+        }
+
+        let filter = request.predicate;
+        let count_ctx = format!("Failed to count rows for table at '{}'", table_uri);
+        let count = dataset
+            .count_rows(filter)
+            .await
+            .map_err(ns_ctx!(&count_ctx))?;
+
+        Ok(count as i64)
+    }
+
+    async fn insert_into_table(
+        &self,
+        request: InsertIntoTableRequest,
+        request_data: Bytes,
+    ) -> Result<InsertIntoTableResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        if request_data.is_empty() {
+            return Err(ns_err(
+                "Request data (Arrow IPC stream) is required for insert_into_table".to_string(),
+            ));
+        }
+
+        let cursor = Cursor::new(request_data.as_ref());
+        let stream_reader =
+            StreamReader::try_new(cursor, None).map_err(ns_ctx!("Invalid Arrow IPC stream"))?;
+        let arrow_schema = stream_reader.schema();
+
+        let mut batches = Vec::new();
+        for batch_result in stream_reader {
+            batches.push(batch_result.map_err(ns_ctx!("Failed to read batch from IPC stream"))?);
+        }
+
+        let reader = if batches.is_empty() {
+            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
+            let batches = vec![Ok(batch)];
+            RecordBatchIterator::new(batches, arrow_schema.clone())
+        } else {
+            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+            RecordBatchIterator::new(batch_results, arrow_schema)
+        };
+
+        let mode = match request.mode.as_deref() {
+            Some(m) if m.eq_ignore_ascii_case("overwrite") => lance::dataset::WriteMode::Overwrite,
+            _ => lance::dataset::WriteMode::Append,
+        };
+
+        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
+        let write_params = WriteParams {
+            mode,
+            store_params,
+            ..Default::default()
+        };
+
+        let write_ctx = format!("Failed to insert into table at '{}'", table_uri);
+        Dataset::write(reader, &table_uri, Some(write_params))
+            .await
+            .map_err(ns_ctx!(&write_ctx))?;
+
+        Ok(InsertIntoTableResponse {
+            transaction_id: None,
+        })
+    }
+
+    async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+
+        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        let open_ctx = format!("Failed to open table at '{}'", table_uri);
+        let mut dataset = builder.load().await.map_err(ns_ctx!(&open_ctx))?;
+
+        if let Some(version) = request.version {
+            let ver_ctx = format!("Failed to checkout version {} at '{}'", version, table_uri);
+            dataset = dataset
+                .checkout_version(version as u64)
+                .await
+                .map_err(ns_ctx!(&ver_ctx))?;
+        }
+
+        let has_vector =
+            request.vector.single_vector.is_some() || request.vector.multi_vector.is_some();
+
+        let mut scanner = dataset.scan();
+
+        if has_vector {
+            // Vector similarity search path
+            if let Some(ref single) = request.vector.single_vector {
+                let query_array = arrow::array::Float32Array::from(single.clone());
+                scanner
+                    .nearest(
+                        request.vector_column.as_deref().unwrap_or("vector"),
+                        &query_array,
+                        request.k as usize,
+                    )
+                    .map_err(ns_ctx!("Failed to set nearest vector search"))?;
+            }
+
+            if let Some(ref distance_type) = request.distance_type {
+                let dt_ctx = format!("Invalid distance type '{}'", distance_type);
+                let metric = lance_linalg::distance::DistanceType::try_from(distance_type.as_str())
+                    .map_err(ns_ctx!(&dt_ctx))?;
+                scanner.distance_metric(metric);
+            }
+
+            if let Some(nprobes) = request.nprobes {
+                scanner.nprobes(nprobes as usize);
+            }
+
+            if let Some(ref_factor) = request.refine_factor {
+                scanner.refine(ref_factor as u32);
+            }
+
+            if let Some(prefilter) = request.prefilter {
+                scanner.prefilter(prefilter);
+            }
+        } else {
+            // Plain scan path (no vector search)
+            let limit = if request.k > 0 {
+                Some(request.k as i64)
+            } else {
+                None
+            };
+            scanner
+                .limit(limit, request.offset.map(|o| o as i64))
+                .map_err(ns_ctx!("Failed to set limit"))?;
+        }
+
+        if let Some(ref filter) = request.filter {
+            let filter_ctx = format!("Failed to set filter '{}'", filter);
+            scanner.filter(filter).map_err(ns_ctx!(&filter_ctx))?;
+        }
+
+        if let Some(ref columns) = request.columns
+            && let Some(ref col_names) = columns.column_names
+        {
+            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+            scanner
+                .project(&col_refs)
+                .map_err(ns_ctx!("Failed to set projection"))?;
+        }
+
+        // Stream batches directly to IPC writer to avoid double-buffering.
+        // We derive the schema from the first batch (not dataset.schema()) so that
+        // column projections are reflected in the output.
+        let stream_ctx = format!("Failed to create scan stream for table at '{}'", table_uri);
+        let mut stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(ns_ctx!(&stream_ctx))?;
+
+        let mut buffer = Vec::new();
+        let mut writer: Option<arrow_ipc::writer::StreamWriter<&mut Vec<u8>>> = None;
+
+        use futures::StreamExt;
+        let scan_ctx = format!("Failed to scan table at '{}'", table_uri);
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(ns_ctx!(&scan_ctx))?;
+            let w = match writer {
+                Some(ref mut w) => w,
+                None => {
+                    writer = Some(
+                        arrow_ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
+                            .map_err(ns_ctx!("Failed to create IPC writer"))?,
+                    );
+                    writer.as_mut().unwrap()
+                }
+            };
+            w.write(&batch)
+                .map_err(ns_ctx!("Failed to write batch to IPC"))?;
+        }
+
+        if let Some(mut w) = writer {
+            w.finish().map_err(ns_ctx!("Failed to finish IPC writer"))?;
+        } else {
+            // No batches — write an empty IPC stream with the dataset schema
+            let schema: arrow_schema::Schema = dataset.schema().into();
+            let schema = Arc::new(schema);
+            let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut buffer, &schema)
+                .map_err(ns_ctx!("Failed to create IPC writer"))?;
+            w.finish().map_err(ns_ctx!("Failed to finish IPC writer"))?;
+        }
+
+        Ok(Bytes::from(buffer))
     }
 
     fn namespace_id(&self) -> String {
@@ -4808,6 +5039,798 @@ mod tests {
                 version_2_found,
                 "Version 2 manifest should exist in versions directory"
             );
+        }
+
+        // ============================================================
+        // Tests for count_table_rows, insert_into_table, query_table
+        // (discovered during DirectoryNamespace on COS testing)
+        // ============================================================
+
+        /// Helper: create a namespace and a table with some rows, returning (namespace, table_id)
+        async fn create_ns_with_table() -> (DirectoryNamespace, TempStdDir, Vec<String>) {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, temp_dir) = create_test_namespace().await;
+
+            let schema = create_test_schema();
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![1, 2, 3]);
+            let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let mut request = CreateTableRequest::new();
+            let table_id = vec!["test_ops_table".to_string()];
+            request.id = Some(table_id.clone());
+
+            namespace
+                .create_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+
+            (namespace, temp_dir, table_id)
+        }
+
+        #[tokio::test]
+        async fn test_count_table_rows_basic() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+
+            let count = namespace.count_table_rows(request).await.unwrap();
+            assert_eq!(count, 3);
+        }
+
+        #[tokio::test]
+        async fn test_count_table_rows_with_predicate() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: Some("id > 1".to_string()),
+                ..Default::default()
+            };
+
+            let count = namespace.count_table_rows(request).await.unwrap();
+            assert_eq!(count, 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_invalid_distance_type() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                multi_vector: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 2,
+                vector,
+                vector_column: Some("vector".to_string()),
+                distance_type: Some("invalid_metric".to_string()),
+                filter: None,
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let result = namespace.query_table(request).await;
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Invalid distance type"),
+                "Expected ns_ctx! error context, got: {}",
+                err_msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_insert_into_table_append() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Prepare new data to insert
+            let schema = create_test_schema();
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![4, 5]);
+            let name_array = StringArray::from(vec!["Dave", "Eve"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("append".to_string()),
+                ..Default::default()
+            };
+
+            let response = namespace
+                .insert_into_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+            assert!(response.transaction_id.is_none());
+
+            // Verify total rows
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            let count = namespace.count_table_rows(count_req).await.unwrap();
+            assert_eq!(count, 5);
+        }
+
+        #[tokio::test]
+        async fn test_insert_into_table_overwrite() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let schema = create_test_schema();
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![10, 20]);
+            let name_array = StringArray::from(vec!["X", "Y"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("overwrite".to_string()),
+                ..Default::default()
+            };
+
+            namespace
+                .insert_into_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+
+            // Verify overwrite: only 2 rows remain
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            let count = namespace.count_table_rows(count_req).await.unwrap();
+            assert_eq!(count, 2);
+        }
+
+        #[tokio::test]
+        async fn test_insert_into_table_empty_data() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id),
+                mode: None,
+                ..Default::default()
+            };
+
+            let result = namespace.insert_into_table(request, Bytes::new()).await;
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Arrow IPC stream) is required")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_insert_into_table_with_storage_options() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let temp_dir = TempStdDir::default();
+
+            // Build namespace with a (no-op) storage option so self.storage_options is Some
+            let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+                .storage_option("allow_http", "true")
+                .build()
+                .await
+                .unwrap();
+
+            // Create a table first
+            let schema = create_test_schema();
+            let ipc_data = create_test_ipc_data(&schema);
+            let mut create_req = CreateTableRequest::new();
+            let table_id = vec!["so_table".to_string()];
+            create_req.id = Some(table_id.clone());
+            namespace
+                .create_table(create_req, Bytes::from(ipc_data))
+                .await
+                .unwrap();
+
+            // Insert with storage_options present — covers store_params closure
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![10, 20]);
+            let name_array = StringArray::from(vec!["X", "Y"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("append".to_string()),
+                ..Default::default()
+            };
+
+            let response = namespace
+                .insert_into_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+            assert!(response.transaction_id.is_none());
+
+            // Verify rows were inserted
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            let count = namespace.count_table_rows(count_req).await.unwrap();
+            assert_eq!(count, 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_basic() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 10,
+                filter: None,
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            // Decode IPC and verify
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 3);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_with_filter() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 10,
+                filter: Some("id <= 2".to_string()),
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_with_limit_and_offset() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 2,
+                filter: None,
+                offset: Some(1),
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_no_limit() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // k=0 means no limit
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 0,
+                filter: None,
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 3);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_with_columns() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let columns = Box::new(lance_namespace::models::QueryTableRequestColumns {
+                column_names: Some(vec!["id".to_string()]),
+                column_aliases: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 10,
+                filter: None,
+                offset: None,
+                version: None,
+                columns: Some(columns),
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let schema = reader.schema();
+            assert_eq!(schema.fields().len(), 1);
+            assert_eq!(schema.field(0).name(), "id");
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 3);
+        }
+
+        #[tokio::test]
+        async fn test_count_table_rows_with_version() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Insert more data to create version 2
+            let schema = create_test_schema();
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![4, 5]);
+            let name_array = StringArray::from(vec!["Dave", "Eve"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: None,
+                ..Default::default()
+            };
+            namespace
+                .insert_into_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+
+            // Version 1 should have 3 rows
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id.clone()),
+                version: Some(1),
+                predicate: None,
+                ..Default::default()
+            };
+            let count = namespace.count_table_rows(count_req).await.unwrap();
+            assert_eq!(count, 3);
+
+            // Latest version should have 5 rows
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            let count = namespace.count_table_rows(count_req).await.unwrap();
+            assert_eq!(count, 5);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_with_version() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Insert more data to create version 2
+            let schema = create_test_schema();
+            let arrow_schema = convert_json_arrow_schema(&schema).unwrap();
+            let arrow_schema = Arc::new(arrow_schema);
+
+            let id_array = Int32Array::from(vec![4, 5]);
+            let name_array = StringArray::from(vec!["Dave", "Eve"]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(name_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: None,
+                ..Default::default()
+            };
+            namespace
+                .insert_into_table(request, Bytes::from(buffer))
+                .await
+                .unwrap();
+
+            // Query version 1 should return 3 rows
+            let request = QueryTableRequest {
+                id: Some(table_id.clone()),
+                k: 100,
+                filter: None,
+                offset: None,
+                version: Some(1),
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 3);
+
+            // Query latest version should return 5 rows
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 100,
+                filter: None,
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 5);
+        }
+
+        /// Helper to create a namespace with a table that has a vector column for
+        /// vector search tests.
+        async fn create_ns_with_vector_table() -> (DirectoryNamespace, TempStdDir, Vec<String>) {
+            use arrow::array::{FixedSizeListArray, Float32Array, Int32Array};
+            use arrow::ipc::writer::StreamWriter;
+
+            let (namespace, temp_dir) = create_test_namespace().await;
+
+            // Build schema: id (int32), vector (fixed_size_list<float32>[4])
+            let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+                arrow::datatypes::Field::new(
+                    "vector",
+                    arrow::datatypes::DataType::FixedSizeList(
+                        Arc::new(arrow::datatypes::Field::new(
+                            "item",
+                            arrow::datatypes::DataType::Float32,
+                            true,
+                        )),
+                        4,
+                    ),
+                    true,
+                ),
+            ]));
+
+            let id_array = Int32Array::from(vec![1, 2, 3]);
+            let values = Float32Array::from(vec![
+                1.0, 0.0, 0.0, 0.0, // vector for id=1
+                0.0, 1.0, 0.0, 0.0, // vector for id=2
+                0.0, 0.0, 1.0, 0.0, // vector for id=3
+            ]);
+            let vector_array = FixedSizeListArray::try_new(
+                Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    arrow::datatypes::DataType::Float32,
+                    true,
+                )),
+                4,
+                Arc::new(values),
+                None,
+            )
+            .unwrap();
+
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(id_array), Arc::new(vector_array)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            // Write as a Lance dataset directly
+            let table_name = "vector_table";
+            let table_uri = format!("{}/{}.lance", temp_dir.to_str().unwrap(), table_name);
+            let reader = arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(batch)],
+                arrow_schema.clone(),
+            );
+            Dataset::write(reader, &table_uri, None).await.unwrap();
+
+            let table_id = vec![table_name.to_string()];
+            (namespace, temp_dir, table_id)
+        }
+
+        #[tokio::test]
+        async fn test_query_table_vector_search() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                multi_vector: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 2,
+                vector,
+                filter: None,
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_vector_search_with_distance_type() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                multi_vector: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 3,
+                vector,
+                filter: None,
+                offset: None,
+                version: None,
+                distance_type: Some("cosine".to_string()),
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 3);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_vector_search_with_filter() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                multi_vector: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 10,
+                vector,
+                filter: Some("id <= 2".to_string()),
+                offset: None,
+                version: None,
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(total_rows <= 2);
+        }
+
+        #[tokio::test]
+        async fn test_query_table_vector_search_with_nprobes_and_refine() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: Some(vec![0.0, 1.0, 0.0, 0.0]),
+                multi_vector: None,
+            });
+
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 2,
+                vector,
+                filter: None,
+                offset: None,
+                version: None,
+                nprobes: Some(1),
+                refine_factor: Some(1),
+                prefilter: Some(true),
+                ..Default::default()
+            };
+
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2);
+        }
+
+        #[tokio::test]
+        async fn test_namespace_id() {
+            let (namespace, _temp_dir) = create_test_namespace().await;
+            let id = namespace.namespace_id();
+            assert!(id.contains("DirectoryNamespace"));
+            assert!(id.contains("root"));
+        }
+
+        #[tokio::test]
+        async fn test_query_table_empty_table() {
+            let (namespace, _temp_dir) = create_test_namespace().await;
+
+            // Create table with empty IPC data (schema only, no rows)
+            let schema = create_test_schema();
+            let ipc_data = create_test_ipc_data(&schema);
+            let mut create_request = CreateTableRequest::new();
+            create_request.id = Some(vec!["empty_table".to_string()]);
+            namespace
+                .create_table(create_request, bytes::Bytes::from(ipc_data))
+                .await
+                .unwrap();
+
+            // Query the empty table — should hit the "no batches" else branch
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: None,
+                multi_vector: None,
+            });
+            let request = QueryTableRequest {
+                id: Some(vec!["empty_table".to_string()]),
+                k: 10,
+                vector,
+                ..Default::default()
+            };
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+            assert!(batches.is_empty(), "empty table should yield no batches");
+        }
+
+        #[tokio::test]
+        async fn test_query_table_with_plain_filter_no_vector() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Query with filter but no vector (plain scan path + filter)
+            let vector = Box::new(lance_namespace::models::QueryTableRequestVector {
+                single_vector: None,
+                multi_vector: None,
+            });
+            let request = QueryTableRequest {
+                id: Some(table_id),
+                k: 0,
+                vector,
+                filter: Some("id > 1".to_string()),
+                ..Default::default()
+            };
+            let bytes = namespace.query_table(request).await.unwrap();
+
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(total_rows > 0);
+            assert!(total_rows < 3);
         }
     }
 }

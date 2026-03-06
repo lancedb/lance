@@ -44,6 +44,7 @@ url = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
 lance-io = { workspace = true }
+lance-linalg = { workspace = true }
 lance-table = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }

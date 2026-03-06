@@ -3802,6 +3802,7 @@ dependencies = [
  "lance-core",
  "lance-index",
  "lance-io",
+ "lance-linalg",
  "lance-namespace",
  "lance-table",
  "log",
