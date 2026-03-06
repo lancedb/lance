@@ -23,6 +23,37 @@ pub struct AsyncScanner {
     pub(crate) inner: Arc<Scanner>,
 }
 
+/// RAII guard that ensures task cleanup even on panic or early return
+///
+/// This guard prevents memory leaks in the task tracker by guaranteeing
+/// that task_id is removed from the HashMap when the guard is dropped,
+/// regardless of how the async task terminates (normal completion, panic,
+/// or cancellation).
+struct TaskCleanupGuard {
+    task_id: u64,
+}
+
+impl TaskCleanupGuard {
+    fn new(task_id: u64) -> Self {
+        Self { task_id }
+    }
+}
+
+impl Drop for TaskCleanupGuard {
+    fn drop(&mut self) {
+        // GUARANTEED to run when guard goes out of scope
+        // Works even if the task panics or returns early
+        //
+        // Note: We spawn a detached task instead of using block_on()
+        // because Drop may be called from within a tokio runtime context
+        let task_id = self.task_id;
+        RT.spawn(async move {
+            TASK_TRACKER.complete(task_id).await;
+            log::debug!("Task {} cleaned up via RAII guard", task_id);
+        });
+    }
+}
+
 impl AsyncScanner {
     pub fn create(scanner: Scanner) -> Self {
         Self {
@@ -39,6 +70,9 @@ impl AsyncScanner {
 
         // Spawn Tokio task for async I/O
         let handle = RT.spawn(async move {
+            // RAII guard ensures cleanup on normal exit, panic, or cancellation
+            let _cleanup_guard = TaskCleanupGuard::new(task_id);
+
             let result = match scanner.try_into_stream().await {
                 Ok(stream) => {
                     // Convert to FFI pointer
@@ -53,17 +87,15 @@ impl AsyncScanner {
                 Err(e) => Err(e.to_string()),
             };
 
-            // Remove from task tracker (for cleanup) and send to dispatcher
-            // Always send the message even if the task wasn't tracked
-            // (could happen if it completed before registration, though unlikely)
-            TASK_TRACKER.complete(task_id).await;
-
+            // Send result to dispatcher for Java completion
             let dispatcher = DISPATCHER.get().expect("Dispatcher not initialized");
             let _ = dispatcher.send(DispatcherMessage {
                 scanner_global_ref: global_ref_for_task,
                 task_id,
                 result,
             });
+
+            // _cleanup_guard.drop() called here automatically, removing task from tracker
         });
 
         // Register task for cancellation support

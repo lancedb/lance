@@ -50,6 +50,40 @@ impl TaskTracker {
             info.cancel_handle.abort();
         }
     }
+
+    // TODO: Implement timeout-based cleanup for defense-in-depth
+    //
+    // While TaskCleanupGuard (RAII pattern) ensures cleanup in normal and panic cases,
+    // a background cleanup task provides additional safety against edge cases:
+    //
+    // Proposed implementation:
+    // ```
+    // pub async fn cleanup_stale_tasks(&self, max_age: Duration) {
+    //     let mut tasks = self.tasks.write().await;
+    //     let now = Instant::now();
+    //     tasks.retain(|task_id, info| {
+    //         let is_finished = info.cancel_handle.is_finished();
+    //         let is_stale = info.created_at.elapsed() > max_age;
+    //
+    //         if is_finished || is_stale {
+    //             log::warn!("Cleaning up stale/finished task {}", task_id);
+    //             false // remove from HashMap
+    //         } else {
+    //             true // keep in HashMap
+    //         }
+    //     });
+    // }
+    //
+    // // In JNI_OnLoad or module initialization:
+    // RT.spawn(async {
+    //     loop {
+    //         tokio::time::sleep(Duration::from_secs(60)).await;
+    //         TASK_TRACKER.cleanup_stale_tasks(Duration::from_secs(300)).await;
+    //     }
+    // });
+    // ```
+    //
+    // This would require adding `created_at: Instant` field to TaskInfo.
 }
 
 /// Global task tracker instance
