@@ -272,7 +272,13 @@ pub async fn maybe_sample_training_data(
     if sample_size_hint == 0 {
         info!("No sampling required, skipping sampling and returning empty array");
         let data_type = vector_field.data_type();
-        return Ok(new_empty_array(&data_type).as_fixed_size_list().clone());
+        let dimension = infer_vector_dim(&data_type)?;
+        let element_type = infer_vector_element_type(&data_type)?;
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", element_type, false)),
+            dimension as i32,
+        );
+        return Ok(new_empty_array(&fsl_type).as_fixed_size_list().clone());
     }
 
     let is_nullable = vector_field.nullable;
