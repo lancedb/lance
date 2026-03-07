@@ -1565,8 +1565,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
 
     assert info.name == "vector_idx"
     assert info.type_url == "/lance.table.VectorIndexDetails"
-    # This is currently Unknown because vector indices are not yet handled by plugins
-    assert info.index_type == "Unknown"
+    assert info.index_type == "IVF_PQ"
     assert info.num_rows_indexed == 1000
     assert info.fields == [0]
     assert info.field_names == ["vector"]
