@@ -2628,9 +2628,9 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
-            lance_format::LanceIndexStore,
             IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            btree::{BTREE_PAGES_NAME, BTreeIndex},
+            lance_format::LanceIndexStore,
         },
     };
 

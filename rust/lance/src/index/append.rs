@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{
-    utils::mask::{RowAddrTreeMap, RowSetOps},
     Error, Result,
+    utils::mask::{RowAddrTreeMap, RowSetOps},
 };
 use lance_index::{
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
-    scalar::{lance_format::LanceIndexStore, CreatedIndex, OldIndexDataFilter},
+    scalar::{CreatedIndex, OldIndexDataFilter, lance_format::LanceIndexStore},
 };
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
 use super::vector::ivf::optimize_vector_indices;
+use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::dataset::Dataset;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
@@ -304,7 +304,9 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+    use arrow_array::{
+        FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
@@ -314,9 +316,9 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
+        DatasetIndexExt, IndexType,
         scalar::ScalarIndexParams,
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -755,11 +757,13 @@ mod tests {
         let frags = dataset.get_fragments();
         assert!(!frags.is_empty());
         assert!(frags.iter().all(|frag| frag.id() > 0));
-        assert!(dataset
-            .unindexed_fragments("id_idx")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            dataset
+                .unindexed_fragments("id_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         dataset
             .optimize_indices(&OptimizeOptions::default())
