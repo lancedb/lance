@@ -5270,4 +5270,55 @@ mod tests {
             "Field path should contain '.' for nested field"
         );
     }
+
+    #[tokio::test]
+    async fn test_describe_indices_returns_correct_vector_index_type() {
+        const DIM: i32 = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                true,
+            ),
+        ]));
+
+        let data = generate_random_array(256 * DIM as usize);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..256)),
+                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        // Create IVF_FLAT index
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset and call describe_indices
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+
+        assert_eq!(descriptions.len(), 1);
+        let desc = &descriptions[0];
+        assert_eq!(desc.name(), "vector_idx");
+        // This should be "IVF_FLAT", not "Unknown"
+        assert_eq!(desc.index_type(), "IVF_FLAT");
+        assert!(!desc.field_ids().is_empty());
+    }
 }
