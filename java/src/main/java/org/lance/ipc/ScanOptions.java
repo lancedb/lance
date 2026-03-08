@@ -31,6 +31,7 @@ public class ScanOptions {
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
   private final Optional<FullTextQuery> fullTextQuery;
+  private final boolean prefilter;
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
@@ -48,6 +49,7 @@ public class ScanOptions {
    *     Otherwise, only columns present in the List will be scanned.
    * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param limit (Optional) Maximum number of rows to return.
    * @param offset (Optional) Number of rows to skip before returning results.
    * @param withRowId Whether to include the row ID in the results.
@@ -68,6 +70,7 @@ public class ScanOptions {
       Optional<Long> offset,
       Optional<Query> nearest,
       Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
@@ -86,6 +89,7 @@ public class ScanOptions {
     this.offset = offset;
     this.nearest = nearest;
     this.fullTextQuery = fullTextQuery;
+    this.prefilter = prefilter;
     this.withRowId = withRowId;
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
@@ -176,6 +180,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to prefilter before nearest neighbor search.
+   *
+   * @return true if prefilter should be applied, false otherwise.
+   */
+  public boolean isPrefilter() {
+    return prefilter;
+  }
+
+  /**
    * Get whether to include the row ID.
    *
    * @return true if row ID should be included, false otherwise.
@@ -238,6 +251,7 @@ public class ScanOptions {
         .add("offset", offset.orElse(null))
         .add("nearest", nearest.orElse(null))
         .add("fullTextQuery", fullTextQuery.orElse(null))
+        .add("prefilter", prefilter)
         .add("withRowId", withRowId)
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
@@ -260,6 +274,7 @@ public class ScanOptions {
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
     private Optional<FullTextQuery> fullTextQuery = Optional.empty();
+    private boolean prefilter = false;
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
@@ -284,6 +299,7 @@ public class ScanOptions {
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
       this.fullTextQuery = options.getFullTextQuery();
+      this.prefilter = options.isPrefilter();
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
@@ -392,6 +408,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to prefilter during nearest neighbor search.
+     *
+     * @param prefilter true to apply prefilter, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder prefilter(boolean prefilter) {
+      this.prefilter = prefilter;
+      return this;
+    }
+
+    /**
      * Set whether to include the row ID.
      *
      * @param withRowId true to include row ID, false otherwise.
@@ -471,6 +498,7 @@ public class ScanOptions {
           offset,
           nearest,
           fullTextQuery,
+          prefilter,
           withRowId,
           withRowAddress,
           batchReadahead,

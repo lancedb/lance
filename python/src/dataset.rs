@@ -1589,6 +1589,10 @@ impl Dataset {
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
+            data_files_removed: cleanup_stats.data_files_removed,
+            transaction_files_removed: cleanup_stats.transaction_files_removed,
+            index_files_removed: cleanup_stats.index_files_removed,
+            deletion_files_removed: cleanup_stats.deletion_files_removed,
         })
     }
 
@@ -3201,6 +3205,7 @@ fn prepare_vector_index_params(
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
+    let mut skip_transpose = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -3330,6 +3335,10 @@ fn prepare_vector_index_params(
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
         }
+
+        if let Some(value) = kwargs.get_item("skip_transpose")? {
+            skip_transpose = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -3374,6 +3383,7 @@ fn prepare_vector_index_params(
         ))),
     }?;
     params.version(index_file_version);
+    params.skip_transpose(skip_transpose);
     Ok(params)
 }
 

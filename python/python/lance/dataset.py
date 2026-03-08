@@ -2796,6 +2796,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -3270,6 +3271,9 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+        if skip_transpose:
+            kwargs["skip_transpose"] = True
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -4699,6 +4703,35 @@ class ColumnOrdering:
     nulls_first: bool = False
 
 
+def _needs_substrait_placeholder(t: pa.DataType) -> bool:
+    """Return True if *t* contains a type that PyArrow's substrait serializer
+    cannot handle at any nesting depth.
+
+    Three cases require a placeholder:
+
+    * ``fixed_size_list`` — substrait has no equivalent type.
+    * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
+      represent them.
+    * A struct whose fields carry non-``None`` metadata — substrait rejects
+      such structs.  Extension types leave ``metadata={}`` on struct fields
+      after a lance round-trip; ``{}`` is non-``None``.
+    """
+    if pa.types.is_fixed_size_list(t):
+        return True
+    if isinstance(t, pa.lib.BaseExtensionType):
+        return True
+    if pa.types.is_struct(t):
+        for i in range(t.num_fields):
+            f = t.field(i)
+            if f.metadata is not None:
+                return True
+            if _needs_substrait_placeholder(f.type):
+                return True
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _needs_substrait_placeholder(t.value_type)
+    return False
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -4857,14 +4890,14 @@ class ScannerBuilder:
 
                 fields_without_lists = []
                 counter = 0
-                # Pyarrow cannot handle fixed size lists when converting
-                # types to Substrait. So we can't use those in our filter,
-                # which is ok for now but we need to replace them with some
-                # kind of placeholder because Substrait is going to use
-                # ordinal field references and we want to make sure those are
-                # correct.
+                # Pyarrow cannot handle certain types when converting to
+                # Substrait (e.g. fixed_size_list at any nesting depth, or
+                # struct fields with non-None metadata left by extension types
+                # after a lance round-trip).  We replace any top-level field
+                # whose type tree contains such a type with an int8 placeholder
+                # so that ordinal field references in the filter remain correct.
                 for field in self.ds.schema:
-                    if pa.types.is_fixed_size_list(field.type):
+                    if _needs_substrait_placeholder(field.type):
                         pos = counter
                         counter += 1
                         fields_without_lists.append(
@@ -5295,6 +5328,7 @@ class DatasetOptimizer:
         max_bytes_per_file: Optional[int] = None,
         materialize_deletions: bool = True,
         materialize_deletions_threshold: float = 0.1,
+        defer_index_remap: bool = False,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
@@ -5340,6 +5374,8 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float, default 0.1
             The fraction of original rows that are soft deleted in a fragment
             before the fragment is a candidate for compaction.
+        defer_index_remap: bool, default False
+            Whether to defer index remapping during compaction.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -5376,6 +5412,7 @@ class DatasetOptimizer:
             max_bytes_per_file=max_bytes_per_file,
             materialize_deletions=materialize_deletions,
             materialize_deletions_threshold=materialize_deletions_threshold,
+            defer_index_remap=defer_index_remap,
             num_threads=num_threads,
             batch_size=batch_size,
             compaction_mode=compaction_mode,

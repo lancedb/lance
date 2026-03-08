@@ -33,7 +33,7 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, pack_codes, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -1016,6 +1016,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let is_pq = Q::quantization_type() == QuantizationType::Product;
+        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1084,6 +1085,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
                 }
 
+                if is_rq && batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
+                    // RQ storage batches reaching merge_partitions always come
+                    // from RabitQuantizationStorage, which canonicalizes codes
+                    // into packed layout in try_from_batch/remap. Materialize
+                    // row-major bytes so row-wise sort operates on per-row codes.
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let unpacked = Arc::new(unpack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
+                }
+
                 // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
                 // PQ code column moves together with ROW_ID.
                 batch = stable_sort_batch_by_row_id(&batch)?;
@@ -1105,6 +1119,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         bytes_per_code as i32,
                     )?);
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
+                }
+
+                if is_rq
+                    && self.transpose_codes
+                    && batch.column_by_name(RABIT_CODE_COLUMN).is_some()
+                {
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let packed = Arc::new(pack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, packed)?;
                 }
 
                 storage_writer.write_batch(&batch).await?;
@@ -1150,8 +1176,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         let quant_type = Q::quantization_type();
         let transposed = match quant_type {
-            QuantizationType::Product => self.transpose_codes,
-            QuantizationType::Rabit => true,
+            QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
             _ => false,
         };
         // For now, each partition's metadata is just the quantizer,

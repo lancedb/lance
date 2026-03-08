@@ -78,6 +78,18 @@ struct ReferencedFiles {
 pub struct RemovalStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
+    pub data_files_removed: u64,
+    pub transaction_files_removed: u64,
+    pub index_files_removed: u64,
+    pub deletion_files_removed: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RemovedFileType {
+    Data,
+    Transaction,
+    Index,
+    Deletion,
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
@@ -169,6 +181,10 @@ impl<'a> CleanupTask<'a> {
         let stats = self.delete_unreferenced_files(inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
+        final_stats.data_files_removed += stats.data_files_removed;
+        final_stats.transaction_files_removed += stats.transaction_files_removed;
+        final_stats.index_files_removed += stats.index_files_removed;
+        final_stats.deletion_files_removed += stats.deletion_files_removed;
         Ok(final_stats)
     }
 
@@ -282,7 +298,18 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_removed = tracing::field::Empty))]
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            old_versions = inspection.old_manifests.len(),
+            bytes_removed = tracing::field::Empty,
+            data_files_removed = tracing::field::Empty,
+            transaction_files_removed = tracing::field::Empty,
+            index_files_removed = tracing::field::Empty,
+            deletion_files_removed = tracing::field::Empty
+        )
+    )]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
@@ -302,7 +329,9 @@ impl<'a> CleanupTask<'a> {
             )
         };
         // Build stream for a managed subtree
-        let build_listing_stream = |dir: Path| {
+        let build_listing_stream = |dir: Path, file_type: Option<RemovedFileType>| {
+            let inspection_ref = &inspection;
+            let removal_stats_ref = &removal_stats;
             self.dataset
                 .object_store
                 .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
@@ -316,7 +345,7 @@ impl<'a> CleanupTask<'a> {
                     }
                 })
                 .try_flatten()
-                .try_filter_map(|obj_meta| {
+                .try_filter_map(move |obj_meta| {
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
                     let maybe_in_progress = !self.policy.delete_unverified
@@ -324,10 +353,21 @@ impl<'a> CleanupTask<'a> {
                     let path_to_remove = self.path_if_not_referenced(
                         obj_meta.location,
                         maybe_in_progress,
-                        &inspection,
+                        inspection_ref,
                     );
                     if matches!(path_to_remove, Ok(Some(..))) {
-                        removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
+                        let mut stats = removal_stats_ref.lock().unwrap();
+                        stats.bytes_removed += obj_meta.size;
+                        if let Some(file_type) = file_type {
+                            match file_type {
+                                RemovedFileType::Data => stats.data_files_removed += 1,
+                                RemovedFileType::Transaction => {
+                                    stats.transaction_files_removed += 1
+                                }
+                                RemovedFileType::Index => stats.index_files_removed += 1,
+                                RemovedFileType::Deletion => stats.deletion_files_removed += 1,
+                            }
+                        }
                     }
                     future::ready(path_to_remove)
                 })
@@ -336,11 +376,17 @@ impl<'a> CleanupTask<'a> {
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir()),
-            build_listing_stream(self.dataset.transactions_dir()),
-            build_listing_stream(self.dataset.data_dir()),
-            build_listing_stream(self.dataset.indices_dir()),
-            build_listing_stream(self.dataset.deletions_dir()),
+            build_listing_stream(self.dataset.versions_dir(), None),
+            build_listing_stream(
+                self.dataset.transactions_dir(),
+                Some(RemovedFileType::Transaction),
+            ),
+            build_listing_stream(self.dataset.data_dir(), Some(RemovedFileType::Data)),
+            build_listing_stream(self.dataset.indices_dir(), Some(RemovedFileType::Index)),
+            build_listing_stream(
+                self.dataset.deletions_dir(),
+                Some(RemovedFileType::Deletion),
+            ),
         ];
         let unreferenced_paths = stream::iter(streams).flatten().boxed();
 
@@ -381,6 +427,16 @@ impl<'a> CleanupTask<'a> {
 
         let span = Span::current();
         span.record("bytes_removed", removal_stats.bytes_removed);
+        span.record("data_files_removed", removal_stats.data_files_removed);
+        span.record(
+            "transaction_files_removed",
+            removal_stats.transaction_files_removed,
+        );
+        span.record("index_files_removed", removal_stats.index_files_removed);
+        span.record(
+            "deletion_files_removed",
+            removal_stats.deletion_files_removed,
+        );
 
         Ok(removal_stats)
     }
@@ -665,6 +721,11 @@ impl<'a> CleanupTask<'a> {
                             let mut stats_guard = final_stats.lock().unwrap();
                             stats_guard.bytes_removed += stats.bytes_removed;
                             stats_guard.old_versions += stats.old_versions;
+                            stats_guard.data_files_removed += stats.data_files_removed;
+                            stats_guard.transaction_files_removed +=
+                                stats.transaction_files_removed;
+                            stats_guard.index_files_removed += stats.index_files_removed;
+                            stats_guard.deletion_files_removed += stats.deletion_files_removed;
                         }
                     }
                     Ok::<(), Error>(())
@@ -1056,7 +1117,7 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, some_batch};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
 
     #[derive(Debug)]
@@ -1427,6 +1488,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -1965,6 +2027,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_collects_removed_file_metrics() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let row_count = 512;
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                IncrementingInt32::new().named("filter_me".to_owned()),
+            ))
+            .col(Box::new(RandomVector::new().named("indexable".to_owned())));
+
+        fixture
+            .create_with_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture
+            .append_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture.create_some_index().await.unwrap();
+        fixture.delete_data("filter_me < 20").await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture
+            .overwrite_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture.delete_data("filter_me >= 40").await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        let after_count = fixture.count_files().await.unwrap();
+
+        let data_files_removed = (before_count.num_data_files - after_count.num_data_files) as u64;
+        let transaction_files_removed =
+            (before_count.num_tx_files - after_count.num_tx_files) as u64;
+        let index_files_removed =
+            (before_count.num_index_files - after_count.num_index_files) as u64;
+        let deletion_files_removed =
+            (before_count.num_delete_files - after_count.num_delete_files) as u64;
+
+        assert_eq!(removed.data_files_removed, data_files_removed);
+        assert_eq!(removed.transaction_files_removed, transaction_files_removed);
+        assert_eq!(removed.index_files_removed, index_files_removed);
+        assert_eq!(removed.deletion_files_removed, deletion_files_removed);
+        assert_gt!(removed.data_files_removed, 0);
+        assert_gt!(removed.transaction_files_removed, 0);
+        assert_gt!(removed.index_files_removed, 0);
+        assert_gt!(removed.deletion_files_removed, 0);
+    }
+
+    #[tokio::test]
     async fn dont_clean_index_data_files() {
         // Indexes have .lance files in them that are not referenced
         // by any fragment.  We need to make sure the cleanup routine
@@ -2012,6 +2126,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -2045,6 +2160,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.bytes_removed, 0);
+        assert_eq!(removed.data_files_removed, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count, after_count);

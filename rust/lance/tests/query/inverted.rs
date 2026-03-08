@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array};
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering;
+use lance::dataset::{InsertBuilder, WriteParams};
 use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};
@@ -264,5 +265,79 @@ async fn test_inverted_params_combinations() {
                 }
             })
             .await;
+    }
+}
+
+/// Regression test: FTS query after deleting rows should not crash with
+/// "Attempt to merge two RecordBatch with different sizes".
+///
+/// When stable row IDs are enabled, the FTS index may return row IDs for
+/// deleted rows. The row ID index excludes deleted rows, so get_row_addrs()
+/// must filter the input batch to match. Without this filtering, the
+/// downstream merge in TakeExec fails with a size mismatch.
+#[tokio::test]
+async fn test_fts_after_delete_with_stable_row_ids() {
+    let ids = Arc::new(Int32Array::from((0..20).collect::<Vec<i32>>()));
+    // Give each row a unique word + a common word "shared"
+    let texts: Vec<Option<&str>> = (0..20)
+        .map(|i| match i % 4 {
+            0 => Some("alpha shared"),
+            1 => Some("beta shared"),
+            2 => Some("gamma shared"),
+            _ => Some("delta shared"),
+        })
+        .collect();
+    let text_col = Arc::new(StringArray::from(texts));
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", ids as ArrayRef),
+        ("text", text_col as ArrayRef),
+    ])
+    .unwrap();
+
+    // Create dataset with stable row IDs
+    let mut ds = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    // Create FTS index
+    let params = InvertedIndexParams::default();
+    ds.create_index_builder(&["text"], IndexType::Inverted, &params)
+        .await
+        .unwrap();
+
+    // Delete some rows — these will still be referenced by the FTS index
+    ds.delete("id IN (0, 1, 2, 3, 4)").await.unwrap();
+
+    // FTS query for "shared" — matches ALL rows including deleted ones.
+    // Before the fix, this would crash with a merge size mismatch.
+    let query = FullTextSearchQuery::new("shared".to_string())
+        .with_column("text".to_string())
+        .unwrap();
+    let mut scanner = ds.scan();
+    scanner.full_text_search(query).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap();
+    let result = scanner.try_into_batch().await.unwrap();
+
+    // Should only have 15 rows (20 - 5 deleted)
+    assert_eq!(result.num_rows(), 15);
+
+    // Verify no deleted IDs are present
+    let result_ids = result
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    for id in result_ids.values().iter() {
+        assert!(*id >= 5, "Deleted row id {} should not appear", id);
     }
 }

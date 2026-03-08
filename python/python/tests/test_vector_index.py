@@ -827,6 +827,8 @@ def test_create_ivf_rq_index():
         num_bits=1,
     )
     assert ds.describe_indices()[0].field_names == ["vector"]
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["packed"] is True
 
     with pytest.raises(
         NotImplementedError,
@@ -865,6 +867,19 @@ def test_create_ivf_rq_index():
     assert res["_distance"].to_numpy().max() == 0.0
 
 
+def test_create_ivf_rq_skip_transpose():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+        skip_transpose=True,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["packed"] is False
+
+
 def test_create_ivf_rq_requires_dim_divisible_by_8():
     vectors = np.zeros((1000, 30), dtype=np.float32).tolist()
     tbl = pa.Table.from_pydict(
@@ -881,6 +896,33 @@ def test_create_ivf_rq_requires_dim_divisible_by_8():
             num_partitions=4,
             num_bits=1,
         )
+
+
+def test_create_ivf_rq_mostly_null():
+    ndim = 128
+    nvec = 100
+    nnull = 9900
+    vectors = np.random.randn(nvec, ndim).astype(np.float32).tolist()
+    vectors += [None] * nnull
+    tbl = pa.table(
+        {
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), ndim)),
+            "id": pa.array(range(nvec + nnull), type=pa.int32()),
+        }
+    )
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    q = np.random.randn(ndim).astype(np.float32)
+    result = ds.to_table(
+        nearest={"column": "vector", "q": q, "k": 10},
+    )
+    assert result.num_rows == 10
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
@@ -1029,6 +1071,22 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert len(partitions) == 5
     partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
+
+
+def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
+    ds = lance.write_dataset(
+        dataset.to_table(), tmp_path / "indexed_skip_transpose.lance"
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        skip_transpose=True,
+    )
+
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["transposed"] is False
 
 
 def test_optimize_index(dataset, tmp_path):

@@ -8759,6 +8759,7 @@ mod test {
                         }),
                     ],
                     version: crate::index::vector::IndexFileVersion::Legacy,
+                    skip_transpose: false,
                 },
                 false,
             )

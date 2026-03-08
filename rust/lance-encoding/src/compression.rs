@@ -489,7 +489,8 @@ impl DefaultCompressionStrategy {
         }
 
         let use_fsst = compression == Some("fsst")
-            || (!matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+            || (compression.is_none()
+                && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
                 && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                 && data_size >= FSST_LEAST_INPUT_SIZE as u64);
 
@@ -626,7 +627,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
                     let variable_compression = Box::new(VariableEncoder::default());
                     let use_fsst = compression == Some("fsst")
-                        || (!matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+                        || (compression.is_none()
+                            && !matches!(
+                                field.data_type(),
+                                DataType::Binary | DataType::LargeBinary
+                            )
                             && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                             && data_size >= FSST_LEAST_INPUT_SIZE as u64);
 

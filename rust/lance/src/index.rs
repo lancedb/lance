@@ -42,9 +42,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{
-    DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, VECTOR_INDEX_VERSION,
-};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -347,6 +345,12 @@ pub(crate) async fn remap_index(
             }
         }
         it if it.is_vector() => {
+            let index_version = u32::try_from(matched.index_version).map_err(|_| {
+                Error::index(format!(
+                    "Invalid vector index version {} on index {}",
+                    matched.index_version, matched.name
+                ))
+            })?;
             remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field_path,
@@ -361,7 +365,7 @@ pub(crate) async fn remap_index(
                     &lance_table::format::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
-                index_version: VECTOR_INDEX_VERSION,
+                index_version,
             }
         }
         _ => {

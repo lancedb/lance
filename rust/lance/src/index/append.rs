@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
-use lance_index::VECTOR_INDEX_VERSION;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::NoopIndexBuildProgress;
@@ -218,7 +217,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 indices_merged,
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                    // retain_supported_indices guarantees all old_indices have
+                    // index_version <= our max supported version, so we can safely
+                    // write the current library's version for this index type.
+                    index_version: it.version() as u32,
                 },
             ))
         }
