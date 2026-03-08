@@ -40,7 +40,7 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run linalg benchmarks
         working-directory: ./rust/lance-linalg
         run: |
@@ -53,7 +53,7 @@ jobs:
           cargo bench --bench sq --bench hnsw --bench inverted --bench pq_dist_table --bench pq_assignment -- --output-format bencher | tee -a ../../output.txt
       - name: Store benchmark result
         if: github.event_name != 'pull_request'
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@a7bc2366eda11037936ea57d811a43b3418d3073 # v1.21.0
         with:
           name: Lance Rust Benchmarks
           tool: "cargo"

@@ -52,13 +52,13 @@ jobs:
             runner: warp-ubuntu-latest-arm64-4x
     runs-on: ${{ matrix.config.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: 3.${{ matrix.python-minor-version }}
       - name: Handle tag
@@ -82,7 +82,7 @@ jobs:
           manylinux: ${{ matrix.config.manylinux }}
       - name: Upload wheels as artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pylance-debug-manylinux_${{ matrix.config.manylinux }}_${{ matrix.config.platform }}
           path: python/target/wheels/*.whl
@@ -105,13 +105,13 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: 3.13
       - name: Handle tag
@@ -133,7 +133,7 @@ jobs:
           args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }} --target ${{ matrix.config.target }} --features fp16kernels"
       - name: Upload wheels as artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pylance-debug-macosx_arm64
           path: python/target/wheels/*.whl
@@ -151,13 +151,13 @@ jobs:
       matrix:
         python-minor-version: ["9"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: 3.${{ matrix.python-minor-version }}
       - name: Handle tag
@@ -180,7 +180,7 @@ jobs:
           args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }}"
       - name: Upload wheels as artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pylance-debug-win_amd64
           path: python/target/wheels/*.whl
@@ -200,7 +200,7 @@ jobs:
       issues: write
     if: always() && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/create-failure-issue
         with:
           job-results: ${{ toJSON(needs) }}

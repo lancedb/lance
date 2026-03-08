@@ -11,10 +11,10 @@ jobs:
     runs-on: warp-ubuntu-latest-x64-8x
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
@@ -32,7 +32,7 @@ jobs:
           echo "AWS credentials validation successful"
 
       - name: Set up AWS CLI
-        uses: aws-actions/configure-aws-credentials@v3
+        uses: aws-actions/configure-aws-credentials@50ac8dd1e1b10d09dac7b8727528b91bed831ac0 # v3
         with:
           aws-access-key-id: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.LANCEDB_S3_READER_SECRET }}

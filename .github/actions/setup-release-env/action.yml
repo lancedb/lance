@@ -4,7 +4,7 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
       with:
         python-version: "3.11"
 
@@ -14,7 +14,7 @@ runs:
         pip install bump-my-version packaging PyGithub PyYAML
 
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
       with:
         toolchain: stable
         override: true

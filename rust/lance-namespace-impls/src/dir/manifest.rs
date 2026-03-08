@@ -659,7 +659,8 @@ impl ManifestNamespace {
 
     /// Check if the manifest contains an object with the given ID
     async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
-        let filter = format!("object_id = '{}'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}'", escaped_id);
 
         let dataset_guard = self.manifest_dataset.get().await?;
         let mut scanner = dataset_guard.scan();
@@ -693,7 +694,8 @@ impl ManifestNamespace {
 
     /// Query the manifest for a table with the given object ID
     async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
-        let filter = format!("object_id = '{}' AND object_type = 'table'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             Error::io_source(box_error(std::io::Error::other(format!(
@@ -959,7 +961,8 @@ impl ManifestNamespace {
 
     /// Query the manifest for a namespace with the given object ID
     async fn query_manifest_for_namespace(&self, object_id: &str) -> Result<Option<NamespaceInfo>> {
-        let filter = format!("object_id = '{}' AND object_type = 'namespace'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}' AND object_type = 'namespace'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             Error::io_source(box_error(std::io::Error::other(format!(
@@ -1663,7 +1666,8 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         // Check for child namespaces
-        let prefix = format!("{}{}", object_id, DELIMITER);
+        let escaped_id = object_id.replace('\'', "''");
+        let prefix = format!("{}{}", escaped_id, DELIMITER);
         let filter = format!("starts_with(object_id, '{}')", prefix);
         let mut scanner = self.manifest_scanner().boxed().await?;
         scanner.filter(&filter).map_err(|e| {
