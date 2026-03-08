@@ -45,6 +45,9 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             "materialize_deletions_threshold" => {
                 opts.materialize_deletions_threshold = value.extract()?;
             }
+            "defer_index_remap" => {
+                opts.defer_index_remap = value.extract()?;
+            }
             "num_threads" => {
                 opts.num_threads = value.extract()?;
             }

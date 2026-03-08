@@ -77,3 +77,7 @@ class CompactionOptions(TypedDict):
     Controls how much data is read at once when performing binary copy.
     (default: 16MB)
     """
+    defer_index_remap: Optional[bool]
+    """
+    Whether to defer index remapping during compaction (default: False).
+    """

@@ -41,8 +41,13 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
-// Currently all vector indexes are version 1
+/// Default version for vector index metadata.
+///
+/// Most vector indices should use this version unless they need to bump for a
+/// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
+/// Version for IVF_RQ indices.
+pub const IVF_RQ_INDEX_VERSION: u32 = 2;
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -268,16 +273,20 @@ impl IndexType {
             Self::BloomFilter => 0,
             Self::RTree => 0,
 
-            // for now all vector indices are built by the same builder,
-            // so they share the same version.
+            // IMPORTANT: if any vector index subtype needs a format bump that is
+            // not backward compatible, its new version must be set to
+            // (current max vector index version + 1), even if only one subtype
+            // changed. Compatibility filtering currently cannot distinguish vector
+            // subtypes from details-only metadata, so vector versions effectively
+            // share one global monotonic compatibility level.
             Self::Vector
             | Self::IvfFlat
             | Self::IvfSq
             | Self::IvfPq
             | Self::IvfHnswSq
             | Self::IvfHnswPq
-            | Self::IvfHnswFlat
-            | Self::IvfRq => 1,
+            | Self::IvfHnswFlat => VECTOR_INDEX_VERSION as i32,
+            Self::IvfRq => IVF_RQ_INDEX_VERSION as i32,
         }
     }
 
@@ -298,6 +307,24 @@ impl IndexType {
             Self::IvfHnswPq => 1 << 20,
             _ => 8192,
         }
+    }
+
+    /// Returns the highest supported vector index version in this Lance build.
+    pub fn max_vector_version() -> u32 {
+        [
+            Self::Vector,
+            Self::IvfFlat,
+            Self::IvfSq,
+            Self::IvfPq,
+            Self::IvfHnswSq,
+            Self::IvfHnswPq,
+            Self::IvfHnswFlat,
+            Self::IvfRq,
+        ]
+        .into_iter()
+        .map(|index_type| index_type.version() as u32)
+        .max()
+        .unwrap_or(VECTOR_INDEX_VERSION)
     }
 }
 
@@ -327,5 +354,21 @@ pub fn infer_system_index_type(
         Some(IndexType::MemWal)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ivf_rq_has_dedicated_index_version() {
+        assert!(IndexType::IvfRq.version() > IndexType::IvfPq.version());
+        assert_eq!(IndexType::IvfRq.version() as u32, IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_max_vector_version_tracks_highest_supported() {
+        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
     }
 }

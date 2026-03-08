@@ -52,6 +52,13 @@ use lance_core::error::LanceOptionExt;
 use chrono::Utc;
 use lance_core::{Error, Result};
 
+/// Encode a JSON string into a JSONB `LargeBinary` literal expression.
+fn encode_jsonb(json_str: &str) -> Result<Expr> {
+    let bytes = lance_arrow::json::encode_json(json_str)
+        .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
+    Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CastListF16Udf {
     signature: Signature,
@@ -653,6 +660,17 @@ impl Planner {
 
                 Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
+            // JSONB literal: jsonb '{"key": "value"}'
+            SQLExpr::TypedString(TypedString {
+                data_type: SQLDataType::JSONB,
+                value,
+                ..
+            }) => match &value.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => encode_jsonb(s),
+                _ => Err(Error::invalid_input(
+                    "Expected a string value for JSONB literal",
+                )),
+            },
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString(TypedString {
                 data_type, value, ..
@@ -727,6 +745,20 @@ impl Planner {
                 },
                 false,
             ))),
+            // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
+            SQLExpr::Cast {
+                data_type: SQLDataType::JSONB,
+                expr: inner,
+                ..
+            } => match inner.as_ref() {
+                SQLExpr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                    ..
+                }) => encode_jsonb(s),
+                _ => Err(Error::invalid_input(
+                    "CAST to JSONB only supports string literals",
+                )),
+            },
             SQLExpr::Cast {
                 expr,
                 data_type,
@@ -1801,5 +1833,62 @@ mod tests {
 
         // Should not panic
         let _physical = planner.create_physical_expr(&expr).unwrap();
+    }
+
+    #[test]
+    fn test_jsonb_literals() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "j",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let planner = Planner::new(schema);
+
+        let cases = [
+            ("jsonb '{\"key\": \"value\"}'", r#"{"key":"value"}"#),
+            ("cast('{\"a\": 1}' as jsonb)", r#"{"a":1}"#),
+            ("'{\"a\": 1}'::jsonb", r#"{"a":1}"#),
+        ];
+        for (sql, expected) in cases {
+            let ast = parse_sql_expr(sql).unwrap();
+            let expr = planner.parse_sql_expr(&ast).unwrap();
+            match expr {
+                Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), _) => {
+                    assert_eq!(
+                        lance_arrow::json::decode_json(&bytes),
+                        expected,
+                        "failed for: {sql}"
+                    );
+                }
+                other => panic!("Expected LargeBinary literal for '{sql}', got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_jsonb_literal_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "j",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let planner = Planner::new(schema);
+
+        // Invalid JSON content
+        let ast = parse_sql_expr("jsonb 'not valid json'").unwrap();
+        let err = planner.parse_sql_expr(&ast).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to encode JSONB"),
+            "expected JSONB encoding error, got: {err}"
+        );
+
+        // CAST with non-literal expression
+        let ast = parse_sql_expr("cast(j as jsonb)").unwrap();
+        let err = planner.parse_sql_expr(&ast).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CAST to JSONB only supports string literals"),
+            "got: {err}"
+        );
     }
 }

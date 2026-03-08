@@ -210,6 +210,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     offset_obj: JObject,              // Optional<Integer>
     query_obj: JObject,               // Optional<Query>
     fts_query_obj: JObject,           // Optional<FullTextQuery>
+    prefilter: jboolean,              // boolean
     with_row_id: jboolean,            // boolean
     with_row_address: jboolean,       // boolean
     batch_readahead: jint,            // int
@@ -231,6 +232,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             offset_obj,
             query_obj,
             fts_query_obj,
+            prefilter,
             with_row_id,
             with_row_address,
             batch_readahead,
@@ -254,6 +256,7 @@ fn inner_create_scanner<'local>(
     offset_obj: JObject,
     query_obj: JObject,
     fts_query_obj: JObject,
+    prefilter: jboolean,
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
@@ -314,6 +317,10 @@ fn inner_create_scanner<'local>(
 
     if with_row_address == JNI_TRUE {
         scanner.with_row_address();
+    }
+
+    if prefilter == JNI_TRUE {
+        scanner.prefilter(true);
     }
 
     scanner.use_scalar_index(use_scalar_index == JNI_TRUE);

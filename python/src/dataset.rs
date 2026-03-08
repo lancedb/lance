@@ -1589,6 +1589,10 @@ impl Dataset {
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
+            data_files_removed: cleanup_stats.data_files_removed,
+            transaction_files_removed: cleanup_stats.transaction_files_removed,
+            index_files_removed: cleanup_stats.index_files_removed,
+            deletion_files_removed: cleanup_stats.deletion_files_removed,
         })
     }
 

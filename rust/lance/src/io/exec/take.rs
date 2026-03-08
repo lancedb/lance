@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::AsArray;
 use arrow::compute::{TakeOptions, concat_batches};
 use arrow::datatypes::UInt64Type;
-use arrow_array::{Array, UInt32Array};
+use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
@@ -157,22 +157,43 @@ impl TakeStream {
         self.do_open_reader(fragment_id).await
     }
 
-    async fn get_row_addrs(&self, batch: &RecordBatch) -> Result<Arc<dyn Array>> {
+    /// Returns the row addresses for the given batch, plus an optional validity
+    /// mask. When stable row IDs are used, some row IDs from stale index results
+    /// (e.g. FTS matches for deleted rows) may no longer exist in the row ID
+    /// index. These are excluded from the returned addresses, and the mask
+    /// indicates which input rows are still valid so the caller can filter the
+    /// batch to match.
+    async fn get_row_addrs(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<(Arc<dyn Array>, Option<BooleanArray>)> {
         if let Some(row_addr_array) = batch.column_by_name(ROW_ADDR) {
-            Ok(row_addr_array.clone())
+            Ok((row_addr_array.clone(), None))
         } else {
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
 
             if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let addresses = row_id_array
-                    .values()
-                    .iter()
-                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                    .collect::<Vec<u64>>();
-                Ok(Arc::new(UInt64Array::from(addresses)))
+                let mut addresses = Vec::with_capacity(row_id_array.len());
+                let mut valid = Vec::with_capacity(row_id_array.len());
+
+                for id in row_id_array.values().iter() {
+                    if let Some(address) = row_id_index.get(*id) {
+                        addresses.push(u64::from(address));
+                        valid.push(true);
+                    } else {
+                        valid.push(false);
+                    }
+                }
+
+                let mask = if addresses.len() < row_id_array.len() {
+                    Some(BooleanArray::from(valid))
+                } else {
+                    None
+                };
+                Ok((Arc::new(UInt64Array::from(addresses)), mask))
             } else {
-                Ok(row_id_array.clone())
+                Ok((row_id_array.clone(), None))
             }
         }
     }
@@ -183,7 +204,17 @@ impl TakeStream {
         batch_number: u32,
     ) -> DataFusionResult<RecordBatch> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
-        let row_addrs_arr = self.get_row_addrs(&batch).await?;
+        let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
+
+        // Filter out rows whose row IDs no longer exist (e.g. stale FTS/vector
+        // index entries pointing to deleted rows). Without this, the downstream
+        // merge would fail with a row-count mismatch.
+        let batch = if let Some(mask) = validity_mask {
+            arrow::compute::filter_record_batch(&batch, &mask)?
+        } else {
+            batch
+        };
+
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
         debug_assert!(

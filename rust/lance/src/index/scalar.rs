@@ -36,7 +36,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
     lance_format::LanceIndexStore,
 };
-use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
+use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use tracing::instrument;
@@ -243,7 +243,12 @@ impl IndexDetails {
     /// Returns the index version
     pub fn index_version(&self) -> Result<u32> {
         if self.is_vector() {
-            Ok(VECTOR_INDEX_VERSION)
+            // VectorIndexDetails currently does not include the concrete vector
+            // subtype (IVF_PQ / IVF_RQ / ...), so compatibility filtering cannot
+            // do per-subtype version checks here. Use the highest supported
+            // vector index version as a safe upper bound; older binaries still
+            // ignore newer indices based on their own lower bound.
+            Ok(IndexType::max_vector_version())
         } else {
             self.get_plugin().map(|p| p.version())
         }
