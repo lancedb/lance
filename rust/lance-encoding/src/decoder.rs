@@ -298,7 +298,7 @@ impl std::error::Error for DecodeFieldError {
 
 impl From<DecodeFieldError> for Error {
     fn from(err: DecodeFieldError) -> Self {
-        Self::io_source(Box::new(err))
+        Self::wrapped(Box::new(err))
     }
 }
 
@@ -690,8 +690,14 @@ impl CoreFieldDecoderStrategy {
             file_buffers: buffers,
             positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
         };
-        let items_scheduler =
-            self.create_legacy_field_scheduler(&list_field.children[0], column_infos, buffers)?;
+        let child = &list_field.children[0];
+        let items_scheduler = self
+            .create_legacy_field_scheduler(child, column_infos, buffers)
+            .map_err(|source| DecodeFieldError {
+                field_name: child.name.clone(),
+                field_id: child.id,
+                source,
+            })?;
 
         let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
             .page_infos
@@ -2952,6 +2958,7 @@ pub async fn decode_batch(
 }
 
 #[cfg(test)]
+// test coalesce indices to ranges
 mod tests {
     use super::*;
 

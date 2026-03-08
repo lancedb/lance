@@ -84,7 +84,7 @@ impl std::error::Error for ReadFileError {
 
 impl From<ReadFileError> for Error {
     fn from(err: ReadFileError) -> Self {
-        Self::io_source(Box::new(err))
+        Self::wrapped(Box::new(err))
     }
 }
 
