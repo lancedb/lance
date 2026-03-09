@@ -285,18 +285,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             progress.stage_complete("shuffle").await?;
         }
 
-        // step 3. build partitions
+        // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
-        progress
-            .stage_start("build_partitions", num_partitions, "partitions")
-            .await?;
-        let build_idx_stream = self.build_partitions().boxed().await?;
-        progress.stage_complete("build_partitions").await?;
-
-        // step 4. merge all partitions
         progress
             .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
+        let build_idx_stream = self.build_partitions().boxed().await?;
         self.merge_partitions(build_idx_stream).await?;
         progress.stage_complete("merge_partitions").await?;
 
