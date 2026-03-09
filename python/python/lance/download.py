@@ -29,8 +29,7 @@ def _safe_tar_extractall(tar, dest_dir):
             abs_member = os.path.realpath(member_path)
             if not abs_member.startswith(abs_dest + os.sep) and abs_member != abs_dest:
                 raise Exception(
-                    f"Tar member '{member.name}' would extract outside "
-                    f"target directory"
+                    f"Tar member '{member.name}' would extract outside target directory"
                 )
         tar.extractall(path=dest_dir)
 
