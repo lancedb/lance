@@ -4070,6 +4070,7 @@ dependencies = [
  "prost",
  "prost-build",
  "snafu",
+ "substrait",
  "tokio",
  "tracing",
 ]

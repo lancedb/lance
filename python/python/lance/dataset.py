@@ -2796,6 +2796,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -3270,6 +3271,9 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+        if skip_transpose:
+            kwargs["skip_transpose"] = True
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing

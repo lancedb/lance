@@ -3862,6 +3862,7 @@ mod tests {
                         }),
                     ],
                     version: crate::index::vector::IndexFileVersion::V3,
+                    skip_transpose: false,
                 },
                 false,
             )

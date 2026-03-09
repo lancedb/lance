@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
+use arrow_array::new_empty_array;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::StreamExt;
@@ -267,6 +268,19 @@ pub async fn maybe_sample_training_data(
         "Sample training data: column {} does not exist in schema",
         column
     )))?;
+
+    if sample_size_hint == 0 {
+        info!("No sampling required, skipping sampling and returning empty array");
+        let data_type = vector_field.data_type();
+        let dimension = infer_vector_dim(&data_type)?;
+        let element_type = infer_vector_element_type(&data_type)?;
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", element_type, false)),
+            dimension as i32,
+        );
+        return Ok(new_empty_array(&fsl_type).as_fixed_size_list().clone());
+    }
+
     let is_nullable = vector_field.nullable;
 
     let sample_size_hint = match vector_field.data_type() {

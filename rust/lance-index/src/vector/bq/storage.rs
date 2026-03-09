@@ -848,6 +848,14 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use arrow_array::{ArrayRef, Float32Array, UInt64Array};
+    use lance_core::ROW_ID;
+    use lance_linalg::distance::DistanceType;
+
+    use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
+    use crate::vector::quantizer::{Quantization, QuantizerStorage};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -911,5 +919,112 @@ mod tests {
                 num_vectors
             );
         }
+    }
+
+    fn make_test_codes(num_vectors: usize, code_dim: i32) -> FixedSizeListArray {
+        let quantizer =
+            RabitQuantizer::new_with_rotation::<Float32Type>(1, code_dim, RQRotationType::Fast);
+        let values = Float32Array::from_iter_values(
+            (0..num_vectors * code_dim as usize).map(|idx| idx as f32 / code_dim as f32),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, code_dim).unwrap();
+        quantizer
+            .quantize(&vectors)
+            .unwrap()
+            .as_fixed_size_list()
+            .clone()
+    }
+
+    fn make_test_metadata(code_dim: usize) -> RabitQuantizationMetadata {
+        RabitQuantizer::new_with_rotation::<Float32Type>(1, code_dim as i32, RQRotationType::Fast)
+            .metadata(None)
+    }
+
+    fn make_test_batch(codes: FixedSizeListArray) -> RecordBatch {
+        let num_rows = codes.len();
+        RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            ),
+            (RABIT_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            (
+                ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32),
+                )) as ArrayRef,
+            ),
+            (
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 0.5),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn assert_codes_eq(actual: &FixedSizeListArray, expected: &FixedSizeListArray) {
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual.value_length(), expected.value_length());
+        assert_eq!(
+            actual.values().as_primitive::<UInt8Type>().values(),
+            expected.values().as_primitive::<UInt8Type>().values()
+        );
+    }
+
+    #[test]
+    fn test_try_from_batch_canonicalizes_rq_codes_to_packed_layout() {
+        let original_codes = make_test_codes(50, 64);
+        let metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+        assert!(!metadata.packed);
+
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes.clone()),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        assert!(storage.metadata().packed);
+        let stored_batch = storage.to_batches().unwrap().next().unwrap();
+        let stored_codes = stored_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
+        let expected_codes = pack_codes(&original_codes);
+        assert_codes_eq(stored_codes, &expected_codes);
+    }
+
+    #[test]
+    fn test_remap_preserves_packed_rq_storage_layout() {
+        let original_codes = make_test_codes(50, 64);
+        let metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes.clone()),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        let mut mapping = HashMap::new();
+        mapping.insert(1, Some(101));
+        mapping.insert(3, None);
+        mapping.insert(4, Some(104));
+
+        let remapped = storage.remap(&mapping).unwrap();
+        assert!(remapped.metadata().packed);
+
+        let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
+        let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let expected_row_ids = UInt64Array::from_iter_values(
+            [0, 101, 2, 104]
+                .into_iter()
+                .chain(5..original_codes.len() as u64),
+        );
+        assert_eq!(remapped_row_ids, expected_row_ids.values());
+
+        let remapped_codes = remapped_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
+        let repacked = pack_codes(&unpack_codes(remapped_codes));
+        assert_codes_eq(remapped_codes, &repacked);
     }
 }
