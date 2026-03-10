@@ -9,41 +9,8 @@
 //! one another. We can also rebuild manifests when retrying committing a
 //! manifest.
 //!
-//! ## Conflict Resolution
-//!
-//! Transactions are compatible with one another if they don't conflict.
-//! Currently, conflict resolution always assumes a Serializable isolation
-//! level.
-//!
-//! Below are the compatibilities between conflicting transactions. The columns
-//! represent the operation that has been applied, while the rows represent the
-//! operation that is being checked for compatibility to see if it can retry.
-//! ✅ indicates that the operation is compatible, while ❌ indicates that it is
-//! a conflict. Some operations have additional conditions that must be met for
-//! them to be compatible.
-//!
-//! NOTE/TODO(rmeng): DataReplacement conflict resolution is not fully implemented
-//!
-//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | UpdateConfig | DataReplacement |
-//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|--------------|-----------------|
-//! | Append           | ✅     | ✅              | ❌                | ✅           | ✅      | ❌     | ❌      | ✅           | ✅
-//! | Delete / Update  | ✅     | 1️⃣              | ❌                | ✅           | 1️⃣      | ❌     | ❌      | ✅           | ✅
-//! | Overwrite/Create | ✅     | ✅              | ✅                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
-//! | Create index     | ✅     | ✅              | ❌                | ✅           | ✅      | ✅     | ✅      | ✅           | 3️⃣
-//! | Rewrite          | ✅     | 1️⃣              | ❌                | ❌           | 1️⃣      | ❌     | ❌      | ✅           | 3️⃣
-//! | Merge            | ❌     | ❌              | ❌                | ❌           | ✅      | ❌     | ❌      | ✅           | ✅
-//! | Project          | ✅     | ✅              | ❌                | ❌           | ✅      | ❌     | ✅      | ✅           | ✅
-//! | UpdateConfig     | ✅     | ✅              | 2️⃣                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
-//! | DataReplacement  | ✅     | ✅              | ❌                | 3️⃣           | 1️⃣      | ✅     | 3️⃣      | ✅           | 3️⃣
-//!
-//! 1️⃣ Delete, update, and rewrite are compatible with each other and themselves only if
-//! they affect distinct fragments. Otherwise, they conflict.
-//! 2️⃣ Operations that mutate the config conflict if one of the operations upserts a key
-//! that if referenced by another concurrent operation or if both operations modify the schema
-//! metadata or the same field metadata.
-//! 3️⃣ DataReplacement on a column without index is compatible with any operation AS LONG AS
-//! the operation does not modify the region of the column being replaced.
-//!
+//! For more details please refer to the
+//! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
