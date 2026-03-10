@@ -8,6 +8,7 @@ use super::{
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
+use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -381,9 +382,13 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
+    let shuffler = Box::new(
+        IvfShuffler::new(temp_dir_path, num_partitions).with_format_version(format_version),
+    );
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let merged_num = match index_type {
@@ -1895,6 +1900,8 @@ pub async fn finalize_distributed_merge(
     .await?;
 
     let meta = aux_reader.metadata();
+    // Inherit file format version from the unified auxiliary (which inherited it from shards)
+    let format_version = meta.version();
     let ivf_buf_idx: u32 = meta
         .file_schema
         .metadata
@@ -1987,7 +1994,14 @@ pub async fn finalize_distributed_merge(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = V2Writer::try_new(obj_writer, schema, V2WriterOptions::default())?;
+    let mut v2_writer = V2Writer::try_new(
+        obj_writer,
+        schema,
+        V2WriterOptions {
+            format_version: Some(format_version),
+            ..Default::default()
+        },
+    )?;
 
     // Attach precise index metadata (type + distance).
     v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);

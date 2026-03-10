@@ -17,8 +17,9 @@ use lance_core::{
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -66,6 +67,7 @@ pub struct IvfShuffler {
     object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
+    format_version: LanceFileVersion,
 
     // options
     precomputed_shuffle_buffers: Option<Vec<String>>,
@@ -78,9 +80,15 @@ impl IvfShuffler {
             object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
+            format_version: LanceFileVersion::V2_0,
             precomputed_shuffle_buffers: None,
             progress: crate::progress::noop_progress(),
         }
+    }
+
+    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+        self.format_version = format_version;
+        self
     }
 
     pub fn with_progress(mut self, progress: Arc<dyn crate::progress::IndexBuildProgress>) -> Self {
@@ -112,12 +120,16 @@ impl Shuffler for IvfShuffler {
                 let spill_path = self.output_dir.child(format!("ivf_{}.spill", partition_id));
                 let object_store = self.object_store.clone();
                 let schema = schema.clone();
+                let format_version = self.format_version;
                 async move {
                     let writer = object_store.create(&part_path).await?;
                     let file_writer = FileWriter::try_new(
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
-                        Default::default(),
+                        FileWriterOptions {
+                            format_version: Some(format_version),
+                            ..Default::default()
+                        },
                     )?
                     .with_page_metadata_spill(object_store.clone(), spill_path);
                     Result::Ok(file_writer)

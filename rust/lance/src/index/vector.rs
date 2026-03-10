@@ -59,6 +59,7 @@ use utils::get_vector_type;
 use uuid::Uuid;
 
 use super::{DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
@@ -397,9 +398,13 @@ pub(crate) async fn build_distributed_vector_index(
         .as_ref()
         .clone();
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions)
+        .with_format_version(format_version)
+        .with_progress(progress.clone());
 
     let filtered_dataset = dataset.clone();
 
@@ -737,9 +742,13 @@ pub(crate) async fn build_vector_index(
     let mut ivf_params = ivf_params.clone();
     ivf_params.num_partitions = Some(num_partitions);
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions)
+        .with_format_version(format_version)
+        .with_progress(progress.clone());
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -1014,10 +1023,14 @@ pub(crate) async fn build_vector_index_incremental(
         )));
     }
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(
-        IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()).with_progress(progress.clone()),
+        IvfShuffler::new(temp_dir_path, ivf_model.num_partitions())
+            .with_format_version(format_version)
+            .with_progress(progress.clone()),
     );
 
     let index_dir = dataset.indices_dir().child(uuid);
