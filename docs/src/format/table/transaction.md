@@ -186,7 +186,6 @@ that are retryable conflicts with index creation:
 
 - Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)
 - DataReplacement (only if overlapping fragments and the column being replaced is being indexed)
-- Merge ??? TODO - test this
 
 Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
 between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
@@ -270,6 +269,7 @@ The following operations conflict with Merge:
 - Overwrite
 - Restore
 - UpdateMemWalState
+- Project
 
 These operations are retryable conflicts with Merge:
 
@@ -279,7 +279,6 @@ These operations are retryable conflicts with Merge:
 - Merge (always)
 - Rewrite (always)
 - DataReplacement (always)
-- Project (always)
 
 ### Project
 
