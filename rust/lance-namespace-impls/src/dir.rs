@@ -3005,7 +3005,17 @@ impl LanceNamespace for DirectoryNamespace {
 
         let mode = match request.mode.as_deref() {
             Some(m) if m.eq_ignore_ascii_case("overwrite") => lance::dataset::WriteMode::Overwrite,
-            _ => lance::dataset::WriteMode::Append,
+            Some(m) if m.eq_ignore_ascii_case("append") => lance::dataset::WriteMode::Append,
+            None => lance::dataset::WriteMode::Append,
+            Some(m) => {
+                return Err(lance_namespace::error::NamespaceError::InvalidInput {
+                    message: format!(
+                        "Unsupported write mode '{}'. Supported modes are: 'append', 'overwrite'",
+                        m
+                    ),
+                }
+                .into());
+            }
         };
 
         let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
