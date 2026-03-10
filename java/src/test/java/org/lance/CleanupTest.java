@@ -22,8 +22,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
   @Test
@@ -111,6 +114,37 @@ public class CleanupTest {
 
         // The version with tag-2 should not be cleaned up
         Assertions.assertEquals("tag-2", dataset.tags().list().get(0).getName());
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupWithRateLimit(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 100).close();
+      testDataset.write(2, 100).close();
+      try (Dataset dataset = testDataset.write(3, 100)) {
+        List<Version> versions = dataset.listVersions();
+        assertEquals(4, versions.size());
+        long beforeTimestampMillis =
+            versions.get(versions.size() - 1).getDataTime().toInstant().toEpochMilli() + 1;
+        long start = System.nanoTime();
+        RemovalStats stats =
+            dataset.cleanupWithPolicy(
+                CleanupPolicy.builder()
+                    .withBeforeTimestampMillis(beforeTimestampMillis)
+                    .withDeleteRateLimit(1L)
+                    .build());
+        long elapsed = System.nanoTime() - start;
+
+        assertEquals(3L, stats.getOldVersions());
+        assertTrue(stats.getBytesRemoved() > 0);
+        assertTrue(elapsed >= Duration.ofSeconds(2).toNanos());
       }
     }
   }

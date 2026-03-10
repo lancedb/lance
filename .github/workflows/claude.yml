@@ -13,26 +13,31 @@ on:
 jobs:
   claude:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["MEMBER","COLLABORATOR","OWNER","CONTRIBUTOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["MEMBER","COLLABORATOR","OWNER","CONTRIBUTOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
+          contains(fromJSON('["MEMBER","COLLABORATOR","OWNER","CONTRIBUTOR"]'), github.event.review.author_association)) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+          contains(fromJSON('["MEMBER","COLLABORATOR","OWNER","CONTRIBUTOR"]'), github.event.issue.author_association))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@26ec041249acb0a944c0a47b6c0c13f05dbc5b44 # v1
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -32,8 +32,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
         with:
           components: rustfmt
       - name: Check formatting
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install dependencies
         run: |
           sudo apt update
@@ -56,8 +56,8 @@ jobs:
       checks: write
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
         run: |
           sudo apt update
@@ -73,8 +73,8 @@ jobs:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
         with:
           log-level: warn
           command: check
@@ -89,14 +89,14 @@ jobs:
       # Treat warnings as errors to catch issues early
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # pin the toolchain version to avoid surprises
       - name: Setup rust toolchain
         run: |
           rustup toolchain install nightly
           rustup default nightly
-      - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
         run: |
           sudo apt update
@@ -104,13 +104,13 @@ jobs:
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           codecov_yml_path: codecov.yml
@@ -121,13 +121,13 @@ jobs:
     runs-on: warp-ubuntu-latest-arm64-4x
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
           rustup toolchain install stable
           rustup default stable
-      - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -149,13 +149,13 @@ jobs:
       # We use opt-level 1 which makes some tests 5x faster to run.
       RUSTFLAGS: "-C debuginfo=1 -C opt-level=1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
           rustup toolchain install stable
           rustup default stable
-      - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           cache-targets: false
           cache-workspace-crates: true
@@ -177,7 +177,7 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Set up Rust
         run: |
           rustup update stable
@@ -185,7 +185,7 @@ jobs:
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
-      - uses: rui314/setup-mold@v1
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - name: Install dependencies
         run: |
           sudo apt update
@@ -205,7 +205,7 @@ jobs:
       run:
         working-directory: ./rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Select new xcode
         # Default XCode right now is 15.0.1, which contains a bug that causes
         # backtraces to not show properly. See:
@@ -216,7 +216,7 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Build tests
         run: |
           cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
@@ -232,8 +232,8 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
@@ -262,10 +262,10 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: true
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
         run: |
           sudo apt update

@@ -1558,13 +1558,14 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
         let cleanup_stats = rt()
             .block_on(None, async {
@@ -1581,6 +1582,9 @@ impl Dataset {
                 }
                 if let Some(v) = error_if_tagged_old_versions {
                     builder = builder.error_if_tagged_old_versions(v);
+                }
+                if let Some(v) = delete_rate_limit {
+                    builder = builder.delete_rate_limit(v)?;
                 }
 
                 self.ds.cleanup_with_policy(builder.build()).await

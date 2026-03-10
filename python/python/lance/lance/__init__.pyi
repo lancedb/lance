@@ -317,6 +317,7 @@ class _Dataset:
         older_than_micros: int,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations

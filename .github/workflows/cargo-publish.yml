@@ -39,7 +39,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Check if stable release
         id: check_version
         run: |
@@ -60,19 +60,20 @@ jobs:
             echo "Stable version detected: $TAG"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: steps.check_version.outputs.skip != 'true'
         with:
           workspaces: rust
       - name: Verify and checkout specified tag
         if: github.event_name == 'workflow_dispatch' && steps.check_version.outputs.skip != 'true'
         run: |
+          TAG="${{ github.event.inputs.tag }}"
           git fetch --all --tags
-          if git rev-parse ${{ github.event.inputs.tag }} >/dev/null 2>&1; then
-            git checkout ${{ github.event.inputs.tag }}
-            echo "Successfully checked out tag ${{ github.event.inputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            git checkout "$TAG"
+            echo "Successfully checked out tag $TAG"
           else
-            echo "Error: Tag ${{ github.event.inputs.tag }} does not exist"
+            echo "Error: Tag $TAG does not exist"
             echo "Available tags:"
             git tag -l
             exit 1
@@ -85,7 +86,7 @@ jobs:
       # Wait until https://github.com/rust-lang/crates-io-auth-action/issues/51 fixed
       # - uses: rust-lang/crates-io-auth-action@v1
       #   id: auth
-      - uses: albertlockett/publish-crates@v2.2
+      - uses: albertlockett/publish-crates@85f0989f1298bc3889830b5fc28122c7586efeec # v2.2
         if: steps.check_version.outputs.skip != 'true'
         with:
           # registry-token: ${{ steps.auth.outputs.token }}
@@ -102,7 +103,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/create-failure-issue
         with:
           job-results: ${{ toJSON(needs) }}

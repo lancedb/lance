@@ -2419,6 +2419,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -2458,6 +2459,12 @@ class LanceDataset(pa.dataset.Dataset):
             tagged versions match the parameters. Otherwise, tagged versions will
             be ignored without any error and only untagged versions will be
             cleaned up.
+
+        delete_rate_limit: int, optional
+            Maximum number of delete operations per second. When not set (default),
+            deletions run at full speed. Set this to a positive integer to avoid
+            hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
+            For example, ``delete_rate_limit=100`` limits to 100 operations/second.
         """
         if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
@@ -2467,6 +2474,7 @@ class LanceDataset(pa.dataset.Dataset):
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
+            delete_rate_limit,
         )
 
     def create_scalar_index(
