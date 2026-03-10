@@ -2960,14 +2960,8 @@ mod tests {
         );
 
         // Exactly one should succeed and one should fail
-        let success_count = [&result1, &result2]
-            .iter()
-            .filter(|r| r.is_ok())
-            .count();
-        let failure_count = [&result1, &result2]
-            .iter()
-            .filter(|r| r.is_err())
-            .count();
+        let success_count = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let failure_count = [&result1, &result2].iter().filter(|r| r.is_err()).count();
         assert_eq!(
             success_count, 1,
             "Exactly one create should succeed, got: result1={:?}, result2={:?}",
