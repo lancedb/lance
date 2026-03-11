@@ -4,8 +4,8 @@
 use crate::Dataset;
 use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
-    StringArray, StructArray,
+    Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, NullArray, RecordBatch,
+    RecordBatchIterator, StringArray, StructArray,
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
@@ -548,4 +548,92 @@ async fn prepare_initial_dataset_with_list_struct_col(version: LanceFileVersion)
     assert_eq!(dataset.schema().fields[1].name, "people");
 
     dataset
+}
+
+/// Reproduces ENT-990: panic in `adjust_child_validity` when reading a dataset where:
+/// - Fragment 0 has `meta.extra: Null` (Arrow infers DataType::Null when the user inserts
+///   rows where every value in `extra` is null, e.g. from Python/pandas with an all-None column)
+/// - Fragment 1 (appended later) has a nullable `meta` struct with null rows, but no `extra`
+///   sub-field (Lance allows this because `extra: Null` is nullable in the dataset schema)
+///
+/// When Fragment 1 is read, Lance adds a `NullReader` for the missing `meta.extra: Null`
+/// sub-field. `MergeStream` calls `RecordBatchExt::merge` on the real batch (with null `meta`
+/// rows) and the `NullReader` batch (all-null `meta` struct). The recursive merge descends into
+/// `meta`, where the parent's null validity is non-empty and the child column has `DataType::Null`
+/// — causing `ArrayData::try_new` to panic.
+#[tokio::test]
+async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
+    // Fragment 0: struct column with an `extra` sub-field of DataType::Null.
+    // This simulates a user inserting rows from Python/pandas where `extra` is all None.
+    let meta0 = StructArray::new(
+        ArrowFields::from(vec![
+            ArrowField::new("name", DataType::Utf8, true),
+            ArrowField::new("extra", DataType::Null, true),
+        ]),
+        vec![
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])) as ArrayRef,
+            Arc::new(NullArray::new(2)) as ArrayRef,
+        ],
+        None,
+    );
+    let schema0 = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("meta", meta0.data_type().clone(), true),
+    ]));
+    let batch0 = RecordBatch::try_new(
+        schema0.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(meta0) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch0)], schema0),
+        "memory://",
+        Some(WriteParams::default()),
+    )
+    .await
+    .unwrap();
+
+    // Fragment 1: same struct column but WITHOUT `extra`. Lance's `allow_missing_if_nullable`
+    // permits omitting `extra` (it's nullable), so a NullReader will fill it when reading
+    // Fragment 1. The struct has null rows, which is what exposes the bug.
+    let meta1 = StructArray::new(
+        ArrowFields::from(vec![ArrowField::new("name", DataType::Utf8, true)]),
+        vec![Arc::new(StringArray::from(vec![Some("charlie"), None])) as ArrayRef],
+        Some(vec![true, false].into()), // row 1 is a null struct
+    );
+    let schema1 = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("meta", meta1.data_type().clone(), true),
+    ]));
+    let batch1 = RecordBatch::try_new(
+        schema1.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            Arc::new(meta1) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    ds.append(
+        RecordBatchIterator::new(vec![Ok(batch1)], schema1),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Scanning reads both fragments. Fragment 1 is missing `meta.extra: Null`, so Lance adds
+    // a NullReader for it. MergeStream merges the real batch (with null struct rows) and the
+    // NullReader batch (all-null `meta` struct). The recursive merge in `merge()` descends into
+    // `meta`, where `right_validity` (from the all-null NullReader struct) has non-zero null
+    // count and the child column has DataType::Null — previously panicked:
+    // "Arrays of type Null cannot contain a null bitmask".
+    let result = ds.scan().try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 4);
 }
