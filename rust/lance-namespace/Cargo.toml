@@ -16,6 +16,7 @@ async-trait.workspace = true
 bytes.workspace = true
 arrow.workspace = true
 lance-core.workspace = true
+serde.workspace = true
 snafu.workspace = true
 lance-namespace-reqwest-client.workspace = true
 

@@ -62,6 +62,7 @@ const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
 pub enum ObjectType {
     Namespace,
     Table,
+    TableVersion,
 }
 
 impl ObjectType {
@@ -69,6 +70,7 @@ impl ObjectType {
         match self {
             Self::Namespace => "namespace",
             Self::Table => "table",
+            Self::TableVersion => "table_version",
         }
     }
 
@@ -76,6 +78,7 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
+            "table_version" => Ok(Self::TableVersion),
             _ => Err(Error::io(format!("Invalid object type: {}", s))),
         }
     }
@@ -392,7 +395,7 @@ impl ManifestNamespace {
     }
 
     /// Convert a table ID (vec of strings) to an object_id string
-    fn str_object_id(table_id: &[String]) -> String {
+    pub fn str_object_id(table_id: &[String]) -> String {
         table_id.join(DELIMITER)
     }
 
@@ -787,7 +790,7 @@ impl ManifestNamespace {
     }
 
     /// Insert an entry into the manifest table with metadata and base_objects
-    async fn insert_into_manifest_with_metadata(
+    pub async fn insert_into_manifest_with_metadata(
         &self,
         object_id: String,
         object_type: ObjectType,
@@ -935,6 +938,322 @@ impl ManifestNamespace {
         }
 
         Ok(())
+    }
+
+    /// Batch insert multiple entries into the manifest table atomically.
+    ///
+    /// Uses a single MergeInsert operation to insert all entries at once.
+    /// If any entry already exists (matching object_id), the entire batch fails.
+    /// This provides atomic multi-table version creation semantics.
+    pub async fn batch_insert_into_manifest(
+        &self,
+        entries: Vec<(String, ObjectType, Option<String>, Option<String>)>,
+    ) -> Result<()> {
+        use arrow::array::builder::{ListBuilder, StringBuilder};
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let schema = Self::manifest_schema();
+
+        let mut object_ids = Vec::with_capacity(entries.len());
+        let mut object_types = Vec::with_capacity(entries.len());
+        let mut locations: Vec<Option<String>> = Vec::with_capacity(entries.len());
+        let mut metadatas: Vec<Option<String>> = Vec::with_capacity(entries.len());
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
+            "object_id",
+            DataType::Utf8,
+            true,
+        )));
+
+        for (object_id, object_type, location, metadata) in entries {
+            object_ids.push(object_id);
+            object_types.push(object_type.as_str().to_string());
+            locations.push(location);
+            metadatas.push(metadata);
+            // base_objects is intentionally null for table version entries —
+            // version metadata is stored in the `metadata` column instead.
+            list_builder.append_null();
+        }
+
+        let base_objects_array = list_builder.finish();
+
+        let location_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            locations.iter().map(|l| l.as_deref()).collect::<Vec<_>>(),
+        ));
+
+        let metadata_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            metadatas.iter().map(|m| m.as_deref()).collect::<Vec<_>>(),
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    object_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    object_types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                location_array,
+                metadata_array,
+                Arc::new(base_objects_array),
+            ],
+        )
+        .map_err(|e| Error::io(format!("Failed to create manifest entries: {}", e)))?;
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        // Use MergeInsert with WhenMatched::Fail to ensure atomicity:
+        // if any object_id already exists, the entire batch fails
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset_arc = Arc::new(dataset_guard.clone());
+        drop(dataset_guard);
+
+        let mut merge_builder =
+            lance::dataset::MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()])
+                .map_err(|e| {
+                    Error::io_source(box_error(std::io::Error::other(format!(
+                        "Failed to create merge builder: {}",
+                        e
+                    ))))
+                })?;
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        merge_builder.conflict_retries(0);
+        merge_builder.use_index(false);
+        if let Some(retries) = self.commit_retries {
+            merge_builder.commit_retries(retries);
+        }
+
+        let (new_dataset_arc, _merge_stats) = merge_builder
+            .try_build()
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
+                    "Failed to build merge: {}",
+                    e
+                ))))
+            })?
+            .execute_reader(Box::new(reader))
+            .await
+            .map_err(|e| {
+                convert_lance_commit_error(
+                    &e,
+                    "Failed to execute batch merge for multi-table version creation",
+                    None,
+                )
+            })?;
+
+        let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
+        self.manifest_dataset.set_latest(new_dataset).await;
+
+        // Run inline optimization after write
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Query the manifest for all versions of a table, sorted by version.
+    ///
+    /// Returns a list of (version, metadata_json_string) tuples where metadata_json_string
+    /// contains the full metadata JSON stored in the manifest (manifest_path, manifest_size,
+    /// e_tag, naming_scheme).
+    ///
+    /// **Known limitation**: All matching rows are loaded into memory, sorted in Rust,
+    /// and then truncated. For tables with a very large number of versions this may be
+    /// expensive. Pushing sort/limit into the scan is not yet supported by Lance.
+    pub async fn query_table_versions(
+        &self,
+        table_id: &str,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<(i64, String)>> {
+        let escaped_id = table_id.replace('\'', "''");
+        // table_version object_ids are formatted as "{table_id}${version}"
+        let filter = format!(
+            "object_type = 'table_version' AND starts_with(object_id, '{}$')",
+            escaped_id
+        );
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to filter: {}",
+                e
+            ))))
+        })?;
+        scanner.project(&["object_id", "metadata"]).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to project: {}",
+                e
+            ))))
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+
+        let mut versions: Vec<(i64, String)> = Vec::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let object_id_array = Self::get_string_column(&batch, "object_id")?;
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            for i in 0..batch.num_rows() {
+                let oid = object_id_array.value(i);
+                // Parse version from object_id: "{table_id}${version}"
+                if let Some(ver_str) = oid.rsplit('$').next() {
+                    if let Ok(version) = ver_str.parse::<i64>() {
+                        let metadata_str = metadata_array.value(i).to_string();
+                        versions.push((version, metadata_str));
+                    }
+                }
+            }
+        }
+
+        if descending {
+            versions.sort_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            versions.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        if let Some(limit) = limit {
+            versions.truncate(limit as usize);
+        }
+
+        Ok(versions)
+    }
+
+    /// Query the manifest for a specific version of a table.
+    ///
+    /// Returns the full metadata JSON string if found, which contains
+    /// manifest_path, manifest_size, e_tag, and naming_scheme.
+    pub async fn query_table_version(
+        &self,
+        table_id: &str,
+        version: i64,
+    ) -> Result<Option<String>> {
+        let object_id = format!("{}${}", table_id, version);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!(
+            "object_id = '{}' AND object_type = 'table_version'",
+            escaped_id
+        );
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to filter: {}",
+                e
+            ))))
+        })?;
+        scanner.project(&["metadata"]).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to project: {}",
+                e
+            ))))
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            return Ok(Some(metadata_array.value(0).to_string()));
+        }
+
+        Ok(None)
+    }
+
+    /// Delete table version entries from the manifest for a given table and version ranges.
+    ///
+    /// Each range is (start_version, end_version) inclusive. Deletes all matching
+    /// `object_type = 'table_version'` entries whose object_id matches `{table_id}${version}`.
+    ///
+    /// Builds a single filter expression covering all version ranges and executes
+    /// one bulk delete operation instead of deleting versions one at a time.
+    pub async fn delete_table_versions(
+        &self,
+        table_id: &str,
+        ranges: &[(i64, i64)],
+    ) -> Result<i64> {
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+
+        // Collect all object_ids to delete
+        let escaped_table_id = table_id.replace('\'', "''");
+        let mut object_id_conditions: Vec<String> = Vec::new();
+        for (start, end) in ranges {
+            for version in *start..=*end {
+                let object_id = format!("{}${}", escaped_table_id, version);
+                object_id_conditions.push(format!("'{}'", object_id));
+            }
+        }
+
+        if object_id_conditions.is_empty() {
+            return Ok(0);
+        }
+
+        // First, count how many entries exist so we can report the deleted count
+        let in_list = object_id_conditions.join(", ");
+        let filter = format!(
+            "object_type = 'table_version' AND object_id IN ({})",
+            in_list
+        );
+
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to filter: {}",
+                e
+            ))))
+        })?;
+        scanner.project(&["object_id"]).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to project: {}",
+                e
+            ))))
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+
+        // Execute a single bulk delete with the combined filter
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard);
+
+        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &filter)
+            .execute()
+            .await
+            .map_err(|e| {
+                convert_lance_commit_error(&e, "Failed to batch delete table versions", None)
+            })?;
+
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
+
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
+        Ok(deleted_count)
     }
 
     /// Register a table in the manifest without creating the physical table (internal helper for migration)

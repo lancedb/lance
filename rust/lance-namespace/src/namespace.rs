@@ -11,6 +11,7 @@ use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    BatchCreateTableVersionsRequest, BatchCreateTableVersionsResponse,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
@@ -355,6 +356,30 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<BatchDeleteTableVersionsResponse> {
         Err(Error::not_supported(
             "batch_delete_table_versions not implemented",
+        ))
+    }
+
+    /// Batch create table versions across multiple tables.
+    ///
+    /// This operation atomically creates version entries for multiple tables.
+    /// Each entry specifies the table identifier, version number, manifest path,
+    /// and optional metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains a list of entries, each specifying the table
+    ///   identifier, version, and manifest details.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if any version already exists (conflict).
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if any table does not exist.
+    async fn batch_create_table_versions(
+        &self,
+        _request: BatchCreateTableVersionsRequest,
+    ) -> Result<BatchCreateTableVersionsResponse> {
+        Err(Error::not_supported(
+            "batch_create_table_versions not implemented",
         ))
     }
 

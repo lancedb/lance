@@ -81,6 +81,14 @@ impl RestAdapter {
                 "/v1/table/:id/version/describe",
                 post(describe_table_version),
             )
+            .route(
+                "/v1/table/:id/version/batch_delete",
+                post(batch_delete_table_versions),
+            )
+            .route(
+                "/v1/table/version/batch_create",
+                post(batch_create_table_versions),
+            )
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -778,6 +786,41 @@ async fn describe_table_version(
     };
 
     match backend.describe_table_version(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_delete_table_versions(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(body): Json<BatchDeleteTableVersionsRequest>,
+) -> Response {
+    let request = BatchDeleteTableVersionsRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        identity: extract_identity(&headers),
+        ranges: body.ranges,
+        ..Default::default()
+    };
+
+    match backend.batch_delete_table_versions(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_create_table_versions(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Query(_params): Query<DelimiterQuery>,
+    Json(body): Json<BatchCreateTableVersionsRequest>,
+) -> Response {
+    let mut request = body;
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_create_table_versions(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
