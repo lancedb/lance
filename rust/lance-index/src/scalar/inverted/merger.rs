@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::progress::IndexBuildProgress;
 use crate::scalar::IndexStore;
+use crate::scalar::OldIndexDataFilter;
 
 use super::{
     InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
@@ -26,11 +27,14 @@ pub trait Merger {
 pub(super) struct PartitionSource {
     store: std::sync::Arc<dyn IndexStore>,
     id: u64,
+    /// Whether this partition comes from the existing (old) index.
+    /// When true, `old_data_filter` in the merger will be applied.
+    is_old: bool,
 }
 
 impl PartitionSource {
-    pub(super) fn new(store: std::sync::Arc<dyn IndexStore>, id: u64) -> Self {
-        Self { store, id }
+    pub(super) fn new(store: std::sync::Arc<dyn IndexStore>, id: u64, is_old: bool) -> Self {
+        Self { store, id, is_old }
     }
 
     async fn load(
@@ -56,6 +60,8 @@ pub struct SizeBasedMerger<'a> {
     builder: Option<InnerBuilder>,
     next_id: u64,
     partitions: Vec<u64>,
+    /// Filter applied to old partitions to exclude stale row IDs.
+    old_data_filter: Option<OldIndexDataFilter>,
 }
 
 impl<'a> SizeBasedMerger<'a> {
@@ -69,6 +75,7 @@ impl<'a> SizeBasedMerger<'a> {
         target_size: u64,
         token_set_format: TokenSetFormat,
         progress: Arc<dyn IndexBuildProgress>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Self {
         let max_id = input.iter().map(|p| p.id).max().unwrap_or(0);
 
@@ -82,6 +89,7 @@ impl<'a> SizeBasedMerger<'a> {
             builder: None,
             next_id: max_id + 1,
             partitions: Vec::new(),
+            old_data_filter,
         }
     }
 
@@ -142,6 +150,7 @@ impl<'a> SizeBasedMerger<'a> {
     async fn merge_partition(
         &mut self,
         part: InvertedPartition,
+        is_old: bool,
         estimated_size: &mut u64,
     ) -> Result<()> {
         self.ensure_builder(&part)?;
@@ -156,6 +165,14 @@ impl<'a> SizeBasedMerger<'a> {
                 self.ensure_builder(&part)?;
             }
         }
+
+        // Determine which filter (if any) to apply.
+        // Only old partitions are filtered; new partitions pass through unmodified.
+        let filter = if is_old {
+            self.old_data_filter.as_ref()
+        } else {
+            None
+        };
 
         let builder = self.builder.as_mut().expect("builder must exist");
         let mut token_id_map = vec![u32::MAX; part.tokens.len()];
@@ -180,10 +197,37 @@ impl<'a> SizeBasedMerger<'a> {
                 }
             }
         }
+
+        // Build doc_id mapping. When a filter is present, only docs whose
+        // row_id passes the filter are kept; others are skipped.
+        // old_doc_id_map[old_doc_id] = Some(new_doc_id) if kept, None if filtered.
         let doc_id_offset = builder.docs.len() as u32;
-        for (row_id, num_tokens) in part.docs.iter() {
-            builder.docs.append(*row_id, *num_tokens);
-        }
+        let old_doc_id_map: Vec<Option<u32>> = if let Some(filter) = filter {
+            let mut next_new = doc_id_offset;
+            part.docs
+                .iter()
+                .map(|(row_id, num_tokens)| {
+                    if filter.contains(*row_id) {
+                        builder.docs.append(*row_id, *num_tokens);
+                        let mapped = next_new;
+                        next_new += 1;
+                        Some(mapped)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            part.docs
+                .iter()
+                .enumerate()
+                .map(|(i, (row_id, num_tokens))| {
+                    builder.docs.append(*row_id, *num_tokens);
+                    Some(doc_id_offset + i as u32)
+                })
+                .collect()
+        };
+
         builder.posting_lists.resize_with(builder.tokens.len(), || {
             PostingListBuilder::new(part.inverted_list.has_positions())
         });
@@ -201,12 +245,13 @@ impl<'a> SizeBasedMerger<'a> {
             let builder = &mut builder.posting_lists[new_token_id as usize];
             let old_size = builder.size();
             for (doc_id, freq, positions) in posting_list.iter() {
-                let new_doc_id = doc_id_offset + doc_id as u32;
-                let positions = match positions {
-                    Some(positions) => PositionRecorder::Position(positions.collect()),
-                    None => PositionRecorder::Count(freq),
-                };
-                builder.add(new_doc_id, positions);
+                if let Some(new_doc_id) = old_doc_id_map[doc_id as usize] {
+                    let positions = match positions {
+                        Some(positions) => PositionRecorder::Position(positions.collect()),
+                        None => PositionRecorder::Count(freq),
+                    };
+                    builder.add(new_doc_id, positions);
+                }
             }
             let new_size = builder.size();
             *estimated_size += new_size - old_size;
@@ -217,7 +262,7 @@ impl<'a> SizeBasedMerger<'a> {
 
 impl Merger for SizeBasedMerger<'_> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
-        if self.input.len() <= 1 {
+        if self.input.len() <= 1 && self.old_data_filter.is_none() {
             let mut completed = 0;
             for part in self.input.iter() {
                 part.store
@@ -257,16 +302,21 @@ impl Merger for SizeBasedMerger<'_> {
         let cache = LanceCache::no_cache();
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
+            let is_old = part.is_old;
             let cache = cache.clone();
-            tokio::task::spawn(async move { part.load(&cache, token_set_format).await })
+            tokio::task::spawn(async move {
+                let loaded = part.load(&cache, token_set_format).await?;
+                Ok::<_, lance_core::Error>((loaded, is_old))
+            })
         }))
         .buffered(buffer_size);
 
         let mut idx = 0;
-        while let Some(part) = stream.try_next().await? {
-            let part = part?;
+        while let Some(result) = stream.try_next().await? {
+            let (part, is_old) = result?;
             idx += 1;
-            self.merge_partition(part, &mut estimated_size).await?;
+            self.merge_partition(part, is_old, &mut estimated_size)
+                .await?;
             self.progress
                 .stage_progress("merge_partitions", idx as u64)
                 .await?;
@@ -335,12 +385,13 @@ mod tests {
         let mut merger = SizeBasedMerger::new(
             dest_store.as_ref(),
             vec![
-                PartitionSource::new(src_store.clone(), 0),
-                PartitionSource::new(src_store.clone(), 1),
+                PartitionSource::new(src_store.clone(), 0, false),
+                PartitionSource::new(src_store.clone(), 1, false),
             ],
             u64::MAX,
             token_set_format,
             crate::progress::noop_progress(),
+            None,
         );
         let merged_partitions = merger.merge().await?;
         assert_eq!(merged_partitions, vec![2]);
@@ -397,7 +448,7 @@ mod tests {
             let doc_id = builder.docs.append(id * 10, 1);
             builder.posting_lists[token_id as usize].add(doc_id, PositionRecorder::Count(1));
             builder.write(src_store.as_ref()).await?;
-            sources.push(PartitionSource::new(src_store.clone(), id));
+            sources.push(PartitionSource::new(src_store.clone(), id, false));
         }
 
         let mut merger = SizeBasedMerger::new(
@@ -406,6 +457,7 @@ mod tests {
             u64::MAX,
             token_set_format,
             crate::progress::noop_progress(),
+            None,
         );
         let merged_partitions = merger.merge().await?;
         assert_eq!(merged_partitions, vec![num_parts as u64]);

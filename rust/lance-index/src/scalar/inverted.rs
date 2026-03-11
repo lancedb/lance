@@ -66,7 +66,7 @@ impl InvertedIndexPlugin {
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
                 .with_progress(progress);
-        inverted_index.update(data, index_store).await?;
+        inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: INVERTED_INDEX_VERSION,

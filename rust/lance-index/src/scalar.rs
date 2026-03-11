@@ -832,6 +832,14 @@ impl OldIndexDataFilter {
                 .collect(),
         }
     }
+
+    /// Check whether a single row ID passes the filter.
+    pub fn contains(&self, row_id: u64) -> bool {
+        match self {
+            Self::Fragments(valid_fragments) => valid_fragments.contains((row_id >> 32) as u32),
+            Self::RowIds(valid_row_ids) => valid_row_ids.contains(row_id),
+        }
+    }
 }
 
 impl UpdateCriteria {

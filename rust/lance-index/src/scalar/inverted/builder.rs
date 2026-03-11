@@ -7,6 +7,7 @@ use super::{
     merger::{Merger, PartitionSource, SizeBasedMerger},
 };
 use crate::scalar::IndexStore;
+use crate::scalar::OldIndexDataFilter;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
@@ -140,6 +141,7 @@ impl InvertedIndexBuilder {
         &mut self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<()> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
@@ -159,7 +161,7 @@ impl InvertedIndexBuilder {
             .await?;
         self.update_index(new_data).await?;
         self.progress.stage_complete("tokenize_docs").await?;
-        self.write(dest_store).await?;
+        self.write(dest_store, old_data_filter).await?;
         Ok(())
     }
 
@@ -353,7 +355,11 @@ impl InvertedIndexBuilder {
         Ok(())
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
+    async fn write(
+        &self,
+        dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
+    ) -> Result<()> {
         if self.params.skip_merge {
             let mut partitions =
                 Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
@@ -409,11 +415,11 @@ impl InvertedIndexBuilder {
         let partitions = self
             .partitions
             .iter()
-            .map(|part| PartitionSource::new(self.src_store.clone(), *part))
+            .map(|part| PartitionSource::new(self.src_store.clone(), *part, true))
             .chain(
                 self.new_partitions
                     .iter()
-                    .map(|part| PartitionSource::new(self.local_store.clone(), *part)),
+                    .map(|part| PartitionSource::new(self.local_store.clone(), *part, false)),
             )
             .collect::<Vec<_>>();
         self.progress
@@ -429,6 +435,7 @@ impl InvertedIndexBuilder {
             *LANCE_FTS_TARGET_SIZE << 20,
             self.token_set_format,
             self.progress.clone(),
+            old_data_filter,
         );
         let partitions = merger.merge().await?;
         self.progress.stage_complete("merge_partitions").await?;
@@ -1478,7 +1485,7 @@ mod tests {
             token_set_format,
             None,
         );
-        builder.write(dest_store.as_ref()).await?;
+        builder.write(dest_store.as_ref(), None).await?;
 
         let metadata_reader = dest_store.open_index_file(METADATA_FILE).await?;
         let metadata = &metadata_reader.schema().metadata;
@@ -1526,7 +1533,7 @@ mod tests {
         .max_token_length(None);
 
         let mut builder = InvertedIndexBuilder::new(params);
-        builder.update(stream, store.as_ref()).await?;
+        builder.update(stream, store.as_ref(), None).await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.partitions.len(), 1);
@@ -1620,7 +1627,7 @@ mod tests {
         let mut builder =
             InvertedIndexBuilder::new(InvertedIndexParams::default().skip_merge(true))
                 .with_progress(progress.clone());
-        builder.update(stream, store.as_ref()).await?;
+        builder.update(stream, store.as_ref(), None).await?;
 
         let events = progress.events.lock().await.clone();
         let tags = events

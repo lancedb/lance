@@ -634,9 +634,11 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.to_builder().update(new_data, dest_store).await?;
+        self.to_builder()
+            .update(new_data, dest_store, old_data_filter)
+            .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
@@ -819,17 +821,20 @@ impl InvertedPartition {
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
 
-                Result::Ok(PostingIterator::new(
-                    token,
-                    token_id,
-                    position as u32,
-                    posting,
-                    num_docs,
-                ))
+                Result::Ok((token, token_id, position as u32, posting))
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await
+            .map(|items| {
+                items
+                    .into_iter()
+                    .filter(|(_, _, _, posting)| !posting.is_empty())
+                    .map(|(token, token_id, position, posting)| {
+                        PostingIterator::new(token, token_id, position, posting, num_docs)
+                    })
+                    .collect()
+            })
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1956,6 +1961,28 @@ impl PostingListBuilder {
         }
     }
 
+    fn build_empty_batch(self, schema: SchemaRef) -> Result<RecordBatch> {
+        let empty_compressed = LargeBinaryArray::from(Vec::<&[u8]>::new());
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 0]));
+        let mut columns = vec![
+            Arc::new(ListArray::try_new(
+                Arc::new(Field::new("item", datatypes::DataType::LargeBinary, true)),
+                offsets,
+                Arc::new(empty_compressed),
+                None,
+            )?) as ArrayRef,
+            Arc::new(Float32Array::from_iter_values(std::iter::once(0.0_f32))) as ArrayRef,
+            Arc::new(UInt32Array::from_iter_values(std::iter::once(0_u32))) as ArrayRef,
+        ];
+        if self.positions.is_some() {
+            let mut position_builder =
+                ListBuilder::new(ListBuilder::with_capacity(LargeBinaryBuilder::new(), 0));
+            position_builder.append(true);
+            columns.push(Arc::new(position_builder.finish()));
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
     fn build_batch(
         self,
         compressed: LargeBinaryArray,
@@ -2012,6 +2039,9 @@ impl PostingListBuilder {
 
     pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
         let length = self.len();
+        if length == 0 {
+            return self.build_empty_batch(schema);
+        }
         let avgdl = docs.average_length();
         let idf_scale = idf(length, docs.len()) * (K1 + 1.0);
         let (compressed, max_score) = compress_posting_list_with_scores(
