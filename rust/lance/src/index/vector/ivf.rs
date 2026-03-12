@@ -2250,6 +2250,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
+    use lance_table::format::IndexSegmentLifecycle;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -2654,6 +2655,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -2692,6 +2694,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2757,6 +2760,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
 
         // We need to commit this new index to the dataset so it can be found

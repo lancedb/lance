@@ -25,7 +25,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, IndexSegmentLifecycle};
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
@@ -428,6 +428,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         })
     }
 

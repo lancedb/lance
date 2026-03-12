@@ -52,7 +52,7 @@ use lance_index::{
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, IndexSegmentLifecycle};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
@@ -1583,6 +1583,7 @@ pub async fn initialize_vector_index(
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        segment_lifecycle: IndexSegmentLifecycle::Sealed,
     };
 
     let transaction = Transaction::new(

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration};
-use lance_table::format::{IndexMetadata, pb};
+use lance_table::format::{IndexMetadata, IndexSegmentLifecycle, pb};
 use uuid::Uuid;
 
 /// Load MemWalIndexDetails from an IndexMetadata.
@@ -111,6 +111,7 @@ pub(crate) fn new_mem_wal_index_meta(
         index_version: 0,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        segment_lifecycle: IndexSegmentLifecycle::Sealed,
     })
 }
 

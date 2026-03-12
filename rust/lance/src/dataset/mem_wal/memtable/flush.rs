@@ -12,7 +12,7 @@ use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, IndexSegmentLifecycle};
 use log::info;
 use object_store::path::Path;
 use uuid::Uuid;
@@ -483,6 +483,7 @@ impl MemTableFlusher {
                 index_version: INVERTED_INDEX_VERSION as i32,
                 created_at: None,
                 base_id: None,
+                segment_lifecycle: IndexSegmentLifecycle::Sealed,
             };
 
             // Commit the index to the dataset
@@ -726,6 +727,7 @@ impl MemTableFlusher {
             base_id: None,
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
 
         Ok(index_meta)

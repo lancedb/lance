@@ -3442,6 +3442,7 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 mod tests {
     use super::*;
     use lance_io::utils::CachedFileSize;
+    use lance_table::format::IndexSegmentLifecycle;
 
     #[test]
     fn test_rewrite_fragments() {
@@ -3875,6 +3876,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         }
     }
 
@@ -3896,6 +3898,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         }
     }
 

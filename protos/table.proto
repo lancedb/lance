@@ -280,6 +280,30 @@ message IndexMetadata {
   // The base path index of the data file. Used when the file is imported or referred from another dataset.
   // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
   optional uint32 base_id = 9;
+
+  // The lifecycle state of an index segment.
+  //
+  // This describes whether a segment is still expected to absorb future index
+  // updates (`ACTIVE`) or has been finalized into a stable segment (`SEALED`).
+  //
+  // This is a lifecycle label, not a query-planning role. A sealed segment is
+  // typically searchable, but the two concepts are not identical.
+  optional IndexSegmentLifecycle segment_lifecycle = 10;
+}
+
+// Lifecycle state for a committed index segment.
+//
+// This enum is intentionally separate from higher-level planning concepts such
+// as "active segment" or "searchable segment". It only captures whether the
+// segment may continue to evolve or has been sealed into a stable form.
+enum IndexSegmentLifecycle {
+  // Legacy or missing value. Readers should interpret this as a sealed segment
+  // for backward compatibility.
+  INDEX_SEGMENT_LIFECYCLE_UNSPECIFIED = 0;
+  // Segment is still mutable from the maintenance workflow's point of view.
+  INDEX_SEGMENT_LIFECYCLE_ACTIVE = 1;
+  // Segment is sealed and should no longer absorb future updates.
+  INDEX_SEGMENT_LIFECYCLE_SEALED = 2;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

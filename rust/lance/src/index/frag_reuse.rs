@@ -9,9 +9,9 @@ use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
     FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
+use lance_table::format::{IndexMetadata, IndexSegmentLifecycle};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
@@ -172,5 +172,6 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        segment_lifecycle: IndexSegmentLifecycle::Sealed,
     })
 }

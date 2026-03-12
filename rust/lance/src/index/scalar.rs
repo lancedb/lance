@@ -560,6 +560,7 @@ mod tests {
     use lance_datagen::array;
     use lance_index::{IndexType, optimize::OptimizeOptions};
     use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
+    use lance_table::format::IndexSegmentLifecycle;
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -596,6 +597,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         }
     }
 

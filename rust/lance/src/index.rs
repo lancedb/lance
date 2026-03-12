@@ -54,8 +54,9 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::IndexMetadata;
-use lance_table::format::{Fragment, SelfDescribingFileReader};
+use lance_table::format::{
+    Fragment, IndexMetadata, IndexSegmentLifecycle, SelfDescribingFileReader,
+};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -778,6 +779,7 @@ impl DatasetIndexExt for Dataset {
             index_version: 0,
             created_at: Some(chrono::Utc::now()),
             base_id: None, // New indices don't have base_id (they're not from shallow clone)
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
 
         let transaction = Transaction::new(
@@ -898,6 +900,7 @@ impl DatasetIndexExt for Dataset {
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // Mew merged index file locates in the cloned dataset.
+                segment_lifecycle: IndexSegmentLifecycle::Sealed,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             if deltas.len() > res.removed_indices.len() {

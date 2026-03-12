@@ -1655,7 +1655,7 @@ mod tests {
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
-    use lance_table::format::IndexMetadata;
+    use lance_table::format::{IndexMetadata, IndexSegmentLifecycle};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -2142,6 +2142,7 @@ mod tests {
             index_version: 0,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
