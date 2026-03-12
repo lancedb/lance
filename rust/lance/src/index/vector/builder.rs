@@ -279,21 +279,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
-            progress.stage_start("shuffle", None, "batches").await?;
+            let num_rows = self.num_rows_to_shuffle().await?;
+            progress.stage_start("shuffle", num_rows, "rows").await?;
             self.shuffle_dataset().await?;
             progress.stage_complete("shuffle").await?;
         }
 
-        // step 3. build partitions
+        // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
         progress
-            .stage_start("build_partitions", num_partitions, "partitions")
+            .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
-
-        // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
-        progress.stage_complete("build_partitions").await?;
+        progress.stage_complete("merge_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -504,6 +503,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
             }),
         )
+    }
+
+    async fn num_rows_to_shuffle(&self) -> Result<Option<u64>> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Ok(None);
+        };
+        match &self.fragment_filter {
+            Some(fragment_ids) => {
+                let fragments: Vec<_> = dataset
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|f| fragment_ids.contains(&(f.id() as u32)))
+                    .collect();
+                let counts = futures::stream::iter(fragments)
+                    .map(|f| async move { f.count_rows(None).await })
+                    .buffer_unordered(16) // ref: Dataset::count_all_rows()
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok(Some(counts.iter().sum::<usize>() as u64))
+            }
+            None => Ok(Some(dataset.count_rows(None).await? as u64)),
+        }
     }
 
     async fn shuffle_dataset(&mut self) -> Result<()> {
@@ -1047,7 +1068,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
-            progress.stage_progress("build_partitions", part_id).await?;
+            progress.stage_progress("merge_partitions", part_id).await?;
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 

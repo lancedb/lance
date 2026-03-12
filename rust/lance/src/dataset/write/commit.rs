@@ -193,9 +193,10 @@ impl<'a> CommitBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
-                let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
+                let commit_handler = if let (Some(_), Some(commit_handler)) =
+                    (&self.object_store, &self.commit_handler)
                 {
-                    self.commit_handler.as_ref().unwrap().clone()
+                    commit_handler.clone()
                 } else {
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
                         .await?

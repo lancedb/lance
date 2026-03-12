@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
           lfs: true
       - name: Authenticate with GCS
-        uses: "google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2"
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           credentials_json: "${{ secrets.GCLOUD_BENCH_STORAGE_USER_KEY }}"
       - name: Install bencher

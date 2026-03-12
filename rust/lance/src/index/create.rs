@@ -315,7 +315,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 if train {
                     // Check if this is distributed indexing (fragment-level)
-                    if self.fragments.is_some() {
+                    if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
                         Box::pin(build_distributed_vector_index(
@@ -325,7 +325,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             &index_id.to_string(),
                             vec_params,
                             fri,
-                            self.fragments.as_ref().unwrap(),
+                            fragments,
                             self.progress.clone(),
                         ))
                         .await?;

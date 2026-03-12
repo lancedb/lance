@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   backport:
-    runs-on: warp-ubuntu-latest-x64-4x
+    runs-on: ubuntu-24.04-4x
     timeout-minutes: 60
     env:
       CC: clang

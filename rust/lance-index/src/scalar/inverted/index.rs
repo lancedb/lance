@@ -8,7 +8,7 @@ use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
 };
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, time::Instant};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
@@ -528,9 +528,19 @@ impl Index for InvertedIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        for part in &self.partitions {
-            part.inverted_list.prewarm().await?;
-        }
+        let io_parallelism = self.store.io_parallelism();
+        let prewarm_futures = self
+            .partitions
+            .iter()
+            .map(Arc::clone)
+            .map(|part| async move {
+                part.inverted_list.prewarm().await?;
+                Result::Ok(())
+            });
+        stream::iter(prewarm_futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(())
     }
 
@@ -1393,12 +1403,21 @@ impl PostingListReader {
         Ok(posting)
     }
 
+    fn posting_list_from_batch_parts(
+        batch: &RecordBatch,
+        max_score: Option<f32>,
+        length: Option<u32>,
+    ) -> Result<PostingList> {
+        let posting_list = PostingList::from_batch(batch, max_score, length)?;
+        Ok(posting_list)
+    }
+
     pub(crate) fn posting_list_from_batch(
         &self,
         batch: &RecordBatch,
         token_id: u32,
     ) -> Result<PostingList> {
-        let posting_list = PostingList::from_batch(
+        Self::posting_list_from_batch_parts(
             batch,
             self.max_scores
                 .as_ref()
@@ -1406,35 +1425,81 @@ impl PostingListReader {
             self.lengths
                 .as_ref()
                 .map(|lengths| lengths[token_id as usize]),
-        )?;
-        Ok(posting_list)
+        )
+    }
+
+    fn build_prewarm_posting_lists(
+        batch: RecordBatch,
+        offsets: Option<Vec<usize>>,
+        max_scores: Option<Vec<f32>>,
+        lengths: Option<Vec<u32>>,
+    ) -> Result<Vec<(u32, PostingList)>> {
+        let token_count = if let Some(offsets) = offsets.as_ref() {
+            offsets.len()
+        } else if let Some(lengths) = lengths.as_ref() {
+            lengths.len()
+        } else {
+            batch.num_rows()
+        };
+
+        let mut posting_lists = Vec::with_capacity(token_count);
+        for token_id in 0..token_count {
+            let batch = if let Some(offsets) = offsets.as_ref() {
+                let start = offsets[token_id];
+                let end = if token_id + 1 < offsets.len() {
+                    offsets[token_id + 1]
+                } else {
+                    batch.num_rows()
+                };
+                batch.slice(start, end - start)
+            } else {
+                batch.slice(token_id, 1)
+            };
+            let batch = batch.shrink_to_fit()?;
+            let posting_list = Self::posting_list_from_batch_parts(
+                &batch,
+                max_scores.as_ref().map(|scores| scores[token_id]),
+                lengths.as_ref().map(|lengths| lengths[token_id]),
+            )?;
+            posting_lists.push((token_id as u32, posting_list));
+        }
+
+        Ok(posting_lists)
     }
 
     async fn prewarm(&self) -> Result<()> {
+        let read_batch_start = Instant::now();
         let batch = self.read_batch(false).await?;
-        for token_id in 0..self.len() {
-            let posting_range = self.posting_list_range(token_id as u32);
-            let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
-            // Apply shrink_to_fit to create a deep copy with compacted buffers
-            // This ensures each cached entry has its own memory, not shared references
-            let batch = batch.shrink_to_fit()?;
-            let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            let inserted = self
-                .index_cache
-                .insert_with_key(
-                    &PostingListKey {
-                        token_id: token_id as u32,
-                    },
-                    Arc::new(posting_list),
-                )
-                .await;
+        let read_batch_elapsed = read_batch_start.elapsed();
 
-            if !inserted {
-                return Err(Error::internal(
-                    "Failed to prewarm index: cache is no longer available".to_string(),
-                ));
-            }
+        let legacy_layout = self.offsets.is_some();
+        let offsets = self.offsets.clone();
+        let max_scores = self.max_scores.clone();
+        let lengths = self.lengths.clone();
+        let populate_start = Instant::now();
+        let posting_lists = spawn_blocking(move || {
+            Self::build_prewarm_posting_lists(batch, offsets, max_scores, lengths)
+        })
+        .await
+        .map_err(|err| {
+            Error::internal(format!(
+                "Failed to build prewarm posting lists in blocking task: {err}"
+            ))
+        })??;
+        for (token_id, posting_list) in posting_lists {
+            self.index_cache
+                .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
+                .await;
         }
+        let populate_elapsed = populate_start.elapsed();
+
+        info!(
+            legacy_layout,
+            token_count = self.len(),
+            read_batch_ms = read_batch_elapsed.as_secs_f64() * 1000.0,
+            post_read_loop_ms = populate_elapsed.as_secs_f64() * 1000.0,
+            "posting list prewarm timing"
+        );
 
         Ok(())
     }
@@ -1675,7 +1740,7 @@ impl DeepSizeOf for PlainPostingList {
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_buffer_memory_size())
+                .map(Array::get_buffer_memory_size)
                 .unwrap_or(0)
     }
 }
@@ -1776,7 +1841,7 @@ impl DeepSizeOf for CompressedPostingList {
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_buffer_memory_size())
+                .map(Array::get_buffer_memory_size)
                 .unwrap_or(0)
     }
 }
@@ -3019,6 +3084,87 @@ mod tests {
         assert!(
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modern_prewarm_shrinks_cached_posting_buffers() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.tokens.add("beta".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(1, PositionRecorder::Count(2));
+        builder.posting_lists[1].add(2, PositionRecorder::Count(3));
+        builder.posting_lists[1].add(3, PositionRecorder::Count(4));
+        builder.docs.append(100, 1);
+        builder.docs.append(101, 2);
+        builder.docs.append(102, 3);
+        builder.docs.append(103, 4);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let inverted_list = &index.partitions[0].inverted_list;
+        assert!(
+            inverted_list.offsets.is_none(),
+            "test should use modern posting layout"
+        );
+
+        inverted_list.prewarm().await.unwrap();
+
+        let alpha = inverted_list
+            .index_cache
+            .get_with_key(&PostingListKey { token_id: 0 })
+            .await
+            .unwrap();
+        let beta = inverted_list
+            .index_cache
+            .get_with_key(&PostingListKey { token_id: 1 })
+            .await
+            .unwrap();
+
+        let PostingList::Compressed(alpha) = alpha.as_ref() else {
+            panic!("expected compressed posting list for token 0");
+        };
+        let PostingList::Compressed(beta) = beta.as_ref() else {
+            panic!("expected compressed posting list for token 1");
+        };
+
+        assert_ne!(
+            alpha.blocks.values().as_ptr(),
+            beta.blocks.values().as_ptr(),
+            "prewarm should not leave cached posting lists sharing the same values buffer"
         );
     }
 

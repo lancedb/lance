@@ -2291,6 +2291,71 @@ mod tests {
         assert_eq!(before_scalar_result, after_scalar_result);
     }
 
+    // Regression test for https://github.com/lancedb/lance/issues/6161
+    // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
+    // file. Previously the file was silently dropped (temp file deleted) because
+    // tokio::io::AsyncWriteExt::shutdown was called instead of
+    // lance_io::traits::Writer::shutdown, which persists the temp file.
+    #[tokio::test]
+    async fn test_defer_index_remap_large_external_file() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Create ~150 fragments × 1000 rows to produce a FragReuseIndexDetails
+        // that exceeds the 204800-byte inline threshold (~302 KB serialized).
+        let num_fragments = 150usize;
+        let rows_per_fragment = 1000usize;
+        let total_rows = num_fragments * rows_per_fragment;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..total_rows as i32)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), num_fragments);
+
+        // Delete a few rows from each fragment so compaction has something to do.
+        dataset.delete("i % 1000 = 0").await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Loading the FragReuseIndex details must succeed even when the details
+        // were written to an external file.
+        let frag_reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist after compaction");
+
+        load_frag_reuse_index_details(&dataset, &frag_reuse_meta)
+            .await
+            .expect("loading large frag reuse index details must not fail");
+    }
+
     #[tokio::test]
     async fn test_defer_index_remap() {
         let mut data_gen = BatchGenerator::new()

@@ -500,11 +500,27 @@ impl Writer for ObjectWriter {
 }
 
 pub struct LocalWriter {
-    inner: tokio::io::BufWriter<tokio::fs::File>,
-    cursor: usize,
     path: Path,
+    state: LocalWriteState,
+}
+
+#[derive(Default)]
+enum LocalWriteState {
+    Writing(WritingState),
+    Finishing {
+        size: usize,
+        future: BoxFuture<'static, Result<WriteResult>>,
+    },
+    Done(WriteResult),
+    #[default]
+    Poisoned,
+}
+
+struct WritingState {
+    writer: tokio::io::BufWriter<tokio::fs::File>,
+    cursor: usize,
     /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
-    temp_path: Option<tempfile::TempPath>,
+    temp_path: tempfile::TempPath,
     io_tracker: Arc<IOTracker>,
 }
 
@@ -516,12 +532,56 @@ impl LocalWriter {
         io_tracker: Arc<IOTracker>,
     ) -> Self {
         Self {
-            inner: tokio::io::BufWriter::new(file),
-            cursor: 0,
             path,
-            temp_path: Some(temp_path),
-            io_tracker,
+            state: LocalWriteState::Writing(WritingState {
+                writer: tokio::io::BufWriter::new(file),
+                cursor: 0,
+                temp_path,
+                io_tracker,
+            }),
         }
+    }
+
+    fn already_closed_err(path: &Path) -> io::Error {
+        io::Error::other(format!(
+            "cannot write to LocalWriter for {} after shutdown",
+            path
+        ))
+    }
+
+    fn poisoned_err(path: &Path) -> io::Error {
+        io::Error::other(format!("LocalWriter for {} is in poisoned state", path))
+    }
+
+    async fn persist(
+        temp_path: tempfile::TempPath,
+        final_path: Path,
+        size: usize,
+        io_tracker: Arc<IOTracker>,
+    ) -> Result<WriteResult> {
+        let local_path = crate::local::to_local_path(&final_path);
+        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+            temp_path.persist(&local_path).map_err(|e| {
+                Error::io(format!(
+                    "failed to persist temp file to {}: {}",
+                    local_path, e.error
+                ))
+            })?;
+
+            let metadata = std::fs::metadata(&local_path).map_err(|e| {
+                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
+            })?;
+            Ok(get_etag(&metadata))
+        })
+        .await
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+
+        io_tracker.record_write("put", final_path, size as u64);
+
+        Ok(WriteResult {
+            size,
+            e_tag: Some(e_tag),
+        })
     }
 }
 
@@ -531,32 +591,82 @@ impl AsyncWrite for LocalWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            self.cursor += *n;
+        if let LocalWriteState::Writing(state) = &mut self.state {
+            let poll = Pin::new(&mut state.writer).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = &poll {
+                state.cursor += *n;
+            }
+            poll
+        } else {
+            Poll::Ready(Err(Self::already_closed_err(&self.path)))
         }
-        poll
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        if let LocalWriteState::Writing(state) = &mut self.state {
+            Pin::new(&mut state.writer).poll_flush(cx)
+        } else {
+            Poll::Ready(Err(Self::already_closed_err(&self.path)))
+        }
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let mut_self = &mut *self;
+        loop {
+            match &mut mut_self.state {
+                LocalWriteState::Writing(state) => {
+                    if Pin::new(&mut state.writer).poll_shutdown(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+
+                    // Write is complete, we can transition to persisting.
+                    let LocalWriteState::Writing(state) =
+                        std::mem::replace(&mut mut_self.state, LocalWriteState::Poisoned)
+                    else {
+                        unreachable!()
+                    };
+                    let size = state.cursor;
+                    mut_self.state = LocalWriteState::Finishing {
+                        size,
+                        future: Box::pin(Self::persist(
+                            state.temp_path,
+                            mut_self.path.clone(),
+                            size,
+                            state.io_tracker,
+                        )),
+                    };
+                }
+                LocalWriteState::Finishing { future, .. } => match future.poll_unpin(cx) {
+                    Poll::Ready(Ok(result)) => mut_self.state = LocalWriteState::Done(result),
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(io::Error::other(e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                LocalWriteState::Done(_) => return Poll::Ready(Ok(())),
+                LocalWriteState::Poisoned => {
+                    return Poll::Ready(Err(Self::poisoned_err(&self.path)));
+                }
+            }
+        }
     }
 }
 
 #[async_trait]
 impl Writer for LocalWriter {
     async fn tell(&mut self) -> Result<usize> {
-        Ok(self.cursor)
+        match &mut self.state {
+            LocalWriteState::Writing(state) => Ok(state.cursor),
+            LocalWriteState::Finishing { size, .. } => Ok(*size),
+            LocalWriteState::Done(result) => Ok(result.size),
+            LocalWriteState::Poisoned => Err(Self::poisoned_err(&self.path).into()),
+        }
     }
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
@@ -567,34 +677,10 @@ impl Writer for LocalWriter {
             ))
         })?;
 
-        let final_path = crate::local::to_local_path(&self.path);
-        let temp_path = self.temp_path.take().ok_or_else(|| {
-            Error::io(format!("local writer for {} already shut down", self.path))
-        })?;
-        let path_clone = self.path.clone();
-        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&final_path).map_err(|e| {
-                Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    final_path, e.error
-                ))
-            })?;
-
-            let metadata = std::fs::metadata(&final_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", path_clone, e))
-            })?;
-            Ok(get_etag(&metadata))
-        })
-        .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
-
-        self.io_tracker
-            .record_write("put", self.path.clone(), self.cursor as u64);
-
-        Ok(WriteResult {
-            size: self.cursor,
-            e_tag: Some(e_tag),
-        })
+        match &self.state {
+            LocalWriteState::Done(result) => Ok(result.clone()),
+            _ => unreachable!(),
+        }
     }
 }
 

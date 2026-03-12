@@ -166,7 +166,7 @@ impl Shuffler for IvfShuffler {
             .buffered(get_num_compute_intensive_cpus());
 
         let mut total_loss = 0.0;
-        let mut counter: u64 = 0;
+        let mut num_rows = 0u64;
         while let Some(shuffled) = parallel_sort_stream.next().await {
             let (shuffled, loss) = shuffled?;
             total_loss += loss;
@@ -175,14 +175,15 @@ impl Shuffler for IvfShuffler {
             for (part_id, (writer, batches)) in writers.iter_mut().zip(shuffled.iter()).enumerate()
             {
                 if !batches.is_empty() {
-                    partition_sizes[part_id] += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                    let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                    partition_sizes[part_id] += rows;
+                    num_rows += rows as u64;
                     futs.push(writer.write_batches(batches.iter()));
                 }
             }
             try_join_all(futs).await?;
 
-            counter += 1;
-            self.progress.stage_progress("shuffle", counter).await?;
+            self.progress.stage_progress("shuffle", num_rows).await?;
         }
 
         // finish all writers

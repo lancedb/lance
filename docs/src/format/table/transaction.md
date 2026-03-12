@@ -52,6 +52,12 @@ The authoritative specification for transaction types is defined in [`protos/tra
 Each transaction contains a `read_version` field indicating the table version from which the transaction was built,
 a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types:
 
+In the following section, we will describe each transaction type and its compatibility with other transaction types. This
+compatibility is not always bi-directional. We are describing it from the perspective of the operation being committed. For example, we say that an Append is not compatible with an Overwrite which means that if we are trying to commit an Append, and an
+Overwrite has already been committed (since we started the Append), then the Append will fail. On the other hand, when describing the
+Overwrite operation, we say that it does not conflict with Append. This is because, if we are trying to commit an Overwrite, and an
+Append operation has occurred in the meantime, we still allow the Overwrite to proceed.
+
 ### Append
 
 Adds new fragments to the table without modifying existing data.
@@ -65,6 +71,16 @@ Fragment IDs are not assigned at transaction creation time; they are assigned du
 ```
 
 </details>
+
+#### Append Compatibility
+
+The append operation is one of the most common operations and is designed to be compatible with most other operations, even
+itself. This is to ensure that multiple writers can append without worry about conflicts. These are the operations
+that conflict with append:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
 
 ### Delete
 
@@ -81,6 +97,30 @@ The `predicate` field stores the deletion condition, enabling conflict detection
 
 </details>
 
+#### Delete Compatibility
+
+Delete modifies an existing fragment, so there may be conflicts with other operations on overlapping fragments.
+Generally these conflicts are rebaseable or retryable.
+
+These are the operations that conflict with delete:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+
+These operations conflict with delete but can be retried:
+
+- Merge (only if there are overlapping fragments)
+- Rewrite (only if there are overlapping fragments)
+- DataReplacement (only if there are overlapping fragments)
+
+These operations conflict with delete but can potentially be rebased. The deletion
+masks from the two operations will be merged. However, if both operations modified
+the same rows, then the conflict becomes a retryable conflict.
+
+- Delete
+- Update
+
 ### Overwrite
 
 Creates or completely overwrites the table with new data, schema, and configuration.
@@ -94,6 +134,18 @@ Creates or completely overwrites the table with new data, schema, and configurat
 
 </details>
 
+#### Overwrite Compatibility
+
+An overwrite operation completely overwrites the table. Generally, we do not care what has happened since
+the read version.
+
+However, the overwrite does not necessarily rewrite the table config. As a result, we consider the following
+to be retryable conflicts:
+
+- UpdateConfig (only if the two operations modify the same config key)
+- Overwrite (always)
+- UpdateMemWalState (always)
+
 ### CreateIndex
 
 Adds, replaces, or removes secondary indices (vector indices, scalar indices, full-text search indices).
@@ -106,6 +158,40 @@ Adds, replaces, or removes secondary indices (vector indices, scalar indices, fu
 ```
 
 </details>
+
+#### CreateIndex Compatibility
+
+Indexes record which fragments are covered by the index and we don't require all fragments be covered. As a result, it
+is typically ok for an index to be created concurrently with the addition of new fragments. These new fragments will simply
+be unindexed.
+
+Updates and deletes are also compatible with index creation. This is because it is ok for an index to refer to deleted rows.
+Those results will be filtered out after the index search. If an update occurs then the old value will be filtered out and the
+new value will be considered part of the unindexed set.
+
+If two CreateIndex operations are committed concurrently then it is allowed. If the indexes have different names this is no
+problem. If the indexes have the same name then the second operation will win and replace the first.
+
+These operations conflict with index creation:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+
+Data replacement operations will conflict with index creation if the column being replaced is being indexed. Rewrite operations
+will conflict with index creation if the rewritten fragments are covered by the index. This is because an index refers to row
+addresses and the rewrite operation changes the row addresses. However, if a fragment reuse index is being used, or if the stable
+row ids feature is enable, then the rewrite operation is compatible with index creation. As a result, these are the operations
+that are retryable conflicts with index creation:
+
+- Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)
+- DataReplacement (only if overlapping fragments and the column being replaced is being indexed)
+
+Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
+between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
+As a result, these are the operations that are rebaseable conflicts with index creation:
+
+- CreateIndex (only if both operations are modifying the same singleton index)
 
 ### Rewrite
 
@@ -123,6 +209,38 @@ New fragment IDs must be reserved via `ReserveFragments` before executing a `Rew
 
 </details>
 
+#### Rewrite Compatibility
+
+Rewrite operations do not change data but they can materialize deletions and they do replace fragments. As a result,
+they can potentially conflict with other operations that modify the fragments being rewritten.
+
+These are the operations that conflict with rewrite:
+
+- Overwrite
+- Restore
+
+Rewrite is not compatible with CreateIndex by default because the operation will change the row addresses that the CreateIndex
+refers to. However, a fragment reuse index or the stable row ids feature can allow these operations to be compatible.
+
+Several operations modify existing fragments. As a result, they can potentially conflict with Rewrite if they modify
+the same fragments. However, Merge is [overly general](#overly-general-operation) and so no conflict detection is possible.
+As a result, here are the operations that are retryable conflicts with Rewrite:
+
+- Merge (always)
+- DataReplacement (only if overlapping fragments)
+- Delete (only if overlapping fragments)
+- Update (only if overlapping fragments)
+- Rewrite (if overlapping fragments or both carry a fragment reuse index)
+- CreateIndex (overlapping fragments and no fragment reuse index or stable row ids)
+
+There is one case where a Rewrite will rebase. This is when the Rewrite operation has a fragment reuse index and there is
+a CreateIndex operation that is writing the fragment reuse index. In this case the Rewrite will rebase and update its
+fragment reuse index to include the conflicting fragment reuse index.
+
+As a result, these are the operations that are rebaseable conflicts with Rewrite:
+
+- CreateIndex (if the CreateIndex is writing the fragment reuse index and the Rewrite is carrying a fragment reuse index)
+
 ### Merge
 
 Adds new columns to the table, modifying the schema.
@@ -136,6 +254,31 @@ All fragments must be updated to include the new columns.
 ```
 
 </details>
+
+#### Overly General Operation
+
+The Merge operation is a very generic operation. The set of fragments provided in the operation will be the final set of
+fragments in the resulting dataset. As a result, it has a high potential for conflicts with other operations. If possible,
+more restrictive operations such as Rewrite, DataReplacement, or Append should be preferred over Merge.
+
+#### Merge Compatibility
+
+As mentioned above, Merge is a very generic operation, as a result it has a high potential for conflicts with other operations.
+The following operations conflict with Merge:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+- Project
+
+These operations are retryable conflicts with Merge:
+
+- Update (always)
+- Append (always)
+- Delete (always)
+- Merge (always)
+- Rewrite (always)
+- DataReplacement (always)
 
 ### Project
 
@@ -151,6 +294,23 @@ This is a metadata-only operation; data files are not modified.
 
 </details>
 
+#### Project Compatibility
+
+Since project only modifies the schema, it is compatible with most other operations. However, it is not compatible with Merge
+because the Merge operation modifies the schema (can potentially add columns) and the logic to rebase those changes does not
+currently exist (project is cheap and easy enough to retry).
+
+These are the operations that conflict with Project:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+
+The following operations are retryable conflicts with Project:
+
+- Project (always)
+- Merge (always)
+
 ### Restore
 
 Reverts the table to a previous version.
@@ -163,6 +323,13 @@ Reverts the table to a previous version.
 ```
 
 </details>
+
+#### Restore Compatibility
+
+The Restore operation reverts the table to a previous version. It's generally assumed this trumps any
+other operation. Here are the operations that conflict with Restore:
+
+- UpdateMemWalState
 
 ### ReserveFragments
 
@@ -177,6 +344,14 @@ This allows rewrite operations to reference fragment IDs before the rewrite tran
 ```
 
 </details>
+
+#### ReserveFragments Compatibility
+
+The ReserveFragments operation is fairly trivial. The only thing it changes is the max fragment id. So this
+only conflicts with operations that modify the max fragment id. Here are the operations that conflict with ReserveFragments:
+
+- Overwrite
+- Restore
 
 ### Clone
 
@@ -193,6 +368,11 @@ Deep clones are full copies using object storage native copy operations (e.g., S
 
 </details>
 
+#### Clone Compatibility
+
+The Clone operation can only be the first operation in a dataset. If there is an existing dataset, then the Clone operation will fail.
+As a result, there is no such thing as a conflict with Clone.
+
 ### Update
 
 Modifies row values without adding or removing rows.
@@ -207,6 +387,27 @@ Supports two execution modes: REWRITE_ROWS deletes rows in current fragments and
 
 </details>
 
+#### Update Compatibility
+
+Here are the operations that conflict with Update:
+
+- Overwrite
+- Restore
+
+An update operation is both a delete and an append operation. Like a Delete operation, it will modify fragments to change
+the deletion mask. As a result, there will be a retryable conflict with other operations that modify the same fragments.
+Here are the operations that are retryable conflicts with Update:
+
+- Rewrite (only if overlapping fragments)
+- DataReplacement (only if overlapping fragments)
+- Merge (always)
+
+Similar to Delete, the Update operation can rebase other modifications to the deletion mask. Here are the operations that
+are rebaseable conflicts with Update:
+
+- Delete
+- Update
+
 ### UpdateConfig
 
 Modifies table configuration, table metadata, schema metadata, or field metadata without changing data.
@@ -220,6 +421,14 @@ Modifies table configuration, table metadata, schema metadata, or field metadata
 
 </details>
 
+#### UpdateConfig Compatibility
+
+An UpdateConfig operation only modifies table config and tends to be compatible with other operations. Here
+are the operations that conflict with UpdateConfig:
+
+- Overwrite
+- UpdateConfig (only if the two operations modify the same config)
+
 ### DataReplacement
 
 Replaces data in specific column regions with new data files.
@@ -232,6 +441,21 @@ Replaces data in specific column regions with new data files.
 ```
 
 </details>
+
+#### DataReplacement Compatibility
+
+A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
+or Update operations. Here are the operations that conflict with DataReplacement:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+
+The following operations are retryable conflicts with DataReplacement:
+
+- DataReplacement (only if same field and overlapping fragments)
+- CreateIndex (only if the field being replaced is being indexed)
+- Rewrite (only if overlapping fragments)
 
 ### UpdateMemWalState
 
@@ -258,6 +482,12 @@ Adds new base paths to the table, enabling reference to data files in additional
 ```
 
 </details>
+
+#### UpdateBases Compatibility
+
+An UpdateBases operation only modifies the base paths. As a result, it only conflicts with other
+UpdateBases operations and even then only conflicts if the two operations have base paths with the
+same id, name, or path.
 
 ## Conflict Resolution
 
@@ -383,7 +613,6 @@ In this scenario:
 - The commit fails with a non-retryable error
 - If the caller retries the deletion operation against version 4, it would either delete nothing (if those rows don't exist in v1) or delete different rows (if similar row IDs exist in v1), producing semantically different results than originally intended
 
-
 ## External Manifest Store
 
 If the backing object store does not support atomic operations (rename-if-not-exists or put-if-not-exists), an external manifest store can be used to enable concurrent writers.
@@ -399,21 +628,21 @@ The commit process follows a four-step protocol:
 ![External Store Commit Process](../../images/external_store_commit.gif)
 
 1. **Stage manifest**: `PUT_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid}`
-    - Write the new manifest to object storage under a unique path determined by a new UUID
-    - This staged manifest is not yet visible to readers
+   - Write the new manifest to object storage under a unique path determined by a new UUID
+   - This staged manifest is not yet visible to readers
 
 2. **Commit to external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
-    - Atomically commit the path of the staged manifest to the external store using put-if-not-exists
-    - The commit is effectively complete after this step
-    - If this operation fails due to conflict, another writer has committed this version
+   - Atomically commit the path of the staged manifest to the external store using put-if-not-exists
+   - The commit is effectively complete after this step
+   - If this operation fails due to conflict, another writer has committed this version
 
 3. **Finalize in object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
-    - Copy the staged manifest to the final path
-    - This makes the manifest discoverable by readers unaware of the external store
+   - Copy the staged manifest to the final path
+   - This makes the manifest discoverable by readers unaware of the external store
 
 4. **Update external store pointer**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-    - Update the external store to point to the finalized manifest path
-    - Completes the synchronization between external store and object storage
+   - Update the external store to point to the finalized manifest path
+   - Completes the synchronization between external store and object storage
 
 **Fault Tolerance:**
 
@@ -428,20 +657,20 @@ The reader follows a validation and synchronization protocol:
 ![External Store Reader Process](../../images/external_store_reader.gif)
 
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
-    - Retrieve the manifest path for the requested version
-    - If the path does not end with a UUID, return it directly (synchronization complete)
-    - If the path ends with a UUID, synchronization is required
+   - Retrieve the manifest path for the requested version
+   - If the path does not end with a UUID, return it directly (synchronization complete)
+   - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
-    - Attempt to finalize the staged manifest
-    - This operation is idempotent
+   - Attempt to finalize the staged manifest
+   - This operation is idempotent
 
 3. **Update external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-    - Update the external store to reflect the finalized path
-    - Future readers will see the synchronized state
+   - Update the external store to reflect the finalized path
+   - Future readers will see the synchronized state
 
 4. **Return finalized path**: Return `{dataset}/_versions/{version}.manifest`
-    - Always return the finalized path
-    - If synchronization fails, return an error to prevent reading inconsistent state
+   - Always return the finalized path
+   - If synchronization fails, return an error to prevent reading inconsistent state
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.
