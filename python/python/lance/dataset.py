@@ -2608,11 +2608,13 @@ class LanceDataset(pa.dataset.Dataset):
             True.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
-            If set, Lance divides this budget evenly across FTS workers. By default
-            Lance uses roughly ``num_cpus / 2`` workers unless
-            ``LANCE_FTS_NUM_SHARDS`` is set. If unset, each worker defaults to a
-            2 GiB build-time memory limit. This parameter is only used for the
+            If set, Lance divides this budget evenly across the workers. If unset, 
+            the default will be 2 GiB per worker. This parameter is only used for the
             current build and is not persisted with the index.
+            
+            A larger memory limit will create an index with fewer shards which will
+            be easier to search so this is a trade-off between build resources and
+            search cost.
         num_workers: int, optional
             This is for the ``INVERTED`` index. Number of FTS workers to use for
             the current build. The effective worker count is clamped to
