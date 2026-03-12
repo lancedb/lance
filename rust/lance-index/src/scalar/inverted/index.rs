@@ -2010,7 +2010,7 @@ impl CompressedDocPositions {
 #[derive(Debug)]
 pub struct PostingListBuilder {
     encoded_blocks: Option<Box<EncodedBlocks>>,
-    positions: Option<Box<Vec<CompressedDocPositions>>>,
+    positions: Option<Vec<CompressedDocPositions>>,
     tail_entries: Vec<RawDocInfo>,
     memory_size_bytes: u32,
     len: u32,
@@ -2060,7 +2060,7 @@ impl PostingListBuilder {
         }
         if let PositionRecorder::Position(positions_in_doc) = term_positions {
             if self.positions.is_none() {
-                self.positions = Some(Box::default());
+                self.positions = Some(Vec::new());
                 self.add_memory_bytes(std::mem::size_of::<Vec<CompressedDocPositions>>());
             }
             let positions = self.positions.as_mut().expect("positions must exist");
@@ -2169,7 +2169,7 @@ impl PostingListBuilder {
     }
 
     fn build_positions_column(
-        positions: Option<&Vec<CompressedDocPositions>>,
+        positions: Option<&[CompressedDocPositions]>,
         len: usize,
     ) -> Result<Option<ArrayRef>> {
         let Some(positions) = positions else {
@@ -2307,7 +2307,7 @@ impl PostingListBuilder {
 
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let schema = inverted_list_schema(self.has_positions());
-        let PostingListBuilder {
+        let Self {
             encoded_blocks,
             positions,
             tail_entries,
@@ -2321,7 +2321,7 @@ impl PostingListBuilder {
             tail_entries.as_slice(),
             block_max_scores.into_iter(),
         )?;
-        let builder = PostingListBuilder {
+        let builder = Self {
             encoded_blocks: None,
             positions,
             tail_entries: Vec::new(),
@@ -2332,7 +2332,7 @@ impl PostingListBuilder {
     }
 
     pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
-        let PostingListBuilder {
+        let Self {
             encoded_blocks,
             positions,
             tail_entries,
@@ -2348,7 +2348,7 @@ impl PostingListBuilder {
             tail_entries.as_slice(),
             docs,
         )?;
-        let builder = PostingListBuilder {
+        let builder = Self {
             encoded_blocks: None,
             positions,
             tail_entries: Vec::new(),

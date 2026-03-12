@@ -89,7 +89,7 @@ pub fn compress_posting_list<'a>(
     Ok(builder.finish())
 }
 
-pub(crate) fn encode_full_posting_block_into(
+pub fn encode_full_posting_block_into(
     doc_ids: &[u32],
     frequencies: &[u32],
     block: &mut Vec<u8>,
@@ -103,7 +103,7 @@ pub(crate) fn encode_full_posting_block_into(
     Ok(())
 }
 
-pub(crate) fn encode_remainder_posting_block_into(
+pub fn encode_remainder_posting_block_into(
     doc_ids: &[u32],
     frequencies: &[u32],
     block: &mut Vec<u8>,
@@ -245,7 +245,7 @@ pub fn decompress_posting_remainder(
     decompress_remainder(&block[n * 4..], n, frequencies);
 }
 
-pub(crate) fn decode_full_posting_block(
+pub fn decode_full_posting_block(
     block: &[u8],
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,

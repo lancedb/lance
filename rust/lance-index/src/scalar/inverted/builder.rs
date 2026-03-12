@@ -563,8 +563,8 @@ impl InnerBuilder {
         Ok(())
     }
 
-    pub fn merge_from(&mut self, other: InnerBuilder) -> Result<()> {
-        let InnerBuilder {
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        let Self {
             id: _,
             with_position,
             token_set_format,
