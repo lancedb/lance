@@ -692,9 +692,12 @@ impl BlobFile {
         let position = self.position;
         let size = self.size;
         self.do_with_reader(|cursor, reader| async move {
+            if cursor >= size {
+                return Ok((size, bytes::Bytes::new()));
+            }
             let start = position as usize + cursor as usize;
             let end = (position + size) as usize;
-            Ok((end as u64, reader.get_range(start..end).await?))
+            Ok((size, reader.get_range(start..end).await?))
         })
         .await
     }
@@ -707,6 +710,9 @@ impl BlobFile {
         let position = self.position;
         let size = self.size;
         self.do_with_reader(|cursor, reader| async move {
+            if cursor >= size || len == 0 {
+                return Ok((size.min(cursor), bytes::Bytes::new()));
+            }
             let start = position as usize + cursor as usize;
             let read_size = len.min((size - cursor) as usize);
             let end = start + read_size;
@@ -1120,12 +1126,18 @@ mod tests {
     use arrow_array::RecordBatch;
     use arrow_array::{RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use futures::TryStreamExt;
     use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, DataTypeExt};
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
+    use object_store::{
+        GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    };
+    use url::Url;
 
     use lance_core::{
         Error, Result,
@@ -1134,7 +1146,7 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::version::LanceFileVersion;
 
-    use super::data_file_key_from_path;
+    use super::{BlobFile, data_file_key_from_path};
     use crate::{
         Dataset,
         blob::{BlobArrayBuilder, blob_field},
@@ -1152,6 +1164,119 @@ mod tests {
         _test_dir: TempDir,
         dataset: Arc<Dataset>,
         expected: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct RejectEmptyRangeObjectStore;
+
+    impl std::fmt::Display for RejectEmptyRangeObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RejectEmptyRangeObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
+        async fn put(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!("put is not used by these tests")
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+            _opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!("put_opts is not used by these tests")
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!("put_multipart is not used by these tests")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!("put_multipart_opts is not used by these tests")
+        }
+
+        async fn get(&self, _location: &Path) -> object_store::Result<GetResult> {
+            Err(object_store::Error::NotSupported {
+                source: "get is not used by these tests".into(),
+            })
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let Some(GetRange::Bounded(range)) = options.range else {
+                unreachable!("blob reads should always request a bounded range")
+            };
+            if range.start == range.end {
+                return Err(object_store::Error::Generic {
+                    store: "RejectEmptyRangeObjectStore",
+                    source: format!(
+                        "Range started at {} and ended at {}",
+                        range.start, range.end
+                    )
+                    .into(),
+                });
+            }
+            Err(object_store::Error::NotSupported {
+                source: format!("unexpected non-empty range {range:?} for {location}").into(),
+            })
+        }
+
+        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+            unimplemented!("delete is not used by these tests")
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            unimplemented!("list is not used by these tests")
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            unimplemented!("list_with_delimiter is not used by these tests")
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!("copy is not used by these tests")
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!("copy_if_not_exists is not used by these tests")
+        }
+    }
+
+    fn reject_empty_range_store() -> Arc<ObjectStore> {
+        Arc::new(ObjectStore::new(
+            Arc::new(RejectEmptyRangeObjectStore) as Arc<dyn object_store::ObjectStore>,
+            Url::parse("mock:///blob-tests").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ))
     }
 
     impl BlobTestFixture {
@@ -1516,6 +1641,32 @@ mod tests {
         let second = blobs[1].read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_read_empty_range_returns_empty_bytes() {
+        let store = reject_empty_range_store();
+        let path = Path::from("blobs/test.bin");
+
+        let empty_blob = BlobFile::new_packed(store.clone(), path.clone(), 1, 0);
+        assert!(empty_blob.read().await.unwrap().is_empty());
+        assert!(empty_blob.read_up_to(16).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_read_tracks_relative_cursor() {
+        let test_dir = TempDir::default();
+        let file_path = test_dir.std_path().join("blob.bin");
+        std::fs::write(&file_path, b"abcd").unwrap();
+
+        let path = Path::from_absolute_path(file_path).unwrap();
+        let blob = BlobFile::new_packed(Arc::new(ObjectStore::local()), path, 1, 2);
+
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"bc");
+        assert_eq!(blob.tell().await.unwrap(), 2);
+        assert!(blob.read().await.unwrap().is_empty());
+        assert!(blob.read_up_to(1).await.unwrap().is_empty());
+        assert_eq!(blob.tell().await.unwrap(), 2);
     }
 
     #[tokio::test]
