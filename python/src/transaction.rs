@@ -11,7 +11,9 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::format::{
+    BasePath, DataFile, Fragment, IndexMetadata, IndexSegmentLifecycle,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -54,6 +56,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         }))
     }
 }

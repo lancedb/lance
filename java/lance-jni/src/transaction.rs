@@ -24,7 +24,7 @@ use lance::dataset::transaction::{
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance::table::format::{Fragment, IndexMetadata};
+use lance::table::format::{Fragment, IndexMetadata, IndexSegmentLifecycle};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
@@ -214,6 +214,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             index_version,
             created_at,
             base_id,
+            segment_lifecycle: IndexSegmentLifecycle::Sealed,
         })
     }
 }
