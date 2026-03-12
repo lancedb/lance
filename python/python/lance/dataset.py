@@ -2616,9 +2616,9 @@ class LanceDataset(pa.dataset.Dataset):
             be easier to search so this is a trade-off between build resources and
             search cost.
         num_workers: int, optional
-            This is for the ``INVERTED`` index. Number of FTS workers to use for
+            This is for the ``INVERTED`` index. Number of workers to use for
             the current build. The effective worker count is clamped to
-            ``[1, num_cpus - 2]``. If unset, Lance uses roughly ``num_cpus / 2``
+            ``[1, num_compute_cpus]``. If unset, Lance uses ``num_compute_cpus``
             workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
             only used for the current build and is not persisted with the index.
         base_tokenizer: str, default "simple"
