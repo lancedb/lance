@@ -61,14 +61,40 @@ impl AsyncScanner {
         }
     }
 
-    /// Start an async scan task
-    pub fn start_scan(&self, task_id: u64, scanner_global_ref: jni::objects::GlobalRef) {
-        let scanner = self.inner.clone();
-        // Clone the global ref so the spawned task has its own copy
-        // This prevents race condition where task completes before registration
+    /// Start an async scan task (static method to avoid holding locks)
+    pub fn start_scan_with_scanner(
+        scanner: Arc<Scanner>,
+        task_id: u64,
+        scanner_global_ref: jni::objects::GlobalRef,
+    ) {
+        // Two-phase registration to prevent race condition:
+        // 1. Pre-register with placeholder handle BEFORE spawning
+        // 2. Spawn the actual task
+        // 3. Update registration with real handle
+        // This ensures task is registered before cleanup can run
+
+        // Clone for the spawned task
         let global_ref_for_task = scanner_global_ref.clone();
 
-        // Spawn Tokio task for async I/O
+        // Step 1: Pre-register with placeholder handle
+        let placeholder_handle = RT.spawn(async {
+            // Placeholder task that does nothing
+            // Will be aborted when real handle is registered
+        });
+
+        RT.block_on(async {
+            TASK_TRACKER
+                .register(
+                    task_id,
+                    TaskInfo {
+                        scanner_global_ref: scanner_global_ref.clone(),
+                        cancel_handle: placeholder_handle,
+                    },
+                )
+                .await;
+        });
+
+        // Step 2: Spawn the actual task
         let handle = RT.spawn(async move {
             // RAII guard ensures cleanup on normal exit, panic, or cancellation
             let _cleanup_guard = TaskCleanupGuard::new(task_id);
@@ -88,27 +114,32 @@ impl AsyncScanner {
             };
 
             // Send result to dispatcher for Java completion
-            let dispatcher = DISPATCHER.get().expect("Dispatcher not initialized");
-            let _ = dispatcher.send(DispatcherMessage {
+            let dispatcher = match DISPATCHER.get() {
+                Some(d) => d,
+                None => {
+                    log::error!(
+                        "Dispatcher not initialized - cannot complete task {}. \
+                         This indicates a critical initialization failure.",
+                        task_id
+                    );
+                    return; // Task will never complete, but won't crash JVM
+                }
+            };
+
+            if let Err(e) = dispatcher.send(DispatcherMessage {
                 scanner_global_ref: global_ref_for_task,
                 task_id,
                 result,
-            });
+            }) {
+                log::error!("Failed to send completion message for task {}: {}", task_id, e);
+            }
 
             // _cleanup_guard.drop() called here automatically, removing task from tracker
         });
 
-        // Register task for cancellation support
+        // Step 3: Update registration with real handle
         RT.block_on(async {
-            TASK_TRACKER
-                .register(
-                    task_id,
-                    TaskInfo {
-                        scanner_global_ref,
-                        cancel_handle: handle,
-                    },
-                )
-                .await;
+            TASK_TRACKER.update_handle(task_id, handle).await;
         });
     }
 }
@@ -233,10 +264,15 @@ fn inner_start_scan(env: &mut JNIEnv, j_scanner: JObject, task_id: u64) -> Resul
     // Create global reference first, before borrowing scanner
     let scanner_global_ref = env.new_global_ref(&j_scanner)?;
 
-    let scanner_guard =
-        unsafe { env.get_rust_field::<_, _, AsyncScanner>(&j_scanner, NATIVE_ASYNC_SCANNER)? };
+    // Clone the Arc<Scanner> and drop the MutexGuard before calling start_scan,
+    // which does block_on internally. Holding the guard across block_on risks deadlock.
+    let scanner = {
+        let guard =
+            unsafe { env.get_rust_field::<_, _, AsyncScanner>(&j_scanner, NATIVE_ASYNC_SCANNER)? };
+        guard.inner.clone()
+    };
 
-    scanner_guard.start_scan(task_id, scanner_global_ref);
+    AsyncScanner::start_scan_with_scanner(scanner, task_id, scanner_global_ref);
     Ok(())
 }
 

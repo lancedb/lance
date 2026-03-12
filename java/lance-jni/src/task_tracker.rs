@@ -33,6 +33,26 @@ impl TaskTracker {
         tasks.insert(task_id, info);
     }
 
+    /// Update the cancel handle for a task (used in two-phase registration)
+    /// Returns true if task was found and updated, false if task already completed
+    pub async fn update_handle(
+        &self,
+        task_id: TaskId,
+        cancel_handle: tokio::task::JoinHandle<()>,
+    ) -> bool {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task_info) = tasks.get_mut(&task_id) {
+            // Abort the old placeholder handle and replace with real handle
+            task_info.cancel_handle.abort();
+            task_info.cancel_handle = cancel_handle;
+            true
+        } else {
+            // Task already completed before we could update - abort the handle
+            cancel_handle.abort();
+            false
+        }
+    }
+
     /// Mark a task as complete and return its info
     pub async fn complete(&self, task_id: TaskId) -> Option<TaskInfo> {
         let mut tasks = self.tasks.write().await;
