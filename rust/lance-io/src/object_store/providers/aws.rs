@@ -447,6 +447,11 @@ impl ObjectStoreParams {
 /// AWS-specific credentials that can be used with S3. All caching and refresh logic
 /// is handled by the accessor.
 ///
+/// When the accessor returns storage options that do not contain explicit
+/// credentials (e.g. because the namespace layer stripped credential keys),
+/// this provider falls back to the default AWS credentials chain
+/// (environment variables, instance profile, etc.).
+///
 /// # Future Work
 ///
 /// TODO: Support AWS/GCP/Azure together in a unified credential provider.
@@ -456,6 +461,8 @@ impl ObjectStoreParams {
 /// See: <https://github.com/lance-format/lance/pull/4905#discussion_r2474605265>
 pub struct DynamicStorageOptionsCredentialProvider {
     accessor: Arc<StorageOptionsAccessor>,
+    /// Lazily-initialized fallback for when storage options lack credentials.
+    default_chain: RwLock<Option<Arc<dyn ProvideCredentials>>>,
 }
 
 impl fmt::Debug for DynamicStorageOptionsCredentialProvider {
@@ -469,7 +476,10 @@ impl fmt::Debug for DynamicStorageOptionsCredentialProvider {
 impl DynamicStorageOptionsCredentialProvider {
     /// Create a new credential provider from a storage options accessor
     pub fn new(accessor: Arc<StorageOptionsAccessor>) -> Self {
-        Self { accessor }
+        Self {
+            accessor,
+            default_chain: RwLock::new(None),
+        }
     }
 
     /// Create a new credential provider from a storage options provider
@@ -483,6 +493,7 @@ impl DynamicStorageOptionsCredentialProvider {
     pub fn from_provider(provider: Arc<dyn StorageOptionsProvider>) -> Self {
         Self {
             accessor: Arc::new(StorageOptionsAccessor::with_provider(provider)),
+            default_chain: RwLock::new(None),
         }
     }
 
@@ -504,7 +515,26 @@ impl DynamicStorageOptionsCredentialProvider {
                 initial_options,
                 provider,
             )),
+            default_chain: RwLock::new(None),
         }
+    }
+
+    /// Get or lazily initialize the default AWS credentials chain.
+    async fn get_default_chain(&self) -> Arc<dyn ProvideCredentials> {
+        {
+            let cached = self.default_chain.read().await;
+            if let Some(chain) = &*cached {
+                return chain.clone();
+            }
+        }
+        let mut guard = self.default_chain.write().await;
+        if let Some(chain) = &*guard {
+            return chain.clone();
+        }
+        let chain: Arc<dyn ProvideCredentials> =
+            Arc::new(DefaultCredentialsChain::builder().build().await);
+        *guard = Some(chain.clone());
+        chain
     }
 }
 
@@ -521,20 +551,39 @@ impl CredentialProvider for DynamicStorageOptionsCredentialProvider {
         })?;
 
         let s3_options = storage_options.as_s3_options();
-        let static_creds = extract_static_s3_credentials(&s3_options).ok_or_else(|| {
-            object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: "Missing required credentials in storage options".into(),
-            }
-        })?;
 
-        static_creds
-            .get_credential()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: Box::new(e),
-            })
+        if let Some(static_creds) = extract_static_s3_credentials(&s3_options) {
+            return static_creds
+                .get_credential()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "DynamicStorageOptionsCredentialProvider",
+                    source: Box::new(e),
+                });
+        }
+
+        // Fall back to the default AWS credentials chain when storage options
+        // do not contain explicit credentials (e.g. credential keys may have
+        // been stripped by the namespace layer).
+        log::debug!(
+            "Storage options from provider do not contain explicit AWS credentials, \
+             falling back to default AWS credentials chain."
+        );
+        let chain = self.get_default_chain().await;
+        let creds =
+            chain
+                .provide_credentials()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "DynamicStorageOptionsCredentialProvider",
+                    source: Box::new(e),
+                })?;
+
+        Ok(Arc::new(ObjectStoreAwsCredential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(|s| s.to_string()),
+        }))
     }
 }
 
@@ -1174,5 +1223,60 @@ mod tests {
 
         // Storage options provider should have been called once
         assert_eq!(mock_storage_provider.get_call_count().await, 1);
+    }
+
+    /// A mock provider that returns storage options containing only
+    /// non-credential configuration (region, endpoint), simulating what a
+    /// client receives after credential keys have been stripped by the
+    /// namespace layer.
+    #[derive(Debug)]
+    struct MockNoCredStorageOptionsProvider;
+
+    #[async_trait::async_trait]
+    impl StorageOptionsProvider for MockNoCredStorageOptionsProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            Ok(Some(HashMap::from([
+                ("aws_region".to_string(), "us-west-2".to_string()),
+                (
+                    "aws_endpoint".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+            ])))
+        }
+
+        fn provider_id(&self) -> String {
+            "MockNoCredStorageOptionsProvider".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_credential_provider_falls_back_to_default_chain() {
+        // Create an accessor with a provider that returns NO credentials
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            MockNoCredStorageOptionsProvider,
+        )));
+        let provider = DynamicStorageOptionsCredentialProvider::new(accessor);
+
+        // get_credential should succeed by falling back to the default AWS
+        // chain instead of returning an error about missing credentials.
+        let result = provider.get_credential().await;
+
+        // The default chain may or may not find credentials depending on the
+        // test environment. The key assertion is that we don't get the old
+        // "Missing required credentials in storage options" error — the
+        // fallback to the default chain must be attempted.
+        match result {
+            Ok(_) => {
+                // Default chain found credentials in the environment
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Missing required credentials"),
+                    "Should fall back to default chain, not error about missing credentials. Got: {}",
+                    err_msg
+                );
+            }
+        }
     }
 }

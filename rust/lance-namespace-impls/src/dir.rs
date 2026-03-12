@@ -45,6 +45,70 @@ use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
 
+/// Credential-related storage option keys that are stripped before returning
+/// storage options to clients. This prevents leaking stale or expired
+/// credentials; clients should resolve credentials through their own
+/// credential chain or a configured credential vendor.
+///
+/// Key names correspond to the config keys accepted by the `object_store`
+/// crate providers (`AmazonS3ConfigKey`, `AzureConfigKey`, `GoogleConfigKey`)
+/// and the custom `google_storage_token` bearer-token key used in
+/// `lance-io`'s GCP provider.
+const CREDENTIAL_KEYS: &[&str] = &[
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "access_key_id",
+    "secret_access_key",
+    "session_token",
+    "azure_storage_account_key",
+    "azure_storage_sas_token",
+    "azure_storage_client_id",
+    "azure_storage_client_secret",
+    "google_service_account_key",
+    "google_service_account",
+    "google_storage_token",
+];
+
+/// Check if a storage option key is a credential key (case-insensitive).
+fn is_credential_key(key: &str) -> bool {
+    CREDENTIAL_KEYS
+        .iter()
+        .any(|ck| ck.eq_ignore_ascii_case(key))
+}
+
+/// Return a copy of `storage_options` with credential keys removed.
+///
+/// When there is no credential vendor, raw storage options may contain
+/// stale or expired credentials that were valid at namespace initialization
+/// but should not be handed to clients. Stripping credential keys preserves
+/// configuration (endpoint, region, etc.) while letting the client resolve
+/// credentials through its own credential chain.
+///
+/// Returns `None` if no options remain after filtering (or if input is `None`).
+pub(crate) fn strip_credential_options(
+    storage_options: &Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    storage_options
+        .as_ref()
+        .map(|opts| {
+            let stripped_count = opts.keys().filter(|k| is_credential_key(k)).count();
+            if stripped_count > 0 {
+                log::debug!(
+                    "Stripping {} credential key(s) from storage options returned to client. \
+                     Clients should resolve credentials through the default credential chain \
+                     or a configured credential vendor.",
+                    stripped_count
+                );
+            }
+            opts.iter()
+                .filter(|(k, _)| !is_credential_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<String, String>>()
+        })
+        .filter(|opts| !opts.is_empty())
+}
+
 /// Result of checking table status atomically.
 ///
 /// This struct captures the state of a table directory in a single snapshot,
@@ -799,10 +863,10 @@ impl DirectoryNamespace {
 
     /// Get storage options for a table, using credential vending if configured.
     ///
-    /// If credential vendor properties are configured and the table location matches
-    /// a supported cloud provider, this will create an appropriate vendor and vend
-    /// temporary credentials scoped to the table location. Otherwise, returns the
-    /// static storage options.
+    /// If a credential vendor is configured, this vends temporary credentials
+    /// scoped to the table location. Otherwise, returns the namespace's storage
+    /// options with credential keys stripped (see [`strip_credential_options`])
+    /// so that clients resolve credentials through their own credential chain.
     ///
     /// The vendor type is auto-selected based on the table URI:
     /// - `s3://` locations use AWS STS AssumeRole
@@ -825,7 +889,7 @@ impl DirectoryNamespace {
             let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
-        Ok(self.storage_options.clone())
+        Ok(strip_credential_options(&self.storage_options))
     }
 
     /// Migrate directory-based tables to the manifest.
@@ -1361,7 +1425,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
-            storage_options: self.storage_options.clone(),
+            storage_options: strip_credential_options(&self.storage_options),
             ..Default::default()
         })
     }
@@ -2279,6 +2343,131 @@ mod tests {
         let storage_options = response.storage_options.unwrap();
         assert_eq!(storage_options.get("option1"), Some(&"value1".to_string()));
         assert_eq!(storage_options.get("option2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_strip_credential_options() {
+        // Stripping with mixed credential and non-credential keys
+        let opts = Some(HashMap::from([
+            ("aws_access_key_id".to_string(), "AKID".to_string()),
+            ("aws_secret_access_key".to_string(), "SECRET".to_string()),
+            ("aws_session_token".to_string(), "TOKEN".to_string()),
+            (
+                "azure_storage_account_key".to_string(),
+                "AZ_KEY".to_string(),
+            ),
+            (
+                "google_service_account_key".to_string(),
+                "GCP_KEY".to_string(),
+            ),
+            ("google_storage_token".to_string(), "GCP_TOKEN".to_string()),
+            ("option1".to_string(), "value1".to_string()),
+        ]));
+        let result = strip_credential_options(&opts).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("option1"), Some(&"value1".to_string()));
+
+        // Case-insensitive stripping
+        let opts = Some(HashMap::from([
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKID".to_string()),
+            ("option1".to_string(), "value1".to_string()),
+        ]));
+        let result = strip_credential_options(&opts).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(!result.contains_key("AWS_ACCESS_KEY_ID"));
+
+        // Only credentials → returns None
+        let opts = Some(HashMap::from([
+            ("aws_access_key_id".to_string(), "AKID".to_string()),
+            ("aws_secret_access_key".to_string(), "SECRET".to_string()),
+        ]));
+        assert!(strip_credential_options(&opts).is_none());
+
+        // None input → None
+        assert!(strip_credential_options(&None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_credential_stripping_across_operations() {
+        use lance_namespace::models::DeclareTableRequest;
+
+        let temp_dir = TempStdDir::default();
+
+        // V1 mode (no manifest) — exercises DirectoryNamespace paths
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .storage_option("aws_access_key_id", "AKID_SECRET")
+            .storage_option("aws_secret_access_key", "SECRET_KEY")
+            .storage_option("option1", "value1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // create_table
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+        let opts = resp.storage_options.unwrap();
+        assert_eq!(opts.get("option1"), Some(&"value1".to_string()));
+        assert!(!opts.contains_key("aws_access_key_id"));
+
+        // describe_table
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        let opts = resp.storage_options.unwrap();
+        assert_eq!(opts.get("option1"), Some(&"value1".to_string()));
+        assert!(!opts.contains_key("aws_access_key_id"));
+
+        // declare_table
+        let mut decl_req = DeclareTableRequest::new();
+        decl_req.id = Some(vec!["t2".to_string()]);
+        let resp = namespace.declare_table(decl_req).await.unwrap();
+        let opts = resp.storage_options.unwrap();
+        assert_eq!(opts.get("option1"), Some(&"value1".to_string()));
+        assert!(!opts.contains_key("aws_access_key_id"));
+    }
+
+    #[tokio::test]
+    async fn test_credential_stripping_manifest_mode() {
+        let temp_dir = TempStdDir::default();
+
+        // Manifest-enabled (default) — exercises ManifestNamespace paths
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .storage_option("aws_access_key_id", "AKID_SECRET")
+            .storage_option("aws_secret_access_key", "SECRET_KEY")
+            .storage_option("option1", "value1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // create_table through manifest
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+        let opts = resp.storage_options.unwrap();
+        assert_eq!(opts.get("option1"), Some(&"value1".to_string()));
+        assert!(!opts.contains_key("aws_access_key_id"));
+
+        // describe_table through manifest
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        let opts = resp.storage_options.unwrap();
+        assert_eq!(opts.get("option1"), Some(&"value1".to_string()));
+        assert!(!opts.contains_key("aws_access_key_id"));
     }
 
     #[tokio::test]
