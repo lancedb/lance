@@ -45,11 +45,11 @@ jobs:
           - platform: aarch64
             manylinux: "2_17"
             extra_args: ""
-            runner: warp-ubuntu-latest-arm64-4x
+            runner: ubuntu-24.04-arm64-4x
           - platform: aarch64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
-            runner: warp-ubuntu-latest-arm64-4x
+            runner: ubuntu-24.04-arm64-4x
     runs-on: ${{ matrix.config.runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -146,7 +146,7 @@ jobs:
           repo: ${{ steps.handle_tag.outputs.repo }}
   windows:
     timeout-minutes: 60
-    runs-on: windows-latest
+    runs-on: windows-latest-4x
     strategy:
       matrix:
         python-minor-version: ["9"]

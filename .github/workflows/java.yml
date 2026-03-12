@@ -47,7 +47,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
-    runs-on: warp-ubuntu-latest-x64-4x
+    runs-on: ubuntu-24.04-4x
     timeout-minutes: 60
     strategy:
       matrix:
