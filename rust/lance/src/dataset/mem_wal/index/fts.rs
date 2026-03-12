@@ -96,11 +96,11 @@ pub enum FtsQueryExpr {
     /// Boolean combination of queries.
     Boolean {
         /// All MUST clauses must match for a document to be included.
-        must: Vec<FtsQueryExpr>,
+        must: Vec<Self>,
         /// At least one SHOULD clause should match (adds to score).
-        should: Vec<FtsQueryExpr>,
+        should: Vec<Self>,
         /// No MUST_NOT clause may match (excludes documents).
-        must_not: Vec<FtsQueryExpr>,
+        must_not: Vec<Self>,
     },
     /// Boosting query with positive and optional negative components.
     ///
@@ -109,9 +109,9 @@ pub enum FtsQueryExpr {
     /// and negative have their scores reduced by `negative_boost`.
     Boost {
         /// The primary query (documents must match this).
-        positive: Box<FtsQueryExpr>,
+        positive: Box<Self>,
         /// Optional query to demote matching documents.
-        negative: Option<Box<FtsQueryExpr>>,
+        negative: Option<Box<Self>>,
         /// Boost factor for documents matching negative query (typically < 1.0).
         /// Score becomes: original_score * negative_boost for docs matching negative.
         negative_boost: f32,

@@ -2300,28 +2300,19 @@ mod tests {
             }
         }
 
-        fn distance_between_points(&self) -> f32 {
-            (self.dim as f32).sqrt()
-        }
-
-        fn generate_centroids(&self) -> Float32Array {
+        fn generate_centroids(dim: u32, num_centroids: u32) -> Float32Array {
             const MAX_ATTEMPTS: u32 = 10;
-            let distance_needed =
-                self.distance_between_points() * Self::VALS_PER_CODE as f32 * 2_f32;
+            let distance_needed = (dim as f32).sqrt() * Self::VALS_PER_CODE as f32 * 2_f32;
             let mut attempts_remaining = MAX_ATTEMPTS;
-            let num_values = self.dim * self.num_centroids;
+            let num_values = dim * num_centroids;
             while attempts_remaining > 0 {
                 // Use some biggish numbers to ensure we get the distance we want but make them positive
                 // and not too big for easier debugging.
                 let centroids: Float32Array =
                     generate_scaled_random_array(num_values as usize, 0_f32, 1000_f32);
                 let mut broken = false;
-                for (index, centroid) in centroids
-                    .values()
-                    .chunks_exact(self.dim as usize)
-                    .enumerate()
-                {
-                    let offset = (index + 1) * self.dim as usize;
+                for (index, centroid) in centroids.values().chunks_exact(dim as usize).enumerate() {
+                    let offset = (index + 1) * dim as usize;
                     let length = centroids.len() - offset;
                     if length == 0 {
                         // This will be true for the last item since we ignore comparison with self
@@ -2330,7 +2321,7 @@ mod tests {
                     let distances = l2_distance_batch(
                         centroid,
                         &centroids.values()[offset..offset + length],
-                        self.dim as usize,
+                        dim as usize,
                     );
                     let min_distance = distances.min_by(|a, b| a.total_cmp(b)).unwrap();
                     // In theory we could just replace this one vector but, out of laziness, we just retry all of them
@@ -2351,11 +2342,10 @@ mod tests {
         }
 
         fn get_centroids(&mut self) -> &Float32Array {
-            if self.centroids.is_some() {
-                return self.centroids.as_ref().unwrap();
-            }
-            self.centroids = Some(self.generate_centroids());
-            self.centroids.as_ref().unwrap()
+            let dim = self.dim;
+            let num_centroids = self.num_centroids;
+            self.centroids
+                .get_or_insert_with(|| Self::generate_centroids(dim, num_centroids))
         }
 
         fn get_centroids_as_list_arr(&mut self) -> Arc<FixedSizeListArray> {
@@ -2368,10 +2358,12 @@ mod tests {
             )
         }
 
-        fn generate_vectors(&mut self) -> Float32Array {
-            let dim = self.dim as usize;
-            let num_centroids = self.num_centroids;
-            let centroids = self.get_centroids();
+        fn generate_vectors(
+            dim: u32,
+            num_centroids: u32,
+            centroids: &Float32Array,
+        ) -> Float32Array {
+            let dim = dim as usize;
             let mut vectors: Vec<f32> =
                 vec![0_f32; Self::VALS_PER_CODE as usize * dim * num_centroids as usize];
             for (centroid, dst_batch) in centroids
@@ -2389,11 +2381,11 @@ mod tests {
         }
 
         fn get_vectors(&mut self) -> &Float32Array {
-            if self.vectors.is_some() {
-                return self.vectors.as_ref().unwrap();
-            }
-            self.vectors = Some(self.generate_vectors());
-            self.vectors.as_ref().unwrap()
+            let dim = self.dim;
+            let num_centroids = self.num_centroids;
+            let centroids = self.get_centroids().clone();
+            self.vectors
+                .get_or_insert_with(|| Self::generate_vectors(dim, num_centroids, &centroids))
         }
 
         fn get_vector(&mut self, idx: u32) -> Float32Array {

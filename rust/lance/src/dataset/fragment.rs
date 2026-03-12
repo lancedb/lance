@@ -1113,8 +1113,14 @@ impl FileFragment {
     /// Fails if the fragment does not have the physical row count in the metadata.  This method should
     /// only be called in new workflows which are not run on old versions of Lance.
     pub fn fast_physical_rows(&self) -> Result<usize> {
-        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
-            Ok(self.metadata.physical_rows.unwrap())
+        if self.dataset.manifest.writer_version.is_some() {
+            let Some(physical_rows) = self.metadata.physical_rows else {
+                return Err(Error::internal(format!(
+                    "The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}",
+                    self.id()
+                )));
+            };
+            Ok(physical_rows)
         } else {
             Err(Error::internal(format!(
                 "The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}",
@@ -1168,8 +1174,10 @@ impl FileFragment {
         // we should not used the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
         // See: https://github.com/lance-format/lance/issues/1531
-        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
-            return Ok(self.metadata.physical_rows.unwrap());
+        if self.dataset.manifest.writer_version.is_some()
+            && let Some(physical_rows) = self.metadata.physical_rows
+        {
+            return Ok(physical_rows);
         }
 
         // Just open any file. All of them should have same size.
