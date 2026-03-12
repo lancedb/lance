@@ -39,7 +39,7 @@ env:
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: "warp-ubuntu-latest-x64-4x"
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -96,7 +96,7 @@ jobs:
       matrix:
         python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: "warp-ubuntu-latest-x64-4x"
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -161,7 +161,7 @@ jobs:
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: warp-ubuntu-latest-arm64-4x
+    runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
@@ -219,7 +219,7 @@ jobs:
           skip-torch: "true"
 
   windows:
-    runs-on: windows-latest
+    runs-on: windows-latest-4x
     timeout-minutes: 90
     defaults:
       run:
@@ -240,7 +240,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
-    runs-on: "warp-ubuntu-latest-x64-4x"
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
