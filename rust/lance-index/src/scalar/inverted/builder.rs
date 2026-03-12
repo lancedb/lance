@@ -17,13 +17,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
+use fst::Streamer;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
-use lance_core::error::LanceOptionExt;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use smallvec::SmallVec;
@@ -83,6 +84,48 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .memory_limit_mb
         .map(|memory_limit_mb| (memory_limit_mb << 20) / num_workers as u64)
         .unwrap_or(default_worker_memory_limit_bytes)
+}
+
+fn group_tail_partitions(
+    tails: Vec<TailPartition>,
+    worker_memory_limit_bytes: u64,
+) -> Vec<Vec<TailPartition>> {
+    let mut groups = Vec::new();
+    let mut current_group = Vec::new();
+    let mut current_memory_size = 0u64;
+
+    for tail in tails {
+        if !current_group.is_empty()
+            && current_memory_size.saturating_add(tail.memory_size_bytes)
+                > worker_memory_limit_bytes
+        {
+            groups.push(current_group);
+            current_group = Vec::new();
+            current_memory_size = 0;
+        }
+        current_memory_size = current_memory_size.saturating_add(tail.memory_size_bytes);
+        current_group.push(tail);
+    }
+
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+
+    groups
+}
+
+fn merge_tail_partition_group(group: Vec<TailPartition>) -> Result<InnerBuilder> {
+    let mut group = group.into_iter();
+    let mut merged = group
+        .next()
+        .ok_or_else(|| {
+            Error::invalid_input("cannot merge an empty tail partition group".to_owned())
+        })?
+        .builder;
+    for tail in group {
+        merged.merge_from(tail.builder)?;
+    }
+    Ok(merged)
 }
 
 #[derive(Debug)]
@@ -217,11 +260,6 @@ impl InvertedIndexBuilder {
                 worker.finish().await
             }));
         }
-        // Keep the channel lifetime tied to the worker tasks so senders observe
-        // worker exits instead of blocking on an orphaned receiver handle.
-        drop(receiver);
-        drop(builder_tx);
-
         let writer = async {
             while let Ok(mut builder) = builder_rx.recv().await {
                 builder.write(dest_store).await?;
@@ -229,45 +267,72 @@ impl InvertedIndexBuilder {
             Result::Ok(())
         };
 
-        let mut stream = Box::pin(stream);
-        log::info!("indexing FTS with {} workers", num_workers);
+        let index_build = async {
+            // Keep the channel lifetime tied to the worker tasks so senders observe
+            // worker exits instead of blocking on an orphaned receiver handle.
+            drop(receiver);
 
-        let mut last_num_rows = 0;
-        let mut total_num_rows = 0;
-        let start = std::time::Instant::now();
-        while let Some(batch) = stream.try_next().await? {
-            let num_rows = batch.num_rows();
+            let mut stream = Box::pin(stream);
+            log::info!("indexing FTS with {} workers", num_workers);
 
-            if sender.send(batch).await.is_err() {
-                // this only happens if all workers have existed,
-                // so we don't return the send error here,
-                // avoiding hiding the real error from workers.
-                break;
+            let mut last_num_rows = 0;
+            let mut total_num_rows = 0;
+            let start = std::time::Instant::now();
+            while let Some(batch) = stream.try_next().await? {
+                let num_rows = batch.num_rows();
+
+                if sender.send(batch).await.is_err() {
+                    // this only happens if all workers have existed,
+                    // so we don't return the send error here,
+                    // avoiding hiding the real error from workers.
+                    break;
+                }
+
+                total_num_rows += num_rows;
+                if total_num_rows >= last_num_rows + 1_000_000 {
+                    log::debug!(
+                        "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
+                        total_num_rows,
+                        start.elapsed(),
+                        total_num_rows as f32 / start.elapsed().as_secs_f32()
+                    );
+                    last_num_rows = total_num_rows;
+                }
             }
+            // drop the sender to stop receivers
+            drop(stream);
+            drop(sender);
+            log::info!("dispatching elapsed: {:?}", start.elapsed());
 
-            total_num_rows += num_rows;
-            if total_num_rows >= last_num_rows + 1_000_000 {
-                log::debug!(
-                    "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
-                    total_num_rows,
-                    start.elapsed(),
-                    total_num_rows as f32 / start.elapsed().as_secs_f32()
-                );
-                last_num_rows = total_num_rows;
+            // wait for the workers to finish
+            let start = std::time::Instant::now();
+            let mut tail_partitions = Vec::new();
+            for index_task in index_tasks {
+                let output = index_task.await??;
+                self.new_partitions.extend(output.partitions);
+                if let Some(tail_partition) = output.tail_partition {
+                    tail_partitions.push(tail_partition);
+                }
             }
-        }
-        // drop the sender to stop receivers
-        drop(stream);
-        drop(sender);
-        log::info!("dispatching elapsed: {:?}", start.elapsed());
+            let merge_tasks = group_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+                .into_iter()
+                .map(|group| spawn_cpu(move || merge_tail_partition_group(group)))
+                .collect::<Vec<_>>();
+            for merge_task in merge_tasks {
+                let builder = merge_task.await?;
+                self.new_partitions.push(builder.id());
+                builder_tx.send(builder).await.map_err(|err| {
+                    Error::execution(format!(
+                        "failed to send merged tail partition to writer: {err}"
+                    ))
+                })?;
+            }
+            drop(builder_tx);
+            log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
+            Result::Ok(())
+        };
 
-        // wait for the workers to finish
-        let start = std::time::Instant::now();
-        for index_task in index_tasks {
-            self.new_partitions.extend(index_task.await??);
-        }
-        writer.await?;
-        log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
+        let (_, _) = tokio::try_join!(writer, index_build)?;
         Ok(())
     }
 
@@ -498,6 +563,74 @@ impl InnerBuilder {
         Ok(())
     }
 
+    pub fn merge_from(&mut self, other: InnerBuilder) -> Result<()> {
+        let InnerBuilder {
+            id: _,
+            with_position,
+            token_set_format,
+            tokens,
+            posting_lists,
+            docs,
+        } = other;
+
+        if self.with_position != with_position {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched positions settings: {} vs {}",
+                self.with_position, with_position
+            )));
+        }
+        if self.token_set_format != token_set_format {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched token set formats: {:?} vs {:?}",
+                self.token_set_format, token_set_format
+            )));
+        }
+
+        let mut token_id_map = vec![u32::MAX; posting_lists.len()];
+        match tokens.tokens {
+            TokenMap::HashMap(map) => {
+                for (token, token_id) in map {
+                    let new_token_id = self.tokens.get_or_add(token.as_str());
+                    token_id_map[token_id as usize] = new_token_id;
+                }
+            }
+            TokenMap::Fst(map) => {
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    let new_token_id = self
+                        .tokens
+                        .get_or_add(String::from_utf8_lossy(token).as_ref());
+                    token_id_map[token_id as usize] = new_token_id;
+                }
+            }
+        }
+
+        let doc_id_offset = self.docs.len() as u32;
+        for (row_id, num_tokens) in docs.iter() {
+            self.docs.append(*row_id, *num_tokens);
+        }
+        self.posting_lists
+            .resize_with(self.tokens.len(), || PostingListBuilder::new(with_position));
+
+        for (token_id, posting_list) in posting_lists.into_iter().enumerate() {
+            if posting_list.is_empty() {
+                continue;
+            }
+            let new_token_id = token_id_map[token_id];
+            debug_assert_ne!(new_token_id, u32::MAX);
+            let merged_posting = &mut self.posting_lists[new_token_id as usize];
+            for (doc_id, freq, positions) in posting_list.iter() {
+                let positions = match positions {
+                    Some(positions) => PositionRecorder::Position(positions.into()),
+                    None => PositionRecorder::Count(freq),
+                };
+                merged_posting.add(doc_id_offset + doc_id, positions);
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
         self.write_posting_lists(store, docs.clone()).await?;
@@ -615,6 +748,16 @@ struct IndexWorker {
     token_ids: Vec<u32>,
     last_token_count: usize,
     last_unique_token_count: usize,
+}
+
+struct TailPartition {
+    builder: InnerBuilder,
+    memory_size_bytes: u64,
+}
+
+struct WorkerOutput {
+    partitions: Vec<u64>,
+    tail_partition: Option<TailPartition>,
 }
 
 impl IndexWorker {
@@ -860,11 +1003,19 @@ impl IndexWorker {
         Ok(())
     }
 
-    async fn finish(mut self) -> Result<Vec<u64>> {
-        if !self.builder.tokens.is_empty() {
-            self.flush().await?;
-        }
-        Ok(self.partitions)
+    async fn finish(self) -> Result<WorkerOutput> {
+        let tail_partition = if self.builder.tokens.is_empty() {
+            None
+        } else {
+            Some(TailPartition {
+                builder: self.builder,
+                memory_size_bytes: self.memory_size,
+            })
+        };
+        Ok(WorkerOutput {
+            partitions: self.partitions,
+            tail_partition,
+        })
     }
 }
 
@@ -1515,7 +1666,12 @@ mod tests {
         worker1
             .process_batch(make_doc_batch("hello world", 0))
             .await?;
-        let mut partitions = worker1.finish().await?;
+        let output1 = worker1.finish().await?;
+        let mut partitions = output1.partitions;
+        if let Some(mut tail_partition) = output1.tail_partition {
+            partitions.push(tail_partition.builder.id());
+            tail_partition.builder.write(src_store.as_ref()).await?;
+        }
         while let Ok(mut builder) = builder_rx.try_recv() {
             builder.write(src_store.as_ref()).await?;
         }
@@ -1533,7 +1689,12 @@ mod tests {
         worker2
             .process_batch(make_doc_batch("goodbye world", 1))
             .await?;
-        partitions.extend(worker2.finish().await?);
+        let output2 = worker2.finish().await?;
+        partitions.extend(output2.partitions);
+        if let Some(mut tail_partition) = output2.tail_partition {
+            partitions.push(tail_partition.builder.id());
+            tail_partition.builder.write(src_store.as_ref()).await?;
+        }
         partitions.sort_unstable();
         assert_eq!(partitions.len(), 2);
         assert_ne!(partitions[0], partitions[1]);
@@ -1871,6 +2032,82 @@ mod tests {
         assert_eq!(resolve_worker_memory_limit_bytes(&params, 16), 256 << 20);
     }
 
+    #[test]
+    fn test_group_tail_partitions_uses_worker_memory_limit() {
+        let groups = group_tail_partitions(
+            vec![
+                TailPartition {
+                    builder: InnerBuilder::new(0, false, TokenSetFormat::default()),
+                    memory_size_bytes: 40,
+                },
+                TailPartition {
+                    builder: InnerBuilder::new(1, false, TokenSetFormat::default()),
+                    memory_size_bytes: 50,
+                },
+                TailPartition {
+                    builder: InnerBuilder::new(2, false, TokenSetFormat::default()),
+                    memory_size_bytes: 30,
+                },
+            ],
+            80,
+        );
+
+        let grouped_ids = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|tail| tail.builder.id())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(grouped_ids, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
+        let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
+        let hello = first.tokens.add("hello".to_owned());
+        first
+            .posting_lists
+            .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
+        let first_doc = first.docs.append(10, 1);
+        first.posting_lists[hello as usize].add(first_doc, PositionRecorder::Count(1));
+
+        let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
+        let world = second.tokens.add("world".to_owned());
+        second
+            .posting_lists
+            .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
+        let second_doc = second.docs.append(20, 2);
+        second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
+
+        let merged = merge_tail_partition_group(vec![
+            TailPartition {
+                builder: first,
+                memory_size_bytes: 10,
+            },
+            TailPartition {
+                builder: second,
+                memory_size_bytes: 20,
+            },
+        ])?;
+
+        assert_eq!(merged.id(), 0);
+        assert_eq!(merged.docs.len(), 2);
+        assert_eq!(merged.tokens.len(), 2);
+        assert_eq!(merged.posting_lists.len(), 2);
+        assert_eq!(
+            merged.posting_lists[merged.tokens.get("hello").unwrap() as usize].len(),
+            1
+        );
+        assert_eq!(
+            merged.posting_lists[merged.tokens.get("world").unwrap() as usize].len(),
+            1
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_update_index_returns_worker_error_when_workers_exit_during_dispatch() {
         let num_batches = (*LANCE_FTS_NUM_SHARDS * 2 + 1) as u64;
@@ -1891,10 +2128,13 @@ mod tests {
             InvertedIndexBuilder::new(InvertedIndexParams::default().skip_merge(true))
                 .with_progress(Arc::new(FailingProgress));
 
-        let result = tokio::time::timeout(Duration::from_secs(5), builder.update_index(stream, store.as_ref()))
-                .await
-                .expect("update_index should not hang")
-                .expect_err("worker failure should be returned");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            builder.update_index(stream, store.as_ref()),
+        )
+        .await
+        .expect("update_index should not hang")
+        .expect_err("worker failure should be returned");
 
         assert!(
             result.to_string().contains("injected progress failure"),
