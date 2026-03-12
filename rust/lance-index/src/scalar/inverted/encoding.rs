@@ -245,11 +245,7 @@ pub fn decompress_posting_remainder(
     decompress_remainder(&block[n * 4..], n, frequencies);
 }
 
-pub fn decode_full_posting_block(
-    block: &[u8],
-    doc_ids: &mut Vec<u32>,
-    frequencies: &mut Vec<u32>,
-) {
+pub fn decode_full_posting_block(block: &[u8], doc_ids: &mut Vec<u32>, frequencies: &mut Vec<u32>) {
     let mut buffer = [0u32; BLOCK_SIZE];
     decompress_posting_block(block, &mut buffer, doc_ids, frequencies);
 }
