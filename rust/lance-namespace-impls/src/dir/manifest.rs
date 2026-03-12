@@ -1256,6 +1256,88 @@ impl ManifestNamespace {
         Ok(deleted_count)
     }
 
+    /// Atomically delete table version entries from the manifest by their object_ids.
+    ///
+    /// This method supports multi-table transactional deletion: all specified
+    /// object_ids (which may span multiple tables) are deleted in a single atomic
+    /// `DeleteBuilder` operation. Either all entries are removed or none are.
+    ///
+    /// Object IDs are formatted as `{table_id}${version}`.
+    pub async fn batch_delete_table_versions_by_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<i64> {
+        if object_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let in_list: String = object_ids
+            .iter()
+            .map(|oid| {
+                let escaped = oid.replace('\'', "''");
+                format!("'{}'", escaped)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let filter = format!(
+            "object_type = 'table_version' AND object_id IN ({})",
+            in_list
+        );
+
+        // Count how many entries exist so we can report the deleted count
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to filter: {}",
+                e
+            ))))
+        })?;
+        scanner.project(&["object_id"]).map_err(|e| {
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to project: {}",
+                e
+            ))))
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+
+        // Execute a single atomic bulk delete covering all tables
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard);
+
+        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &filter)
+            .execute()
+            .await
+            .map_err(|e| {
+                convert_lance_commit_error(
+                    &e,
+                    "Failed to batch delete table versions across multiple tables",
+                    None,
+                )
+            })?;
+
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
+
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
+        Ok(deleted_count)
+    }
+
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);

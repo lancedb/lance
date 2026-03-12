@@ -1928,92 +1928,153 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
-        let table_uri = self.resolve_table_location(&request.id).await?;
-        let table_path = Self::uri_to_object_store_path(&table_uri);
-        let table_path_str = table_path.as_ref();
-        let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+        // Normalize request into a list of (table_id, ranges) entries.
+        // Multi-table mode (`entries`) takes precedence over single-table mode (`id` + `ranges`).
+        struct TableDeleteEntry {
+            table_id: Option<Vec<String>>,
+            ranges: Vec<(i64, i64)>,
+        }
 
-        let ranges: Vec<(i64, i64)> = request
-            .ranges
-            .iter()
-            .map(|r| {
-                let start = r.start_version;
-                let end = if r.end_version > 0 {
-                    r.end_version
-                } else {
-                    start
-                };
-                (start, end)
-            })
-            .collect();
+        let table_entries: Vec<TableDeleteEntry> = if let Some(entries) = &request.entries {
+            entries
+                .iter()
+                .map(|entry| {
+                    let ranges = entry
+                        .ranges
+                        .iter()
+                        .map(|r| {
+                            let start = r.start_version;
+                            let end = if r.end_version > 0 {
+                                r.end_version
+                            } else {
+                                start
+                            };
+                            (start, end)
+                        })
+                        .collect();
+                    TableDeleteEntry {
+                        table_id: Some(entry.id.clone()),
+                        ranges,
+                    }
+                })
+                .collect()
+        } else {
+            // Legacy single-table mode
+            let ranges = request
+                .ranges
+                .iter()
+                .map(|r| {
+                    let start = r.start_version;
+                    let end = if r.end_version > 0 {
+                        r.end_version
+                    } else {
+                        start
+                    };
+                    (start, end)
+                })
+                .collect();
+            vec![TableDeleteEntry {
+                table_id: request.id.clone(),
+                ranges,
+            }]
+        };
 
-        let mut deleted_count = 0i64;
+        let mut total_deleted_count = 0i64;
 
         if self.table_version_storage_enabled {
             if let Some(ref manifest_ns) = self.manifest_ns {
-                // Phase 1 (atomic commit point): Delete version records from __manifest first.
-                // This is the authoritative source of truth when table_version_storage_enabled,
-                // so once __manifest entries are removed, the versions are logically deleted.
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &request.id.clone().unwrap_or_default(),
-                );
+                // Phase 1 (atomic commit point): Delete version records from __manifest
+                // for ALL tables in a single atomic operation. This is the authoritative
+                // source of truth — once __manifest entries are removed, the versions
+                // are logically deleted across all tables atomically.
 
-                deleted_count = manifest_ns
-                    .delete_table_versions(&table_id_str, &ranges)
-                    .await?;
+                // Collect all (table_id_str, ranges) for batch deletion
+                let mut all_object_ids: Vec<String> = Vec::new();
+                for te in &table_entries {
+                    let table_id_str = manifest::ManifestNamespace::str_object_id(
+                        &te.table_id.clone().unwrap_or_default(),
+                    );
+                    for (start, end) in &te.ranges {
+                        for version in *start..=*end {
+                            let object_id = format!("{}${}", table_id_str, version);
+                            all_object_ids.push(object_id);
+                        }
+                    }
+                }
+
+                if !all_object_ids.is_empty() {
+                    total_deleted_count = manifest_ns
+                        .batch_delete_table_versions_by_object_ids(&all_object_ids)
+                        .await?;
+                }
 
                 // Phase 2: Delete physical manifest files (best-effort).
                 // Even if some file deletions fail, the versions are already removed from
                 // __manifest, so they won't be visible to readers. Leftover files are
                 // orphaned but harmless and can be cleaned up later.
-                for (start, end) in &ranges {
-                    for version in *start..=*end {
-                        let version_path =
-                            versions_dir_path.child(format!("{}.manifest", version as u64));
-                        if let Err(e) = self.object_store.inner.delete(&version_path).await {
-                            if !matches!(e, object_store::Error::NotFound { .. }) {
-                                log::warn!(
-                                    "Failed to delete manifest file for version {} of table {:?}: {:?}",
-                                    version,
-                                    request.id,
-                                    e
-                                );
+                for te in &table_entries {
+                    let table_uri = self.resolve_table_location(&te.table_id).await?;
+                    let table_path = Self::uri_to_object_store_path(&table_uri);
+                    let table_path_str = table_path.as_ref();
+                    let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+
+                    for (start, end) in &te.ranges {
+                        for version in *start..=*end {
+                            let version_path =
+                                versions_dir_path.child(format!("{}.manifest", version as u64));
+                            if let Err(e) = self.object_store.inner.delete(&version_path).await {
+                                if !matches!(e, object_store::Error::NotFound { .. }) {
+                                    log::warn!(
+                                        "Failed to delete manifest file for version {} of table {:?}: {:?}",
+                                        version,
+                                        te.table_id,
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
                 return Ok(BatchDeleteTableVersionsResponse {
-                    deleted_count: Some(deleted_count),
+                    deleted_count: Some(total_deleted_count),
                     transaction_id: None,
                 });
             }
         }
 
         // Legacy behavior: delete physical files directly (no __manifest)
-        for (start, end) in &ranges {
-            for version in *start..=*end {
-                let version_path = versions_dir_path.child(format!("{}.manifest", version as u64));
-                match self.object_store.inner.delete(&version_path).await {
-                    Ok(_) => {
-                        deleted_count += 1;
-                    }
-                    Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => {
-                        return Err(Error::namespace_source(
-                            format!(
-                                "Failed to delete version {} for table at '{}': {}",
-                                version, table_uri, e
-                            )
-                            .into(),
-                        ));
+        for te in &table_entries {
+            let table_uri = self.resolve_table_location(&te.table_id).await?;
+            let table_path = Self::uri_to_object_store_path(&table_uri);
+            let table_path_str = table_path.as_ref();
+            let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+
+            for (start, end) in &te.ranges {
+                for version in *start..=*end {
+                    let version_path =
+                        versions_dir_path.child(format!("{}.manifest", version as u64));
+                    match self.object_store.inner.delete(&version_path).await {
+                        Ok(_) => {
+                            total_deleted_count += 1;
+                        }
+                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(e) => {
+                            return Err(Error::namespace_source(
+                                format!(
+                                    "Failed to delete version {} for table at '{}': {}",
+                                    version, table_uri, e
+                                )
+                                .into(),
+                            ));
+                        }
                     }
                 }
             }
         }
 
         Ok(BatchDeleteTableVersionsResponse {
-            deleted_count: Some(deleted_count),
+            deleted_count: Some(total_deleted_count),
             transaction_id: None,
         })
     }
@@ -2152,13 +2213,15 @@ impl LanceNamespace for DirectoryNamespace {
                 )
             })?;
 
-        // Phase 2: Copy staging manifests to their final locations.
-        // The __manifest entries are already committed, so readers using
-        // table_version_storage_enabled will see the versions. If a copy fails,
-        // we roll back the __manifest entries that were just inserted.
+        // Phase 2: Copy staging manifests to their final locations (best-effort).
+        // The __manifest entries are already committed (Phase 1 is the atomic commit
+        // point), so the versions are logically visible to readers. Physical file
+        // writes are best-effort — failures are logged but do NOT roll back Phase 1.
+        // Metadata is the source of truth: if a physical file is missing, readers
+        // will see the version in __manifest but get a 404 on the file (orphaned
+        // metadata that can be repaired or retried later).
         let mut committed: Vec<(StagingEntry, Option<String>)> =
             Vec::with_capacity(staging_entries.len());
-        let mut copy_error: Option<Error> = None;
 
         for se in staging_entries {
             let put_result = self
@@ -2180,49 +2243,19 @@ impl LanceNamespace for DirectoryNamespace {
                     committed.push((se, result.e_tag));
                 }
                 Err(e) => {
-                    copy_error = Some(Error::namespace_source(
-                        format!(
-                            "Failed to write manifest for table {:?} version {}: {}",
-                            se.entry.id, se.entry.version, e
-                        )
-                        .into(),
-                    ));
-                    break;
-                }
-            }
-        }
-
-        // If any copy failed, roll back: delete __manifest entries and already-written files
-        if let Some(err) = copy_error {
-            // Roll back __manifest entries grouped by table_id for efficient deletion
-            let mut table_versions: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-            for (se, _) in &committed {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(&se.entry.id);
-                table_versions
-                    .entry(table_id_str)
-                    .or_default()
-                    .push((se.entry.version, se.entry.version));
-            }
-            for (table_id, ranges) in &table_versions {
-                if let Err(e) = manifest_ns.delete_table_versions(table_id, ranges).await {
+                    // Log the failure but continue with remaining entries.
+                    // The __manifest entry is already committed so this version
+                    // is logically visible; the physical file can be retried later.
                     log::warn!(
-                        "Failed to roll back __manifest entries for table '{}': {:?}",
-                        table_id,
+                        "Failed to write manifest for table {:?} version {} (best-effort, \
+                         __manifest entry already committed): {:?}",
+                        se.entry.id,
+                        se.entry.version,
                         e
                     );
+                    committed.push((se, None));
                 }
             }
-            // Also delete already-written final files
-            for (se, _) in &committed {
-                if let Err(e) = self.object_store.inner.delete(&se.final_path).await {
-                    log::warn!(
-                        "Failed to clean up manifest file at '{}': {:?}",
-                        se.final_path,
-                        e
-                    );
-                }
-            }
-            return Err(err);
         }
 
         // Phase 3: Build response

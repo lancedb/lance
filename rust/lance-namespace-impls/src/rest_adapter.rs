@@ -802,6 +802,7 @@ async fn batch_delete_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
         ranges: body.ranges,
+        entries: body.entries,
         ..Default::default()
     };
 
