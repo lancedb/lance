@@ -39,8 +39,8 @@ use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
-    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, PARTITIONS_RANKED_METRIC,
-    PARTITIONS_SEARCHED_METRIC,
+    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_CALLS_METRIC,
+    PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
@@ -68,6 +68,7 @@ pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
     partitions_ranked: Count,
     deltas_searched: Count,
+    find_partitions_calls: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -77,6 +78,7 @@ impl AnnPartitionMetrics {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
             deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
+            find_partitions_calls: metrics.new_count(FIND_PARTITIONS_CALLS_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -508,6 +510,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     };
 
                     metrics.partitions_ranked.add(index.total_partitions());
+                    metrics.find_partitions_calls.add(1);
 
                     let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
@@ -1352,6 +1355,7 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+    use lance_datafusion::utils::FIND_PARTITIONS_CALLS_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -1766,6 +1770,10 @@ mod tests {
         if get_num_compute_intensive_cpus() <= 32 {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
+        assert_eq!(
+            stats.all_counts.get(FIND_PARTITIONS_CALLS_METRIC).unwrap(),
+            &(num_deltas)
+        );
     }
 
     #[rstest]
@@ -1801,6 +1809,10 @@ mod tests {
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
+        );
+        assert_eq!(
+            stats.all_counts.get(FIND_PARTITIONS_CALLS_METRIC).unwrap(),
+            &(num_deltas)
         );
     }
 
@@ -1841,6 +1853,10 @@ mod tests {
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
                 &(100 * num_deltas)
             );
+            assert_eq!(
+                stats.all_counts.get(FIND_PARTITIONS_CALLS_METRIC).unwrap(),
+                &(num_deltas)
+            );
         }
     }
 
@@ -1875,6 +1891,10 @@ mod tests {
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
+        );
+        assert_eq!(
+            stats.all_counts.get(FIND_PARTITIONS_CALLS_METRIC).unwrap(),
+            &(num_deltas)
         );
         assert_eq!(results.num_rows(), 20);
 
@@ -1946,6 +1966,10 @@ mod tests {
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(100 * num_deltas)
+        );
+        assert_eq!(
+            stats.all_counts.get(FIND_PARTITIONS_CALLS_METRIC).unwrap(),
+            &(num_deltas)
         );
         assert_eq!(results.num_rows(), 10000);
     }
