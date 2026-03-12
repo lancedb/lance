@@ -1854,7 +1854,7 @@ impl ExecutionPlan for FilteredReadExec {
 
         let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
 
-        if self.options.full_filter.is_none() {
+        let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
             // divided by the number of partitions.
             let total_rows =
@@ -1876,83 +1876,81 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
-            Ok(Statistics {
+            return Ok(Statistics {
                 num_rows: Precision::Exact(total_rows as usize),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
-            })
-        } else {
-            // We could evaluate the indexed filter here but this is still during the planning
-            // phase so we want to avoid that.
-            //
-            // Instead, we create a mock input which is the filtered read (without the filter)
-            // and then use DF's FilterExec logic to calculate the statistics (which uses column
-            // stats and basic filter shape)
-            let filter = self.options.full_filter.as_ref().unwrap();
+            });
+        };
 
-            // Need to add in filter columns even though they aren't part of the projection
-            let filter_columns = Planner::column_names_in_expr(filter);
-            let read_projection = self
-                .options
-                .projection
-                .clone()
-                .union_columns(filter_columns, OnMissing::Error)?;
+        // We could evaluate the indexed filter here but this is still during the planning
+        // phase so we want to avoid that.
+        //
+        // Instead, we create a mock input which is the filtered read (without the filter)
+        // and then use DF's FilterExec logic to calculate the statistics (which uses column
+        // stats and basic filter shape)
 
-            let read_schema = Arc::new(read_projection.to_arrow_schema());
+        // Need to add in filter columns even though they aren't part of the projection
+        let filter_columns = Planner::column_names_in_expr(filter);
+        let read_projection = self
+            .options
+            .projection
+            .clone()
+            .union_columns(filter_columns, OnMissing::Error)?;
 
-            let planner = Arc::new(Planner::new(read_schema.clone()));
-            let physical_filter = planner.create_physical_expr(filter)?;
+        let read_schema = Arc::new(read_projection.to_arrow_schema());
 
-            let mock_input = Arc::new(Self::try_new(
-                self.dataset.clone(),
-                FilteredReadOptions {
-                    scan_range_after_filter: None,
-                    refine_filter: None,
-                    full_filter: None,
-                    projection: read_projection,
-                    ..self.options.clone()
-                },
-                None,
-            )?);
-            let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-            let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+        let planner = Arc::new(Planner::new(read_schema.clone()));
+        let physical_filter = planner.create_physical_expr(filter)?;
 
-            // If we have an after-filter range, we should apply it to the stats (the before-filter range
-            // is applied in the mock input)
-            let total_rows = if let Some(scan_range_after_filter) =
-                &self.options.scan_range_after_filter
-            {
+        let mock_input = Arc::new(Self::try_new(
+            self.dataset.clone(),
+            FilteredReadOptions {
+                scan_range_after_filter: None,
+                refine_filter: None,
+                full_filter: None,
+                projection: read_projection,
+                ..self.options.clone()
+            },
+            None,
+        )?);
+        let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
+        let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+
+        // If we have an after-filter range, we should apply it to the stats (the before-filter range
+        // is applied in the mock input)
+        let total_rows =
+            if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
                 df_stats.num_rows.min(&Precision::Exact(
                     scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
                 ))
             } else {
                 df_stats.num_rows
             };
-            df_stats.num_rows = total_rows;
+        df_stats.num_rows = total_rows;
 
-            let schema = self.schema();
+        let schema = self.schema();
 
-            // We might have added some columns to the schema so the filter compiles but we drop this
-            // columns during the filtered read and they aren't part of the output.  So we need to make
-            // sure and drop them from the column stats as well.
-            assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
-            let mut proj_iter = schema.fields.iter().peekable();
-            let mut stats_iter = read_schema.fields.iter();
-            df_stats.column_statistics.retain(|_| {
-                let stats_field = stats_iter.next().unwrap();
-                if let Some(proj_field) = proj_iter.peek() {
-                    if proj_field.name() == stats_field.name() {
-                        proj_iter.next();
-                        true
-                    } else {
-                        false
-                    }
+        // We might have added some columns to the schema so the filter compiles but we drop this
+        // columns during the filtered read and they aren't part of the output.  So we need to make
+        // sure and drop them from the column stats as well.
+        assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
+        let mut proj_iter = schema.fields.iter().peekable();
+        let mut stats_iter = read_schema.fields.iter();
+        df_stats.column_statistics.retain(|_| {
+            let stats_field = stats_iter.next().unwrap();
+            if let Some(proj_field) = proj_iter.peek() {
+                if proj_field.name() == stats_field.name() {
+                    proj_iter.next();
+                    true
                 } else {
                     false
                 }
-            });
+            } else {
+                false
+            }
+        });
 
-            Ok(df_stats)
-        }
+        Ok(df_stats)
     }
 
     fn with_new_children(
