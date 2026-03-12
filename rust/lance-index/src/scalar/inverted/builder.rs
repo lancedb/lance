@@ -282,7 +282,7 @@ impl InvertedIndexBuilder {
                 let num_rows = batch.num_rows();
 
                 if sender.send(batch).await.is_err() {
-                    // this only happens if all workers have existed,
+                    // this only happens if all workers have exited,
                     // so we don't return the send error here,
                     // avoiding hiding the real error from workers.
                     break;
