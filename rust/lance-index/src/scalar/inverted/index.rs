@@ -1141,7 +1141,6 @@ impl TokenSet {
         token_id
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
         let next_id = self.next_id;
         match self.tokens {

@@ -2606,10 +2606,6 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
-        skip_merge: bool, default False
-            This is for the ``INVERTED`` index. If True, the index will skip the
-            partition merge stage after indexing. This can be useful for
-            distributed/fragment-level indexing where a later merge is desired.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across FTS workers. By default

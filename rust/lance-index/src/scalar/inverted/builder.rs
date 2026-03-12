@@ -1633,7 +1633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skip_merge_writes_partitions_as_is() -> Result<()> {
+    async fn test_build_only_path_writes_partitions_as_is() -> Result<()> {
         let src_dir = TempDir::default();
         let dest_dir = TempDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -1707,7 +1707,7 @@ mod tests {
         }
 
         let builder = InvertedIndexBuilder::from_existing_index(
-            InvertedIndexParams::default().skip_merge(true),
+            InvertedIndexParams::default(),
             Some(src_store.clone()),
             partitions.clone(),
             token_set_format,
@@ -1852,9 +1852,8 @@ mod tests {
         let stream = Box::pin(stream);
 
         let progress = Arc::new(RecordingProgress::default());
-        let mut builder =
-            InvertedIndexBuilder::new(InvertedIndexParams::default().skip_merge(true))
-                .with_progress(progress.clone());
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default())
+            .with_progress(progress.clone());
         builder.update(stream, store.as_ref()).await?;
 
         let events = progress.events.lock().await.clone();
@@ -1927,7 +1926,7 @@ mod tests {
         );
         assert!(
             !tags.iter().any(|e| e == "start:merge_partitions"),
-            "merge_partitions should not run in skip_merge mode"
+            "merge_partitions should not run in the build-only path"
         );
 
         Ok(())
@@ -2124,9 +2123,8 @@ mod tests {
         );
         let stream = Box::pin(stream);
 
-        let mut builder =
-            InvertedIndexBuilder::new(InvertedIndexParams::default().skip_merge(true))
-                .with_progress(Arc::new(FailingProgress));
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default())
+            .with_progress(Arc::new(FailingProgress));
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),

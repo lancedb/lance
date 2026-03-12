@@ -90,11 +90,6 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
-    /// If true, skip the partition merge stage after indexing.
-    /// This can be useful for distributed indexing where merge is handled separately.
-    #[serde(default)]
-    pub(crate) skip_merge: bool,
-
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -162,7 +157,6 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
-            skip_merge: defaults.skip_merge,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
         })
@@ -216,7 +210,6 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
-            skip_merge: false,
             memory_limit_mb: None,
             num_workers: None,
         }
@@ -304,12 +297,6 @@ impl InvertedIndexParams {
     /// Default to `false`.
     pub fn ngram_prefix_only(mut self, prefix_only: bool) -> Self {
         self.prefix_only = prefix_only;
-        self
-    }
-
-    /// Skip merging partitions after indexing.
-    pub fn skip_merge(mut self, skip_merge: bool) -> Self {
-        self.skip_merge = skip_merge;
         self
     }
 
