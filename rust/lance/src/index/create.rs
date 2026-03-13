@@ -278,8 +278,8 @@ impl<'a> CreateIndexBuilder<'a> {
                         )
                     })?;
 
-                let params =
-                    ScalarIndexParams::new("inverted".to_string()).with_params(inverted_params);
+                let params = ScalarIndexParams::new("inverted".to_string())
+                    .with_params(&inverted_params.to_training_json()?);
                 build_scalar_index(
                     self.dataset,
                     column,
@@ -488,6 +488,22 @@ mod tests {
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+
+    #[test]
+    fn test_inverted_training_params_include_build_only_fields() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(7);
+        let scalar_params = ScalarIndexParams::new("inverted".to_string())
+            .with_params(&params.to_training_json().unwrap());
+        let json: serde_json::Value =
+            serde_json::from_str(scalar_params.params.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            json.get("memory_limit"),
+            Some(&serde_json::Value::from(4096))
+        );
+        assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(7)));
+    }
 
     #[test]
     fn test_default_index_name() {
