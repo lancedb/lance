@@ -45,46 +45,6 @@ use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
 
-/// Credential-related storage option keys that should not be returned
-/// to clients. Clients should resolve credentials through their own
-/// credential chain or a configured credential vendor.
-const CREDENTIAL_KEYS: &[&str] = &[
-    "aws_access_key_id",
-    "aws_secret_access_key",
-    "aws_session_token",
-    "access_key_id",
-    "secret_access_key",
-    "session_token",
-    "azure_storage_account_key",
-    "azure_storage_sas_token",
-    "azure_storage_client_id",
-    "azure_storage_client_secret",
-    "google_service_account_key",
-    "google_service_account",
-    "google_storage_token",
-];
-
-/// Return a copy of `storage_options` with credential keys removed.
-///
-/// Preserves non-credential configuration (endpoint, region, etc.) so
-/// clients can locate the object store, while preventing leaking stale
-/// or static credentials.
-///
-/// Returns `None` if no options remain after filtering (or if input is `None`).
-fn strip_credential_options(
-    storage_options: &Option<HashMap<String, String>>,
-) -> Option<HashMap<String, String>> {
-    storage_options
-        .as_ref()
-        .map(|opts| {
-            opts.iter()
-                .filter(|(k, _)| !CREDENTIAL_KEYS.iter().any(|ck| ck.eq_ignore_ascii_case(k)))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<String, String>>()
-        })
-        .filter(|opts| !opts.is_empty())
-}
-
 /// Result of checking table status atomically.
 ///
 /// This struct captures the state of a table directory in a single snapshot,
@@ -866,10 +826,9 @@ impl DirectoryNamespace {
             let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
-        // Return non-credential storage options (endpoint, region, etc.)
-        // so clients can locate the object store, but strip credential keys
-        // to prevent leaking stale or static credentials.
-        Ok(strip_credential_options(&self.storage_options))
+        // When no credential vendor is configured, return None to avoid
+        // leaking the namespace's own static credentials to clients.
+        Ok(None)
     }
 
     /// Migrate directory-based tables to the manifest.
@@ -2311,7 +2270,7 @@ mod tests {
     /// `declare_table` must strip credential keys from storage options
     /// while preserving non-credential config (region, endpoint, etc.).
     #[tokio::test]
-    async fn test_credential_stripping_without_vendor() {
+    async fn test_no_storage_options_without_vendor() {
         use lance_namespace::models::DeclareTableRequest;
 
         let temp_dir = TempStdDir::default();
@@ -2337,28 +2296,22 @@ mod tests {
             .await
             .unwrap();
 
-        // describe_table should return config but not credentials
+        // describe_table should not return storage options without a vendor
         let mut desc_req = DescribeTableRequest::new();
         desc_req.id = Some(vec!["t1".to_string()]);
         let resp = namespace.describe_table(desc_req).await.unwrap();
-        let opts = resp.storage_options.unwrap();
-        assert_eq!(opts.get("region"), Some(&"us-east-1".to_string()));
-        assert!(!opts.contains_key("aws_access_key_id"));
-        assert!(!opts.contains_key("aws_secret_access_key"));
+        assert!(resp.storage_options.is_none());
 
-        // declare_table should return config but not credentials
+        // declare_table should not return storage options without a vendor
         let mut decl_req = DeclareTableRequest::new();
         decl_req.id = Some(vec!["t2".to_string()]);
         let resp = namespace.declare_table(decl_req).await.unwrap();
-        let opts = resp.storage_options.unwrap();
-        assert_eq!(opts.get("region"), Some(&"us-east-1".to_string()));
-        assert!(!opts.contains_key("aws_access_key_id"));
-        assert!(!opts.contains_key("aws_secret_access_key"));
+        assert!(resp.storage_options.is_none());
     }
 
     /// Same test with manifest mode enabled.
     #[tokio::test]
-    async fn test_credential_stripping_without_vendor_manifest() {
+    async fn test_no_storage_options_without_vendor_manifest() {
         let temp_dir = TempStdDir::default();
 
         let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
@@ -2379,14 +2332,11 @@ mod tests {
             .await
             .unwrap();
 
-        // describe_table through manifest should return config but not credentials
+        // describe_table through manifest should not return storage options without a vendor
         let mut desc_req = DescribeTableRequest::new();
         desc_req.id = Some(vec!["t1".to_string()]);
         let resp = namespace.describe_table(desc_req).await.unwrap();
-        let opts = resp.storage_options.unwrap();
-        assert_eq!(opts.get("region"), Some(&"us-east-1".to_string()));
-        assert!(!opts.contains_key("aws_access_key_id"));
-        assert!(!opts.contains_key("aws_secret_access_key"));
+        assert!(resp.storage_options.is_none());
     }
 
     #[tokio::test]
