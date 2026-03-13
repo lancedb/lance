@@ -2016,6 +2016,92 @@ pub struct PostingListBuilder {
     len: u32,
 }
 
+pub(super) struct PostingListBatchBuilder {
+    schema: SchemaRef,
+    postings: ListBuilder<LargeBinaryBuilder>,
+    max_scores: Float32Builder,
+    lengths: UInt32Builder,
+    positions: Option<ListBuilder<ListBuilder<LargeBinaryBuilder>>>,
+    len: usize,
+}
+
+impl PostingListBatchBuilder {
+    pub fn new(schema: SchemaRef, with_positions: bool, capacity: usize) -> Self {
+        let positions = with_positions.then(|| {
+            ListBuilder::with_capacity(
+                ListBuilder::with_capacity(LargeBinaryBuilder::new(), capacity),
+                capacity,
+            )
+        });
+        Self {
+            schema,
+            postings: ListBuilder::with_capacity(LargeBinaryBuilder::new(), capacity),
+            max_scores: Float32Builder::with_capacity(capacity),
+            lengths: UInt32Builder::with_capacity(capacity),
+            positions,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn append(
+        &mut self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<&[CompressedDocPositions]>,
+    ) -> Result<()> {
+        {
+            let values = self.postings.values();
+            for index in 0..compressed.len() {
+                values.append_value(compressed.value(index));
+            }
+        }
+        self.postings.append(true);
+        self.max_scores.append_value(max_score);
+        self.lengths.append_value(length);
+
+        if let Some(position_builder) = self.positions.as_mut() {
+            let positions = positions.ok_or_else(|| {
+                Error::index("positions builder missing position data".to_owned())
+            })?;
+            {
+                let docs_builder = position_builder.values();
+                for compressed_doc in positions {
+                    for block in &compressed_doc.blocks {
+                        docs_builder.values().append_value(block);
+                    }
+                    docs_builder.append(true);
+                }
+            }
+            position_builder.append(true);
+        }
+
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<RecordBatch> {
+        let mut columns = vec![
+            Arc::new(self.postings.finish()) as ArrayRef,
+            Arc::new(self.max_scores.finish()) as ArrayRef,
+            Arc::new(self.lengths.finish()) as ArrayRef,
+        ];
+        if let Some(positions) = self.positions.as_mut() {
+            columns.push(Arc::new(positions.finish()) as ArrayRef);
+        }
+        self.len = 0;
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(Error::from)
+    }
+}
+
 impl PostingListBuilder {
     pub fn size(&self) -> u64 {
         self.memory_size_bytes as u64
@@ -2045,6 +2131,43 @@ impl PostingListBuilder {
 
     pub fn iter(&self) -> std::vec::IntoIter<(u32, u32, Option<Vec<u32>>)> {
         self.collect_entries().into_iter()
+    }
+
+    pub fn for_each_entry<E>(
+        &self,
+        mut visit: impl FnMut(u32, u32, Option<Vec<u32>>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut position_index = 0usize;
+        let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
+        let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
+
+        if let Some(encoded_blocks) = self.encoded_blocks.as_deref() {
+            for block in encoded_blocks.iter() {
+                doc_ids.clear();
+                frequencies.clear();
+                super::encoding::decode_full_posting_block(block, &mut doc_ids, &mut frequencies);
+                for (doc_id, frequency) in doc_ids.iter().copied().zip(frequencies.iter().copied())
+                {
+                    let positions = self.positions.as_ref().map(|positions| {
+                        let decompressed = positions[position_index].decompress();
+                        position_index += 1;
+                        decompressed
+                    });
+                    visit(doc_id, frequency, positions)?;
+                }
+            }
+        }
+
+        for entry in &self.tail_entries {
+            let positions = self.positions.as_ref().map(|positions| {
+                let decompressed = positions[position_index].decompress();
+                position_index += 1;
+                decompressed
+            });
+            visit(entry.doc_id, entry.frequency, positions)?;
+        }
+
+        Ok(())
     }
 
     pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
@@ -2217,6 +2340,30 @@ impl PostingListBuilder {
 
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+
+    pub(super) fn append_to_batch_with_docs(
+        self,
+        docs: &DocSet,
+        batch_builder: &mut PostingListBatchBuilder,
+    ) -> Result<()> {
+        let Self {
+            encoded_blocks,
+            positions,
+            tail_entries,
+            len,
+            ..
+        } = self;
+        let length = len as usize;
+        let (compressed, max_score) = Self::build_compressed_with_scores_from_parts(
+            length,
+            encoded_blocks
+                .map(|encoded_blocks| *encoded_blocks)
+                .unwrap_or_default(),
+            tail_entries.as_slice(),
+            docs,
+        )?;
+        batch_builder.append(compressed, max_score, len, positions.as_deref())
     }
 
     fn extend_tail_components(

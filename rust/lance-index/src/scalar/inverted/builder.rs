@@ -64,6 +64,12 @@ static LANCE_FTS_WRITE_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_WRITE_QUEUE_SIZE")
 });
+static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_POSTING_BATCH_ROWS")
+        .unwrap_or_else(|_| "256".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
+});
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -86,32 +92,11 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
-fn group_tail_partitions(
-    tails: Vec<TailPartition>,
-    worker_memory_limit_bytes: u64,
-) -> Vec<Vec<TailPartition>> {
-    let mut groups = Vec::new();
-    let mut current_group = Vec::new();
-    let mut current_memory_size = 0u64;
-
-    for tail in tails {
-        if !current_group.is_empty()
-            && current_memory_size.saturating_add(tail.memory_size_bytes)
-                > worker_memory_limit_bytes
-        {
-            groups.push(current_group);
-            current_group = Vec::new();
-            current_memory_size = 0;
-        }
-        current_memory_size = current_memory_size.saturating_add(tail.memory_size_bytes);
-        current_group.push(tail);
+fn merge_all_tail_partitions(tails: Vec<TailPartition>) -> Result<Option<InnerBuilder>> {
+    if tails.is_empty() {
+        return Ok(None);
     }
-
-    if !current_group.is_empty() {
-        groups.push(current_group);
-    }
-
-    groups
+    merge_tail_partition_group(tails).map(Some)
 }
 
 fn merge_tail_partition_group(group: Vec<TailPartition>) -> Result<InnerBuilder> {
@@ -314,12 +299,9 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merge_tasks = group_tail_partitions(tail_partitions, worker_memory_limit_bytes)
-                .into_iter()
-                .map(|group| spawn_cpu(move || merge_tail_partition_group(group)))
-                .collect::<Vec<_>>();
-            for merge_task in merge_tasks {
-                let builder = merge_task.await?;
+            let merged_tail_partitions =
+                spawn_cpu(move || merge_all_tail_partitions(tail_partitions)).await?;
+            if let Some(builder) = merged_tail_partitions {
                 self.new_partitions.push(builder.id());
                 builder_tx.send(builder).await.map_err(|err| {
                     Error::execution(format!(
@@ -619,13 +601,14 @@ impl InnerBuilder {
             let new_token_id = token_id_map[token_id];
             debug_assert_ne!(new_token_id, u32::MAX);
             let merged_posting = &mut self.posting_lists[new_token_id as usize];
-            for (doc_id, freq, positions) in posting_list.iter() {
+            posting_list.for_each_entry(|doc_id, freq, positions| {
                 let positions = match positions {
                     Some(positions) => PositionRecorder::Position(positions.into()),
                     None => PositionRecorder::Count(freq),
                 };
                 merged_posting.add(doc_id_offset + doc_id, positions);
-            }
+                Ok::<(), Error>(())
+            })?;
         }
 
         Ok(())
@@ -660,43 +643,47 @@ impl InnerBuilder {
             id,
             self.with_position
         );
+        let with_position = self.with_position;
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
+        let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
         let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
         let producer = spawn_cpu(move || {
+            let mut batch_builder =
+                PostingListBatchBuilder::new(schema_for_batches.clone(), with_position, batch_rows);
             for posting_list in posting_lists {
-                let batch = posting_list
-                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
+                posting_list.append_to_batch_with_docs(&docs_for_batches, &mut batch_builder)?;
+                if batch_builder.len() < batch_rows {
+                    continue;
+                }
+
+                let batch = batch_builder.finish()?;
                 if let Err(err) = tx.send_blocking(batch) {
                     return Err(Error::execution(format!(
                         "failed to send posting list batch to writer: {err}"
                     )));
                 }
             }
+
+            if !batch_builder.is_empty() {
+                let batch = batch_builder.finish()?;
+                if let Err(err) = tx.send_blocking(batch) {
+                    return Err(Error::execution(format!(
+                        "failed to send posting list batch to writer: {err}"
+                    )));
+                }
+            }
+
             Result::Ok(())
         });
 
-        let mut write_duration = std::time::Duration::ZERO;
-        let mut num_posting_lists = 0;
         while let Ok(batch) = rx.recv().await {
-            num_posting_lists += 1;
-            let start = std::time::Instant::now();
             if let Err(err) = writer.write_record_batch(batch).await {
                 drop(rx);
                 // Wait for producer to stop; preserve the write error as the primary failure.
                 let _ = producer.await;
                 return Err(err);
-            }
-            write_duration += start.elapsed();
-
-            if num_posting_lists % 500_000 == 0 {
-                log::info!(
-                    "wrote {} posting lists of partition {}, writing elapsed: {:?}",
-                    num_posting_lists,
-                    id,
-                    write_duration,
-                );
             }
         }
         drop(rx);
@@ -752,7 +739,6 @@ struct IndexWorker {
 
 struct TailPartition {
     builder: InnerBuilder,
-    memory_size_bytes: u64,
 }
 
 struct WorkerOutput {
@@ -1009,7 +995,6 @@ impl IndexWorker {
         } else {
             Some(TailPartition {
                 builder: self.builder,
-                memory_size_bytes: self.memory_size,
             })
         };
         Ok(WorkerOutput {
@@ -1612,7 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_posting_lists_writes_each_batch() -> Result<()> {
+    async fn test_write_posting_lists_batches_multiple_rows() -> Result<()> {
         let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
         for doc_id in 0..3u64 {
             builder.docs.append(doc_id, 1);
@@ -1628,7 +1613,7 @@ mod tests {
         let docs = Arc::new(std::mem::take(&mut builder.docs));
         builder.write_posting_lists(&store, docs).await?;
 
-        assert_eq!(store.write_count(), 3);
+        assert_eq!(store.write_count(), 1);
         Ok(())
     }
 
@@ -2032,35 +2017,27 @@ mod tests {
     }
 
     #[test]
-    fn test_group_tail_partitions_uses_worker_memory_limit() {
-        let groups = group_tail_partitions(
-            vec![
-                TailPartition {
-                    builder: InnerBuilder::new(0, false, TokenSetFormat::default()),
-                    memory_size_bytes: 40,
-                },
-                TailPartition {
-                    builder: InnerBuilder::new(1, false, TokenSetFormat::default()),
-                    memory_size_bytes: 50,
-                },
-                TailPartition {
-                    builder: InnerBuilder::new(2, false, TokenSetFormat::default()),
-                    memory_size_bytes: 30,
-                },
-            ],
-            80,
-        );
+    fn test_merge_all_tail_partitions_combines_everything() -> Result<()> {
+        let merged = merge_all_tail_partitions(vec![
+            TailPartition {
+                builder: InnerBuilder::new(0, false, TokenSetFormat::default()),
+            },
+            TailPartition {
+                builder: InnerBuilder::new(1, false, TokenSetFormat::default()),
+            },
+            TailPartition {
+                builder: InnerBuilder::new(2, false, TokenSetFormat::default()),
+            },
+        ])?;
 
-        let grouped_ids = groups
-            .iter()
-            .map(|group| {
-                group
-                    .iter()
-                    .map(|tail| tail.builder.id())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(grouped_ids, vec![vec![0], vec![1, 2]]);
+        assert_eq!(merged.expect("merged builder should exist").id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
+        assert!(merge_all_tail_partitions(Vec::new())?.is_none());
+        Ok(())
     }
 
     #[test]
@@ -2082,14 +2059,8 @@ mod tests {
         second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
 
         let merged = merge_tail_partition_group(vec![
-            TailPartition {
-                builder: first,
-                memory_size_bytes: 10,
-            },
-            TailPartition {
-                builder: second,
-                memory_size_bytes: 20,
-            },
+            TailPartition { builder: first },
+            TailPartition { builder: second },
         ])?;
 
         assert_eq!(merged.id(), 0);
