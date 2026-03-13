@@ -1400,9 +1400,7 @@ impl RepDefUnraveler {
     }
 
     pub fn skip_validity(&mut self) {
-        let meaning = self.def_meaning[self.current_layer];
         debug_assert!(self.is_all_valid());
-        self.current_def_cmp += meaning.num_def_levels();
         self.current_layer += 1;
     }
 
@@ -1410,7 +1408,6 @@ impl RepDefUnraveler {
     pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
         let meaning = self.def_meaning[self.current_layer];
         if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
-            self.current_def_cmp += meaning.num_def_levels();
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
             return;
