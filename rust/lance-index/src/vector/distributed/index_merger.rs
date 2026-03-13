@@ -808,6 +808,10 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Handle logic based on detected index type
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+
+        // Compute format version once; defaults to V2_0 if no shards processed yet
+        let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
+
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -861,7 +865,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w =
                         init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
@@ -964,7 +967,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w =
                         init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
                     v2w_opt = Some(w);
@@ -990,7 +992,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt, fv).await?;
                     v2w_opt = Some(w);
                 }
@@ -1048,7 +1049,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w = init_writer_for_flat(object_store, &aux_out, d0, dt, fv).await?;
                     v2w_opt = Some(w);
                 }
@@ -1146,7 +1146,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w =
                         init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
                     v2w_opt = Some(w);
@@ -1199,7 +1198,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
                     let w =
                         init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
