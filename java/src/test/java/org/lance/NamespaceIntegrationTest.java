@@ -217,27 +217,27 @@ public class NamespaceIntegrationTest {
     }
 
     /**
-     * Modifies storage options to add incrementing credentials with expiration timestamp.
+     * Simulates a credential vendor returning connection config and vended credentials.
      *
-     * @param storageOptions Original storage options
+     * <p>The base connection config (endpoint, region, allow_http) is included alongside vended
+     * credentials, mirroring what a real credential vendor would return.
+     *
      * @param count Call count to use for credential generation
-     * @return Modified storage options with new credentials
+     * @return Storage options with connection config and vended credentials
      */
-    private Map<String, String> modifyStorageOptions(
-        Map<String, String> storageOptions, int count) {
-      Map<String, String> modified =
-          storageOptions != null ? new HashMap<>(storageOptions) : new HashMap<>();
+    private Map<String, String> vendStorageOptions(int count) {
+      Map<String, String> options = new HashMap<>(baseStorageOptions);
 
-      modified.put("aws_access_key_id", "AKID_" + count);
-      modified.put("aws_secret_access_key", "SECRET_" + count);
-      modified.put("aws_session_token", "TOKEN_" + count);
+      options.put("aws_access_key_id", "AKID_" + count);
+      options.put("aws_secret_access_key", "SECRET_" + count);
+      options.put("aws_session_token", "TOKEN_" + count);
 
       long expiresAtMillis = System.currentTimeMillis() + (credentialExpiresInSeconds * 1000L);
-      modified.put("expires_at_millis", String.valueOf(expiresAtMillis));
+      options.put("expires_at_millis", String.valueOf(expiresAtMillis));
       // Set refresh offset to 1 second (1000ms) for short-lived credential tests
-      modified.put("refresh_offset_millis", "1000");
+      options.put("refresh_offset_millis", "1000");
 
-      return modified;
+      return options;
     }
 
     @Override
@@ -245,7 +245,7 @@ public class NamespaceIntegrationTest {
       int count = createCallCount.incrementAndGet();
 
       DeclareTableResponse response = inner.declareTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }
@@ -255,7 +255,7 @@ public class NamespaceIntegrationTest {
       int count = describeCallCount.incrementAndGet();
 
       DescribeTableResponse response = inner.describeTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }

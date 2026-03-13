@@ -113,23 +113,25 @@ class TrackingNamespace(LanceNamespace):
     def namespace_id(self) -> str:
         return f"TrackingNamespace {{ inner: {self.inner.namespace_id()} }}"
 
-    def _modify_storage_options(
-        self, storage_options: Dict[str, str], count: int
-    ) -> Dict[str, str]:
-        """Add incrementing credentials with expiration timestamp."""
-        modified = copy.deepcopy(storage_options) if storage_options else {}
+    def _vend_storage_options(self, count: int) -> Dict[str, str]:
+        """Simulate a credential vendor returning connection config and credentials.
 
-        modified["aws_access_key_id"] = f"AKID_{count}"
-        modified["aws_secret_access_key"] = f"SECRET_{count}"
-        modified["aws_session_token"] = f"TOKEN_{count}"
+        The base connection config (endpoint, region, allow_http) is included
+        alongside vended credentials, mirroring what a real credential vendor
+        would return.
+        """
+        options = copy.deepcopy(self.base_storage_options)
+        options["aws_access_key_id"] = f"AKID_{count}"
+        options["aws_secret_access_key"] = f"SECRET_{count}"
+        options["aws_session_token"] = f"TOKEN_{count}"
         expires_at_millis = int(
             (time.time() + self.credential_expires_in_seconds) * 1000
         )
-        modified["expires_at_millis"] = str(expires_at_millis)
+        options["expires_at_millis"] = str(expires_at_millis)
         # Set refresh offset to 1 second (1000ms) for short-lived credential tests
-        modified["refresh_offset_millis"] = "1000"
+        options["refresh_offset_millis"] = "1000"
 
-        return modified
+        return options
 
     def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
         with self.lock:
@@ -137,9 +139,7 @@ class TrackingNamespace(LanceNamespace):
             count = self.create_call_count
 
         response = self.inner.declare_table(request)
-        response.storage_options = self._modify_storage_options(
-            response.storage_options, count
-        )
+        response.storage_options = self._vend_storage_options(count)
 
         return response
 
@@ -149,9 +149,7 @@ class TrackingNamespace(LanceNamespace):
             count = self.describe_call_count
 
         response = self.inner.describe_table(request)
-        response.storage_options = self._modify_storage_options(
-            response.storage_options, count
-        )
+        response.storage_options = self._vend_storage_options(count)
 
         return response
 
