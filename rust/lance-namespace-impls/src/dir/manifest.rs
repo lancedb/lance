@@ -6,6 +6,7 @@
 //! This module provides a namespace implementation that uses a manifest table
 //! to track tables and nested namespaces.
 
+use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow_ipc::reader::StreamReader;
@@ -13,7 +14,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{FutureExt, stream::StreamExt};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::{ReadParams, WriteParams, builder::DatasetBuilder};
+use lance::dataset::{
+    DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteParams,
+    builder::DatasetBuilder,
+};
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
@@ -383,7 +387,7 @@ impl ManifestNamespace {
     }
 
     /// Split an object ID (table_id as vec of strings) into namespace and table name
-    fn split_object_id(table_id: &[String]) -> (Vec<String>, String) {
+    pub fn split_object_id(table_id: &[String]) -> (Vec<String>, String) {
         if table_id.len() == 1 {
             (vec![], table_id[0].clone())
         } else {
@@ -394,9 +398,40 @@ impl ManifestNamespace {
         }
     }
 
-    /// Convert a table ID (vec of strings) to an object_id string
-    pub fn str_object_id(table_id: &[String]) -> String {
-        table_id.join(DELIMITER)
+    /// Convert an ID (vec of strings) to an object_id string
+    pub fn str_object_id(object_id: &[String]) -> String {
+        object_id.join(DELIMITER)
+    }
+
+    /// Format a version number as a zero-padded lexicographically sortable string.
+    ///
+    /// Versions are stored as 20-digit zero-padded integers (e.g., `00000000000000000001`
+    /// for version 1) so that string-based range queries and sorting work correctly.
+    pub fn format_version(version: i64) -> String {
+        format!("{:020}", version)
+    }
+
+    /// Build the object_id for a table version entry.
+    ///
+    /// Format: `{table_object_id}${zero_padded_version}`
+    pub fn build_version_object_id(table_object_id: &str, version: i64) -> String {
+        format!(
+            "{}{}{}",
+            table_object_id,
+            DELIMITER,
+            Self::format_version(version)
+        )
+    }
+
+    /// Parse a version number from the version suffix of a table version object_id.
+    ///
+    /// The object_id is formatted as `{table_id}${version}` where version may be
+    /// either zero-padded (new format) or plain integer (legacy format).
+    pub fn parse_version_from_object_id(object_id: &str) -> Option<i64> {
+        object_id
+            .rsplit(DELIMITER)
+            .next()
+            .and_then(|ver_str| ver_str.parse::<i64>().ok())
     }
 
     /// Generate a new directory name in format: <hash>_<object_id>
@@ -405,7 +440,7 @@ impl ManifestNamespace {
     /// failed table creation, delete and create new table of the same name, etc.
     /// The object_id is added after the hash to ensure
     /// dir name uniqueness and make debugging easier.
-    fn generate_dir_name(object_id: &str) -> String {
+    pub fn generate_dir_name(object_id: &str) -> String {
         // Generate a random number for uniqueness
         let random_num: u64 = rand::random();
 
@@ -798,8 +833,6 @@ impl ManifestNamespace {
         metadata: Option<String>,
         base_objects: Option<Vec<String>>,
     ) -> Result<()> {
-        use arrow::array::builder::{ListBuilder, StringBuilder};
-
         let schema = Self::manifest_schema();
 
         // Create base_objects array from the provided list
@@ -855,13 +888,22 @@ impl ManifestNamespace {
         drop(dataset_guard); // Drop read guard before merge insert
 
         let mut merge_builder =
-            lance::dataset::MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()])
-                .map_err(|e| {
+            MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()]).map_err(
+                |e| {
                     Error::io_source(box_error(std::io::Error::other(format!(
                         "Failed to create merge builder: {}",
                         e
                     ))))
-                })?;
+                },
+            )?;
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
 
         merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
         merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
@@ -871,6 +913,98 @@ impl ManifestNamespace {
         // the full MergeInsert plan against the latest data, where the join detects
         // the existing row and WhenMatched::Fail fires, producing a clear error.
         merge_builder.conflict_retries(5);
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.conflict_retries(5);
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.conflict_retries(5);
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
+        merge_builder.conflict_retries(5);
+        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
+        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+
         // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
         // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
         // results in (Some, None) filter mismatch when rebasing against V2 operations.
@@ -917,7 +1051,7 @@ impl ManifestNamespace {
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard); // Drop read guard before delete
 
-        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &predicate)
+        let new_dataset = DeleteBuilder::new(dataset, &predicate)
             .execute()
             .await
             .map_err(|e| convert_lance_commit_error(&e, "Failed to delete", None))?;
@@ -949,8 +1083,6 @@ impl ManifestNamespace {
         &self,
         entries: Vec<(String, ObjectType, Option<String>, Option<String>)>,
     ) -> Result<()> {
-        use arrow::array::builder::{ListBuilder, StringBuilder};
-
         if entries.is_empty() {
             return Ok(());
         }
@@ -1014,16 +1146,16 @@ impl ManifestNamespace {
         drop(dataset_guard);
 
         let mut merge_builder =
-            lance::dataset::MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()])
-                .map_err(|e| {
+            MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()]).map_err(
+                |e| {
                     Error::io_source(box_error(std::io::Error::other(format!(
                         "Failed to create merge builder: {}",
                         e
                     ))))
-                })?;
+                },
+            )?;
 
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         merge_builder.conflict_retries(0);
         merge_builder.use_index(false);
         if let Some(retries) = self.commit_retries {
@@ -1073,15 +1205,15 @@ impl ManifestNamespace {
     /// expensive. Pushing sort/limit into the scan is not yet supported by Lance.
     pub async fn query_table_versions(
         &self,
-        table_id: &str,
+        object_id: &str,
         descending: bool,
         limit: Option<i32>,
     ) -> Result<Vec<(i64, String)>> {
-        let escaped_id = table_id.replace('\'', "''");
-        // table_version object_ids are formatted as "{table_id}${version}"
+        let escaped_id = object_id.replace('\'', "''");
+        // table_version object_ids are formatted as "{object_id}${zero_padded_version}"
         let filter = format!(
-            "object_type = 'table_version' AND starts_with(object_id, '{}$')",
-            escaped_id
+            "object_type = 'table_version' AND starts_with(object_id, '{}{}')",
+            escaped_id, DELIMITER
         );
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
@@ -1107,12 +1239,10 @@ impl ManifestNamespace {
             let metadata_array = Self::get_string_column(&batch, "metadata")?;
             for i in 0..batch.num_rows() {
                 let oid = object_id_array.value(i);
-                // Parse version from object_id: "{table_id}${version}"
-                if let Some(ver_str) = oid.rsplit('$').next() {
-                    if let Ok(version) = ver_str.parse::<i64>() {
-                        let metadata_str = metadata_array.value(i).to_string();
-                        versions.push((version, metadata_str));
-                    }
+                // Parse version from object_id (supports both zero-padded and legacy formats)
+                if let Some(version) = Self::parse_version_from_object_id(oid) {
+                    let metadata_str = metadata_array.value(i).to_string();
+                    versions.push((version, metadata_str));
                 }
             }
         }
@@ -1134,13 +1264,38 @@ impl ManifestNamespace {
     ///
     /// Returns the full metadata JSON string if found, which contains
     /// manifest_path, manifest_size, e_tag, and naming_scheme.
+    ///
+    /// Supports both zero-padded (new) and plain integer (legacy) object_id formats
+    /// by trying the new format first, then falling back to legacy.
     pub async fn query_table_version(
         &self,
-        table_id: &str,
+        object_id: &str,
         version: i64,
     ) -> Result<Option<String>> {
-        let object_id = format!("{}${}", table_id, version);
-        let escaped_id = object_id.replace('\'', "''");
+        // Try new zero-padded format first
+        let version_object_id = Self::build_version_object_id(object_id, version);
+        if let Some(metadata) = self
+            .query_table_version_by_object_id(&version_object_id)
+            .await?
+        {
+            return Ok(Some(metadata));
+        }
+        // Fall back to legacy plain integer format
+        let legacy_object_id = format!("{}{}{}", object_id, DELIMITER, version);
+        if legacy_object_id != version_object_id {
+            return self
+                .query_table_version_by_object_id(&legacy_object_id)
+                .await;
+        }
+        Ok(None)
+    }
+
+    /// Query a specific table version by its exact object_id.
+    async fn query_table_version_by_object_id(
+        &self,
+        version_object_id: &str,
+    ) -> Result<Option<String>> {
+        let escaped_id = version_object_id.replace('\'', "''");
         let filter = format!(
             "object_id = '{}' AND object_type = 'table_version'",
             escaped_id
@@ -1174,26 +1329,33 @@ impl ManifestNamespace {
     /// Delete table version entries from the manifest for a given table and version ranges.
     ///
     /// Each range is (start_version, end_version) inclusive. Deletes all matching
-    /// `object_type = 'table_version'` entries whose object_id matches `{table_id}${version}`.
+    /// `object_type = 'table_version'` entries whose object_id matches
+    /// `{object_id}${zero_padded_version}`.
     ///
     /// Builds a single filter expression covering all version ranges and executes
     /// one bulk delete operation instead of deleting versions one at a time.
     pub async fn delete_table_versions(
         &self,
-        table_id: &str,
+        object_id: &str,
         ranges: &[(i64, i64)],
     ) -> Result<i64> {
         if ranges.is_empty() {
             return Ok(0);
         }
 
-        // Collect all object_ids to delete
-        let escaped_table_id = table_id.replace('\'', "''");
+        // Collect all object_ids to delete (both new zero-padded and legacy formats)
         let mut object_id_conditions: Vec<String> = Vec::new();
         for (start, end) in ranges {
             for version in *start..=*end {
-                let object_id = format!("{}${}", escaped_table_id, version);
-                object_id_conditions.push(format!("'{}'", object_id));
+                let new_oid = Self::build_version_object_id(object_id, version);
+                let escaped = new_oid.replace('\'', "''");
+                object_id_conditions.push(format!("'{}'", escaped));
+                // Also include legacy plain integer format for backwards compatibility
+                let legacy_oid = format!("{}{}{}", object_id, DELIMITER, version);
+                if legacy_oid != new_oid {
+                    let escaped_legacy = legacy_oid.replace('\'', "''");
+                    object_id_conditions.push(format!("'{}'", escaped_legacy));
+                }
             }
         }
 
@@ -1233,7 +1395,7 @@ impl ManifestNamespace {
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard);
 
-        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &filter)
+        let new_dataset = DeleteBuilder::new(dataset, &filter)
             .execute()
             .await
             .map_err(|e| {
@@ -1311,7 +1473,7 @@ impl ManifestNamespace {
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard);
 
-        let new_dataset = lance::dataset::DeleteBuilder::new(dataset, &filter)
+        let new_dataset = DeleteBuilder::new(dataset, &filter)
             .execute()
             .await
             .map_err(|e| {

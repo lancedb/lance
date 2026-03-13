@@ -11,14 +11,14 @@ use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    BatchCreateTableVersionsRequest, BatchCreateTableVersionsResponse,
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
-    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    BatchCommitTablesRequest, BatchCommitTablesResponse, BatchCreateTableVersionsRequest,
+    BatchCreateTableVersionsResponse, BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
@@ -387,6 +387,31 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         Err(Error::not_supported(
             "batch_create_table_versions not implemented",
         ))
+    }
+
+    /// Batch commit table operations atomically.
+    ///
+    /// This operation atomically commits a list of mixed table operations
+    /// (declare_table, create_table_version, delete_table_versions, deregister_table)
+    /// across multiple tables in a single transaction at the metadata layer.
+    ///
+    /// All operations are committed atomically: either all succeed or none are applied.
+    /// Physical file operations (writing manifests, deleting files) are best-effort —
+    /// metadata is the source of truth.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Contains a list of operations to commit atomically.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if any operation conflicts (e.g., version already exists).
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if any referenced table does not exist.
+    async fn batch_commit_tables(
+        &self,
+        _request: BatchCommitTablesRequest,
+    ) -> Result<BatchCommitTablesResponse> {
+        Err(Error::not_supported("batch_commit_tables not implemented"))
     }
 
     /// Update table schema metadata.

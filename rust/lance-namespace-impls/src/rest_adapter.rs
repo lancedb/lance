@@ -89,6 +89,7 @@ impl RestAdapter {
                 "/v1/table/version/batch_create",
                 post(batch_create_table_versions),
             )
+            .route("/v1/table/batch_commit", post(batch_commit_tables))
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -822,6 +823,21 @@ async fn batch_create_table_versions(
     request.identity = extract_identity(&headers);
 
     match backend.batch_create_table_versions(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_commit_tables(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Query(_params): Query<DelimiterQuery>,
+    Json(body): Json<BatchCommitTablesRequest>,
+) -> Response {
+    let mut request = body;
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_commit_tables(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
