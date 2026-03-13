@@ -236,9 +236,17 @@ struct DelimiterQuery {
 #[derive(Debug, Deserialize)]
 struct PaginationQuery {
     delimiter: Option<String>,
+    // Optional snapshot selection for APIs that support historical reads.
+    version: Option<i64>,
     page_token: Option<String>,
     limit: Option<i32>,
     descending: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionQuery {
+    delimiter: Option<String>,
+    version: Option<i64>,
 }
 
 // ============================================================================
@@ -860,13 +868,14 @@ async fn list_table_indices(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
+    Query(params): Query<PaginationQuery>,
 ) -> Response {
+    // Keep HTTP query params as a thin mapping to namespace request fields.
     let request = ListTableIndicesRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
-        version: None,
-        page_token: None,
-        limit: None,
+        version: params.version,
+        page_token: params.page_token,
+        limit: params.limit,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -887,11 +896,12 @@ async fn describe_table_index_stats(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
-    Query(query): Query<DelimiterQuery>,
+    Query(query): Query<VersionQuery>,
 ) -> Response {
+    // Stats endpoint takes index name from path and optional snapshot version from query.
     let request = DescribeTableIndexStatsRequest {
         id: Some(parse_id(&params.id, query.delimiter.as_deref())),
-        version: None,
+        version: query.version,
         index_name: Some(params.index_name),
         identity: extract_identity(&headers),
         ..Default::default()
@@ -2948,6 +2958,132 @@ mod tests {
                 result.is_ok(),
                 "Failed to list table versions with ascending: {:?}",
                 result
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_list_table_indices_with_query_pagination() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["index_test_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(vec!["index_test_ns".to_string(), "index_table".to_string()]),
+                mode: Some("create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            let mut create_idx_a =
+                CreateTableIndexRequest::new("id".to_string(), "BTREE".to_string());
+            create_idx_a.id = Some(vec!["index_test_ns".to_string(), "index_table".to_string()]);
+            create_idx_a.name = Some("a_index".to_string());
+            fixture
+                .namespace
+                .create_table_index(create_idx_a)
+                .await
+                .unwrap();
+
+            let mut create_idx_b =
+                CreateTableIndexRequest::new("id".to_string(), "BITMAP".to_string());
+            create_idx_b.id = Some(vec!["index_test_ns".to_string(), "index_table".to_string()]);
+            create_idx_b.name = Some("b_index".to_string());
+            fixture
+                .namespace
+                .create_table_index(create_idx_b)
+                .await
+                .unwrap();
+
+            let mut page1_req = ListTableIndicesRequest::new();
+            page1_req.id = Some(vec!["index_test_ns".to_string(), "index_table".to_string()]);
+            page1_req.limit = Some(1);
+            let page1 = fixture
+                .namespace
+                .list_table_indices(page1_req)
+                .await
+                .unwrap();
+            assert_eq!(page1.indexes.len(), 1);
+            assert_eq!(page1.page_token.as_deref(), Some("a_index"));
+
+            let mut page2_req = ListTableIndicesRequest::new();
+            page2_req.id = Some(vec!["index_test_ns".to_string(), "index_table".to_string()]);
+            page2_req.limit = Some(1);
+            page2_req.page_token = page1.page_token.clone();
+            let page2 = fixture
+                .namespace
+                .list_table_indices(page2_req)
+                .await
+                .unwrap();
+            assert_eq!(page2.indexes.len(), 1);
+            assert_eq!(page2.indexes[0].index_name, "b_index".to_string());
+            assert_eq!(page2.page_token, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_describe_table_index_stats_propagates_version_query() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["stats_test_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(vec!["stats_test_ns".to_string(), "stats_table".to_string()]),
+                mode: Some("create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            let mut create_idx_req =
+                CreateTableIndexRequest::new("id".to_string(), "BTREE".to_string());
+            create_idx_req.id = Some(vec!["stats_test_ns".to_string(), "stats_table".to_string()]);
+            create_idx_req.name = Some("id_btree_idx".to_string());
+            fixture
+                .namespace
+                .create_table_index(create_idx_req)
+                .await
+                .unwrap();
+
+            let stats_req = DescribeTableIndexStatsRequest {
+                id: Some(vec!["stats_test_ns".to_string(), "stats_table".to_string()]),
+                version: Some(-1),
+                index_name: Some("id_btree_idx".to_string()),
+                ..Default::default()
+            };
+
+            let err = fixture
+                .namespace
+                .describe_table_index_stats(stats_req)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Version must be non-negative"),
+                "Expected version validation error, got: {}",
+                err
             );
         }
 

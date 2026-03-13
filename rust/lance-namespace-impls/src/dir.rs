@@ -6,6 +6,7 @@
 //! This module provides a directory-based implementation of the Lance namespace
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
+mod indexes;
 pub mod manifest;
 
 use arrow::record_batch::RecordBatchIterator;
@@ -16,6 +17,7 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
+use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
@@ -27,12 +29,15 @@ use std::sync::Arc;
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableVersionRequest,
     CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
-    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
-    ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableIndicesRequest, ListTableIndicesResponse, ListTableVersionsRequest,
     ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
     TableExistsRequest, TableVersion,
 };
@@ -693,6 +698,46 @@ impl DirectoryNamespace {
         }
 
         Ok(id[0].clone())
+    }
+
+    async fn load_dataset_at_version(
+        &self,
+        table_uri: &str,
+        version: Option<i64>,
+    ) -> Result<Dataset> {
+        // Always construct through DatasetBuilder so storage/session context is preserved
+        // for local and object-store-backed URIs.
+        let mut builder = DatasetBuilder::from_uri(table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        let mut dataset = builder.load().await.map_err(|e| {
+            Error::namespace_source(
+                format!("Failed to load table at '{}': {}", table_uri, e).into(),
+            )
+        })?;
+
+        if let Some(v) = version {
+            if v < 0 {
+                return Err(Error::invalid_input_source(
+                    format!("Version must be non-negative, got {}", v).into(),
+                ));
+            }
+            // Version checkout is explicit to keep callers from reading latest implicitly.
+            dataset = dataset.checkout_version(v as u64).await.map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to checkout version {} for table at '{}': {}",
+                        v, table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+        }
+        Ok(dataset)
     }
 
     async fn resolve_table_location(&self, id: &Option<Vec<String>>) -> Result<String> {
@@ -1518,6 +1563,67 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn create_table_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableIndexResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self.load_dataset_at_version(&table_uri, None).await?;
+        indexes::create_table_index(&mut dataset, &request).await?;
+
+        Ok(CreateTableIndexResponse::new())
+    }
+
+    async fn create_table_scalar_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableScalarIndexResponse> {
+        indexes::validate_scalar_index_type(&request.index_type)?;
+        self.create_table_index(request).await?;
+        Ok(CreateTableScalarIndexResponse::new())
+    }
+
+    async fn list_table_indices(
+        &self,
+        request: ListTableIndicesRequest,
+    ) -> Result<ListTableIndicesResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset_at_version(&table_uri, request.version)
+            .await?;
+        indexes::list_table_indices(&dataset, &request).await
+    }
+
+    async fn describe_table_index_stats(
+        &self,
+        request: DescribeTableIndexStatsRequest,
+    ) -> Result<DescribeTableIndexStatsResponse> {
+        // Validate required fields before any table lookup so error shape is deterministic.
+        if request.index_name.is_none() {
+            return Err(Error::invalid_input_source(
+                "index_name is required".to_string().into(),
+            ));
+        }
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset_at_version(&table_uri, request.version)
+            .await?;
+        indexes::describe_table_index_stats(&dataset, &request).await
+    }
+
+    async fn drop_table_index(
+        &self,
+        request: DropTableIndexRequest,
+    ) -> Result<DropTableIndexResponse> {
+        let index_name = request.index_name.as_ref().ok_or_else(|| {
+            Error::invalid_input_source("index_name is required".to_string().into())
+        })?;
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self.load_dataset_at_version(&table_uri, None).await?;
+        dataset.drop_index(index_name).await?;
+        Ok(DropTableIndexResponse::new())
+    }
+
     async fn list_table_versions(
         &self,
         request: ListTableVersionsRequest,
@@ -1817,13 +1923,19 @@ impl LanceNamespace for DirectoryNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::ipc::writer::StreamWriter;
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_index::IndexType;
     use lance_namespace::models::{
-        CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
+        CreateTableIndexRequest, CreateTableRequest, DescribeTableIndexStatsRequest,
+        DropTableIndexRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema,
+        ListTableIndicesRequest, ListTablesRequest,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
+    use serde_json::Value as JsonValue;
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -1840,11 +1952,32 @@ mod tests {
 
     /// Helper to create test IPC data from a schema
     fn create_test_ipc_data(schema: &JsonArrowSchema) -> Vec<u8> {
-        use arrow::ipc::writer::StreamWriter;
-
         let arrow_schema = convert_json_arrow_schema(schema).unwrap();
         let arrow_schema = Arc::new(arrow_schema);
         let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buffer
+    }
+
+    /// Helper to create test IPC data with rows matching the default test schema.
+    fn create_test_ipc_data_with_rows(schema: &JsonArrowSchema, ids: &[i32]) -> Vec<u8> {
+        let arrow_schema = Arc::new(convert_json_arrow_schema(schema).unwrap());
+        let id_array = Int32Array::from(ids.to_vec());
+        let name_values: Vec<Option<String>> =
+            ids.iter().map(|id| Some(format!("name-{}", id))).collect();
+        let name_array = StringArray::from(name_values);
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap();
+
         let mut buffer = Vec::new();
         {
             let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
@@ -1877,6 +2010,278 @@ mod tests {
             fields: vec![id_field, name_field],
             metadata: None,
         }
+    }
+
+    #[test]
+    fn test_normalize_index_type_aliases() {
+        assert_eq!(indexes::normalize_index_type("fts"), "INVERTED");
+        assert_eq!(indexes::normalize_index_type("label_list"), "LABELLIST");
+        assert_eq!(indexes::normalize_index_type("BLOOMFILTER"), "BLOOMFILTER");
+        assert_eq!(indexes::normalize_index_type("BLOOM_FILTER"), "BLOOMFILTER");
+        assert_eq!(indexes::normalize_index_type("BTREE"), "BTREE");
+    }
+
+    #[test]
+    fn test_parse_index_type_aliases_and_invalid() {
+        assert_eq!(
+            indexes::parse_index_type("FTS").unwrap(),
+            IndexType::Inverted
+        );
+        assert_eq!(
+            indexes::parse_index_type("label_list").unwrap(),
+            IndexType::LabelList
+        );
+        assert_eq!(
+            indexes::parse_index_type("bloom_filter").unwrap(),
+            IndexType::BloomFilter
+        );
+
+        let err = indexes::parse_index_type("not_a_real_type").unwrap_err();
+        assert!(err.to_string().contains("Invalid index_type"));
+    }
+
+    #[test]
+    fn test_as_i64_handles_signed_unsigned_and_invalid() {
+        let signed = JsonValue::from(-11);
+        assert_eq!(indexes::as_i64(Some(&signed)), Some(-11));
+
+        let unsigned = JsonValue::from(42_u64);
+        assert_eq!(indexes::as_i64(Some(&unsigned)), Some(42));
+
+        let too_large_unsigned = JsonValue::from(u64::MAX);
+        assert_eq!(indexes::as_i64(Some(&too_large_unsigned)), None);
+
+        let non_numeric = JsonValue::from("not-a-number");
+        assert_eq!(indexes::as_i64(Some(&non_numeric)), None);
+        assert_eq!(indexes::as_i64(None), None);
+    }
+
+    #[tokio::test]
+    async fn test_load_dataset_at_version_selects_version_and_validates_input() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data_with_rows(&schema, &[1, 2]);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["versioned_table".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let table_uri = namespace.table_full_uri("versioned_table");
+        let mut dataset = Dataset::open(&table_uri).await.unwrap();
+
+        let append_schema = Arc::new(convert_json_arrow_schema(&schema).unwrap());
+        let append_batch = arrow::record_batch::RecordBatch::try_new(
+            append_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(StringArray::from(vec![Some("name-3")])),
+            ],
+        )
+        .unwrap();
+        let append_reader = RecordBatchIterator::new(vec![Ok(append_batch)], append_schema);
+        dataset.append(append_reader, None).await.unwrap();
+
+        let latest = namespace
+            .load_dataset_at_version(&table_uri, None)
+            .await
+            .unwrap();
+        assert_eq!(latest.version().version, 2);
+        assert_eq!(latest.count_rows(None).await.unwrap(), 3);
+
+        let version_1 = namespace
+            .load_dataset_at_version(&table_uri, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(version_1.version().version, 1);
+        assert_eq!(version_1.count_rows(None).await.unwrap(), 2);
+
+        let err = namespace
+            .load_dataset_at_version(&table_uri, Some(-1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Version must be non-negative"));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_scalar_index_lifecycle() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data_with_rows(&schema, &[1, 2, 3, 4]);
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["indexed_table".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut create_index_req =
+            CreateTableIndexRequest::new("id".to_string(), "BTREE".to_string());
+        create_index_req.id = Some(vec!["indexed_table".to_string()]);
+        create_index_req.name = Some("id_btree_idx".to_string());
+        namespace
+            .create_table_scalar_index(create_index_req)
+            .await
+            .unwrap();
+
+        let mut list_req = ListTableIndicesRequest::new();
+        list_req.id = Some(vec!["indexed_table".to_string()]);
+        let list_resp = namespace.list_table_indices(list_req).await.unwrap();
+        assert_eq!(list_resp.indexes.len(), 1);
+        assert_eq!(list_resp.indexes[0].index_name, "id_btree_idx");
+        assert_eq!(list_resp.indexes[0].columns, vec!["id".to_string()]);
+        assert_eq!(list_resp.indexes[0].status, "done");
+
+        let mut describe_req = DescribeTableIndexStatsRequest::new();
+        describe_req.id = Some(vec!["indexed_table".to_string()]);
+        describe_req.index_name = Some("id_btree_idx".to_string());
+        let stats = namespace
+            .describe_table_index_stats(describe_req)
+            .await
+            .unwrap();
+        let index_type = stats.index_type.unwrap_or_default().to_ascii_uppercase();
+        assert!(
+            index_type.contains("BTREE"),
+            "Expected BTREE stats, got: {}",
+            index_type
+        );
+
+        let mut drop_req = DropTableIndexRequest::new();
+        drop_req.id = Some(vec!["indexed_table".to_string()]);
+        drop_req.index_name = Some("id_btree_idx".to_string());
+        namespace.drop_table_index(drop_req).await.unwrap();
+
+        let mut list_req = ListTableIndicesRequest::new();
+        list_req.id = Some(vec!["indexed_table".to_string()]);
+        let list_resp = namespace.list_table_indices(list_req).await.unwrap();
+        assert_eq!(list_resp.indexes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_scalar_index_rejects_vector_index_types() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data_with_rows(&schema, &[1, 2, 3, 4]);
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["indexed_table".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        for index_type in ["IVF_FLAT", "IVF_PQ"] {
+            let mut create_index_req =
+                CreateTableIndexRequest::new("id".to_string(), index_type.to_string());
+            create_index_req.id = Some(vec!["indexed_table".to_string()]);
+            create_index_req.name = Some(format!("{}_idx", index_type.to_ascii_lowercase()));
+
+            let err = namespace
+                .create_table_scalar_index(create_index_req)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("create_table_scalar_index only supports scalar index types"),
+                "Expected scalar-only validation error for index type {}, got: {}",
+                index_type,
+                err
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_table_indices_pagination() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data_with_rows(&schema, &[10, 20, 30, 40]);
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["paged_table".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut idx_a = CreateTableIndexRequest::new("id".to_string(), "BTREE".to_string());
+        idx_a.id = Some(vec!["paged_table".to_string()]);
+        idx_a.name = Some("a_index".to_string());
+        namespace.create_table_index(idx_a).await.unwrap();
+
+        let mut idx_b = CreateTableIndexRequest::new("id".to_string(), "BITMAP".to_string());
+        idx_b.id = Some(vec!["paged_table".to_string()]);
+        idx_b.name = Some("b_index".to_string());
+        namespace.create_table_index(idx_b).await.unwrap();
+
+        let mut page1_req = ListTableIndicesRequest::new();
+        page1_req.id = Some(vec!["paged_table".to_string()]);
+        page1_req.limit = Some(1);
+        let page1 = namespace.list_table_indices(page1_req).await.unwrap();
+        assert_eq!(page1.indexes.len(), 1);
+        assert_eq!(page1.page_token.as_deref(), Some("a_index"));
+
+        let mut page2_req = ListTableIndicesRequest::new();
+        page2_req.id = Some(vec!["paged_table".to_string()]);
+        page2_req.limit = Some(1);
+        page2_req.page_token = page1.page_token.clone();
+        let page2 = namespace.list_table_indices(page2_req).await.unwrap();
+        assert_eq!(page2.indexes.len(), 1);
+        assert_ne!(page1.indexes[0].index_name, page2.indexes[0].index_name);
+        assert_eq!(page2.page_token, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_table_indices_rejects_non_positive_limit() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data_with_rows(&schema, &[10, 20, 30, 40]);
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["limit_table".to_string()]);
+        namespace
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        for limit in [0, -1] {
+            let mut req = ListTableIndicesRequest::new();
+            req.id = Some(vec!["limit_table".to_string()]);
+            req.limit = Some(limit);
+
+            let err = namespace.list_table_indices(req).await.unwrap_err();
+            assert!(
+                err.to_string().contains("limit must be positive"),
+                "Expected non-positive limit error for limit={}, got: {}",
+                limit,
+                err
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_index_stats_requires_index_name() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let mut request = DescribeTableIndexStatsRequest::new();
+        request.id = Some(vec!["table".to_string()]);
+
+        let err = namespace
+            .describe_table_index_stats(request)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("index_name is required"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_index_requires_index_name() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let mut request = DropTableIndexRequest::new();
+        request.id = Some(vec!["table".to_string()]);
+
+        let err = namespace.drop_table_index(request).await.unwrap_err();
+        assert!(err.to_string().contains("index_name is required"));
     }
 
     #[tokio::test]

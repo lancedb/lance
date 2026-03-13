@@ -1010,8 +1010,25 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/index/list", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "list_table_indices", &id)
+        // The REST spec models list/read operations as GET + query parameters.
+        // Keep request shaping here so clients interoperate with non-adapter servers.
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let version_str;
+        if let Some(version) = request.version {
+            version_str = version.to_string();
+            query.push(("version", version_str.as_str()));
+        }
+        let page_token_str;
+        if let Some(ref page_token) = request.page_token {
+            page_token_str = page_token.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.get_json(&path, &query, "list_table_indices", &id)
             .await
     }
 
@@ -1021,14 +1038,27 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<DescribeTableIndexStatsResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
-        let index_name = request.index_name.as_deref().unwrap_or("");
+        let index_name = request.index_name.as_deref().ok_or_else(|| {
+            Error::invalid_input_source("index_name is required".to_string().into())
+        })?;
+        if index_name.is_empty() {
+            return Err(Error::invalid_input_source(
+                "index_name must not be empty".to_string().into(),
+            ));
+        }
         let path = format!(
             "/v1/table/{}/index/{}/stats",
             encoded_id,
             urlencode(index_name)
         );
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "describe_table_index_stats", &id)
+        // Version is optional and lets callers request stats from historical snapshots.
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let version_str;
+        if let Some(version) = request.version {
+            version_str = version.to_string();
+            query.push(("version", version_str.as_str()));
+        }
+        self.get_json(&path, &query, "describe_table_index_stats", &id)
             .await
     }
 
@@ -1074,7 +1104,14 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<DropTableIndexResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
-        let index_name = request.index_name.as_deref().unwrap_or("");
+        let index_name = request.index_name.as_deref().ok_or_else(|| {
+            Error::invalid_input_source("index_name is required".to_string().into())
+        })?;
+        if index_name.is_empty() {
+            return Err(Error::invalid_input_source(
+                "index_name must not be empty".to_string().into(),
+            ));
+        }
         let path = format!(
             "/v1/table/{}/index/{}/drop",
             encoded_id,
@@ -1348,7 +1385,7 @@ impl LanceNamespace for RestNamespace {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1695,6 +1732,119 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.transaction_id, Some("txn-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_table_indices_uses_get_with_query_params() {
+        let mock_server = MockServer::start().await;
+        let path_str = "/v1/table/test$namespace$table/index/list".replace("$", "%24");
+
+        Mock::given(method("GET"))
+            .and(path(path_str.as_str()))
+            .and(query_param("delimiter", "$"))
+            .and(query_param("version", "7"))
+            .and(query_param("page_token", "a_index"))
+            .and(query_param("limit", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "indexes": [],
+                "page_token": "next_page"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let request = ListTableIndicesRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            version: Some(7),
+            page_token: Some("a_index".to_string()),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        let result = namespace.list_table_indices(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let response = result.unwrap();
+        assert_eq!(response.page_token.as_deref(), Some("next_page"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_index_stats_uses_get_with_version_query() {
+        let mock_server = MockServer::start().await;
+        let path_str =
+            "/v1/table/test$namespace$table/index/id_btree_idx/stats".replace("$", "%24");
+
+        Mock::given(method("GET"))
+            .and(path(path_str.as_str()))
+            .and(query_param("delimiter", "$"))
+            .and(query_param("version", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "distance_type": null,
+                "index_type": "BTREE",
+                "num_indexed_rows": 3,
+                "num_unindexed_rows": 0,
+                "num_indices": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let request = DescribeTableIndexStatsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            version: Some(3),
+            index_name: Some("id_btree_idx".to_string()),
+            ..Default::default()
+        };
+
+        let result = namespace.describe_table_index_stats(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let stats = result.unwrap();
+        assert_eq!(stats.index_type.as_deref(), Some("BTREE"));
+        assert_eq!(stats.num_indexed_rows, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_index_stats_requires_index_name() {
+        let namespace = RestNamespaceBuilder::new("http://127.0.0.1:9").build();
+        let request = DescribeTableIndexStatsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            index_name: None,
+            ..Default::default()
+        };
+
+        let err = namespace
+            .describe_table_index_stats(request)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("index_name is required"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_index_requires_index_name() {
+        let namespace = RestNamespaceBuilder::new("http://127.0.0.1:9").build();
+        let request = DropTableIndexRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            index_name: None,
+            ..Default::default()
+        };
+
+        let err = namespace.drop_table_index(request).await.unwrap_err();
+        assert!(err.to_string().contains("index_name is required"));
     }
 
     // Integration tests for DynamicContextProvider
