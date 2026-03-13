@@ -73,7 +73,7 @@ lance-testing = { version = "=4.0.0-beta.10", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "57.0.0", optional = false, features = ["prettyprint"] }
-arrow-scalar = { version = "=57.0.0", path = "./rust/arrow-scalar" }
+lance-arrow-scalar = { version = "=57.0.0", path = "./rust/arrow-scalar" }
 arrow-arith = "57.0.0"
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"

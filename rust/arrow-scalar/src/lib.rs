@@ -40,7 +40,7 @@ type Result<T> = std::result::Result<T, ArrowError>;
 /// # Examples
 ///
 /// ```
-/// use arrow_scalar::ArrowScalar;
+/// use lance_arrow_scalar::ArrowScalar;
 ///
 /// let a = ArrowScalar::from(1i32);
 /// let b = ArrowScalar::from(2i32);

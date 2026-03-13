@@ -407,22 +407,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-scalar"
-version = "57.0.0"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "half",
- "proptest",
- "rstest",
-]
-
-[[package]]
 name = "arrow-schema"
 version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4870,6 +4854,22 @@ dependencies = [
  "jsonb",
  "num-traits",
  "rand 0.9.2",
+]
+
+[[package]]
+name = "lance-arrow-scalar"
+version = "57.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-ord",
+ "arrow-row",
+ "arrow-schema",
+ "half",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]
