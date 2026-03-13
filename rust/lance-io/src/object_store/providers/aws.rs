@@ -543,6 +543,26 @@ impl CredentialProvider for DynamicStorageOptionsCredentialProvider {
     type Credential = ObjectStoreAwsCredential;
 
     async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        // If we have already fallen back to the default chain, the accessor
+        // will never return credentials — skip it entirely.
+        {
+            let cached = self.default_chain.read().await;
+            if let Some(chain) = &*cached {
+                let creds = chain.provide_credentials().await.map_err(|e| {
+                    object_store::Error::Generic {
+                        store: "DynamicStorageOptionsCredentialProvider",
+                        source: Box::new(e),
+                    }
+                })?;
+
+                return Ok(Arc::new(ObjectStoreAwsCredential {
+                    key_id: creds.access_key_id().to_string(),
+                    secret_key: creds.secret_access_key().to_string(),
+                    token: creds.session_token().map(|s| s.to_string()),
+                }));
+            }
+        }
+
         let storage_options = self.accessor.get_storage_options().await.map_err(|e| {
             object_store::Error::Generic {
                 store: "DynamicStorageOptionsCredentialProvider",
