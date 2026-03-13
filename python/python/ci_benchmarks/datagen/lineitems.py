@@ -21,14 +21,13 @@ def _gen_data(tmpdir: str, scale_factor: int):
     con.execute("INSTALL tpch; LOAD tpch")
     con.execute(f"CALL dbgen(sf={scale_factor})")
     res = con.query("SELECT * FROM lineitem")
-    return res.fetch_arrow_reader()
+    return res.to_arrow_reader()
 
 
 def _create(dataset_uri: str, data_storage_version: str, scale_factor: int = 10):
     tmpdir = tempfile.mkdtemp(prefix=f"tpch-scale-factor-{scale_factor}-")
     try:
         ds = lance.dataset(dataset_uri)
-        print(ds.count_rows())
         if ds.count_rows() == NUM_ROWS:
             return
         elif ds.count_rows() == 0:
