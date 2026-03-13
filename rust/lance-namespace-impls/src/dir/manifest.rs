@@ -896,15 +896,6 @@ impl ManifestNamespace {
                     ))))
                 },
             )?;
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-
         merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
         merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
         // Use conflict_retries to handle cross-process races on manifest mutations.
@@ -913,98 +904,6 @@ impl ManifestNamespace {
         // the full MergeInsert plan against the latest data, where the join detects
         // the existing row and WhenMatched::Fail fires, producing a clear error.
         merge_builder.conflict_retries(5);
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.conflict_retries(5);
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.conflict_retries(5);
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
-        merge_builder.conflict_retries(5);
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
-        merge_builder.conflict_retries(5);
-
         // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
         // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
         // results in (Some, None) filter mismatch when rebasing against V2 operations.
