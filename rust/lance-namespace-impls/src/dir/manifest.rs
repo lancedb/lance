@@ -68,9 +68,6 @@ pub enum ObjectType {
     Namespace,
     Table,
     TableVersion,
-    /// A property entry used to persist feature flags and configuration
-    /// in the __manifest table (e.g., `table_version_storage_enabled`).
-    Property,
 }
 
 impl ObjectType {
@@ -79,7 +76,6 @@ impl ObjectType {
             Self::Namespace => "namespace",
             Self::Table => "table",
             Self::TableVersion => "table_version",
-            Self::Property => "property",
         }
     }
 
@@ -88,7 +84,6 @@ impl ObjectType {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
             "table_version" => Ok(Self::TableVersion),
-            "property" => Ok(Self::Property),
             _ => Err(Error::io(format!("Invalid object type: {}", s))),
         }
     }
@@ -413,7 +408,7 @@ impl ManifestNamespace {
     ///
     /// Versions are stored as 20-digit zero-padded integers (e.g., `00000000000000000001`
     /// for version 1) so that string-based range queries and sorting work correctly.
-    pub fn format_version(version: i64) -> String {
+    pub fn format_table_version(version: i64) -> String {
         format!("{:020}", version)
     }
 
@@ -425,7 +420,7 @@ impl ManifestNamespace {
             "{}{}{}",
             table_object_id,
             DELIMITER,
-            Self::format_version(version)
+            Self::format_table_version(version)
         )
     }
 
@@ -1383,29 +1378,35 @@ impl ManifestNamespace {
         Ok(deleted_count)
     }
 
-    /// Set a boolean property flag in the __manifest table.
+    /// Set a property flag in the __manifest table's metadata key-value map.
     ///
-    /// Property entries use `ObjectType::Property` and the property name as object_id.
-    /// If the property already exists, this is a no-op.
+    /// This uses `dataset.update_metadata()` to persist the flag in the
+    /// __manifest dataset's table metadata, rather than inserting a row.
+    /// If the property already exists with the same value, this is a no-op.
     pub async fn set_property(&self, name: &str, value: &str) -> Result<()> {
-        let object_id = format!("__property{}{}", DELIMITER, name);
-        if self.manifest_contains_object(&object_id).await? {
+        let dataset_guard = self.manifest_dataset.get().await?;
+        if dataset_guard.metadata().get(name) == Some(&value.to_string()) {
             return Ok(());
         }
-        self.insert_into_manifest_with_metadata(
-            object_id,
-            ObjectType::Property,
-            None,
-            Some(value.to_string()),
-            None,
-        )
-        .await
+        drop(dataset_guard);
+
+        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
+        dataset_guard
+            .update_metadata([(name, value)])
+            .await
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
+                    "Failed to set property '{}' in __manifest metadata: {}",
+                    name, e
+                ))))
+            })?;
+        Ok(())
     }
 
-    /// Check if a boolean property flag exists in the __manifest table.
+    /// Check if a property flag exists in the __manifest table's metadata key-value map.
     pub async fn has_property(&self, name: &str) -> Result<bool> {
-        let object_id = format!("__property{}{}", DELIMITER, name);
-        self.manifest_contains_object(&object_id).await
+        let dataset_guard = self.manifest_dataset.get().await?;
+        Ok(dataset_guard.metadata().contains_key(name))
     }
 
     /// Parse metadata JSON into a `TableVersion`.
