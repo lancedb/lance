@@ -353,7 +353,7 @@ pub fn detect_provider_from_uri(uri: &str) -> &'static str {
     match url.scheme() {
         "s3" => "aws",
         "gs" => "gcp",
-        "az" => "azure",
+        "az" | "abfss" => "azure",
         _ => "unknown",
     }
 }
