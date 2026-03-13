@@ -90,10 +90,28 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
-    /// If true, skip the partition merge stage after indexing.
-    /// This can be useful for distributed indexing where merge is handled separately.
-    #[serde(default)]
-    pub(crate) skip_merge: bool,
+    /// Total memory limit in MiB for the build stage.
+    ///
+    /// This is split evenly across FTS workers at build time. By default Lance
+    /// uses roughly `num_cpus / 2` workers, unless `LANCE_FTS_NUM_SHARDS` is set.
+    /// If unset, each worker defaults to a 2 GiB build-time memory limit.
+    ///
+    /// This is a build-time only parameter and is not persisted with the index.
+    #[serde(
+        rename = "memory_limit",
+        skip_serializing,
+        default,
+        alias = "worker_memory_limit_mb"
+    )]
+    pub(crate) memory_limit_mb: Option<u64>,
+
+    /// Number of workers to use for FTS build.
+    ///
+    /// This is a build-time only parameter and is not persisted with the index.
+    /// By default Lance uses roughly `num_cpus / 2` workers.
+    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    #[serde(rename = "num_workers", skip_serializing, default)]
+    pub(crate) num_workers: Option<usize>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -139,7 +157,8 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
-            skip_merge: defaults.skip_merge,
+            memory_limit_mb: defaults.memory_limit_mb,
+            num_workers: defaults.num_workers,
         })
     }
 }
@@ -191,7 +210,8 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
-            skip_merge: false,
+            memory_limit_mb: None,
+            num_workers: None,
         }
     }
 
@@ -280,9 +300,17 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Skip merging partitions after indexing.
-    pub fn skip_merge(mut self, skip_merge: bool) -> Self {
-        self.skip_merge = skip_merge;
+    pub fn memory_limit_mb(mut self, memory_limit_mb: u64) -> Self {
+        self.memory_limit_mb = Some(memory_limit_mb);
+        self
+    }
+
+    /// Set the number of workers to use for this build.
+    ///
+    /// By default Lance uses roughly `num_cpus / 2` workers.
+    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    pub fn num_workers(mut self, num_workers: usize) -> Self {
+        self.num_workers = Some(num_workers);
         self
     }
 
@@ -389,5 +417,45 @@ pub fn language_model_home() -> Option<PathBuf> {
     match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
         Ok(p) => Some(PathBuf::from(p)),
         Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InvertedIndexParams;
+
+    #[test]
+    fn test_build_only_fields_are_not_serialized() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(7);
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("memory_limit").is_none());
+        assert!(json.get("num_workers").is_none());
+    }
+
+    #[test]
+    fn test_memory_limit_serde_accepts_legacy_worker_field_name() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("memory_limit");
+        obj.insert(
+            "worker_memory_limit_mb".to_string(),
+            serde_json::Value::from(2048),
+        );
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.memory_limit_mb, Some(2048));
+    }
+
+    #[test]
+    fn test_build_only_fields_deserialize_from_public_names() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert("memory_limit".to_string(), serde_json::Value::from(4096));
+        obj.insert("num_workers".to_string(), serde_json::Value::from(3));
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.memory_limit_mb, Some(4096));
+        assert_eq!(params.num_workers, Some(3));
     }
 }
