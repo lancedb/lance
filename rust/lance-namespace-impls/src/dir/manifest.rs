@@ -34,10 +34,11 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
     DeclareTableRequest, DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
-    DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
-    DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
-    ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
-    TableExistsRequest,
+    DescribeTableResponse, DescribeTableVersionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
+    ListNamespacesResponse, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
+    NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
+    TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use object_store::path::Path;
@@ -67,6 +68,9 @@ pub enum ObjectType {
     Namespace,
     Table,
     TableVersion,
+    /// A property entry used to persist feature flags and configuration
+    /// in the __manifest table (e.g., `table_version_storage_enabled`).
+    Property,
 }
 
 impl ObjectType {
@@ -75,6 +79,7 @@ impl ObjectType {
             Self::Namespace => "namespace",
             Self::Table => "table",
             Self::TableVersion => "table_version",
+            Self::Property => "property",
         }
     }
 
@@ -83,6 +88,7 @@ impl ObjectType {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
             "table_version" => Ok(Self::TableVersion),
+            "property" => Ok(Self::Property),
             _ => Err(Error::io(format!("Invalid object type: {}", s))),
         }
     }
@@ -386,14 +392,14 @@ impl ManifestNamespace {
         }
     }
 
-    /// Split an object ID (table_id as vec of strings) into namespace and table name
-    pub fn split_object_id(table_id: &[String]) -> (Vec<String>, String) {
-        if table_id.len() == 1 {
-            (vec![], table_id[0].clone())
+    /// Split an object ID (vec of strings) into namespace and table name
+    pub fn split_object_id(object_id: &[String]) -> (Vec<String>, String) {
+        if object_id.len() == 1 {
+            (vec![], object_id[0].clone())
         } else {
             (
-                table_id[..table_id.len() - 1].to_vec(),
-                table_id[table_id.len() - 1].clone(),
+                object_id[..object_id.len() - 1].to_vec(),
+                object_id[object_id.len() - 1].clone(),
             )
         }
     }
@@ -425,8 +431,7 @@ impl ManifestNamespace {
 
     /// Parse a version number from the version suffix of a table version object_id.
     ///
-    /// The object_id is formatted as `{table_id}${version}` where version may be
-    /// either zero-padded (new format) or plain integer (legacy format).
+    /// The object_id is formatted as `{table_id}${zero_padded_version}`.
     pub fn parse_version_from_object_id(object_id: &str) -> Option<i64> {
         object_id
             .rsplit(DELIMITER)
@@ -1138,7 +1143,7 @@ impl ManifestNamespace {
             let metadata_array = Self::get_string_column(&batch, "metadata")?;
             for i in 0..batch.num_rows() {
                 let oid = object_id_array.value(i);
-                // Parse version from object_id (supports both zero-padded and legacy formats)
+                // Parse version from object_id
                 if let Some(version) = Self::parse_version_from_object_id(oid) {
                     let metadata_str = metadata_array.value(i).to_string();
                     versions.push((version, metadata_str));
@@ -1164,29 +1169,14 @@ impl ManifestNamespace {
     /// Returns the full metadata JSON string if found, which contains
     /// manifest_path, manifest_size, e_tag, and naming_scheme.
     ///
-    /// Supports both zero-padded (new) and plain integer (legacy) object_id formats
-    /// by trying the new format first, then falling back to legacy.
     pub async fn query_table_version(
         &self,
         object_id: &str,
         version: i64,
     ) -> Result<Option<String>> {
-        // Try new zero-padded format first
         let version_object_id = Self::build_version_object_id(object_id, version);
-        if let Some(metadata) = self
-            .query_table_version_by_object_id(&version_object_id)
-            .await?
-        {
-            return Ok(Some(metadata));
-        }
-        // Fall back to legacy plain integer format
-        let legacy_object_id = format!("{}{}{}", object_id, DELIMITER, version);
-        if legacy_object_id != version_object_id {
-            return self
-                .query_table_version_by_object_id(&legacy_object_id)
-                .await;
-        }
-        Ok(None)
+        self.query_table_version_by_object_id(&version_object_id)
+            .await
     }
 
     /// Query a specific table version by its exact object_id.
@@ -1246,15 +1236,9 @@ impl ManifestNamespace {
         let mut object_id_conditions: Vec<String> = Vec::new();
         for (start, end) in ranges {
             for version in *start..=*end {
-                let new_oid = Self::build_version_object_id(object_id, version);
-                let escaped = new_oid.replace('\'', "''");
+                let oid = Self::build_version_object_id(object_id, version);
+                let escaped = oid.replace('\'', "''");
                 object_id_conditions.push(format!("'{}'", escaped));
-                // Also include legacy plain integer format for backwards compatibility
-                let legacy_oid = format!("{}{}{}", object_id, DELIMITER, version);
-                if legacy_oid != new_oid {
-                    let escaped_legacy = legacy_oid.replace('\'', "''");
-                    object_id_conditions.push(format!("'{}'", escaped_legacy));
-                }
             }
         }
 
@@ -1397,6 +1381,124 @@ impl ManifestNamespace {
         }
 
         Ok(deleted_count)
+    }
+
+    /// Set a boolean property flag in the __manifest table.
+    ///
+    /// Property entries use `ObjectType::Property` and the property name as object_id.
+    /// If the property already exists, this is a no-op.
+    pub async fn set_property(&self, name: &str, value: &str) -> Result<()> {
+        let object_id = format!("__property{}{}", DELIMITER, name);
+        if self.manifest_contains_object(&object_id).await? {
+            return Ok(());
+        }
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Property,
+            None,
+            Some(value.to_string()),
+            None,
+        )
+        .await
+    }
+
+    /// Check if a boolean property flag exists in the __manifest table.
+    pub async fn has_property(&self, name: &str) -> Result<bool> {
+        let object_id = format!("__property{}{}", DELIMITER, name);
+        self.manifest_contains_object(&object_id).await
+    }
+
+    /// Parse metadata JSON into a `TableVersion`.
+    ///
+    /// Returns `None` if metadata is invalid or missing required fields.
+    fn parse_table_version(version: i64, metadata_str: &str) -> Option<TableVersion> {
+        let meta: serde_json::Value = match serde_json::from_str(metadata_str) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "Skipping version {} due to invalid metadata JSON: {}",
+                    version,
+                    e
+                );
+                return None;
+            }
+        };
+        let manifest_path = match meta.get("manifest_path").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => {
+                log::warn!(
+                    "Skipping version {} due to missing 'manifest_path' in metadata — \
+                     this may indicate data corruption",
+                    version
+                );
+                return None;
+            }
+        };
+        let manifest_size = meta.get("manifest_size").and_then(|v| v.as_i64());
+        let e_tag = meta
+            .get("e_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Some(TableVersion {
+            version,
+            manifest_path,
+            manifest_size,
+            e_tag,
+            timestamp_millis: None,
+            metadata: None,
+        })
+    }
+
+    /// List table versions from the __manifest table.
+    ///
+    /// Queries the manifest for all versions of the given table and returns
+    /// them as a `ListTableVersionsResponse`.
+    pub async fn list_table_versions(
+        &self,
+        table_id: &[String],
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<ListTableVersionsResponse> {
+        let object_id = Self::str_object_id(table_id);
+        let manifest_versions = self
+            .query_table_versions(&object_id, descending, limit)
+            .await?;
+
+        let table_versions: Vec<TableVersion> = manifest_versions
+            .into_iter()
+            .filter_map(|(version, metadata_str)| Self::parse_table_version(version, &metadata_str))
+            .collect();
+
+        Ok(ListTableVersionsResponse {
+            versions: table_versions,
+            page_token: None,
+        })
+    }
+
+    /// Describe a specific table version from the __manifest table.
+    ///
+    /// Queries the manifest for a specific version and returns it as a
+    /// `DescribeTableVersionResponse`. Returns an error if the version is not found.
+    pub async fn describe_table_version(
+        &self,
+        table_id: &[String],
+        version: i64,
+    ) -> Result<DescribeTableVersionResponse> {
+        let object_id = Self::str_object_id(table_id);
+        if let Some(metadata_str) = self.query_table_version(&object_id, version).await? {
+            if let Some(tv) = Self::parse_table_version(version, &metadata_str) {
+                return Ok(DescribeTableVersionResponse {
+                    version: Box::new(tv),
+                });
+            }
+        }
+        Err(Error::namespace_source(
+            format!(
+                "Version {} not found in manifest for table {:?}",
+                version, table_id
+            )
+            .into(),
+        ))
     }
 
     /// Register a table in the manifest without creating the physical table (internal helper for migration)

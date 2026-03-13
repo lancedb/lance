@@ -524,6 +524,22 @@ impl DirectoryNamespaceBuilder {
             None
         };
 
+        // Persist table_version_storage_enabled flag in __manifest so that once
+        // enabled, it becomes a permanent property of this namespace.
+        if self.table_version_storage_enabled {
+            if let Some(ref ns) = manifest_ns {
+                if let Err(e) = ns
+                    .set_property("table_version_storage_enabled", "true")
+                    .await
+                {
+                    log::warn!(
+                        "Failed to persist table_version_storage_enabled flag in __manifest: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+
         // Create credential vendor once during initialization if enabled
         let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
         {
@@ -1553,59 +1569,11 @@ impl LanceNamespace for DirectoryNamespace {
         // When table_version_storage_enabled, query from __manifest
         if self.table_version_storage_enabled {
             if let Some(ref manifest_ns) = self.manifest_ns {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &request.id.clone().unwrap_or_default(),
-                );
+                let table_id = request.id.clone().unwrap_or_default();
                 let want_descending = request.descending == Some(true);
-                let manifest_versions = manifest_ns
-                    .query_table_versions(&table_id_str, want_descending, request.limit)
-                    .await?;
-
-                let table_versions: Vec<TableVersion> = manifest_versions
-                    .into_iter()
-                    .filter_map(|(version, metadata_str)| {
-                        let meta: serde_json::Value = match serde_json::from_str(&metadata_str) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::warn!(
-                                    "Skipping version {} due to invalid metadata JSON: {}",
-                                    version,
-                                    e
-                                );
-                                return None;
-                            }
-                        };
-                        let manifest_path = match meta.get("manifest_path").and_then(|v| v.as_str()) {
-                            Some(p) => p.to_string(),
-                            None => {
-                                log::warn!(
-                                    "Skipping version {} due to missing 'manifest_path' in metadata — \
-                                     this may indicate data corruption",
-                                    version
-                                );
-                                return None;
-                            }
-                        };
-                        let manifest_size = meta.get("manifest_size").and_then(|v| v.as_i64());
-                        let e_tag = meta
-                            .get("e_tag")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        Some(TableVersion {
-                            version,
-                            manifest_path,
-                            manifest_size,
-                            e_tag,
-                            timestamp_millis: None,
-                            metadata: None,
-                        })
-                    })
-                    .collect();
-
-                return Ok(ListTableVersionsResponse {
-                    versions: table_versions,
-                    page_token: None,
-                });
+                return manifest_ns
+                    .list_table_versions(&table_id, want_descending, request.limit)
+                    .await;
             }
         }
 
@@ -1837,45 +1805,8 @@ impl LanceNamespace for DirectoryNamespace {
         // query from __manifest to avoid opening the entire dataset
         if self.table_version_storage_enabled {
             if let (Some(manifest_ns), Some(version)) = (&self.manifest_ns, request.version) {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &request.id.clone().unwrap_or_default(),
-                );
-                if let Some(metadata_str) = manifest_ns
-                    .query_table_version(&table_id_str, version)
-                    .await?
-                {
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&metadata_str) {
-                        let manifest_path = meta
-                            .get("manifest_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let manifest_size = meta.get("manifest_size").and_then(|v| v.as_i64());
-                        let e_tag = meta
-                            .get("e_tag")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        return Ok(DescribeTableVersionResponse {
-                            version: Box::new(TableVersion {
-                                version,
-                                manifest_path,
-                                manifest_size,
-                                e_tag,
-                                timestamp_millis: None,
-                                metadata: None,
-                            }),
-                        });
-                    }
-                }
-                // Version not found in __manifest
-                return Err(Error::namespace_source(
-                    format!(
-                        "Version {} not found in manifest for table {:?}",
-                        version, request.id
-                    )
-                    .into(),
-                ));
+                let table_id = request.id.clone().unwrap_or_default();
+                return manifest_ns.describe_table_version(&table_id, version).await;
             }
         }
 
