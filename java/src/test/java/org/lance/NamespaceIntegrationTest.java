@@ -350,8 +350,7 @@ public class NamespaceIntegrationTest {
       assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace WITH refresh enabled
-      ReadOptions readOptions =
-          new ReadOptions.Builder().setStorageOptions(storageOptions).build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -482,8 +481,7 @@ public class NamespaceIntegrationTest {
       assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace with refresh enabled
-      ReadOptions readOptions =
-          new ReadOptions.Builder().setStorageOptions(storageOptions).build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -748,8 +746,7 @@ public class NamespaceIntegrationTest {
           "describeTable should still be 0 after close (no refresh needed)");
 
       // Now open the dataset through namespace with long-lived credentials (60s expiration)
-      ReadOptions readOptions =
-          new ReadOptions.Builder().setStorageOptions(storageOptions).build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       try (Dataset dsFromNamespace =
           Dataset.open()
@@ -1090,8 +1087,7 @@ public class NamespaceIntegrationTest {
                 .allocator(allocator)
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
-                .readOptions(
-                    new ReadOptions.Builder().setStorageOptions(storageOptions).build())
+                .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
                 .build()) {
           assertEquals(2, ds.countRows(), "Should have 2 rows after overwrite");
           assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1221,8 +1217,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
-              .readOptions(
-                  new ReadOptions.Builder().setStorageOptions(storageOptions).build())
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(5, dsFromNamespace.countRows(), "Should read 5 rows through namespace");
       }
@@ -1336,8 +1331,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
-              .readOptions(
-                  new ReadOptions.Builder().setStorageOptions(storageOptions).build())
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(6, ds.countRows(), "Should have 6 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1469,8 +1463,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
-              .readOptions(
-                  new ReadOptions.Builder().setStorageOptions(storageOptions).build())
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(4, ds.countRows(), "Should have 4 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
