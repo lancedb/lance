@@ -340,22 +340,17 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
 
     /// Batch delete table versions.
     ///
-    /// Supports two modes:
-    /// - **Single-table (legacy)**: Uses `request.id` + `request.ranges` to delete
-    ///   versions from one table.
-    /// - **Multi-table (transactional)**: Uses `request.entries` to atomically delete
-    ///   versions across multiple tables. Metadata deletion is a single atomic
-    ///   operation; physical file cleanup is best-effort (orphaned files are harmless).
-    ///
-    /// When `entries` is provided, `id` and `ranges` are ignored.
+    /// Deletes version records for a single table using `request.id` + `request.ranges`.
+    /// For multi-table atomic version deletion, use `batch_commit_tables` with
+    /// `CommitTableOperation::delete_table_versions`.
     ///
     /// # Arguments
     ///
-    /// * `request` - Contains table identifier(s) and version ranges to delete.
+    /// * `request` - Contains the table identifier and version ranges to delete.
     ///
     /// # Errors
     ///
-    /// - Returns [`crate::ErrorCode::TableNotFound`] if any table does not exist.
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
     async fn batch_delete_table_versions(
         &self,
         _request: BatchDeleteTableVersionsRequest,

@@ -82,14 +82,14 @@ impl RestAdapter {
                 post(describe_table_version),
             )
             .route(
-                "/v1/table/:id/version/batch_delete",
+                "/v1/table/:id/version/delete",
                 post(batch_delete_table_versions),
             )
             .route(
-                "/v1/table/version/batch_create",
+                "/v1/table/version/batch-create",
                 post(batch_create_table_versions),
             )
-            .route("/v1/table/batch_commit", post(batch_commit_tables))
+            .route("/v1/table/batch-commit", post(batch_commit_tables))
             .route("/v1/table/:id/stats", get(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -803,7 +803,6 @@ async fn batch_delete_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
         ranges: body.ranges,
-        entries: body.entries,
         ..Default::default()
     };
 

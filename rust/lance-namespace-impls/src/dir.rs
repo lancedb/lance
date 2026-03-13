@@ -28,9 +28,7 @@ use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     BatchCommitTablesRequest, BatchCommitTablesResponse, BatchCreateTableVersionsRequest,
     BatchCreateTableVersionsResponse, BatchDeleteTableVersionsRequest,
-    BatchDeleteTableVersionsResponse, CommitTableOperation, CommitTableResult,
-    CommitTableResultCreateTableVersion, CommitTableResultDeclareTable,
-    CommitTableResultDeleteTableVersions, CommitTableResultDeregisterTable, CreateNamespaceRequest,
+    BatchDeleteTableVersionsResponse, CommitTableResult, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionEntry,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
     DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
@@ -1940,60 +1938,31 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
-        // Normalize request into a list of (table_id, ranges) entries.
-        // Multi-table mode (`entries`) takes precedence over single-table mode (`id` + `ranges`).
+        // Single-table mode: use `id` (from path parameter) + `ranges` to delete
+        // versions from one table. For multi-table deletion, use `batch_commit_tables`
+        // with `CommitTableOperation::delete_table_versions`.
         struct TableDeleteEntry {
             table_id: Option<Vec<String>>,
             ranges: Vec<(i64, i64)>,
         }
 
-        let table_entries: Vec<TableDeleteEntry> = if let Some(entries) = &request.entries {
-            entries
-                .iter()
-                .map(|entry| {
-                    let ranges = entry
-                        .ranges
-                        .iter()
-                        .map(|r| {
-                            let start = r.start_version;
-                            let end = if r.end_version > 0 {
-                                r.end_version
-                            } else {
-                                start
-                            };
-                            (start, end)
-                        })
-                        .collect();
-                    TableDeleteEntry {
-                        table_id: Some(entry.id.clone()),
-                        ranges,
-                    }
-                })
-                .collect()
-        } else {
-            // Legacy single-table mode
-            let ranges = request
-                .ranges
-                .as_ref()
-                .map(|rs| {
-                    rs.iter()
-                        .map(|r| {
-                            let start = r.start_version;
-                            let end = if r.end_version > 0 {
-                                r.end_version
-                            } else {
-                                start
-                            };
-                            (start, end)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            vec![TableDeleteEntry {
-                table_id: request.id.clone(),
-                ranges,
-            }]
-        };
+        let ranges: Vec<(i64, i64)> = request
+            .ranges
+            .iter()
+            .map(|r| {
+                let start = r.start_version;
+                let end = if r.end_version > 0 {
+                    r.end_version
+                } else {
+                    start
+                };
+                (start, end)
+            })
+            .collect();
+        let table_entries = vec![TableDeleteEntry {
+            table_id: request.id.clone(),
+            ranges,
+        }];
 
         let mut total_deleted_count = 0i64;
 
@@ -2345,7 +2314,6 @@ impl LanceNamespace for DirectoryNamespace {
                 metadata: Option<std::collections::HashMap<String, String>>,
             },
             DeleteTableVersions {
-                id: Vec<String>,
                 version_count: i64,
             },
             DeregisterTable {
@@ -2357,144 +2325,137 @@ impl LanceNamespace for DirectoryNamespace {
         let mut prepared_ops: Vec<PreparedOp> = Vec::with_capacity(request.operations.len());
 
         for op in &request.operations {
-            match op {
-                CommitTableOperation::DeclareTable(op) => {
-                    let table_name = Self::table_name_from_id(&Some(op.id.clone()))?;
-                    let table_uri = self.table_full_uri(&table_name);
+            if let Some(declare_op) = &op.declare_table {
+                let id = declare_op.id.clone().unwrap_or_default();
+                let table_name = Self::table_name_from_id(&Some(id.clone()))?;
+                let table_uri = self.table_full_uri(&table_name);
 
-                    if let Some(loc) = &op.location {
-                        let loc = loc.trim_end_matches('/');
-                        if loc != table_uri {
-                            return Err(Error::namespace_source(
-                                format!(
-                                    "Cannot declare table {} at location {}, must be at location {}",
-                                    table_name, loc, table_uri
-                                )
-                                .into(),
-                            ));
-                        }
-                    }
-
-                    let (namespace_parts, tname) =
-                        manifest::ManifestNamespace::split_object_id(&op.id);
-                    let full_object_id =
-                        manifest::ManifestNamespace::build_object_id(&namespace_parts, &tname);
-                    let dir_name = manifest::ManifestNamespace::generate_dir_name(&full_object_id);
-                    let object_id = manifest::ManifestNamespace::str_object_id(&op.id);
-
-                    insert_entries.push((
-                        object_id,
-                        manifest::ObjectType::Table,
-                        Some(dir_name),
-                        None,
-                    ));
-                    prepared_ops.push(PreparedOp::DeclareTable {
-                        id: op.id.clone(),
-                        location: table_uri,
-                    });
-                }
-                CommitTableOperation::CreateTableVersion(op) => {
-                    let table_uri = self.resolve_table_location(&Some(op.id.clone())).await?;
-                    let table_path = Self::uri_to_object_store_path(&table_uri);
-                    let scheme = match op.naming_scheme.as_deref() {
-                        Some("V1") => ManifestNamingScheme::V1,
-                        _ => ManifestNamingScheme::V2,
-                    };
-                    let final_path = scheme.manifest_path(&table_path, op.version as u64);
-                    let staging_path = Self::uri_to_object_store_path(&op.manifest_path);
-
-                    let data = self
-                        .object_store
-                        .inner
-                        .get(&staging_path)
-                        .await
-                        .map_err(|e| {
-                            Error::namespace_source(
-                                format!(
-                                    "Failed to read staging manifest at '{}': {}",
-                                    op.manifest_path, e
-                                )
-                                .into(),
+                if let Some(loc) = &declare_op.location {
+                    let loc = loc.trim_end_matches('/');
+                    if loc != table_uri {
+                        return Err(Error::namespace_source(
+                            format!(
+                                "Cannot declare table {} at location {}, must be at location {}",
+                                table_name, loc, table_uri
                             )
-                        })?
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            Error::namespace_source(
-                                format!(
-                                    "Failed to read staging manifest bytes at '{}': {}",
-                                    op.manifest_path, e
-                                )
-                                .into(),
-                            )
-                        })?;
-
-                    let size = data.len() as i64;
-                    let table_id_str = manifest::ManifestNamespace::str_object_id(&op.id);
-                    let ver_object_id = manifest::ManifestNamespace::build_version_object_id(
-                        &table_id_str,
-                        op.version,
-                    );
-                    let metadata_json = serde_json::json!({
-                        "manifest_path": final_path.to_string(),
-                        "manifest_size": size,
-                        "naming_scheme": op.naming_scheme.as_deref().unwrap_or("V2"),
-                    })
-                    .to_string();
-
-                    insert_entries.push((
-                        ver_object_id,
-                        manifest::ObjectType::TableVersion,
-                        None,
-                        Some(metadata_json),
-                    ));
-                    prepared_ops.push(PreparedOp::CreateTableVersion {
-                        id: op.id.clone(),
-                        version: op.version,
-                        final_path,
-                        staging_path,
-                        manifest_data: data,
-                        manifest_size: size,
-                        metadata: op.metadata.clone(),
-                    });
-                }
-                CommitTableOperation::DeleteTableVersions(op) => {
-                    let table_id_str = manifest::ManifestNamespace::str_object_id(&op.id);
-                    let mut count = 0i64;
-                    for range in &op.ranges {
-                        let start = range.start_version;
-                        let end = if range.end_version > 0 {
-                            range.end_version
-                        } else {
-                            start
-                        };
-                        for version in start..=end {
-                            let oid = manifest::ManifestNamespace::build_version_object_id(
-                                &table_id_str,
-                                version,
-                            );
-                            delete_object_ids.push(oid);
-                            count += 1;
-                        }
+                            .into(),
+                        ));
                     }
-                    prepared_ops.push(PreparedOp::DeleteTableVersions {
-                        id: op.id.clone(),
-                        version_count: count,
-                    });
                 }
-                CommitTableOperation::DeregisterTable(op) => {
-                    let object_id = manifest::ManifestNamespace::str_object_id(&op.id);
-                    // Look up the table location before we delete
-                    let location = match self.resolve_table_location(&Some(op.id.clone())).await {
-                        Ok(loc) => Some(loc),
-                        Err(_) => None,
+
+                let (namespace_parts, tname) = manifest::ManifestNamespace::split_object_id(&id);
+                let full_object_id =
+                    manifest::ManifestNamespace::build_object_id(&namespace_parts, &tname);
+                let dir_name = manifest::ManifestNamespace::generate_dir_name(&full_object_id);
+                let object_id = manifest::ManifestNamespace::str_object_id(&id);
+
+                insert_entries.push((object_id, manifest::ObjectType::Table, Some(dir_name), None));
+                prepared_ops.push(PreparedOp::DeclareTable {
+                    id,
+                    location: table_uri,
+                });
+            } else if let Some(create_op) = &op.create_table_version {
+                let id = create_op.id.clone().unwrap_or_default();
+                let table_uri = self.resolve_table_location(&Some(id.clone())).await?;
+                let table_path = Self::uri_to_object_store_path(&table_uri);
+                let scheme = match create_op.naming_scheme.as_deref() {
+                    Some("V1") => ManifestNamingScheme::V1,
+                    _ => ManifestNamingScheme::V2,
+                };
+                let final_path = scheme.manifest_path(&table_path, create_op.version as u64);
+                let staging_path = Self::uri_to_object_store_path(&create_op.manifest_path);
+
+                let data = self
+                    .object_store
+                    .inner
+                    .get(&staging_path)
+                    .await
+                    .map_err(|e| {
+                        Error::namespace_source(
+                            format!(
+                                "Failed to read staging manifest at '{}': {}",
+                                create_op.manifest_path, e
+                            )
+                            .into(),
+                        )
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|e| {
+                        Error::namespace_source(
+                            format!(
+                                "Failed to read staging manifest bytes at '{}': {}",
+                                create_op.manifest_path, e
+                            )
+                            .into(),
+                        )
+                    })?;
+
+                let size = data.len() as i64;
+                let table_id_str = manifest::ManifestNamespace::str_object_id(&id);
+                let ver_object_id = manifest::ManifestNamespace::build_version_object_id(
+                    &table_id_str,
+                    create_op.version,
+                );
+                let metadata_json = serde_json::json!({
+                    "manifest_path": final_path.to_string(),
+                    "manifest_size": size,
+                    "naming_scheme": create_op.naming_scheme.as_deref().unwrap_or("V2"),
+                })
+                .to_string();
+
+                insert_entries.push((
+                    ver_object_id,
+                    manifest::ObjectType::TableVersion,
+                    None,
+                    Some(metadata_json),
+                ));
+                prepared_ops.push(PreparedOp::CreateTableVersion {
+                    id,
+                    version: create_op.version,
+                    final_path,
+                    staging_path,
+                    manifest_data: data,
+                    manifest_size: size,
+                    metadata: create_op.metadata.clone(),
+                });
+            } else if let Some(delete_op) = &op.delete_table_versions {
+                let id = delete_op.id.clone().unwrap_or_default();
+                let table_id_str = manifest::ManifestNamespace::str_object_id(&id);
+                let mut count = 0i64;
+                for range in &delete_op.ranges {
+                    let start = range.start_version;
+                    let end = if range.end_version > 0 {
+                        range.end_version
+                    } else {
+                        start
                     };
-                    delete_object_ids.push(object_id);
-                    prepared_ops.push(PreparedOp::DeregisterTable {
-                        id: op.id.clone(),
-                        location,
-                    });
+                    for version in start..=end {
+                        let oid = manifest::ManifestNamespace::build_version_object_id(
+                            &table_id_str,
+                            version,
+                        );
+                        delete_object_ids.push(oid);
+                        count += 1;
+                    }
                 }
+                prepared_ops.push(PreparedOp::DeleteTableVersions {
+                    version_count: count,
+                });
+            } else if let Some(deregister_op) = &op.deregister_table {
+                let id = deregister_op.id.clone().unwrap_or_default();
+                let object_id = manifest::ManifestNamespace::str_object_id(&id);
+                // Look up the table location before we delete
+                let location = match self.resolve_table_location(&Some(id.clone())).await {
+                    Ok(loc) => Some(loc),
+                    Err(_) => None,
+                };
+                delete_object_ids.push(object_id);
+                prepared_ops.push(PreparedOp::DeregisterTable { id, location });
+            } else {
+                return Err(Error::invalid_input(
+                    "CommitTableOperation must have exactly one operation field set",
+                ));
             }
         }
 
@@ -2546,13 +2507,18 @@ impl LanceNamespace for DirectoryNamespace {
                             e
                         );
                     }
-                    results.push(CommitTableResult::DeclareTable(Box::new(
-                        CommitTableResultDeclareTable {
-                            r#type: lance_namespace::models::commit_table_result_declare_table::Type::DeclareTable,
-                            id,
+                    results.push(CommitTableResult {
+                        declare_table: Some(Box::new(DeclareTableResponse {
+                            transaction_id: None,
                             location: Some(location),
-                        },
-                    )));
+                            storage_options: None,
+                            properties: None,
+                            managed_versioning: None,
+                        })),
+                        create_table_version: None,
+                        delete_table_versions: None,
+                        deregister_table: None,
+                    });
                 }
                 PreparedOp::CreateTableVersion {
                     id,
@@ -2591,39 +2557,50 @@ impl LanceNamespace for DirectoryNamespace {
                             );
                         }
                     }
-                    results.push(CommitTableResult::CreateTableVersion(Box::new(
-                        CommitTableResultCreateTableVersion {
-                            r#type: lance_namespace::models::commit_table_result_create_table_version::Type::CreateTableVersion,
-                            version: Box::new(TableVersion {
+                    results.push(CommitTableResult {
+                        declare_table: None,
+                        create_table_version: Some(Box::new(CreateTableVersionResponse {
+                            transaction_id: None,
+                            version: Some(Box::new(TableVersion {
                                 version,
                                 manifest_path: final_path.to_string(),
                                 manifest_size: Some(manifest_size),
                                 e_tag,
                                 timestamp_millis: None,
                                 metadata,
-                            }),
-                        },
-                    )));
+                            })),
+                        })),
+                        delete_table_versions: None,
+                        deregister_table: None,
+                    });
                 }
-                PreparedOp::DeleteTableVersions { id, version_count } => {
+                PreparedOp::DeleteTableVersions { version_count } => {
                     // Physical file deletion is handled separately if needed.
                     // The metadata is already deleted in Phase 1.
-                    results.push(CommitTableResult::DeleteTableVersions(Box::new(
-                        CommitTableResultDeleteTableVersions {
-                            r#type: lance_namespace::models::commit_table_result_delete_table_versions::Type::DeleteTableVersions,
-                            id,
-                            deleted_count: version_count,
-                        },
-                    )));
+                    results.push(CommitTableResult {
+                        declare_table: None,
+                        create_table_version: None,
+                        delete_table_versions: Some(Box::new(BatchDeleteTableVersionsResponse {
+                            deleted_count: Some(version_count),
+                            transaction_id: None,
+                        })),
+                        deregister_table: None,
+                    });
                 }
                 PreparedOp::DeregisterTable { id, location } => {
-                    results.push(CommitTableResult::DeregisterTable(Box::new(
-                        CommitTableResultDeregisterTable {
-                            r#type: lance_namespace::models::commit_table_result_deregister_table::Type::DeregisterTable,
-                            id,
-                            location,
-                        },
-                    )));
+                    results.push(CommitTableResult {
+                        declare_table: None,
+                        create_table_version: None,
+                        delete_table_versions: None,
+                        deregister_table: Some(Box::new(
+                            lance_namespace::models::DeregisterTableResponse {
+                                transaction_id: None,
+                                id: Some(id),
+                                location,
+                                properties: None,
+                            },
+                        )),
+                    });
                 }
             }
         }

@@ -1178,7 +1178,7 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<BatchDeleteTableVersionsResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/version/batch_delete", encoded_id);
+        let path = format!("/v1/table/{}/version/delete", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "batch_delete_table_versions", &id)
             .await
@@ -1188,7 +1188,7 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: BatchCreateTableVersionsRequest,
     ) -> Result<BatchCreateTableVersionsResponse> {
-        let path = "/v1/table/version/batch_create".to_string();
+        let path = "/v1/table/version/batch-create".to_string();
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "batch_create_table_versions", "")
             .await
