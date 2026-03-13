@@ -1068,6 +1068,7 @@ impl LanceNamespace for DirectoryNamespace {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
                     if let Some(ref table_uri) = response.table_uri {
+                        // For backwards compatibility, only skip vending credentials when explicitly set to false
                         let vend = request.vend_credentials.unwrap_or(true);
                         let identity = request.identity.as_deref();
                         response.storage_options = self
@@ -1360,6 +1361,7 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
             if let Some(ref location) = response.location {
+                // For backwards compatibility, only skip vending credentials when explicitly set to false
                 let vend = request.vend_credentials.unwrap_or(true);
                 let identity = request.identity.as_deref();
                 response.storage_options = self
