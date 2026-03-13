@@ -1128,16 +1128,20 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
-                    // Only apply identity-based credential vending when explicitly requested
-                    if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+                    if request.vend_credentials == Some(false) {
+                        response.storage_options = None;
+                    } else if self.credential_vendor.is_some() {
+                        // Vend fresh, scoped credentials for the table
                         if let Some(ref table_uri) = response.table_uri {
                             let identity = request.identity.as_deref();
                             response.storage_options = self
                                 .get_storage_options_for_table(table_uri, identity)
                                 .await?;
                         }
-                    } else if request.vend_credentials == Some(false) {
-                        response.storage_options = None;
+                    } else {
+                        // No vendor configured — strip static credentials so
+                        // clients resolve through their own credential chain
+                        response.storage_options = strip_credential_options(&self.storage_options);
                     }
                     // Set managed_versioning flag when table_version_tracking_enabled
                     if self.table_version_tracking_enabled {
@@ -1364,7 +1368,11 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
-            return manifest_ns.create_table(request, request_data).await;
+            let mut response = manifest_ns.create_table(request, request_data).await?;
+            if self.credential_vendor.is_none() {
+                response.storage_options = strip_credential_options(&self.storage_options);
+            }
+            return Ok(response);
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
@@ -1422,10 +1430,16 @@ impl LanceNamespace for DirectoryNamespace {
                 Error::namespace_source(format!("Failed to create Lance dataset: {}", e).into())
             })?;
 
+        let storage_options = if self.credential_vendor.is_some() {
+            self.storage_options.clone()
+        } else {
+            strip_credential_options(&self.storage_options)
+        };
+
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
-            storage_options: strip_credential_options(&self.storage_options),
+            storage_options,
             ..Default::default()
         })
     }
@@ -1433,16 +1447,19 @@ impl LanceNamespace for DirectoryNamespace {
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
-            // Only apply identity-based credential vending when explicitly requested
-            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
+            if request.vend_credentials == Some(false) {
+                response.storage_options = None;
+            } else if self.credential_vendor.is_some() {
+                // Vend fresh, scoped credentials for the table
                 if let Some(ref location) = response.location {
                     let identity = request.identity.as_deref();
                     response.storage_options = self
                         .get_storage_options_for_table(location, identity)
                         .await?;
                 }
-            } else if request.vend_credentials == Some(false) {
-                response.storage_options = None;
+            } else {
+                // No vendor configured — strip static credentials
+                response.storage_options = strip_credential_options(&self.storage_options);
             }
             // Set managed_versioning when table_version_tracking_enabled
             if self.table_version_tracking_enabled {

@@ -1267,7 +1267,7 @@ impl LanceNamespace for ManifestNamespace {
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 let storage_options = if vend_credentials {
-                    super::strip_credential_options(&self.storage_options)
+                    self.storage_options.clone()
                 } else {
                     None
                 };
@@ -1444,7 +1444,7 @@ impl LanceNamespace for ManifestNamespace {
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
-            storage_options: super::strip_credential_options(&self.storage_options),
+            storage_options: self.storage_options.clone(),
             ..Default::default()
         })
     }
@@ -1816,7 +1816,7 @@ impl LanceNamespace for ManifestNamespace {
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let storage_options = if vend_credentials {
-            super::strip_credential_options(&self.storage_options)
+            self.storage_options.clone()
         } else {
             None
         };
