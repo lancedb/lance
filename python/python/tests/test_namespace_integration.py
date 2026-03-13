@@ -893,14 +893,10 @@ def table_to_ipc_bytes(table):
 def test_basic_create_and_drop_on_s3(s3_bucket: str):
     """Test basic create and drop table operations on S3.
 
-    Uses server-side create_table (namespace writes data directly) so the
-    client does not need credentials from the namespace response.
-
     Mirrors Java: testBasicCreateAndDropOnS3
     """
     from lance.namespace import DirectoryNamespace
     from lance_namespace import (
-        CreateTableRequest,
         DropTableRequest,
         TableExistsRequest,
     )
@@ -915,11 +911,16 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str):
     table_data = create_test_table_data()
     table_id = ["test_ns", table_name]
 
-    # Create table using server-side create_table (namespace writes data)
-    create_req = CreateTableRequest(id=table_id)
-    create_resp = namespace.create_table(create_req, table_to_ipc_bytes(table_data))
-    assert create_resp is not None
-    assert create_resp.location is not None
+    # Create table using lance.write_dataset
+    ds = lance.write_dataset(
+        table_data,
+        namespace=namespace,
+        table_id=table_id,
+        mode="create",
+        storage_options=storage_options,
+    )
+    assert ds is not None
+    assert ds.count_rows() == 3
 
     # Drop table
     drop_req = DropTableRequest(id=table_id)

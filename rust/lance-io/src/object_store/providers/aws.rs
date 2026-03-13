@@ -448,9 +448,8 @@ impl ObjectStoreParams {
 /// is handled by the accessor.
 ///
 /// When the accessor returns storage options that do not contain explicit
-/// credentials (e.g. because the namespace layer stripped credential keys),
-/// this provider falls back to the default AWS credentials chain
-/// (environment variables, instance profile, etc.).
+/// credentials, this provider falls back to the default AWS credentials
+/// chain (environment variables, instance profile, etc.).
 ///
 /// # Future Work
 ///
@@ -583,8 +582,7 @@ impl CredentialProvider for DynamicStorageOptionsCredentialProvider {
         }
 
         // Fall back to the default AWS credentials chain when storage options
-        // do not contain explicit credentials (e.g. credential keys may have
-        // been stripped by the namespace layer).
+        // do not contain explicit credentials.
         log::debug!(
             "Storage options from provider do not contain explicit AWS credentials, \
              falling back to default AWS credentials chain."
