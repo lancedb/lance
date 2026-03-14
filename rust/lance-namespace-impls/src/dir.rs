@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::{Dataset, WriteParams};
+use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::io::commit::ManifestNamingScheme;
@@ -1396,7 +1396,7 @@ impl LanceNamespace for DirectoryNamespace {
         });
 
         let write_params = WriteParams {
-            mode: lance::dataset::WriteMode::Create,
+            mode: WriteMode::Create,
             store_params,
             ..Default::default()
         };
