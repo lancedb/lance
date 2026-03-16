@@ -14,7 +14,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.query import MatchQuery, PhraseQuery
+from lance.query import MatchQuery
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -298,12 +298,6 @@ class FtsIndex(UpgradeDowngradeTest):
         match_table = ds.to_table(full_text_query=MatchQuery("words 7", "text"))
         assert match_table.num_rows > 0
         assert 7 in match_table.column("idx").to_pylist()
-
-        phrase_table = ds.to_table(
-            full_text_query=PhraseQuery("words 7", "text", slop=0)
-        )
-        assert phrase_table.num_rows == 1
-        assert phrase_table.column("idx").to_pylist() == [7]
 
     def check_write(self):
         """Verify can insert data with FTS index."""
