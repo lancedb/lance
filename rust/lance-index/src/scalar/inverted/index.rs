@@ -78,8 +78,8 @@ use std::str::FromStr;
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Older version-2 indices may omit codec metadata and default to varint-doc-delta positions
-// plus fixed32 posting tails; current version-2 writes Lucene-style packed position deltas
-// plus varint-delta posting tails.
+// plus fixed32 posting tails; current version-2 writes packed position deltas plus
+// varint-delta posting tails.
 pub const INVERTED_INDEX_VERSION: u32 = 2;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -109,7 +109,7 @@ pub const POSTING_TAIL_CODEC_FIXED32_V1: &str = "fixed32_v1";
 pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
-pub const POSITIONS_CODEC_LUCENE_PACKED_DELTA_V1: &str = "lucene_packed_delta_v1";
+pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -178,7 +178,7 @@ impl DeepSizeOf for TokenSetFormat {
 pub enum PositionStreamCodec {
     VarintDocDelta,
     #[default]
-    LucenePackedDelta,
+    PackedDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -220,14 +220,14 @@ impl PositionStreamCodec {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::VarintDocDelta => POSITIONS_CODEC_VARINT_DOC_DELTA_V2,
-            Self::LucenePackedDelta => POSITIONS_CODEC_LUCENE_PACKED_DELTA_V1,
+            Self::PackedDelta => POSITIONS_CODEC_PACKED_DELTA_V1,
         }
     }
 
     fn from_metadata_value(value: &str) -> Result<Self> {
         match value.trim() {
             POSITIONS_CODEC_VARINT_DOC_DELTA_V2 => Ok(Self::VarintDocDelta),
-            POSITIONS_CODEC_LUCENE_PACKED_DELTA_V1 => Ok(Self::LucenePackedDelta),
+            POSITIONS_CODEC_PACKED_DELTA_V1 => Ok(Self::PackedDelta),
             other => Err(Error::index(format!(
                 "unsupported positions codec {}",
                 other
@@ -2306,18 +2306,14 @@ impl EncodedPositionBlocks {
         super::encoding::encode_position_stream_block_into(
             positions,
             frequencies,
-            PositionStreamCodec::LucenePackedDelta,
+            PositionStreamCodec::PackedDelta,
             &mut self.bytes,
         )?;
         Ok(self.bytes.len() - start)
     }
 
     fn into_stream(self) -> SharedPositionStream {
-        SharedPositionStream::new(
-            PositionStreamCodec::LucenePackedDelta,
-            self.offsets,
-            self.bytes,
-        )
+        SharedPositionStream::new(PositionStreamCodec::PackedDelta, self.offsets, self.bytes)
     }
 }
 
@@ -2479,7 +2475,7 @@ impl PostingListBuilder {
                     super::encoding::decode_position_stream_block(
                         position_blocks.block(position_block_index),
                         &frequencies,
-                        PositionStreamCodec::LucenePackedDelta,
+                        PositionStreamCodec::PackedDelta,
                         &mut decoded_positions,
                     )
                     .expect("position stream decoding should succeed");
@@ -3754,7 +3750,7 @@ mod tests {
         );
         assert_eq!(
             batch.schema_ref().metadata().get(POSITIONS_CODEC_KEY),
-            Some(&PositionStreamCodec::LucenePackedDelta.as_str().to_owned())
+            Some(&PositionStreamCodec::PackedDelta.as_str().to_owned())
         );
 
         let posting =

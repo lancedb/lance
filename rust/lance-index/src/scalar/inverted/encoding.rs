@@ -344,7 +344,7 @@ fn decode_position_stream_varint_block(
     Ok(())
 }
 
-fn encode_position_stream_lucene_block_into(
+fn encode_position_stream_packed_block_into(
     positions: &[u32],
     frequencies: &[u32],
     dst: &mut Vec<u8>,
@@ -403,7 +403,7 @@ fn encode_position_stream_lucene_block_into(
     Ok(())
 }
 
-fn decode_position_stream_lucene_block(
+fn decode_position_stream_packed_block(
     src: &[u8],
     frequencies: &[u32],
     dst: &mut Vec<u32>,
@@ -477,8 +477,8 @@ pub fn encode_position_stream_block_into(
         PositionStreamCodec::VarintDocDelta => {
             encode_position_stream_varint_block_into(positions, frequencies, dst)
         }
-        PositionStreamCodec::LucenePackedDelta => {
-            encode_position_stream_lucene_block_into(positions, frequencies, dst)
+        PositionStreamCodec::PackedDelta => {
+            encode_position_stream_packed_block_into(positions, frequencies, dst)
         }
     }
 }
@@ -493,8 +493,8 @@ pub fn decode_position_stream_block(
         PositionStreamCodec::VarintDocDelta => {
             decode_position_stream_varint_block(src, frequencies, dst)
         }
-        PositionStreamCodec::LucenePackedDelta => {
-            decode_position_stream_lucene_block(src, frequencies, dst)
+        PositionStreamCodec::PackedDelta => {
+            decode_position_stream_packed_block(src, frequencies, dst)
         }
     }
 }
@@ -759,7 +759,7 @@ mod tests {
         let positions = vec![7, 1, 3, 8, 2, 100, 0, 4, 9, 25];
         for codec in [
             PositionStreamCodec::VarintDocDelta,
-            PositionStreamCodec::LucenePackedDelta,
+            PositionStreamCodec::PackedDelta,
         ] {
             let mut encoded = Vec::new();
             encode_position_stream_block_into(&positions, &frequencies, codec, &mut encoded)?;

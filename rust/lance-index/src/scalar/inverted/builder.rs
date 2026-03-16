@@ -368,7 +368,7 @@ impl InvertedIndexBuilder {
             );
             metadata.insert(
                 POSITIONS_CODEC_KEY.to_owned(),
-                PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
             );
         }
         let mut writer = dest_store
@@ -407,7 +407,7 @@ impl InvertedIndexBuilder {
             );
             metadata.insert(
                 POSITIONS_CODEC_KEY.to_owned(),
-                PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
             );
         }
         // Use partition ID to generate a unique temporary filename
@@ -1165,7 +1165,7 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
         );
         metadata.insert(
             POSITIONS_CODEC_KEY.to_owned(),
-            PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+            PositionStreamCodec::PackedDelta.as_str().to_owned(),
         );
     }
     Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
