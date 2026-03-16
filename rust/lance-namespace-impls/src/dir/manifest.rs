@@ -453,7 +453,7 @@ impl ManifestNamespace {
         name.parse::<i64>().ok()
     }
 
-    /// Generate a new directory name in format: <hash>_<object_id>
+    /// Generate a new directory name in format: `<hash>_<object_id>`
     /// The hash is used to (1) optimize object store throughput,
     /// (2) have high enough entropy in a short period of time to prevent issues like
     /// failed table creation, delete and create new table of the same name, etc.
