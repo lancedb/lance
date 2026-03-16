@@ -120,6 +120,7 @@ pub struct InvertedIndexBuilder {
     new_partitions: Vec<u64>,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
+    posting_tail_codec: PostingTailCodec,
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
 }
@@ -159,8 +160,14 @@ impl InvertedIndexBuilder {
             src_store: store,
             token_set_format,
             fragment_mask,
+            posting_tail_codec: PostingTailCodec::default(),
             progress: noop_progress(),
         }
+    }
+
+    pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
+        self.posting_tail_codec = posting_tail_codec;
+        self
     }
 
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
@@ -204,6 +211,7 @@ impl InvertedIndexBuilder {
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
+        let posting_tail_codec = self.posting_tail_codec;
         let worker_memory_limit_bytes =
             resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
@@ -226,6 +234,7 @@ impl InvertedIndexBuilder {
                     tokenizer,
                     builder_tx,
                     with_position,
+                    posting_tail_codec,
                     id_alloc,
                     fragment_mask,
                     token_set_format,
@@ -358,7 +367,7 @@ impl InvertedIndexBuilder {
             ),
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
-                PostingTailCodec::VarintDelta.as_str().to_owned(),
+                self.posting_tail_codec.as_str().to_owned(),
             ),
         ]);
         if self.params.with_position {
@@ -397,7 +406,7 @@ impl InvertedIndexBuilder {
             ),
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
-                PostingTailCodec::VarintDelta.as_str().to_owned(),
+                self.posting_tail_codec.as_str().to_owned(),
             ),
         ]);
         if self.params.with_position {
@@ -511,6 +520,7 @@ pub struct InnerBuilder {
     id: u64,
     with_position: bool,
     token_set_format: TokenSetFormat,
+    posting_tail_codec: PostingTailCodec,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
@@ -518,10 +528,25 @@ pub struct InnerBuilder {
 
 impl InnerBuilder {
     pub fn new(id: u64, with_position: bool, token_set_format: TokenSetFormat) -> Self {
+        Self::new_with_posting_tail_codec(
+            id,
+            with_position,
+            token_set_format,
+            PostingTailCodec::default(),
+        )
+    }
+
+    pub fn new_with_posting_tail_codec(
+        id: u64,
+        with_position: bool,
+        token_set_format: TokenSetFormat,
+        posting_tail_codec: PostingTailCodec,
+    ) -> Self {
         Self {
             id,
             with_position,
             token_set_format,
+            posting_tail_codec,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -578,6 +603,7 @@ impl InnerBuilder {
             id: _,
             with_position,
             token_set_format,
+            posting_tail_codec,
             tokens,
             posting_lists,
             docs,
@@ -593,6 +619,12 @@ impl InnerBuilder {
             return Err(Error::index(format!(
                 "cannot merge partitions with mismatched token set formats: {:?} vs {:?}",
                 self.token_set_format, token_set_format
+            )));
+        }
+        if self.posting_tail_codec != posting_tail_codec {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched posting tail codecs: {:?} vs {:?}",
+                self.posting_tail_codec, posting_tail_codec
             )));
         }
 
@@ -619,8 +651,9 @@ impl InnerBuilder {
         for (row_id, num_tokens) in docs.iter() {
             self.docs.append(*row_id, *num_tokens);
         }
-        self.posting_lists
-            .resize_with(self.tokens.len(), || PostingListBuilder::new(with_position));
+        self.posting_lists.resize_with(self.tokens.len(), || {
+            PostingListBuilder::new_with_posting_tail_codec(with_position, self.posting_tail_codec)
+        });
 
         for (token_id, posting_list) in posting_lists.into_iter().enumerate() {
             if posting_list.is_empty() {
@@ -660,7 +693,7 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
-                inverted_list_schema(self.with_position),
+                inverted_list_schema_with_tail_codec(self.with_position, self.posting_tail_codec),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
@@ -672,7 +705,8 @@ impl InnerBuilder {
             self.with_position
         );
         let with_position = self.with_position;
-        let schema = inverted_list_schema(self.with_position);
+        let schema =
+            inverted_list_schema_with_tail_codec(self.with_position, self.posting_tail_codec);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
@@ -803,21 +837,23 @@ impl IndexWorker {
         tokenizer: Box<dyn LanceTokenizer>,
         builder_tx: async_channel::Sender<InnerBuilder>,
         with_position: bool,
+        posting_tail_codec: PostingTailCodec,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
         token_set_format: TokenSetFormat,
         worker_memory_limit_bytes: u64,
     ) -> Result<Self> {
-        let schema = inverted_list_schema(with_position);
+        let schema = inverted_list_schema_with_tail_codec(with_position, posting_tail_codec);
 
         Ok(Self {
             tokenizer,
             builder_tx,
-            builder: InnerBuilder::new(
+            builder: InnerBuilder::new_with_posting_tail_codec(
                 id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | fragment_mask.unwrap_or(0),
                 with_position,
                 token_set_format,
+                posting_tail_codec,
             ),
             partitions: Vec::new(),
             id_alloc,
@@ -897,7 +933,10 @@ impl IndexWorker {
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
-                    PostingListBuilder::new(with_position)
+                    PostingListBuilder::new_with_posting_tail_codec(
+                        with_position,
+                        self.builder.posting_tail_codec,
+                    )
                 });
             let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
             Self::adjust_tracked_value(
@@ -999,14 +1038,16 @@ impl IndexWorker {
         );
         self.memory_size = 0;
         let with_position = self.has_position();
+        let posting_tail_codec = self.builder.posting_tail_codec;
         let builder = std::mem::replace(
             &mut self.builder,
-            InnerBuilder::new(
+            InnerBuilder::new_with_posting_tail_codec(
                 self.id_alloc
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | self.fragment_mask.unwrap_or(0),
                 with_position,
                 self.token_set_format,
+                posting_tail_codec,
             ),
         );
         let written_partition_id = builder.id();
@@ -1123,6 +1164,13 @@ pub fn legacy_inverted_list_schema(with_position: bool) -> SchemaRef {
 }
 
 pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+    inverted_list_schema_with_tail_codec(with_position, PostingTailCodec::VarintDelta)
+}
+
+pub fn inverted_list_schema_with_tail_codec(
+    with_position: bool,
+    posting_tail_codec: PostingTailCodec,
+) -> SchemaRef {
     let mut fields = vec![
         // we compress the posting lists (including row ids and frequencies),
         // and store the compressed posting lists, so it's a large binary array
@@ -1156,7 +1204,7 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     }
     let mut metadata = HashMap::from([(
         POSTING_TAIL_CODEC_KEY.to_owned(),
-        PostingTailCodec::VarintDelta.as_str().to_owned(),
+        posting_tail_codec.as_str().to_owned(),
     )]);
     if with_position {
         metadata.insert(
@@ -1364,6 +1412,7 @@ async fn merge_metadata_files(
     let mut all_partitions = Vec::new();
     let mut params = None;
     let mut token_set_format = None;
+    let mut posting_tail_codec = None;
 
     for file_name in part_metadata_files {
         let reader = store.open_index_file(file_name).await?;
@@ -1393,6 +1442,9 @@ async fn merge_metadata_files(
             && let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY)
         {
             token_set_format = Some(TokenSetFormat::from_str(name)?);
+        }
+        if posting_tail_codec.is_none() {
+            posting_tail_codec = Some(parse_posting_tail_codec(metadata)?);
         }
     }
 
@@ -1472,7 +1524,8 @@ async fn merge_metadata_files(
         remapped_partitions.clone(),
         token_set_format,
         None,
-    );
+    )
+    .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
     builder
         .write_metadata(&*store, &remapped_partitions)
         .await?;
@@ -1530,7 +1583,7 @@ mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
-    use crate::scalar::{IndexReader, IndexWriter};
+    use crate::scalar::{IndexReader, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -1688,6 +1741,7 @@ mod tests {
             tokenizer.clone(),
             builder_tx.clone(),
             params.with_position,
+            PostingTailCodec::default(),
             id_alloc.clone(),
             None,
             token_set_format,
@@ -1711,6 +1765,7 @@ mod tests {
             tokenizer.clone(),
             builder_tx,
             params.with_position,
+            PostingTailCodec::default(),
             id_alloc.clone(),
             None,
             token_set_format,
@@ -1759,6 +1814,80 @@ mod tests {
             dest_store.open_index_file(&posting_file_path(*id)).await?;
             dest_store.open_index_file(&doc_file_path(*id)).await?;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_preserves_existing_posting_tail_codec() -> Result<()> {
+        let src_dir = TempDir::default();
+        let dest_dir = TempDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let posting_tail_codec = PostingTailCodec::Fixed32;
+        let mut partition = InnerBuilder::new_with_posting_tail_codec(
+            0,
+            false,
+            TokenSetFormat::default(),
+            posting_tail_codec,
+        );
+        partition.tokens.add("hello".to_owned());
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
+        posting_list.add(0, PositionRecorder::Count(1));
+        partition.posting_lists.push(posting_list);
+        partition.docs.append(100, 1);
+        partition.write(src_store.as_ref()).await?;
+
+        let metadata_writer = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            Some(src_store.clone()),
+            vec![0],
+            TokenSetFormat::default(),
+            None,
+        )
+        .with_posting_tail_codec(posting_tail_codec);
+        metadata_writer
+            .write_metadata(src_store.as_ref(), &[0])
+            .await?;
+
+        let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let docs = Arc::new(StringArray::from(vec![Some("hello again")]));
+        let row_ids = Arc::new(UInt64Array::from(vec![101u64]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![docs, row_ids])?;
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
+        index
+            .update(Box::pin(stream), dest_store.as_ref(), None)
+            .await?;
+
+        let updated =
+            InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache()).await?;
+        assert_eq!(updated.partitions.len(), 2);
+        for partition in &updated.partitions {
+            assert_eq!(
+                partition.inverted_list.posting_tail_codec(),
+                posting_tail_codec
+            );
+        }
+
+        let metadata = dest_store.open_index_file(METADATA_FILE).await?;
+        assert_eq!(
+            metadata.schema().metadata.get(POSTING_TAIL_CODEC_KEY),
+            Some(&posting_tail_codec.as_str().to_owned())
+        );
 
         Ok(())
     }

@@ -50,8 +50,8 @@ use super::iter::PostingListIterator;
 use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema, posting_file_path,
-        token_file_path,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema_with_tail_codec,
+        posting_file_path, token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -208,7 +208,9 @@ impl PostingTailCodec {
     }
 }
 
-fn parse_posting_tail_codec(metadata: &HashMap<String, String>) -> Result<PostingTailCodec> {
+pub(crate) fn parse_posting_tail_codec(
+    metadata: &HashMap<String, String>,
+) -> Result<PostingTailCodec> {
     Ok(metadata
         .get(POSTING_TAIL_CODEC_KEY)
         .map(|codec| PostingTailCodec::from_metadata_value(codec))
@@ -276,6 +278,13 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
+    fn posting_tail_codec(&self) -> PostingTailCodec {
+        self.partitions
+            .first()
+            .map(|partition| partition.inverted_list.posting_tail_codec())
+            .unwrap_or_default()
+    }
+
     fn to_builder(&self) -> InvertedIndexBuilder {
         self.to_builder_with_offset(None)
     }
@@ -290,6 +299,7 @@ impl InvertedIndex {
                 self.token_set_format,
                 fragment_mask,
             )
+            .with_posting_tail_codec(self.posting_tail_codec())
         } else {
             let partitions = match fragment_mask {
                 Some(fragment_mask) => self
@@ -311,6 +321,7 @@ impl InvertedIndex {
                 self.token_set_format,
                 fragment_mask,
             )
+            .with_posting_tail_codec(self.posting_tail_codec())
         }
     }
 
@@ -939,10 +950,11 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(
+        let mut builder = InnerBuilder::new_with_posting_tail_codec(
             self.id,
             self.inverted_list.has_positions(),
             self.token_set_format,
+            self.inverted_list.posting_tail_codec(),
         );
         builder.tokens = self.tokens;
         builder.docs = self.docs;
@@ -1426,6 +1438,10 @@ impl PostingListReader {
 
     pub(crate) fn has_positions(&self) -> bool {
         self.has_position
+    }
+
+    pub(crate) fn posting_tail_codec(&self) -> PostingTailCodec {
+        self.posting_tail_codec
     }
 
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
@@ -1947,7 +1963,14 @@ impl PostingList {
     }
 
     pub fn into_builder(self, docs: &DocSet) -> PostingListBuilder {
-        let mut builder = PostingListBuilder::new(self.has_position());
+        let posting_tail_codec = match &self {
+            Self::Plain(_) => PostingTailCodec::Fixed32,
+            Self::Compressed(posting) => posting.posting_tail_codec,
+        };
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec(
+            self.has_position(),
+            posting_tail_codec,
+        );
         match self {
             // legacy format
             Self::Plain(posting) => {
@@ -2253,12 +2276,17 @@ impl EncodedBlocks {
         self.bytes[start..start + 4].copy_from_slice(&score.to_le_bytes());
     }
 
-    fn append_remainder_block(&mut self, doc_ids: &[u32], frequencies: &[u32]) -> Result<()> {
+    fn append_remainder_block_with_codec(
+        &mut self,
+        doc_ids: &[u32],
+        frequencies: &[u32],
+        codec: PostingTailCodec,
+    ) -> Result<()> {
         self.offsets.push(self.bytes.len() as u32);
         super::encoding::encode_remainder_posting_block_into(
             doc_ids,
             frequencies,
-            PostingTailCodec::VarintDelta,
+            codec,
             &mut self.bytes,
         )
     }
@@ -2320,6 +2348,7 @@ impl EncodedPositionBlocks {
 #[derive(Debug)]
 pub struct PostingListBuilder {
     with_positions: bool,
+    posting_tail_codec: PostingTailCodec,
     encoded_blocks: Option<Box<EncodedBlocks>>,
     encoded_position_blocks: Option<Box<EncodedPositionBlocks>>,
     tail_entries: Vec<RawDocInfo>,
@@ -2429,8 +2458,16 @@ impl PostingListBuilder {
     }
 
     pub fn new(with_position: bool) -> Self {
+        Self::new_with_posting_tail_codec(with_position, PostingTailCodec::default())
+    }
+
+    pub fn new_with_posting_tail_codec(
+        with_position: bool,
+        posting_tail_codec: PostingTailCodec,
+    ) -> Self {
         Self {
             with_positions: with_position,
+            posting_tail_codec,
             encoded_blocks: None,
             encoded_position_blocks: None,
             tail_entries: Vec::new(),
@@ -2684,6 +2721,7 @@ impl PostingListBuilder {
     ) -> Result<()> {
         let Self {
             with_positions,
+            posting_tail_codec,
             encoded_blocks,
             encoded_position_blocks,
             tail_entries,
@@ -2694,6 +2732,7 @@ impl PostingListBuilder {
         let length = len as usize;
         let (compressed, positions, max_score) = Self::build_compressed_with_scores_from_parts(
             with_positions,
+            posting_tail_codec,
             length,
             encoded_blocks
                 .map(|encoded_blocks| *encoded_blocks)
@@ -2721,6 +2760,7 @@ impl PostingListBuilder {
 
     fn build_compressed_with_scores_from_parts(
         with_positions: bool,
+        posting_tail_codec: PostingTailCodec,
         length: usize,
         mut encoded_blocks: EncodedBlocks,
         mut encoded_position_blocks: EncodedPositionBlocks,
@@ -2760,7 +2800,11 @@ impl PostingListBuilder {
                 frequencies.iter().copied(),
             );
             max_score = max_score.max(block_score);
-            encoded_blocks.append_remainder_block(doc_ids.as_slice(), frequencies.as_slice())?;
+            encoded_blocks.append_remainder_block_with_codec(
+                doc_ids.as_slice(),
+                frequencies.as_slice(),
+                posting_tail_codec,
+            )?;
             encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
             if with_positions {
                 encoded_position_blocks.push_block(tail_positions, frequencies.as_slice())?;
@@ -2776,6 +2820,7 @@ impl PostingListBuilder {
 
     fn build_compressed_with_block_scores_from_parts(
         with_positions: bool,
+        posting_tail_codec: PostingTailCodec,
         mut encoded_blocks: EncodedBlocks,
         mut encoded_position_blocks: EncodedPositionBlocks,
         tail_entries: &[RawDocInfo],
@@ -2800,7 +2845,11 @@ impl PostingListBuilder {
                 .ok_or_else(|| Error::index("missing tail block max score".to_owned()))?;
             max_score = max_score.max(block_score);
             Self::extend_tail_components(tail_entries, &mut doc_ids, &mut frequencies);
-            encoded_blocks.append_remainder_block(doc_ids.as_slice(), frequencies.as_slice())?;
+            encoded_blocks.append_remainder_block_with_codec(
+                doc_ids.as_slice(),
+                frequencies.as_slice(),
+                posting_tail_codec,
+            )?;
             encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
             if with_positions {
                 encoded_position_blocks.push_block(tail_positions, frequencies.as_slice())?;
@@ -2815,9 +2864,11 @@ impl PostingListBuilder {
     }
 
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
-        let schema = inverted_list_schema(self.has_positions());
+        let schema =
+            inverted_list_schema_with_tail_codec(self.has_positions(), self.posting_tail_codec);
         let Self {
             with_positions,
+            posting_tail_codec,
             encoded_blocks,
             encoded_position_blocks,
             tail_entries,
@@ -2828,6 +2879,7 @@ impl PostingListBuilder {
         let (compressed, positions, max_score) =
             Self::build_compressed_with_block_scores_from_parts(
                 with_positions,
+                posting_tail_codec,
                 encoded_blocks
                     .map(|encoded_blocks| *encoded_blocks)
                     .unwrap_or_default(),
@@ -2840,6 +2892,7 @@ impl PostingListBuilder {
             )?;
         let builder = Self {
             with_positions,
+            posting_tail_codec,
             encoded_blocks: None,
             encoded_position_blocks: None,
             tail_entries: Vec::new(),
@@ -2853,6 +2906,7 @@ impl PostingListBuilder {
     pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
         let Self {
             with_positions,
+            posting_tail_codec,
             encoded_blocks,
             encoded_position_blocks,
             tail_entries,
@@ -2863,6 +2917,7 @@ impl PostingListBuilder {
         let length = len as usize;
         let (compressed, positions, max_score) = Self::build_compressed_with_scores_from_parts(
             with_positions,
+            posting_tail_codec,
             length,
             encoded_blocks
                 .map(|encoded_blocks| *encoded_blocks)
@@ -2876,6 +2931,7 @@ impl PostingListBuilder {
         )?;
         let builder = Self {
             with_positions,
+            posting_tail_codec,
             encoded_blocks: None,
             encoded_position_blocks: None,
             tail_entries: Vec::new(),
@@ -2888,7 +2944,8 @@ impl PostingListBuilder {
 
     pub fn remap(&mut self, removed: &[u32]) {
         let mut cursor = 0;
-        let mut new_builder = Self::new(self.has_positions());
+        let mut new_builder =
+            Self::new_with_posting_tail_codec(self.has_positions(), self.posting_tail_codec);
         for (doc_id, freq, positions) in self.iter() {
             while cursor < removed.len() && removed[cursor] < doc_id {
                 cursor += 1;
