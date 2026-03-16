@@ -14,7 +14,6 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.query import MatchQuery
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -290,12 +289,12 @@ class FtsIndex(UpgradeDowngradeTest):
             }
         )
         dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
-        dataset.create_scalar_index("text", "INVERTED", with_position=True)
+        dataset.create_scalar_index("text", "INVERTED")
 
     def check_read(self):
         """Verify FTS index can be queried."""
         ds = lance.dataset(self.path)
-        match_table = ds.to_table(full_text_query=MatchQuery("words 7", "text"))
+        match_table = ds.to_table(full_text_query="words 7")
         assert match_table.num_rows > 0
         assert 7 in match_table.column("idx").to_pylist()
 
