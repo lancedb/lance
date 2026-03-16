@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -34,9 +34,10 @@ use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
-    DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode, VisitedGenerator,
+    BorrowingGraph, DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode,
+    VisitedGenerator,
 };
-use crate::vector::graph::{Visited, greedy_search};
+use crate::vector::graph::{Visited, beam_search_borrowed, greedy_search, greedy_search_borrowed};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
@@ -57,6 +58,9 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+
+    /// Optional seed for deterministic level generation.
+    pub level_seed: Option<u64>,
 }
 
 impl Default for HnswBuildParams {
@@ -66,6 +70,7 @@ impl Default for HnswBuildParams {
             m: 20,
             ef_construction: 150,
             prefetch_distance: Some(2),
+            level_seed: None,
         }
     }
 }
@@ -94,6 +99,12 @@ impl HnswBuildParams {
         self
     }
 
+    /// Seed the random level generation for deterministic graph structure.
+    pub fn level_seed(mut self, level_seed: u64) -> Self {
+        self.level_seed = Some(level_seed);
+        self
+    }
+
     /// Build the HNSW index from the given data.
     ///
     /// # Parameters
@@ -117,7 +128,38 @@ impl HnswBuildParams {
 /// Each node in the graph has a global ID which is the index on the base layer.
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
-    inner: Arc<HnswBuilder>,
+    inner: Arc<HnswCore>,
+}
+
+struct HnswCore {
+    params: HnswBuildParams,
+    nodes: Arc<Vec<GraphBuilderNode>>,
+    level_count: Vec<usize>,
+    entry_point: u32,
+    visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
+}
+
+impl DeepSizeOf for HnswCore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.params.deep_size_of_children(context)
+            + self.nodes.deep_size_of_children(context)
+            + self.level_count.deep_size_of_children(context)
+        // Skipping the visited_generator_queue
+    }
+}
+
+impl HnswCore {
+    fn max_level(&self) -> u16 {
+        self.params.max_level
+    }
+
+    fn num_nodes(&self, level: usize) -> usize {
+        self.level_count[level]
+    }
+
+    fn nodes(&self) -> Arc<Vec<GraphBuilderNode>> {
+        self.nodes.clone()
+    }
 }
 
 impl Debug for HNSW {
@@ -129,7 +171,7 @@ impl Debug for HNSW {
 impl HNSW {
     pub fn empty() -> Self {
         Self {
-            inner: Arc::new(HnswBuilder {
+            inner: Arc::new(HnswCore {
                 params: HnswBuildParams::default(),
                 nodes: Arc::new(Vec::new()),
                 level_count: Vec::new(),
@@ -155,7 +197,7 @@ impl HNSW {
         self.inner.num_nodes(level)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
+    pub fn nodes(&self) -> Arc<Vec<GraphBuilderNode>> {
         self.inner.nodes()
     }
 
@@ -172,10 +214,10 @@ impl HNSW {
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
-        let nodes = &self.nodes();
+        let nodes = self.inner.nodes.as_ref();
         for level in (0..self.max_level()).rev() {
-            let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(
+            let cur_level = ImmutableHnswLevelView::new(level, nodes);
+            ep = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 &dist_calc,
@@ -183,9 +225,9 @@ impl HNSW {
             );
         }
 
-        let bottom_level = HnswBottomView::new(nodes);
+        let bottom_level = ImmutableHnswBottomView::new(nodes);
         let mut visited = visited_generator.generate(storage.len());
-        Ok(beam_search(
+        Ok(beam_search_borrowed(
             &bottom_level,
             &ep,
             params,
@@ -306,10 +348,10 @@ impl HNSW {
             .inner
             .level_count
             .iter()
-            .chain(iter::once(&AtomicUsize::new(0)))
+            .chain(iter::once(&0))
             .scan(0, |state, x| {
                 let start = *state;
-                *state += x.load(Ordering::Relaxed);
+                *state += *x;
                 Some(start)
             })
             .collect();
@@ -343,16 +385,33 @@ impl DeepSizeOf for HnswBuilder {
 }
 
 impl HnswBuilder {
-    fn max_level(&self) -> u16 {
-        self.params.max_level
-    }
+    fn finish(self) -> HNSW {
+        let nodes = match Arc::try_unwrap(self.nodes) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .map(|node| node.into_inner().expect("builder lock poisoned"))
+                .collect(),
+            Err(nodes) => nodes
+                .iter()
+                .map(|node| node.read().expect("builder lock poisoned").clone())
+                .collect(),
+        };
 
-    fn num_nodes(&self, level: usize) -> usize {
-        self.level_count[level].load(Ordering::Relaxed)
-    }
+        let level_count = self
+            .level_count
+            .into_iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
 
-    fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
-        self.nodes.clone()
+        HNSW {
+            inner: Arc::new(HnswCore {
+                params: self.params,
+                nodes: Arc::new(nodes),
+                level_count,
+                entry_point: self.entry_point,
+                visited_generator_queue: self.visited_generator_queue,
+            }),
+        }
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
@@ -387,11 +446,22 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
-            for i in 1..len {
-                nodes.push(RwLock::new(GraphBuilderNode::new(
-                    i as u32,
-                    builder.random_level() as usize + 1,
-                )));
+            if let Some(level_seed) = builder.params.level_seed {
+                let mut level_rng = StdRng::seed_from_u64(level_seed);
+                for i in 1..len {
+                    nodes.push(RwLock::new(GraphBuilderNode::new(
+                        i as u32,
+                        builder.random_level(&mut level_rng) as usize + 1,
+                    )));
+                }
+            } else {
+                let mut level_rng = rng();
+                for i in 1..len {
+                    nodes.push(RwLock::new(GraphBuilderNode::new(
+                        i as u32,
+                        builder.random_level(&mut level_rng) as usize + 1,
+                    )));
+                }
             }
         }
         builder.nodes = Arc::new(nodes);
@@ -402,8 +472,7 @@ impl HnswBuilder {
     /// New node's level
     ///
     /// See paper `Algorithm 1`
-    fn random_level(&self) -> u16 {
-        let mut rng = rng();
+    fn random_level<R: Rng + ?Sized>(&self, rng: &mut R) -> u16 {
         let ml = 1.0 / (self.params.m as f32).ln();
         min(
             (-rng.random::<f32>().ln() * ml) as u16,
@@ -518,7 +587,6 @@ impl HnswBuilder {
         if level_neighbors.len() <= m_max {
             builder_node.update_from_ranked_neighbors(level);
             return;
-            //return level_neighbors;
         }
 
         *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
@@ -550,24 +618,64 @@ impl Graph for HnswLevelView<'_> {
     }
 }
 
-pub(crate) struct HnswBottomView<'a> {
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+pub(crate) struct ImmutableHnswLevelView<'a> {
+    level: u16,
+    nodes: &'a Vec<GraphBuilderNode>,
 }
 
-impl<'a> HnswBottomView<'a> {
-    pub fn new(nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
-        Self { nodes }
+impl<'a> ImmutableHnswLevelView<'a> {
+    pub fn new(level: u16, nodes: &'a Vec<GraphBuilderNode>) -> Self {
+        Self { level, nodes }
     }
 }
 
-impl Graph for HnswBottomView<'_> {
+impl Graph for ImmutableHnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
 
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
-        let node = &self.nodes[key as usize];
-        node.read().unwrap().bottom_neighbors.clone()
+        self.nodes[key as usize].level_neighbors[self.level as usize].clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswLevelView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].level_neighbors[self.level as usize].as_slice()
+    }
+}
+
+pub(crate) struct ImmutableHnswBottomView<'a> {
+    nodes: &'a Vec<GraphBuilderNode>,
+}
+
+impl<'a> ImmutableHnswBottomView<'a> {
+    pub fn new(nodes: &'a Vec<GraphBuilderNode>) -> Self {
+        Self { nodes }
+    }
+}
+
+impl Graph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
+        self.nodes[key as usize].bottom_neighbors.clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].bottom_neighbors.as_slice()
     }
 }
 
@@ -657,10 +765,10 @@ impl IvfSubIndex for HNSW {
                 .push(VisitedGenerator::new(0))
                 .unwrap();
         }
-        let inner = HnswBuilder {
+        let inner = HnswCore {
             params: hnsw_metadata.params,
-            nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
-            level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
+            nodes: Arc::new(nodes),
+            level_count,
             entry_point: hnsw_metadata.entry_point,
             visited_generator_queue,
         };
@@ -756,35 +864,32 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
-        let inner = HnswBuilder::with_params(params, storage);
-        let hnsw = Self {
-            inner: Arc::new(inner),
-        };
+        let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
-            hnsw.inner.params.max_level,
-            hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction,
+            builder.params.max_level,
+            builder.params.m,
+            builder.params.ef_construction,
             storage.distance_type(),
         );
 
         if storage.is_empty() {
-            return Ok(hnsw);
+            return Ok(builder.finish());
         }
 
         let len = storage.len();
-        hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
+        builder.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
-                hnsw.inner.insert(node as u32, visited_generator, storage);
+                builder.insert(node as u32, visited_generator, storage);
             },
         );
 
-        assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
-        Ok(hnsw)
+        assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        Ok(builder.finish())
     }
 
     fn remap(
@@ -807,7 +912,6 @@ impl IvfSubIndex for HNSW {
         for level in 0..self.max_level() {
             let level = level as usize;
             for (id, node) in self.inner.nodes.iter().enumerate() {
-                let node = node.read().unwrap();
                 if level >= node.level_neighbors.len() {
                     continue;
                 }
@@ -889,7 +993,8 @@ mod tests {
             store.as_ref(),
             HnswBuildParams::default()
                 .num_edges(NUM_EDGES)
-                .ef_construction(50),
+                .ef_construction(50)
+                .level_seed(42),
         )
         .unwrap();
 

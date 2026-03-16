@@ -9,7 +9,6 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
-use bitvec::vec::BitVec;
 use deepsize::DeepSizeOf;
 
 use crate::vector::hnsw::builder::HnswQueryParams;
@@ -161,40 +160,62 @@ pub trait Graph {
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>>;
 }
 
-/// Array-based visited list (faster than HashSet)
+pub trait BorrowingGraph {
+    /// Get the number of nodes in the graph.
+    fn len(&self) -> usize;
+
+    /// Returns true if the graph is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Borrow the neighbors of a graph node, identified by the index.
+    fn neighbors(&self, key: u32) -> &[u32];
+}
+
+const WORD_BITS: usize = usize::BITS as usize;
+
+/// Compact visited list for graph traversals.
 pub struct Visited<'a> {
-    visited: &'a mut BitVec,
-    recently_visited: Vec<u32>,
+    visited: &'a mut Vec<usize>,
+    recently_visited: &'a mut Vec<u32>,
 }
 
 impl Visited<'_> {
     pub fn insert(&mut self, node_id: u32) {
         let node_id_usize = node_id as usize;
-        if !self.visited[node_id_usize] {
-            self.visited.set(node_id_usize, true);
+        let word_index = node_id_usize / WORD_BITS;
+        let mask = 1usize << (node_id_usize % WORD_BITS);
+        if self.visited[word_index] & mask == 0 {
+            self.visited[word_index] |= mask;
             self.recently_visited.push(node_id);
         }
     }
 
     pub fn contains(&self, node_id: u32) -> bool {
         let node_id_usize = node_id as usize;
-        self.visited[node_id_usize]
+        let word_index = node_id_usize / WORD_BITS;
+        let mask = 1usize << (node_id_usize % WORD_BITS);
+        self.visited[word_index] & mask != 0
     }
 
     #[inline(always)]
     pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
-        self.visited.iter_ones()
+        self.recently_visited.iter().map(|node_id| *node_id as usize)
     }
 
     pub fn count_ones(&self) -> usize {
-        self.visited.count_ones()
+        self.recently_visited.len()
     }
 }
 
 impl Drop for Visited<'_> {
     fn drop(&mut self) {
-        for node_id in self.recently_visited.iter() {
-            self.visited.set(*node_id as usize, false);
+        for node_id in self.recently_visited.iter().copied() {
+            let node_id_usize = node_id as usize;
+            let word_index = node_id_usize / WORD_BITS;
+            let mask = 1usize << (node_id_usize % WORD_BITS);
+            self.visited[word_index] &= !mask;
         }
         self.recently_visited.clear();
     }
@@ -202,14 +223,16 @@ impl Drop for Visited<'_> {
 
 #[derive(Debug, Clone)]
 pub struct VisitedGenerator {
-    visited: BitVec,
+    visited: Vec<usize>,
+    recently_visited: Vec<u32>,
     capacity: usize,
 }
 
 impl VisitedGenerator {
     pub fn new(capacity: usize) -> Self {
         Self {
-            visited: BitVec::repeat(false, capacity),
+            visited: vec![0; capacity.div_ceil(WORD_BITS)],
+            recently_visited: Vec::new(),
             capacity,
         }
     }
@@ -217,12 +240,12 @@ impl VisitedGenerator {
     pub fn generate(&mut self, node_count: usize) -> Visited<'_> {
         if node_count > self.capacity {
             let new_capacity = self.capacity.max(node_count).next_power_of_two();
-            self.visited.resize(new_capacity, false);
+            self.visited.resize(new_capacity.div_ceil(WORD_BITS), 0);
             self.capacity = new_capacity;
         }
         Visited {
             visited: &mut self.visited,
-            recently_visited: Vec::new(),
+            recently_visited: &mut self.recently_visited,
         }
     }
 }
@@ -291,11 +314,58 @@ pub fn beam_search(
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
 
+    let mut results = BinaryHeap::with_capacity(k);
+    let no_filter = bitset.is_none() && params.lower_bound.is_none() && params.upper_bound.is_none();
+
+    if no_filter {
+        results.push(ep.clone());
+
+        while !candidates.is_empty() {
+            let current = candidates.pop().expect("candidates is empty").0;
+            let furthest = results
+                .peek()
+                .map(|node| node.dist)
+                .unwrap_or(OrderedFloat(f32::INFINITY));
+
+            if current.dist > furthest && results.len() == k {
+                break;
+            }
+            let furthest = results
+                .peek()
+                .map(|node| node.dist)
+                .unwrap_or(OrderedFloat(f32::INFINITY));
+
+            let process_neighbor = |neighbor: u32| {
+                if visited.contains(neighbor) {
+                    return;
+                }
+                visited.insert(neighbor);
+                let dist: OrderedFloat = dist_calc.distance(neighbor).into();
+                if dist <= furthest || results.len() < k {
+                    if results.len() < k {
+                        results.push((dist, neighbor).into());
+                    } else if results.len() == k && dist < results.peek().unwrap().dist {
+                        results.pop();
+                        results.push((dist, neighbor).into());
+                    }
+                    candidates.push(Reverse((dist, neighbor).into()));
+                }
+            };
+            let neighbors = graph.neighbors(current.id);
+            process_neighbors_with_look_ahead(
+                &neighbors,
+                process_neighbor,
+                prefetch_distance,
+                dist_calc,
+            );
+        }
+
+        return results.into_sorted_vec();
+    }
+
     // add range search support
     let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
     let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
-
-    let mut results = BinaryHeap::with_capacity(k);
 
     if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true)
         && ep.dist >= lower_bound
@@ -355,6 +425,129 @@ pub fn beam_search(
     results.into_sorted_vec()
 }
 
+pub fn beam_search_borrowed(
+    graph: &impl BorrowingGraph,
+    ep: &OrderedNode,
+    params: &HnswQueryParams,
+    dist_calc: &impl DistCalculator,
+    bitset: Option<&Visited>,
+    prefetch_distance: Option<usize>,
+    visited: &mut Visited,
+) -> Vec<OrderedNode> {
+    let k = params.ef;
+    let mut candidates = BinaryHeap::with_capacity(k);
+    visited.insert(ep.id);
+    candidates.push(Reverse(ep.clone()));
+
+    let mut results = BinaryHeap::with_capacity(k);
+    let no_filter = bitset.is_none() && params.lower_bound.is_none() && params.upper_bound.is_none();
+
+    if no_filter {
+        results.push(ep.clone());
+
+        while !candidates.is_empty() {
+            let current = candidates.pop().expect("candidates is empty").0;
+            let furthest = results
+                .peek()
+                .map(|node| node.dist)
+                .unwrap_or(OrderedFloat(f32::INFINITY));
+
+            if current.dist > furthest && results.len() == k {
+                break;
+            }
+            let furthest = results
+                .peek()
+                .map(|node| node.dist)
+                .unwrap_or(OrderedFloat(f32::INFINITY));
+
+            let process_neighbor = |neighbor: u32| {
+                if visited.contains(neighbor) {
+                    return;
+                }
+                visited.insert(neighbor);
+                let dist: OrderedFloat = dist_calc.distance(neighbor).into();
+                if dist <= furthest || results.len() < k {
+                    if results.len() < k {
+                        results.push((dist, neighbor).into());
+                    } else if results.len() == k && dist < results.peek().unwrap().dist {
+                        results.pop();
+                        results.push((dist, neighbor).into());
+                    }
+                    candidates.push(Reverse((dist, neighbor).into()));
+                }
+            };
+            let neighbors = graph.neighbors(current.id);
+            process_neighbors_with_look_ahead(
+                neighbors,
+                process_neighbor,
+                prefetch_distance,
+                dist_calc,
+            );
+        }
+
+        return results.into_sorted_vec();
+    }
+
+    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true)
+        && ep.dist >= lower_bound
+        && ep.dist < upper_bound
+    {
+        results.push(ep.clone());
+    }
+
+    while !candidates.is_empty() {
+        let current = candidates.pop().expect("candidates is empty").0;
+        let furthest = results
+            .peek()
+            .map(|node| node.dist)
+            .unwrap_or(OrderedFloat(f32::INFINITY));
+
+        if current.dist > furthest && results.len() == k {
+            break;
+        }
+        let furthest = results
+            .peek()
+            .map(|node| node.dist)
+            .unwrap_or(OrderedFloat(f32::INFINITY));
+
+        let process_neighbor = |neighbor: u32| {
+            if visited.contains(neighbor) {
+                return;
+            }
+            visited.insert(neighbor);
+            let dist: OrderedFloat = dist_calc.distance(neighbor).into();
+            if dist <= furthest || results.len() < k {
+                if bitset
+                    .map(|bitset| bitset.contains(neighbor))
+                    .unwrap_or(true)
+                    && dist >= lower_bound
+                    && dist < upper_bound
+                {
+                    if results.len() < k {
+                        results.push((dist, neighbor).into());
+                    } else if results.len() == k && dist < results.peek().unwrap().dist {
+                        results.pop();
+                        results.push((dist, neighbor).into());
+                    }
+                }
+                candidates.push(Reverse((dist, neighbor).into()));
+            }
+        };
+        let neighbors = graph.neighbors(current.id);
+        process_neighbors_with_look_ahead(
+            neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+    }
+
+    results.into_sorted_vec()
+}
+
 /// Greedy search over a graph
 ///
 /// This searches for only one result, only used for finding the entry point
@@ -384,7 +577,6 @@ pub fn greedy_search(
     loop {
         let neighbors = graph.neighbors(current);
         let mut next = None;
-
         let process_neighbor = |neighbor: u32| {
             let dist = dist_calc.distance(neighbor);
             if dist < closest_dist {
@@ -394,6 +586,42 @@ pub fn greedy_search(
         };
         process_neighbors_with_look_ahead(
             &neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+
+        if let Some(next) = next {
+            current = next;
+        } else {
+            break;
+        }
+    }
+
+    OrderedNode::new(current, closest_dist.into())
+}
+
+pub fn greedy_search_borrowed(
+    graph: &impl BorrowingGraph,
+    start: OrderedNode,
+    dist_calc: &impl DistCalculator,
+    prefetch_distance: Option<usize>,
+) -> OrderedNode {
+    let mut current = start.id;
+    let mut closest_dist = start.dist.0;
+    loop {
+        let neighbors = graph.neighbors(current);
+        let mut next = None;
+
+        let process_neighbor = |neighbor: u32| {
+            let dist = dist_calc.distance(neighbor);
+            if dist < closest_dist {
+                closest_dist = dist;
+                next = Some(neighbor);
+            }
+        };
+        process_neighbors_with_look_ahead(
+            neighbors,
             process_neighbor,
             prefetch_distance,
             dist_calc,

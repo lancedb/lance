@@ -380,6 +380,7 @@ impl VectorStore for ScalarQuantizationStorage {
             storage: self,
         }
     }
+
 }
 
 #[inline]

@@ -175,6 +175,7 @@ impl VectorStore for FlatFloatStorage {
             self.distance_type,
         )
     }
+
 }
 
 /// All data are stored in memory
