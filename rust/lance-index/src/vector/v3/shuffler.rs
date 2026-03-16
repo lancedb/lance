@@ -704,8 +704,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::stream;
     use lance_arrow::RecordBatchExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_io::stream::RecordBatchStreamAdapter;
-    use tempfile::tempdir;
 
     use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
 
@@ -755,8 +755,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_file_shuffler_round_trip() {
-        let dir = tempdir().unwrap();
-        let output_dir = Path::from(dir.path().to_str().unwrap());
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
         let num_partitions = 3;
 
         // Partition 0: rows with values 10, 40
@@ -799,8 +799,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_file_shuffler_empty_partitions() {
-        let dir = tempdir().unwrap();
-        let output_dir = Path::from(dir.path().to_str().unwrap());
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
         let num_partitions = 5;
 
         // Only use partitions 0 and 3, leaving 1, 2, 4 empty
@@ -828,8 +828,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_file_shuffler_loss_tracking() {
-        let dir = tempdir().unwrap();
-        let output_dir = Path::from(dir.path().to_str().unwrap());
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
         let num_partitions = 2;
 
         let batch1 = make_batch(&[0, 1], &[10, 20], Some(1.5));
@@ -846,8 +846,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_file_shuffler_single_batch() {
-        let dir = tempdir().unwrap();
-        let output_dir = Path::from(dir.path().to_str().unwrap());
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
         let num_partitions = 2;
 
         let batch = make_batch(&[1, 0], &[100, 200], Some(3.0));
@@ -872,8 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_file_shuffler_multiple_batches() {
-        let dir = tempdir().unwrap();
-        let output_dir = Path::from(dir.path().to_str().unwrap());
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
         let num_partitions = 3;
 
         // Use a very small batch size to force multiple write batches
