@@ -442,7 +442,7 @@ impl FlatMatchFilterExec {
             )))?;
         let mut tokenizer = Self::load_tokenizer(&dataset, column, &metrics.index_metrics).await?;
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
-        let column = column.to_string();
+        let column = column.clone();
 
         Ok(input.map(move |batch| -> DataFusionResult<_> {
             let batch = batch?;

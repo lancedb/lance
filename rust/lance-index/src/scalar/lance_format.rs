@@ -11,6 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
@@ -37,6 +38,7 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
+    format_version: LanceFileVersion,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -54,6 +56,21 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
+        Self::with_format_version(
+            object_store,
+            index_dir,
+            metadata_cache,
+            LanceFileVersion::V2_0,
+        )
+    }
+
+    /// Create a new index store at the given directory with a specific format version
+    pub fn with_format_version(
+        object_store: Arc<ObjectStore>,
+        index_dir: Path,
+        metadata_cache: Arc<LanceCache>,
+        format_version: LanceFileVersion,
+    ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -63,6 +80,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            format_version,
         }
     }
 }
@@ -216,7 +234,10 @@ impl IndexStore for LanceIndexStore {
         let writer = current_writer::FileWriter::try_new(
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                format_version: Some(self.format_version),
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(writer))
     }

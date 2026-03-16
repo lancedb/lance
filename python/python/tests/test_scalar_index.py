@@ -849,7 +849,12 @@ def test_fts_ngram_tokenizer(tmp_path):
 
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+        "doc",
+        index_type="INVERTED",
+        with_position=False,
+        remove_stop_words=True,
+        memory_limit=4096,
+        num_workers=2,
     )
     stats = dataset.stats.index_stats("doc_idx")
     assert stats["index_type"] == "Inverted"
@@ -864,6 +869,8 @@ def test_fts_stats(dataset):
     assert params["stem"] is True
     assert params["remove_stop_words"] is True
     assert params["ascii_folding"] is True
+    assert "memory_limit" not in params
+    assert "num_workers" not in params
 
 
 def test_fts_score(tmp_path):

@@ -1299,6 +1299,21 @@ impl MergeInsertJob {
         self.execute_uncommitted_impl(stream).await
     }
 
+    fn create_plan_join_type(&self) -> JoinType {
+        let keep_unmatched_source_rows = self.params.insert_not_matched;
+        let keep_unmatched_target_rows = !matches!(
+            self.params.delete_not_matched_by_source,
+            WhenNotMatchedBySource::Keep
+        );
+
+        match (keep_unmatched_target_rows, keep_unmatched_source_rows) {
+            (false, false) => JoinType::Inner,
+            (false, true) => JoinType::Right,
+            (true, false) => JoinType::Left,
+            (true, true) => JoinType::Full,
+        }
+    }
+
     async fn create_plan(
         self,
         source: SendableRecordBatchStream,
@@ -1322,11 +1337,7 @@ impl MergeInsertJob {
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
-        let join_type = if self.params.insert_not_matched {
-            JoinType::Right
-        } else {
-            JoinType::Inner
-        };
+        let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
         let df = scan_aliased
             .join(
@@ -1446,7 +1457,7 @@ impl MergeInsertJob {
     /// - when_matched is UpdateAll or UpdateIf or Fail
     /// - Either use_index is false OR there's no scalar index on join key
     /// - Source schema matches dataset schema exactly
-    /// - when_not_matched_by_source is Keep
+    /// - when_not_matched_by_source is Keep, Delete, or DeleteIf
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
@@ -1492,6 +1503,8 @@ impl MergeInsertJob {
             && matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
+                    | WhenNotMatchedBySource::Delete
+                    | WhenNotMatchedBySource::DeleteIf(_)
             ))
     }
 
@@ -1733,7 +1746,7 @@ impl MergeInsertJob {
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
         // Create an empty batch with the provided schema to pass to create_plan
@@ -1773,7 +1786,7 @@ impl MergeInsertJob {
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
         // Check if we can use create_plan
         if !self.can_use_create_plan(source.schema().as_ref()).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
         // Clone self since create_plan consumes the job
@@ -2716,6 +2729,18 @@ mod tests {
         check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3])
             .await;
 
+        // conditional upsert, with delete all
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(
+                WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
+            )
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
+        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5], &[6, 7, 8, 9], &[3, 1, 3])
+            .await;
+
         // update only, with delete all (unusual)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
@@ -2765,6 +2790,24 @@ mod tests {
             &[1],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 2],
+        )
+        .await;
+
+        // conditional upsert, with delete some
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(
+                WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
+            )
+            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
+            .try_build()
+            .unwrap();
+        check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 4, 5],
+            &[6, 7, 8, 9],
+            &[3, 1, 2],
         )
         .await;
 
@@ -5310,6 +5353,155 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert!(verbose_plan.contains("MergeInsert"));
         // Verbose should also match the expected pattern
         assert_string_matches(&verbose_plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_explain_plan_full_schema_delete_by_source_with_fsl() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_explain_plan_full_schema_delete_by_source_with_fsl",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .use_index(false)
+                .try_build()
+                .unwrap();
+
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+        assert!(plan.contains("HashJoinExec"));
+        assert!(plan.contains("join_type=Full"));
+        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
+            "target-side scan should prune the FSL payload from the join build side: {plan}"
+        );
+        assert!(
+            !plan.contains("LanceRead: uri=test_explain_plan_full_schema_delete_by_source_with_fsl/data, projection=[id, vec]"),
+            "target-side scan should not include the FSL payload in the join build side: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_full_schema_delete_by_source_with_fsl() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_merge_insert_full_schema_delete_by_source_with_fsl",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(source_batch)],
+                    schema.clone(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 2);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
+        let ids = merged["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(ids, vec![2, 4]);
+
+        let vecs = merged["vec"].as_fixed_size_list();
+        let actual = vecs
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(actual, vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]);
     }
 
     #[tokio::test]

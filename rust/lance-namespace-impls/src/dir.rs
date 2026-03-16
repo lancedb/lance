@@ -819,13 +819,16 @@ impl DirectoryNamespace {
     async fn get_storage_options_for_table(
         &self,
         table_uri: &str,
+        vend_credentials: bool,
         identity: Option<&Identity>,
     ) -> Result<Option<HashMap<String, String>>> {
-        if let Some(ref vendor) = self.credential_vendor {
+        if vend_credentials && let Some(ref vendor) = self.credential_vendor {
             let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
-        Ok(self.storage_options.clone())
+        // When no credential vendor is configured, return None to avoid
+        // leaking the namespace's own static credentials to clients.
+        Ok(None)
     }
 
     /// Migrate directory-based tables to the manifest.
@@ -1064,16 +1067,13 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
-                    // Only apply identity-based credential vending when explicitly requested
-                    if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                        if let Some(ref table_uri) = response.table_uri {
-                            let identity = request.identity.as_deref();
-                            response.storage_options = self
-                                .get_storage_options_for_table(table_uri, identity)
-                                .await?;
-                        }
-                    } else if request.vend_credentials == Some(false) {
-                        response.storage_options = None;
+                    if let Some(ref table_uri) = response.table_uri {
+                        // For backwards compatibility, only skip vending credentials when explicitly set to false
+                        let vend = request.vend_credentials.unwrap_or(true);
+                        let identity = request.identity.as_deref();
+                        response.storage_options = self
+                            .get_storage_options_for_table(table_uri, vend, identity)
+                            .await?;
                     }
                     // Set managed_versioning flag when table_version_tracking_enabled
                     if self.table_version_tracking_enabled {
@@ -1116,12 +1116,9 @@ impl LanceNamespace for DirectoryNamespace {
 
         // If not loading detailed metadata, return minimal response with just location
         if !load_detailed_metadata {
-            let storage_options = if vend_credentials {
-                self.get_storage_options_for_table(&table_uri, identity)
-                    .await?
-            } else {
-                None
-            };
+            let storage_options = self
+                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                .await?;
             return Ok(DescribeTableResponse {
                 table: Some(table_name),
                 namespace: request.id.as_ref().map(|id| {
@@ -1163,12 +1160,9 @@ impl LanceNamespace for DirectoryNamespace {
                 let lance_schema = dataset.schema();
                 let arrow_schema: arrow_schema::Schema = lance_schema.into();
                 let json_schema = arrow_schema_to_json(&arrow_schema)?;
-                let storage_options = if vend_credentials {
-                    self.get_storage_options_for_table(&table_uri, identity)
-                        .await?
-                } else {
-                    None
-                };
+                let storage_options = self
+                    .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                    .await?;
 
                 // Convert BTreeMap to HashMap for the response
                 let metadata: std::collections::HashMap<String, String> =
@@ -1200,12 +1194,9 @@ impl LanceNamespace for DirectoryNamespace {
             Err(err) => {
                 // Use the reserved file status from the atomic check
                 if status.has_reserved_file {
-                    let storage_options = if vend_credentials {
-                        self.get_storage_options_for_table(&table_uri, identity)
-                            .await?
-                    } else {
-                        None
-                    };
+                    let storage_options = self
+                        .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                        .await?;
                     Ok(DescribeTableResponse {
                         table: Some(table_name),
                         namespace: request.id.as_ref().map(|id| {
@@ -1369,16 +1360,13 @@ impl LanceNamespace for DirectoryNamespace {
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
-            // Only apply identity-based credential vending when explicitly requested
-            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                if let Some(ref location) = response.location {
-                    let identity = request.identity.as_deref();
-                    response.storage_options = self
-                        .get_storage_options_for_table(location, identity)
-                        .await?;
-                }
-            } else if request.vend_credentials == Some(false) {
-                response.storage_options = None;
+            if let Some(ref location) = response.location {
+                // For backwards compatibility, only skip vending credentials when explicitly set to false
+                let vend = request.vend_credentials.unwrap_or(true);
+                let identity = request.identity.as_deref();
+                response.storage_options = self
+                    .get_storage_options_for_table(location, vend, identity)
+                    .await?;
             }
             // Set managed_versioning when table_version_tracking_enabled
             if self.table_version_tracking_enabled {
@@ -1427,12 +1415,9 @@ impl LanceNamespace for DirectoryNamespace {
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let identity = request.identity.as_deref();
-        let storage_options = if vend_credentials {
-            self.get_storage_options_for_table(&table_uri, identity)
-                .await?
-        } else {
-            None
-        };
+        let storage_options = self
+            .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+            .await?;
 
         Ok(DeclareTableResponse {
             location: Some(table_uri),
@@ -2279,6 +2264,79 @@ mod tests {
         let storage_options = response.storage_options.unwrap();
         assert_eq!(storage_options.get("option1"), Some(&"value1".to_string()));
         assert_eq!(storage_options.get("option2"), Some(&"value2".to_string()));
+    }
+
+    /// When no credential vendor is configured, `describe_table` and
+    /// `declare_table` must strip credential keys from storage options
+    /// while preserving non-credential config (region, endpoint, etc.).
+    #[tokio::test]
+    async fn test_no_storage_options_without_vendor() {
+        use lance_namespace::models::DeclareTableRequest;
+
+        let temp_dir = TempStdDir::default();
+
+        // No manifest, no credential vendor, but storage options with credentials
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .storage_option("aws_access_key_id", "AKID")
+            .storage_option("aws_secret_access_key", "SECRET")
+            .storage_option("region", "us-east-1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // create_table
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // describe_table should not return storage options without a vendor
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
+
+        // declare_table should not return storage options without a vendor
+        let mut decl_req = DeclareTableRequest::new();
+        decl_req.id = Some(vec!["t2".to_string()]);
+        let resp = namespace.declare_table(decl_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
+    }
+
+    /// Same test with manifest mode enabled.
+    #[tokio::test]
+    async fn test_no_storage_options_without_vendor_manifest() {
+        let temp_dir = TempStdDir::default();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .storage_option("aws_access_key_id", "AKID")
+            .storage_option("aws_secret_access_key", "SECRET")
+            .storage_option("region", "us-east-1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // describe_table through manifest should not return storage options without a vendor
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
     }
 
     #[tokio::test]

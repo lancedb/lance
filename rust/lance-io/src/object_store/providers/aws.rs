@@ -260,7 +260,9 @@ pub async fn build_aws_credential(
 
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
-    // If accessor has a provider, use DynamicStorageOptionsCredentialProvider
+    // If accessor has a provider, check whether it vends credentials.
+    // If it does, use DynamicStorageOptionsCredentialProvider for ongoing
+    // refresh. If not, fall through to the default credentials chain.
     if let Some(accessor) = storage_options_accessor
         && accessor.has_provider()
     {
@@ -268,11 +270,21 @@ pub async fn build_aws_credential(
         if let Some(creds) = credentials {
             return Ok((creds, region));
         }
-        // Use accessor for dynamic credential refresh
-        return Ok((
-            Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-            region,
-        ));
+
+        // Check if the accessor's storage options contain credentials
+        let opts = accessor.get_storage_options().await?;
+        let s3_options = opts.as_s3_options();
+        if extract_static_s3_credentials(&s3_options).is_some() {
+            return Ok((
+                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
+                region,
+            ));
+        }
+
+        log::debug!(
+            "Storage options from provider do not contain explicit AWS credentials, \
+             falling back to default AWS credentials chain."
+        );
     }
 
     // Fall back to existing logic for static credentials
