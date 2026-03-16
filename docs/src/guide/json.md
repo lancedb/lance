@@ -235,6 +235,75 @@ result = dataset.to_table(
 )
 ```
 
+## JSON Indexing
+
+Lance supports indexing JSON columns to accelerate filters on frequently queried paths.
+
+### Scalar Index on a JSON Path
+
+For `pa.json_()` columns, create a scalar index with `IndexConfig` and specify the JSON
+path to index. The query should use the same path literal that was indexed.
+
+```python
+import json
+import lance
+import pyarrow as pa
+from lance.indices import IndexConfig
+
+table = pa.table({
+    "id": [1, 2, 3, 4],
+    "data": pa.array([
+        json.dumps({"x": 7, "y": 10}),
+        json.dumps({"x": 11, "y": 22}),
+        json.dumps({"y": 0}),
+        json.dumps({"x": 10}),
+    ], type=pa.json_()),
+})
+
+lance.write_dataset(table, "json-index.lance")
+dataset = lance.dataset("json-index.lance")
+
+dataset.create_scalar_index(
+    "data",
+    IndexConfig(
+        index_type="json",
+        parameters={
+            "target_index_type": "btree",
+            "path": "x",
+        },
+    ),
+)
+
+result = dataset.to_table(filter="json_get_int(data, 'x') = 10")
+```
+
+!!! note
+    The JSON index matches queries by path literal. For example, if the index is built
+    with `path="x"`, then the filter should also use `"x"` with a function such as
+    `json_get_int(data, 'x')`. If the index is built with `path="$.user.name"`, then
+    the filter should use `json_extract(data, '$.user.name')`.
+
+### Full-Text Search on JSON Documents
+
+If you want text search over the contents of a JSON document instead of scalar filtering
+on a single path, create an `INVERTED` index on the JSON column.
+
+```python
+dataset.create_scalar_index(
+    "data",
+    index_type="INVERTED",
+    base_tokenizer="simple",
+    lower_case=True,
+    stem=True,
+    remove_stop_words=True,
+)
+```
+
+!!! note
+    JSON columns and nested struct columns are indexed differently. For nested struct
+    fields, use dot notation such as `meta.lang`. For `pa.json_()` columns, use the JSON
+    index shown above and query with `json_get_*` or `json_extract`.
+
 ## Usage Examples
 
 ### Working with Nested JSON
@@ -348,7 +417,7 @@ complex_projects = dataset.to_table(
 ## Performance Considerations
 
 1. **Choose the right function**: Use `json_get_*` functions for direct field access and type conversion; use `json_extract` for complex JSONPath queries.
-2. **Index frequently queried paths**: Consider creating computed columns for frequently accessed JSON paths to improve query performance.
+2. **Index frequently queried paths**: Use a JSON scalar index on frequently filtered paths before creating computed columns for the same fields.
 3. **Minimize deep nesting**: While Lance supports arbitrary nesting, flatter structures generally perform better.
 4. **Understand type conversion**: The `json_get_*` functions use strict type conversion, which may fail if types don't match. Plan your schema accordingly.
 5. **Array access**: When working with JSON arrays, you can access elements by index using numeric strings (e.g., "0", "1") with `json_get` functions.
