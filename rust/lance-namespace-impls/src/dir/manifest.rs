@@ -1532,12 +1532,12 @@ impl ManifestNamespace {
         version: i64,
     ) -> Result<DescribeTableVersionResponse> {
         let object_id = Self::str_object_id(table_id);
-        if let Some(metadata_str) = self.query_table_version(&object_id, version).await? {
-            if let Some(tv) = Self::parse_table_version(version, &metadata_str) {
-                return Ok(DescribeTableVersionResponse {
-                    version: Box::new(tv),
-                });
-            }
+        if let Some(metadata_str) = self.query_table_version(&object_id, version).await?
+            && let Some(tv) = Self::parse_table_version(version, &metadata_str)
+        {
+            return Ok(DescribeTableVersionResponse {
+                version: Box::new(tv),
+            });
         }
         Err(Error::namespace_source(
             format!(

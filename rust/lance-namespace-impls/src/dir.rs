@@ -1608,14 +1608,14 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListTableVersionsRequest,
     ) -> Result<ListTableVersionsResponse> {
         // When table_version_storage_enabled, query from __manifest
-        if self.table_version_storage_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                let table_id = request.id.clone().unwrap_or_default();
-                let want_descending = request.descending == Some(true);
-                return manifest_ns
-                    .list_table_versions(&table_id, want_descending, request.limit)
-                    .await;
-            }
+        if self.table_version_storage_enabled
+            && let Some(ref manifest_ns) = self.manifest_ns
+        {
+            let table_id = request.id.clone().unwrap_or_default();
+            let want_descending = request.descending == Some(true);
+            return manifest_ns
+                .list_table_versions(&table_id, want_descending, request.limit)
+                .await;
         }
 
         // Fallback when table_version_storage is not enabled: list from _versions/ directory
@@ -1790,40 +1790,37 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // If table_version_storage_enabled is enabled, also record in __manifest (best-effort)
-        if self.table_version_storage_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &request.id.clone().unwrap_or_default(),
-                );
-                let object_id = manifest::ManifestNamespace::build_version_object_id(
-                    &table_id_str,
-                    version as i64,
-                );
-                let metadata_json = serde_json::json!({
-                    "manifest_path": final_path.to_string(),
-                    "manifest_size": manifest_size,
-                    "e_tag": put_result.e_tag,
-                    "naming_scheme": request.naming_scheme.as_deref().unwrap_or("V2"),
-                })
-                .to_string();
+        if self.table_version_storage_enabled
+            && let Some(ref manifest_ns) = self.manifest_ns
+        {
+            let table_id_str =
+                manifest::ManifestNamespace::str_object_id(&request.id.clone().unwrap_or_default());
+            let object_id =
+                manifest::ManifestNamespace::build_version_object_id(&table_id_str, version as i64);
+            let metadata_json = serde_json::json!({
+                "manifest_path": final_path.to_string(),
+                "manifest_size": manifest_size,
+                "e_tag": put_result.e_tag,
+                "naming_scheme": request.naming_scheme.as_deref().unwrap_or("V2"),
+            })
+            .to_string();
 
-                if let Err(e) = manifest_ns
-                    .insert_into_manifest_with_metadata(
-                        vec![manifest::ManifestEntry {
-                            object_id,
-                            object_type: manifest::ObjectType::TableVersion,
-                            location: None,
-                            metadata: Some(metadata_json),
-                        }],
-                        None,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "Failed to record table version in __manifest (best-effort): {:?}",
-                        e
-                    );
-                }
+            if let Err(e) = manifest_ns
+                .insert_into_manifest_with_metadata(
+                    vec![manifest::ManifestEntry {
+                        object_id,
+                        object_type: manifest::ObjectType::TableVersion,
+                        location: None,
+                        metadata: Some(metadata_json),
+                    }],
+                    None,
+                )
+                .await
+            {
+                log::warn!(
+                    "Failed to record table version in __manifest (best-effort): {:?}",
+                    e
+                );
             }
         }
 
@@ -1846,11 +1843,11 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<DescribeTableVersionResponse> {
         // When table_version_storage_enabled and a specific version is requested,
         // query from __manifest to avoid opening the entire dataset
-        if self.table_version_storage_enabled {
-            if let (Some(manifest_ns), Some(version)) = (&self.manifest_ns, request.version) {
-                let table_id = request.id.clone().unwrap_or_default();
-                return manifest_ns.describe_table_version(&table_id, version).await;
-            }
+        if self.table_version_storage_enabled
+            && let (Some(manifest_ns), Some(version)) = (&self.manifest_ns, request.version)
+        {
+            let table_id = request.id.clone().unwrap_or_default();
+            return manifest_ns.describe_table_version(&table_id, version).await;
         }
 
         // Fallback when table_version_storage is not enabled: open the dataset to describe the version
@@ -1934,49 +1931,49 @@ impl LanceNamespace for DirectoryNamespace {
 
         let mut total_deleted_count = 0i64;
 
-        if self.table_version_storage_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                // Phase 1 (atomic commit point): Delete version records from __manifest
-                // for ALL tables in a single atomic operation. This is the authoritative
-                // source of truth — once __manifest entries are removed, the versions
-                // are logically deleted across all tables atomically.
+        if self.table_version_storage_enabled
+            && let Some(ref manifest_ns) = self.manifest_ns
+        {
+            // Phase 1 (atomic commit point): Delete version records from __manifest
+            // for ALL tables in a single atomic operation. This is the authoritative
+            // source of truth — once __manifest entries are removed, the versions
+            // are logically deleted across all tables atomically.
 
-                // Collect all (table_id_str, ranges) for batch deletion
-                let mut all_object_ids: Vec<String> = Vec::new();
-                for te in &table_entries {
-                    let table_id_str = manifest::ManifestNamespace::str_object_id(
-                        &te.table_id.clone().unwrap_or_default(),
-                    );
-                    for (start, end) in &te.ranges {
-                        for version in *start..=*end {
-                            let object_id = manifest::ManifestNamespace::build_version_object_id(
-                                &table_id_str,
-                                version,
-                            );
-                            all_object_ids.push(object_id);
-                        }
+            // Collect all (table_id_str, ranges) for batch deletion
+            let mut all_object_ids: Vec<String> = Vec::new();
+            for te in &table_entries {
+                let table_id_str = manifest::ManifestNamespace::str_object_id(
+                    &te.table_id.clone().unwrap_or_default(),
+                );
+                for (start, end) in &te.ranges {
+                    for version in *start..=*end {
+                        let object_id = manifest::ManifestNamespace::build_version_object_id(
+                            &table_id_str,
+                            version,
+                        );
+                        all_object_ids.push(object_id);
                     }
                 }
-
-                if !all_object_ids.is_empty() {
-                    total_deleted_count = manifest_ns
-                        .batch_delete_table_versions_by_object_ids(&all_object_ids)
-                        .await?;
-                }
-
-                // Phase 2: Delete physical manifest files (best-effort).
-                // Even if some file deletions fail, the versions are already removed from
-                // __manifest, so they won't be visible to readers. Leftover files are
-                // orphaned but harmless and can be cleaned up later.
-                let _ = self
-                    .delete_physical_version_files(&table_entries, true)
-                    .await;
-
-                return Ok(BatchDeleteTableVersionsResponse {
-                    deleted_count: Some(total_deleted_count),
-                    transaction_id: None,
-                });
             }
+
+            if !all_object_ids.is_empty() {
+                total_deleted_count = manifest_ns
+                    .batch_delete_table_versions_by_object_ids(&all_object_ids)
+                    .await?;
+            }
+
+            // Phase 2: Delete physical manifest files (best-effort).
+            // Even if some file deletions fail, the versions are already removed from
+            // __manifest, so they won't be visible to readers. Leftover files are
+            // orphaned but harmless and can be cleaned up later.
+            let _ = self
+                .delete_physical_version_files(&table_entries, true)
+                .await;
+
+            return Ok(BatchDeleteTableVersionsResponse {
+                deleted_count: Some(total_deleted_count),
+                transaction_id: None,
+            });
         }
 
         // Fallback when table_version_storage is not enabled: delete physical files directly (no __manifest)
