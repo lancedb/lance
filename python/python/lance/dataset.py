@@ -2606,10 +2606,21 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
-        skip_merge: bool, default False
-            This is for the ``INVERTED`` index. If True, the index will skip the
-            partition merge stage after indexing. This can be useful for
-            distributed/fragment-level indexing where a later merge is desired.
+        memory_limit: int, optional
+            This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
+            If set, Lance divides this budget evenly across the workers. If unset,
+            the default will be 2 GiB per worker. This parameter is only used for the
+            current build and is not persisted with the index.
+
+            A larger memory limit will create an index with fewer shards which will
+            be easier to search so this is a trade-off between build resources and
+            search cost.
+        num_workers: int, optional
+            This is for the ``INVERTED`` index. Number of workers to use for
+            the current build. The effective worker count is clamped to
+            ``[1, num_compute_cpus]``. If unset, Lance uses ``num_compute_cpus``
+            workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
+            only used for the current build and is not persisted with the index.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:

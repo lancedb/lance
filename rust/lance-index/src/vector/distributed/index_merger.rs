@@ -9,10 +9,9 @@ use crate::vector::shared::partition_merger::{
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use std::ops::Range;
 use std::sync::Arc;
@@ -350,129 +349,12 @@ fn detect_supported_index_type(
     SupportedIvfIndexType::detect_from_reader_and_schema(reader, schema)
 }
 
-/// Decode the fragment id from an encoded row id.
-///
-/// Row ids are stored as a 64-bit [RowAddress] where the upper 32 bits encode
-/// the fragment id and the lower 32 bits encode the row offset.
-fn decode_fragment_id_from_row_id(row_id_u64: u64) -> u32 {
-    let addr = RowAddress::new_from_u64(row_id_u64);
-    addr.fragment_id()
-}
-
-/// Compute a content-derived shard sort key for a partial auxiliary file.
-///
-/// The key is `(min_fragment_id, min_row_id, parent_dir_name)` where:
-/// - `min_fragment_id` is the minimum fragment id observed among the first row
-///   of each non-empty IVF partition.
-/// - `min_row_id` is the minimum encoded row id (as `u64`) among the same
-///   representative rows.
-/// - `parent_dir_name` is the `partial_*` directory name extracted from
-///   `aux_path` and used only as a final lexicographic tie-breaker.
-///
-/// This helper reads exactly one row per non-empty partition (the first row in
-/// that partition) and never scans entire shards.
-async fn compute_shard_content_key(
-    sched: &std::sync::Arc<ScanScheduler>,
-    _store: &lance_io::object_store::ObjectStore,
-    aux_path: &object_store::path::Path,
-) -> Result<(u32, u64, String)> {
-    let fh = sched
-        .open_file(aux_path, &CachedFileSize::unknown())
-        .await?;
-    let reader = V2Reader::try_open(
-        fh,
-        None,
-        Arc::default(),
-        &lance_core::cache::LanceCache::no_cache(),
-        V2ReaderOptions::default(),
-    )
-    .await?;
-
-    // Locate the ROW_ID_FIELD column to decode fragment / row ids.
-    let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
-    let row_id_idx = schema_arrow
-        .fields
-        .iter()
-        .position(|f| f.name() == ROW_ID_FIELD.name())
-        .ok_or_else(|| Error::index("ROW_ID_FIELD missing in auxiliary shard".to_string()))?;
-
-    // Read IVF lengths from the global buffer.
-    let ivf_idx: u32 = reader
-        .metadata()
-        .file_schema
-        .metadata
-        .get(IVF_METADATA_KEY)
-        .ok_or_else(|| Error::index("IVF meta missing".to_string()))?
-        .parse()
-        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
-    let bytes = reader.read_global_buffer(ivf_idx).await?;
-    let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
-    let lengths = pb_ivf.lengths;
-
-    let mut min_fragment_id: Option<u32> = None;
-    let mut min_row_id: Option<u64> = None;
-
-    let mut offset: usize = 0;
-    for len in &lengths {
-        let part_len = *len as usize;
-        if part_len > 0 {
-            let mut stream = reader.read_stream(
-                lance_io::ReadBatchParams::Range(offset..offset + 1),
-                u32::MAX,
-                4,
-                lance_encoding::decoder::FilterExpression::no_filter(),
-            )?;
-            if let Some(batch_res) = stream.next().await {
-                let batch = batch_res?;
-                if batch.num_rows() > 0 {
-                    let arr = batch
-                        .column(row_id_idx)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            Error::index(
-                                "ROW_ID_FIELD must be a UInt64 column in auxiliary shard"
-                                    .to_string(),
-                            )
-                        })?;
-                    let row_id_val = arr.value(0);
-                    let frag_id = decode_fragment_id_from_row_id(row_id_val);
-                    min_fragment_id = Some(match min_fragment_id {
-                        Some(cur) => cur.min(frag_id),
-                        None => frag_id,
-                    });
-                    min_row_id = Some(match min_row_id {
-                        Some(cur) => cur.min(row_id_val),
-                        None => row_id_val,
-                    });
-                }
-            }
-        }
-        offset += part_len;
-    }
-
-    let min_fragment_id = min_fragment_id.unwrap_or(RowAddress::TOMBSTONE_FRAG);
-    let min_row_id = min_row_id.unwrap_or(RowAddress::TOMBSTONE_ROW);
-
-    let parent_name = {
-        let parts: Vec<_> = aux_path.parts().collect();
-        if parts.len() >= 2 {
-            parts[parts.len() - 2].as_ref().to_string()
-        } else {
-            String::new()
-        }
-    };
-
-    Ok((min_fragment_id, min_row_id, parent_name))
-}
-
 #[derive(Debug)]
 struct ShardInfo {
     reader: Arc<V2Reader>,
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
-    sort_key: (u32, u64, String),
 }
 
 #[derive(Debug)]
@@ -775,20 +657,6 @@ pub async fn merge_partial_vector_auxiliary_files(
         SchedulerConfig::max_bandwidth(object_store),
     );
 
-    // Compute content-derived sort keys for each shard once while opening the
-    // auxiliary readers. These keys will be reused both for ordering the
-    // enumeration of shards and for per-partition writes.
-    let mut shard_keys: Vec<(object_store::path::Path, (u32, u64, String))> =
-        Vec::with_capacity(aux_paths.len());
-    for aux in aux_paths.into_iter() {
-        let key = compute_shard_content_key(&sched, object_store, &aux).await?;
-        shard_keys.push((aux, key));
-    }
-
-    // Sort shards by their content-derived keys (min_fragment_id, min_row_id,
-    // parent_dir_name) to detach from underlying listing order.
-    shard_keys.sort_by(|a, b| a.1.cmp(&b.1));
-
     // Track IVF partition count consistency and accumulate lengths per partition
     let mut nlist_opt: Option<usize> = None;
     let mut accumulated_lengths: Vec<u32> = Vec::new();
@@ -799,7 +667,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
 
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
-    for (aux, key) in &shard_keys {
+    for aux in &aux_paths {
         let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
         let reader = V2Reader::try_open(
             fh,
@@ -1328,13 +1196,8 @@ pub async fn merge_partial_vector_auxiliary_files(
             lengths,
             partition_offsets,
             total_rows: running_offset,
-            sort_key: key.clone(),
         });
     }
-
-    // Re-sort shard_infos using content-derived keys to decouple per-partition
-    // write ordering from discovery order.
-    shard_infos.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
     // Write rows grouped by partition across all shards to ensure contiguous ranges per partition
 
@@ -1427,7 +1290,6 @@ mod tests {
     use futures::StreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
-    use lance_core::utils::address::RowAddress;
     use lance_file::writer::FileWriterOptions as V2WriterOptions;
     use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -2058,133 +1920,5 @@ mod tests {
         assert_eq!(row_ids.len(), 8);
         let first_partition_ids = &row_ids[..4];
         assert_eq!(first_partition_ids, &[0, 1, 1_000, 1_001]);
-    }
-
-    #[tokio::test]
-    async fn test_merge_content_key_order_invariance() {
-        // Two partial directories whose content-derived keys
-        // (min_fragment_id, min_row_id) are identical; ordering is determined
-        // solely by the parent directory name as a lexicographic tie-breaker.
-        let object_store = ObjectStore::memory();
-        let index_dir = Path::from("index/content_key");
-
-        let partial_a = index_dir.child("partial_content_a");
-        let partial_b = index_dir.child("partial_content_b");
-        let aux_a = partial_a.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux_b = partial_b.child(INDEX_AUXILIARY_FILE_NAME);
-
-        // Equal-length shards so per-partition lengths alone cannot disambiguate
-        // ordering.
-        let lengths = vec![2_u32, 2_u32];
-
-        // PQ parameters shared by both shards.
-        let nbits = 4_u32;
-        let num_sub_vectors = 2_usize;
-        let dimension = 8_usize;
-
-        let num_centroids = 1_usize << nbits;
-        let num_codebook_vectors = num_centroids * num_sub_vectors;
-        let total_values = num_codebook_vectors * dimension;
-        let values = Float32Array::from_iter((0..total_values).map(|v| v as f32));
-        let codebook = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
-
-        // Use a RowAddress-encoded base so both shards have the same
-        // (fragment_id, row_offset) for their first row, hence identical
-        // content-derived numeric keys.
-        let base_addr: u64 = RowAddress::new_from_parts(1, 5).into();
-
-        write_pq_partial_aux(
-            &object_store,
-            &aux_a,
-            nbits,
-            num_sub_vectors,
-            dimension,
-            &lengths,
-            base_addr,
-            DistanceType::L2,
-            &codebook,
-        )
-        .await
-        .unwrap();
-
-        write_pq_partial_aux(
-            &object_store,
-            &aux_b,
-            nbits,
-            num_sub_vectors,
-            dimension,
-            &lengths,
-            base_addr,
-            DistanceType::L2,
-            &codebook,
-        )
-        .await
-        .unwrap();
-
-        // Merge must succeed and produce a unified auxiliary file.
-        merge_partial_vector_auxiliary_files(&object_store, &index_dir)
-            .await
-            .unwrap();
-
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(object_store.exists(&aux_out).await.unwrap());
-
-        // Open merged auxiliary file and inspect row id layout.
-        let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
-        );
-        let fh = sched
-            .open_file(&aux_out, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let reader = V2Reader::try_open(
-            fh,
-            None,
-            Arc::default(),
-            &lance_core::cache::LanceCache::no_cache(),
-            V2ReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        let mut stream = reader
-            .read_stream(
-                lance_io::ReadBatchParams::RangeFull,
-                u32::MAX,
-                4,
-                lance_encoding::decoder::FilterExpression::no_filter(),
-            )
-            .unwrap();
-
-        let mut row_ids = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.unwrap();
-            let arr = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            for i in 0..arr.len() {
-                row_ids.push(arr.value(i));
-            }
-        }
-
-        // Two shards, each contributing `sum(lengths)` rows.
-        let expected_total_rows: usize = lengths.iter().map(|v| *v as usize).sum::<usize>() * 2;
-        assert_eq!(row_ids.len(), expected_total_rows);
-
-        let first_partition_rows = lengths[0] as usize * 2;
-        let (p0, p1) = row_ids.split_at(first_partition_rows);
-
-        let base = base_addr;
-        // For partition 0 we expect rows from `partial_content_a` first, then
-        // from `partial_content_b`.
-        let expected_p0 = vec![base, base + 1, base, base + 1];
-        assert_eq!(p0, expected_p0.as_slice());
-
-        // For partition 1 the pattern continues with offsets +2, +3.
-        let expected_p1 = vec![base + 2, base + 3, base + 2, base + 3];
-        assert_eq!(p1, expected_p1.as_slice());
     }
 }
