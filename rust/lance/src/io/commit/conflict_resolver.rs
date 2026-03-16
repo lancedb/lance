@@ -2307,7 +2307,7 @@ mod tests {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
                 },
-                // Will only conflict with operations that modify row ids.
+                // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
                     Compatible,    // append
                     Retryable,     // create index
