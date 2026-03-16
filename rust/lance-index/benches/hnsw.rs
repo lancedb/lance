@@ -43,11 +43,7 @@ fn bench_hnsw(c: &mut Criterion) {
     let query = fsl.value(0);
     c.bench_function(format!("create_hnsw({TOTAL}x{DIMENSION})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
-            let hnsw = HNSW::index_vectors(
-                vectors.as_ref(),
-                HnswBuildParams::default(),
-            )
-            .unwrap();
+            let hnsw = HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
             let uids: HashSet<u32> = hnsw
                 .search_basic(
                     query.clone(),
@@ -72,12 +68,7 @@ fn bench_hnsw(c: &mut Criterion) {
 
     let search_build_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let hnsw = search_build_pool
-        .install(|| {
-            HNSW::index_vectors(
-                vectors.as_ref(),
-                HnswBuildParams::default(),
-            )
-        })
+        .install(|| HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()))
         .unwrap();
     c.bench_function(format!("search_hnsw{TOTAL}x{DIMENSION}").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
@@ -143,11 +134,8 @@ fn bench_hnsw_sq(c: &mut Criterion) {
         format!("create_hnsw_sq({TOTAL}x{DIMENSION})").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let hnsw = HNSW::index_vectors(
-                    vectors.as_ref(),
-                    HnswBuildParams::default(),
-                )
-                .unwrap();
+                let hnsw =
+                    HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
                 let uids: HashSet<u32> = hnsw
                     .search_basic(
                         query.clone(),
@@ -173,12 +161,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
 
     let search_build_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let hnsw = search_build_pool
-        .install(|| {
-            HNSW::index_vectors(
-                vectors.as_ref(),
-                HnswBuildParams::default(),
-            )
-        })
+        .install(|| HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()))
         .unwrap();
     c.bench_function(format!("search_hnsw_sq{TOTAL}x{DIMENSION}").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
@@ -247,11 +230,8 @@ fn bench_hnsw_pq(c: &mut Criterion) {
         format!("create_hnsw_pq({TOTAL}x{DIMENSION})").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let hnsw = HNSW::index_vectors(
-                    vectors.as_ref(),
-                    HnswBuildParams::default(),
-                )
-                .unwrap();
+                let hnsw =
+                    HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
                 let uids: HashSet<u32> = hnsw
                     .search_basic(
                         query.clone(),
@@ -277,12 +257,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
 
     let search_build_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let hnsw = search_build_pool
-        .install(|| {
-            HNSW::index_vectors(
-                vectors.as_ref(),
-                HnswBuildParams::default(),
-            )
-        })
+        .install(|| HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()))
         .unwrap();
     c.bench_function(format!("search_hnsw_pq{TOTAL}x{DIMENSION}").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
