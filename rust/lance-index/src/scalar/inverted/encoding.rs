@@ -4,9 +4,11 @@
 use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
+use super::index::{PositionStreamCodec, PostingTailCodec};
+#[cfg(test)]
 use arrow::array::LargeBinaryBuilder;
 use bitpacking::{BitPacker, BitPacker4x};
-use lance_core::Result;
+use lance_core::{Error, Result};
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -17,12 +19,8 @@ use lance_core::Result;
 // - n bytes for the packed doc ids
 // - 1 byte for the number of bits used to pack the frequencies
 // - n bytes for the packed frequencies
-// if the block is not full (the last block), we don't compress it
-// we directly write the remainder to the buffer with the format:
-// - 4 bytes for the max block score
-// - 4*n bytes for the doc ids
-// - 4*n bytes for the frequencies
-// where n is the number of elements in the block
+// if the block is not full (the last block), we encode the remainder separately
+// using the configured remainder codec.
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -31,7 +29,24 @@ pub fn compress_posting_list<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
     frequencies: impl Iterator<Item = &'a u32>,
+    block_max_scores: impl Iterator<Item = f32>,
+) -> Result<arrow::array::LargeBinaryArray> {
+    compress_posting_list_with_tail_codec(
+        length,
+        doc_ids,
+        frequencies,
+        block_max_scores,
+        PostingTailCodec::VarintDelta,
+    )
+}
+
+#[cfg(test)]
+pub fn compress_posting_list_with_tail_codec<'a>(
+    length: usize,
+    doc_ids: impl Iterator<Item = &'a u32>,
+    frequencies: impl Iterator<Item = &'a u32>,
     mut block_max_scores: impl Iterator<Item = f32>,
+    tail_codec: PostingTailCodec,
 ) -> Result<arrow::array::LargeBinaryArray> {
     if length < BLOCK_SIZE {
         // directly do remainder compression to avoid overhead of creating buffer
@@ -39,12 +54,10 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(
+        compress_posting_remainder(
             doc_ids.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
-        compress_remainder(
             frequencies.copied().collect::<Vec<_>>().as_slice(),
+            tail_codec,
             &mut builder,
         )?;
         builder.append_value("");
@@ -82,8 +95,7 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(&doc_id_buffer, &mut builder)?;
-        compress_remainder(&freq_buffer, &mut builder)?;
+        compress_posting_remainder(&doc_id_buffer, &freq_buffer, tail_codec, &mut builder)?;
         builder.append_value("");
     }
     Ok(builder.finish())
@@ -106,12 +118,12 @@ pub fn encode_full_posting_block_into(
 pub fn encode_remainder_posting_block_into(
     doc_ids: &[u32],
     frequencies: &[u32],
+    codec: PostingTailCodec,
     block: &mut Vec<u8>,
 ) -> Result<()> {
     debug_assert_eq!(doc_ids.len(), frequencies.len());
     block.extend_from_slice(&0f32.to_le_bytes());
-    compress_remainder(doc_ids, block)?;
-    compress_remainder(frequencies, block)?;
+    compress_posting_remainder(doc_ids, frequencies, codec, block)?;
     Ok(())
 }
 
@@ -137,13 +149,66 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Write) -> 
 }
 
 #[inline]
-fn compress_remainder(data: &[u32], builder: &mut impl Write) -> Result<()> {
+fn compress_raw_remainder(data: &[u32], builder: &mut impl Write) -> Result<()> {
     for value in data.iter() {
         let _ = builder.write(value.to_le_bytes().as_ref())?;
     }
     Ok(())
 }
 
+#[inline]
+fn write_varint_u32(builder: &mut impl Write, mut value: u32) -> Result<()> {
+    let mut bytes = [0u8; 5];
+    let mut len = 0usize;
+    while value >= 0x80 {
+        bytes[len] = (value as u8) | 0x80;
+        value >>= 7;
+        len += 1;
+    }
+    bytes[len] = value as u8;
+    len += 1;
+    let _ = builder.write(&bytes[..len])?;
+    Ok(())
+}
+
+#[inline]
+fn compress_posting_remainder(
+    doc_ids: &[u32],
+    frequencies: &[u32],
+    codec: PostingTailCodec,
+    builder: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(doc_ids.len(), frequencies.len());
+    match codec {
+        PostingTailCodec::Fixed32 => {
+            compress_raw_remainder(doc_ids, builder)?;
+            compress_raw_remainder(frequencies, builder)?;
+        }
+        PostingTailCodec::VarintDelta => {
+            let mut previous = 0u32;
+            for (index, &doc_id) in doc_ids.iter().enumerate() {
+                let delta = if index == 0 {
+                    doc_id
+                } else {
+                    doc_id.checked_sub(previous).ok_or_else(|| {
+                        Error::index(format!(
+                            "doc ids must be sorted within a posting tail block, got {} after {}",
+                            doc_id, previous
+                        ))
+                    })?
+                };
+                write_varint_u32(builder, delta)?;
+                previous = doc_id;
+            }
+            for &frequency in frequencies {
+                write_varint_u32(builder, frequency)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinaryArray> {
     let mut builder = LargeBinaryBuilder::with_capacity(
         positions.len().div_ceil(BLOCK_SIZE),
@@ -165,11 +230,273 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let length = positions.len();
     let remainder = length % BLOCK_SIZE;
     if remainder > 0 {
-        compress_remainder(&positions[length - remainder..], &mut builder)?;
+        compress_raw_remainder(&positions[length - remainder..], &mut builder)?;
         builder.append_value("");
     }
 
     Ok(builder.finish())
+}
+
+#[inline]
+fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        dst.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    dst.push(value as u8);
+}
+
+#[inline]
+fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    while *offset < src.len() {
+        let byte = src[*offset];
+        *offset += 1;
+        value |= u32::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 35 {
+            return Err(Error::index(
+                "invalid u32 varint in position stream".to_owned(),
+            ));
+        }
+    }
+    Err(Error::index(
+        "unexpected EOF while decoding position stream".to_owned(),
+    ))
+}
+
+fn encode_position_stream_varint_block_into(
+    positions: &[u32],
+    frequencies: &[u32],
+    dst: &mut Vec<u8>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    for &frequency in frequencies {
+        let frequency = frequency as usize;
+        let end = offset
+            .checked_add(frequency)
+            .ok_or_else(|| Error::index("position block length overflow".to_owned()))?;
+        if end > positions.len() {
+            return Err(Error::index(format!(
+                "position block has {} positions but frequencies require at least {}",
+                positions.len(),
+                end
+            )));
+        }
+        let mut previous = 0u32;
+        for (index, &position) in positions[offset..end].iter().enumerate() {
+            let delta = if index == 0 {
+                position
+            } else {
+                position.checked_sub(previous).ok_or_else(|| {
+                    Error::index(format!(
+                        "positions must be sorted within a document, got {} after {}",
+                        position, previous
+                    ))
+                })?
+            };
+            encode_varint_u32(dst, delta);
+            previous = position;
+        }
+        offset = end;
+    }
+    if offset != positions.len() {
+        return Err(Error::index(format!(
+            "position block has {} trailing positions after consuming {} frequencies",
+            positions.len() - offset,
+            frequencies.len()
+        )));
+    }
+    Ok(())
+}
+
+fn decode_position_stream_varint_block(
+    src: &[u8],
+    frequencies: &[u32],
+    dst: &mut Vec<u32>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    for &frequency in frequencies {
+        let mut previous = 0u32;
+        for index in 0..frequency as usize {
+            let delta = decode_varint_u32(src, &mut offset)?;
+            let position = if index == 0 {
+                delta
+            } else {
+                previous.checked_add(delta).ok_or_else(|| {
+                    Error::index("position stream overflow while decoding".to_owned())
+                })?
+            };
+            dst.push(position);
+            previous = position;
+        }
+    }
+    if offset != src.len() {
+        return Err(Error::index(format!(
+            "position stream has {} trailing bytes after decoding block",
+            src.len() - offset
+        )));
+    }
+    Ok(())
+}
+
+fn encode_position_stream_lucene_block_into(
+    positions: &[u32],
+    frequencies: &[u32],
+    dst: &mut Vec<u8>,
+) -> Result<()> {
+    let mut delta_buffer = [0u32; BLOCK_SIZE];
+    let mut delta_count = 0usize;
+    let mut packed_buffer = [0u8; BLOCK_SIZE * 4 + 1];
+    let mut offset = 0usize;
+
+    for &frequency in frequencies {
+        let frequency = frequency as usize;
+        let end = offset
+            .checked_add(frequency)
+            .ok_or_else(|| Error::index("position block length overflow".to_owned()))?;
+        if end > positions.len() {
+            return Err(Error::index(format!(
+                "position block has {} positions but frequencies require at least {}",
+                positions.len(),
+                end
+            )));
+        }
+        let mut previous = 0u32;
+        for (index, &position) in positions[offset..end].iter().enumerate() {
+            let delta = if index == 0 {
+                position
+            } else {
+                position.checked_sub(previous).ok_or_else(|| {
+                    Error::index(format!(
+                        "positions must be sorted within a document, got {} after {}",
+                        position, previous
+                    ))
+                })?
+            };
+            delta_buffer[delta_count] = delta;
+            delta_count += 1;
+            if delta_count == BLOCK_SIZE {
+                compress_block(&delta_buffer, &mut packed_buffer, dst)?;
+                delta_count = 0;
+            }
+            previous = position;
+        }
+        offset = end;
+    }
+
+    if offset != positions.len() {
+        return Err(Error::index(format!(
+            "position block has {} trailing positions after consuming {} frequencies",
+            positions.len() - offset,
+            frequencies.len()
+        )));
+    }
+
+    for delta in &delta_buffer[..delta_count] {
+        encode_varint_u32(dst, *delta);
+    }
+    Ok(())
+}
+
+fn decode_position_stream_lucene_block(
+    src: &[u8],
+    frequencies: &[u32],
+    dst: &mut Vec<u32>,
+) -> Result<()> {
+    let total_positions = frequencies.iter().try_fold(0usize, |total, &frequency| {
+        total.checked_add(frequency as usize).ok_or_else(|| {
+            Error::index("position stream length overflow while decoding".to_owned())
+        })
+    })?;
+
+    let full_delta_blocks = total_positions / BLOCK_SIZE;
+    let tail_len = total_positions % BLOCK_SIZE;
+
+    let compressor = BitPacker4x::new();
+    let mut packed_offset = 0usize;
+    let mut packed_values = [0u32; BLOCK_SIZE];
+    let mut deltas = Vec::with_capacity(total_positions);
+
+    for _ in 0..full_delta_blocks {
+        if packed_offset >= src.len() {
+            return Err(Error::index(
+                "unexpected EOF while decoding packed position stream".to_owned(),
+            ));
+        }
+        let num_bits = src[packed_offset];
+        packed_offset += 1;
+        let consumed = compressor.decompress(&src[packed_offset..], &mut packed_values, num_bits);
+        packed_offset += consumed;
+        deltas.extend_from_slice(&packed_values);
+    }
+
+    for _ in 0..tail_len {
+        deltas.push(decode_varint_u32(src, &mut packed_offset)?);
+    }
+
+    if packed_offset != src.len() {
+        return Err(Error::index(format!(
+            "position stream has {} trailing bytes after decoding block",
+            src.len() - packed_offset
+        )));
+    }
+
+    let mut delta_offset = 0usize;
+    for &frequency in frequencies {
+        let mut previous = 0u32;
+        for index in 0..frequency as usize {
+            let delta = deltas[delta_offset];
+            delta_offset += 1;
+            let position = if index == 0 {
+                delta
+            } else {
+                previous.checked_add(delta).ok_or_else(|| {
+                    Error::index("position stream overflow while decoding".to_owned())
+                })?
+            };
+            dst.push(position);
+            previous = position;
+        }
+    }
+    debug_assert_eq!(delta_offset, deltas.len());
+    Ok(())
+}
+
+pub fn encode_position_stream_block_into(
+    positions: &[u32],
+    frequencies: &[u32],
+    codec: PositionStreamCodec,
+    dst: &mut Vec<u8>,
+) -> Result<()> {
+    match codec {
+        PositionStreamCodec::VarintDocDelta => {
+            encode_position_stream_varint_block_into(positions, frequencies, dst)
+        }
+        PositionStreamCodec::LucenePackedDelta => {
+            encode_position_stream_lucene_block_into(positions, frequencies, dst)
+        }
+    }
+}
+
+pub fn decode_position_stream_block(
+    src: &[u8],
+    frequencies: &[u32],
+    codec: PositionStreamCodec,
+    dst: &mut Vec<u32>,
+) -> Result<()> {
+    match codec {
+        PositionStreamCodec::VarintDocDelta => {
+            decode_position_stream_varint_block(src, frequencies, dst)
+        }
+        PositionStreamCodec::LucenePackedDelta => {
+            decode_position_stream_lucene_block(src, frequencies, dst)
+        }
+    }
 }
 
 /// decompress the posting list from a LargeBinaryArray
@@ -178,6 +505,15 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 pub fn decompress_posting_list(
     num_docs: u32,
     posting_list: &arrow::array::LargeBinaryArray,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    decompress_posting_list_with_tail_codec(num_docs, posting_list, PostingTailCodec::VarintDelta)
+}
+
+#[cfg(test)]
+pub fn decompress_posting_list_with_tail_codec(
+    num_docs: u32,
+    posting_list: &arrow::array::LargeBinaryArray,
+    tail_codec: PostingTailCodec,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let mut doc_ids: Vec<u32> = Vec::with_capacity(num_docs as usize);
     let mut frequencies: Vec<u32> = Vec::with_capacity(num_docs as usize);
@@ -192,7 +528,13 @@ pub fn decompress_posting_list(
     let remainder = num_docs as usize % BLOCK_SIZE;
     if remainder > 0 {
         let compressed = posting_list.value(bitpacking_blocks);
-        decompress_posting_remainder(compressed, remainder, &mut doc_ids, &mut frequencies);
+        decompress_posting_remainder(
+            compressed,
+            remainder,
+            tail_codec,
+            &mut doc_ids,
+            &mut frequencies,
+        );
     }
 
     Ok((doc_ids, frequencies))
@@ -212,7 +554,7 @@ pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Vec<
     let remainder = num_positions as usize % BLOCK_SIZE;
     if remainder > 0 {
         let compressed_block = compressed.value(num_blocks + 1);
-        decompress_remainder(compressed_block, remainder, &mut positions);
+        decompress_raw_remainder(compressed_block, remainder, &mut positions);
     }
 
     positions
@@ -237,12 +579,45 @@ pub fn decompress_posting_block(
 pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,
+    codec: PostingTailCodec,
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
     let block = &block[4..];
-    decompress_remainder(block, n, doc_ids);
-    decompress_remainder(&block[n * 4..], n, frequencies);
+    match codec {
+        PostingTailCodec::Fixed32 => {
+            decompress_raw_remainder(block, n, doc_ids);
+            decompress_raw_remainder(&block[n * 4..], n, frequencies);
+        }
+        PostingTailCodec::VarintDelta => {
+            let mut offset = 0usize;
+            let mut previous = 0u32;
+            for index in 0..n {
+                let delta = decode_varint_u32(block, &mut offset)
+                    .expect("posting tail doc ids should contain valid varints");
+                let doc_id = if index == 0 {
+                    delta
+                } else {
+                    previous
+                        .checked_add(delta)
+                        .expect("posting tail doc id delta should not overflow")
+                };
+                doc_ids.push(doc_id);
+                previous = doc_id;
+            }
+            for _ in 0..n {
+                let frequency = decode_varint_u32(block, &mut offset)
+                    .expect("posting tail frequencies should contain valid varints");
+                frequencies.push(frequency);
+            }
+            assert_eq!(
+                offset,
+                block.len(),
+                "posting tail block has {} trailing bytes after decoding",
+                block.len() - offset
+            );
+        }
+    }
 }
 
 pub fn decode_full_posting_block(block: &[u8], doc_ids: &mut Vec<u32>, frequencies: &mut Vec<u32>) {
@@ -270,10 +645,21 @@ fn decompress_block(block: &[u8], buffer: &mut [u32; BLOCK_SIZE], res: &mut Vec<
     res.extend_from_slice(&buffer[..]);
 }
 
-pub fn decompress_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
+pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
     for bytes in compressed.chunks_exact(4).take(n) {
         let data = u32::from_le_bytes(bytes.try_into().unwrap());
         dest.push(data);
+    }
+}
+
+pub fn read_posting_tail_first_doc(block: &[u8], codec: PostingTailCodec) -> u32 {
+    match codec {
+        PostingTailCodec::Fixed32 => u32::from_le_bytes(block[4..8].try_into().unwrap()),
+        PostingTailCodec::VarintDelta => {
+            let mut offset = 4usize;
+            decode_varint_u32(block, &mut offset)
+                .expect("posting tail block should contain a valid first doc id")
+        }
     }
 }
 
@@ -322,6 +708,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compress_posting_list_fixed32_tail_still_roundtrips() -> Result<()> {
+        let doc_ids = vec![3_u32, 10_u32, 24_u32];
+        let frequencies = vec![1_u32, 7_u32, 2_u32];
+        let posting_list = compress_posting_list_with_tail_codec(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0_f32),
+            PostingTailCodec::Fixed32,
+        )?;
+        let (decoded_doc_ids, decoded_frequencies) = decompress_posting_list_with_tail_codec(
+            doc_ids.len() as u32,
+            &posting_list,
+            PostingTailCodec::Fixed32,
+        )?;
+        assert_eq!(decoded_doc_ids, doc_ids);
+        assert_eq!(decoded_frequencies, frequencies);
+        Ok(())
+    }
+
+    #[test]
     fn test_compress_positions() -> Result<()> {
         let num_positions: usize = BLOCK_SIZE * 2 - 7;
         let mut rng = rand::rng();
@@ -343,6 +750,24 @@ mod tests {
         let decompressed_positions = decompress_positions(&compressed);
         assert_eq!(positions, decompressed_positions);
         assert_eq!(positions.len(), num_positions);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_position_stream_block_roundtrip() -> Result<()> {
+        let frequencies = vec![1, 3, 2, 4];
+        let positions = vec![7, 1, 3, 8, 2, 100, 0, 4, 9, 25];
+        for codec in [
+            PositionStreamCodec::VarintDocDelta,
+            PositionStreamCodec::LucenePackedDelta,
+        ] {
+            let mut encoded = Vec::new();
+            encode_position_stream_block_into(&positions, &frequencies, codec, &mut encoded)?;
+            let mut decoded = Vec::new();
+            decode_position_stream_block(&encoded, &frequencies, codec, &mut decoded)?;
+            assert_eq!(decoded, positions);
+            assert!(encoded.len() < positions.len() * std::mem::size_of::<u32>());
+        }
         Ok(())
     }
 }

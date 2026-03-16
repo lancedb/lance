@@ -349,14 +349,28 @@ impl InvertedIndexBuilder {
     }
 
     async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
-        let metadata = HashMap::from_iter(vec![
+        let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
             (
                 TOKEN_SET_FORMAT_KEY.to_owned(),
                 self.token_set_format.to_string(),
             ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                PostingTailCodec::VarintDelta.as_str().to_owned(),
+            ),
         ]);
+        if self.params.with_position {
+            metadata.insert(
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+            );
+            metadata.insert(
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+            );
+        }
         let mut writer = dest_store
             .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
             .await?;
@@ -374,14 +388,28 @@ impl InvertedIndexBuilder {
         partition: u64, // Modify parameter type
     ) -> Result<()> {
         let partitions = vec![partition];
-        let metadata = HashMap::from_iter(vec![
+        let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
             (
                 TOKEN_SET_FORMAT_KEY.to_owned(),
                 self.token_set_format.to_string(),
             ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                PostingTailCodec::VarintDelta.as_str().to_owned(),
+            ),
         ]);
+        if self.params.with_position {
+            metadata.insert(
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+            );
+            metadata.insert(
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+            );
+        }
         // Use partition ID to generate a unique temporary filename
         let file_name = part_metadata_file_path(partition);
         let mut writer = dest_store
@@ -807,7 +835,10 @@ impl IndexWorker {
     }
 
     fn has_position(&self) -> bool {
-        self.schema.column_with_name(POSITION_COL).is_some()
+        self.schema
+            .column_with_name(COMPRESSED_POSITION_COL)
+            .is_some()
+            || self.schema.column_with_name(POSITION_COL).is_some()
     }
 
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
@@ -1109,20 +1140,35 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     ];
     if with_position {
         fields.push(arrow_schema::Field::new(
-            POSITION_COL,
+            COMPRESSED_POSITION_COL,
+            arrow_schema::DataType::LargeBinary,
+            false,
+        ));
+        fields.push(arrow_schema::Field::new(
+            POSITION_BLOCK_OFFSET_COL,
             arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    arrow_schema::DataType::LargeBinary,
-                    true,
-                ))),
+                arrow_schema::DataType::UInt32,
                 true,
             ))),
             false,
         ));
     }
-    Arc::new(arrow_schema::Schema::new(fields))
+    let mut metadata = HashMap::from([(
+        POSTING_TAIL_CODEC_KEY.to_owned(),
+        PostingTailCodec::VarintDelta.as_str().to_owned(),
+    )]);
+    if with_position {
+        metadata.insert(
+            POSITIONS_LAYOUT_KEY.to_owned(),
+            POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+        );
+        metadata.insert(
+            POSITIONS_CODEC_KEY.to_owned(),
+            PositionStreamCodec::LucenePackedDelta.as_str().to_owned(),
+        );
+    }
+    Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
 }
 
 /// Flatten the string list stream into a string stream

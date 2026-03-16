@@ -7,9 +7,8 @@ use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{Int32Type, UInt32Type};
-use arrow_array::{Array, UInt32Array};
-use arrow_schema::DataType;
+use arrow::datatypes::Int32Type;
+use arrow_array::Array;
 use itertools::Itertools;
 use lance_core::Result;
 use lance_core::utils::address::RowAddress;
@@ -18,17 +17,21 @@ use lance_core::utils::mask::RowAddrMask;
 use crate::metrics::MetricsCollector;
 
 use super::{
+    CompressedPositionStorage,
+    query::Operator,
+    scorer::{K1, idf},
+};
+use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
-    encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
+    encoding::{
+        decode_position_stream_block, decompress_positions, decompress_posting_block,
+        decompress_posting_remainder,
+    },
     query::FtsSearchParams,
     scorer::Scorer,
 };
 use super::{DocInfo, builder::BLOCK_SIZE};
-use super::{
-    query::Operator,
-    scorer::{K1, idf},
-};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
@@ -60,6 +63,9 @@ struct CompressedState {
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
     buffer: Box<[u32; BLOCK_SIZE]>,
+    position_block_idx: Option<usize>,
+    position_values: Vec<u32>,
+    position_offsets: Vec<usize>,
 }
 
 impl CompressedState {
@@ -69,21 +75,40 @@ impl CompressedState {
             doc_ids: Vec::with_capacity(BLOCK_SIZE),
             freqs: Vec::with_capacity(BLOCK_SIZE),
             buffer: Box::new([0; BLOCK_SIZE]),
+            position_block_idx: None,
+            position_values: Vec::new(),
+            position_offsets: Vec::new(),
         }
     }
 
     #[inline]
-    fn decompress(&mut self, block: &[u8], block_idx: usize, num_blocks: usize, length: u32) {
+    fn decompress(
+        &mut self,
+        block: &[u8],
+        block_idx: usize,
+        num_blocks: usize,
+        length: u32,
+        tail_codec: super::PostingTailCodec,
+    ) {
         self.doc_ids.clear();
         self.freqs.clear();
 
         let remainder = length as usize % BLOCK_SIZE;
         if block_idx + 1 == num_blocks && remainder != 0 {
-            decompress_posting_remainder(block, remainder, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_remainder(
+                block,
+                remainder,
+                tail_codec,
+                &mut self.doc_ids,
+                &mut self.freqs,
+            );
         } else {
             decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
         }
         self.block_idx = block_idx;
+        self.position_block_idx = None;
+        self.position_values.clear();
+        self.position_offsets.clear();
     }
 }
 
@@ -157,7 +182,13 @@ impl PostingIterator {
         let compressed = unsafe { &mut *self.compressed_state_ptr() };
         if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
             let block = list.blocks.value(block_idx);
-            compressed.decompress(block, block_idx, list.blocks.len(), list.length);
+            compressed.decompress(
+                block,
+                block_idx,
+                list.blocks.len(),
+                list.length,
+                list.posting_tail_codec,
+            );
         }
         compressed as *mut CompressedState
     }
@@ -230,14 +261,63 @@ impl PostingIterator {
         }
     }
 
-    fn positions(&self) -> Option<Arc<dyn Array>> {
+    fn position_cursor(&self) -> Option<PositionCursor<'_>> {
         match self.list {
-            PostingList::Plain(ref list) => list.positions(self.index),
-            PostingList::Compressed(ref list) => list.positions.as_ref().map(|p| {
-                let positions = p.value(self.index);
-                let positions = decompress_positions(positions.as_binary());
-                Arc::new(UInt32Array::from(positions)) as Arc<dyn Array>
+            PostingList::Plain(ref list) => list.positions.as_ref().map(|positions| {
+                let start = positions.value_offsets()[self.index] as usize;
+                let end = positions.value_offsets()[self.index + 1] as usize;
+                PositionCursor::new(
+                    PositionValues::Owned(
+                        positions.values().as_primitive::<Int32Type>().values()[start..end]
+                            .iter()
+                            .map(|value| *value as u32)
+                            .collect(),
+                    ),
+                    self.position as i32,
+                )
             }),
+            PostingList::Compressed(ref list) => match list.positions.as_ref()? {
+                CompressedPositionStorage::LegacyPerDoc(positions) => {
+                    let positions = positions.value(self.index);
+                    let positions = decompress_positions(positions.as_binary());
+                    Some(PositionCursor::new(
+                        PositionValues::Owned(positions),
+                        self.position as i32,
+                    ))
+                }
+                CompressedPositionStorage::SharedStream(stream) => {
+                    let block_idx = self.index / BLOCK_SIZE;
+                    let block_offset = self.index % BLOCK_SIZE;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    if compressed.position_block_idx != Some(block_idx) {
+                        decode_position_stream_block(
+                            stream.block(block_idx),
+                            compressed.freqs.as_slice(),
+                            stream.codec(),
+                            &mut compressed.position_values,
+                        )
+                        .expect("shared position stream decoding should succeed");
+                        compressed.position_offsets.clear();
+                        compressed
+                            .position_offsets
+                            .reserve(compressed.freqs.len() + 1);
+                        compressed.position_offsets.push(0);
+                        let mut offset = 0usize;
+                        for &freq in &compressed.freqs {
+                            offset += freq as usize;
+                            compressed.position_offsets.push(offset);
+                        }
+                        compressed.position_block_idx = Some(block_idx);
+                    }
+                    let start = compressed.position_offsets[block_offset];
+                    let end = compressed.position_offsets[block_offset + 1];
+                    Some(PositionCursor::new(
+                        PositionValues::Borrowed(&compressed.position_values[start..end]),
+                        self.position as i32,
+                    ))
+                }
+            },
         }
     }
 
@@ -782,15 +862,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn check_positions(&self, slop: i32) -> bool {
+        if slop == 0 {
+            return self.check_exact_positions();
+        }
+
         let mut position_iters = self
             .postings
             .iter()
-            .map(|posting| {
-                PositionIterator::new(
-                    posting.positions().expect("positions must exist"),
-                    posting.position as i32,
-                )
-            })
+            .map(|posting| posting.position_cursor().expect("positions must exist"))
             .collect::<Vec<_>>();
         position_iters.sort_unstable_by_key(|iter| iter.position_in_query);
 
@@ -821,71 +900,129 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             position_iters.iter_mut().for_each(|iter| {
-                iter.next(max_relative_pos.unwrap());
+                iter.advance_to_relative(max_relative_pos.unwrap());
             });
+        }
+    }
+
+    fn check_exact_positions(&self) -> bool {
+        let mut position_iters = self
+            .postings
+            .iter()
+            .map(|posting| posting.position_cursor().expect("positions must exist"))
+            .collect::<Vec<_>>();
+        position_iters.sort_unstable_by_key(|iter| iter.len());
+        let lead = match position_iters.first() {
+            Some(anchor) => anchor,
+            None => return false,
+        };
+        let lead_position = lead.position_in_query;
+
+        loop {
+            let Some(anchor) = position_iters[0].absolute_position() else {
+                return false;
+            };
+            let Some(base) = anchor.checked_sub(lead_position as u32) else {
+                position_iters[0].advance_next();
+                continue;
+            };
+
+            let mut next_lead_relative = None;
+            let mut matched = true;
+            for follower in position_iters.iter_mut().skip(1) {
+                let Some(target) = base.checked_add(follower.position_in_query as u32) else {
+                    return false;
+                };
+                let Some(position) = follower.advance_to_absolute(target) else {
+                    return false;
+                };
+                if position != target {
+                    next_lead_relative = Some(position as i32 - follower.position_in_query);
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                return true;
+            }
+
+            position_iters[0].advance_to_relative(next_lead_relative.unwrap());
         }
     }
 }
 
 #[derive(Debug)]
-struct PositionIterator {
-    // It's Int32Array for legacy index,
-    // UInt32Array for new index
-    positions: Arc<dyn Array>,
+enum PositionValues<'a> {
+    Borrowed(&'a [u32]),
+    Owned(Vec<u32>),
+}
+
+impl<'a> PositionValues<'a> {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values.as_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+#[derive(Debug)]
+struct PositionCursor<'a> {
+    positions: PositionValues<'a>,
     pub position_in_query: i32,
     index: usize,
 }
 
-impl PositionIterator {
-    fn new(positions: Arc<dyn Array>, position_in_query: i32) -> Self {
-        let mut iter = Self {
+impl<'a> PositionCursor<'a> {
+    fn new(positions: PositionValues<'a>, position_in_query: i32) -> Self {
+        Self {
             positions,
             position_in_query,
             index: 0,
-        };
-        iter.next(0);
-        iter
-    }
-
-    // get the current relative position
-    fn relative_position(&self) -> Option<i32> {
-        if self.index < self.positions.len() {
-            match self.positions.data_type() {
-                DataType::Int32 => Some(
-                    self.positions.as_primitive::<Int32Type>().value(self.index)
-                        - self.position_in_query,
-                ),
-                DataType::UInt32 => Some(
-                    self.positions
-                        .as_primitive::<UInt32Type>()
-                        .value(self.index) as i32
-                        - self.position_in_query,
-                ),
-                _ => {
-                    unreachable!("position iterator only supports Int32 and UInt32");
-                }
-            }
-        } else {
-            None
         }
     }
 
-    // move to the next position that the relative position is greater than or equal to least_pos
-    fn next(&mut self, least_relative_pos: i32) {
+    fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    fn absolute_position(&self) -> Option<u32> {
+        self.positions.as_slice().get(self.index).copied()
+    }
+
+    fn relative_position(&self) -> Option<i32> {
+        self.positions
+            .as_slice()
+            .get(self.index)
+            .map(|position| *position as i32 - self.position_in_query)
+    }
+
+    fn advance_to_relative(&mut self, least_relative_pos: i32) {
+        if self.index >= self.len() {
+            return;
+        }
         let least_pos = least_relative_pos + self.position_in_query;
-        self.index = match self.positions.data_type() {
-            DataType::Int32 => self
-                .positions
-                .as_primitive::<Int32Type>()
-                .values()
-                .partition_point(|&pos| pos < least_pos),
-            DataType::UInt32 => self
-                .positions
-                .as_primitive::<UInt32Type>()
-                .values()
-                .partition_point(|&pos| (pos as i32) < least_pos),
-            _ => unreachable!("position iterator only supports Int32 and UInt32"),
-        };
+        let least_pos = least_pos.max(0) as u32;
+        let values = self.positions.as_slice();
+        self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
+    }
+
+    fn advance_to_absolute(&mut self, least_pos: u32) -> Option<u32> {
+        if self.index >= self.len() {
+            return None;
+        }
+        let values = self.positions.as_slice();
+        self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
+        self.absolute_position()
+    }
+
+    fn advance_next(&mut self) {
+        self.index = self.index.saturating_add(1).min(self.len());
     }
 }
 
@@ -899,7 +1036,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            CompressedPostingList, PlainPostingList, encoding::compress_posting_list,
+            CompressedPostingList, PlainPostingList, PostingListBuilder, builder::PositionRecorder,
+            encoding::compress_posting_list,
         },
     };
 
@@ -923,6 +1061,7 @@ mod tests {
                 blocks,
                 max_score,
                 doc_ids.len() as u32,
+                crate::scalar::inverted::PostingTailCodec::VarintDelta,
                 None,
             ))
         } else {
@@ -931,6 +1070,43 @@ mod tests {
                 ScalarBuffer::from_iter(freqs.iter().map(|freq| *freq as f32)),
                 Some(max_score),
                 None,
+            ))
+        }
+    }
+
+    fn generate_posting_list_with_positions(
+        doc_ids: Vec<u32>,
+        positions_by_doc: Vec<Vec<u32>>,
+        max_score: f32,
+        is_compressed: bool,
+    ) -> PostingList {
+        let freqs = positions_by_doc
+            .iter()
+            .map(|positions| positions.len() as u32)
+            .collect::<Vec<_>>();
+        if is_compressed {
+            let mut builder = PostingListBuilder::new(true);
+            for (doc_id, positions) in doc_ids.iter().copied().zip(positions_by_doc) {
+                builder.add(doc_id, PositionRecorder::Position(positions.into()));
+            }
+            let batch = builder
+                .to_batch(vec![max_score; doc_ids.len().div_ceil(BLOCK_SIZE)])
+                .unwrap();
+            PostingList::from_batch(&batch, Some(max_score), Some(doc_ids.len() as u32)).unwrap()
+        } else {
+            let mut position_builder =
+                arrow::array::ListBuilder::new(arrow::array::Int32Builder::new());
+            for positions in positions_by_doc {
+                for position in positions {
+                    position_builder.values().append_value(position as i32);
+                }
+                position_builder.append(true);
+            }
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from_iter(doc_ids.iter().map(|id| *id as u64)),
+                ScalarBuffer::from_iter(freqs.iter().map(|freq| *freq as f32)),
+                Some(max_score),
+                Some(position_builder.finish()),
             ))
         }
     }
@@ -1061,5 +1237,57 @@ mod tests {
             (actual - expected).abs() < 1e-6,
             "block max score should match stored value"
         );
+    }
+
+    #[rstest]
+    fn test_exact_phrase_with_repeated_terms(#[values(false, true)] is_compressed: bool) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let token_a_positions = vec![vec![1_u32, 3, 10]];
+        let token_b_positions = vec![vec![2_u32, 11]];
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    token_a_positions.clone(),
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    token_b_positions,
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("a"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    token_a_positions,
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        assert!(wand.check_exact_positions());
+        assert!(wand.check_positions(0));
     }
 }
