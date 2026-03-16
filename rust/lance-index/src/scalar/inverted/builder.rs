@@ -364,7 +364,7 @@ impl InvertedIndexBuilder {
         if self.params.with_position {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
-                POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
             );
             metadata.insert(
                 POSITIONS_CODEC_KEY.to_owned(),
@@ -403,7 +403,7 @@ impl InvertedIndexBuilder {
         if self.params.with_position {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
-                POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
             );
             metadata.insert(
                 POSITIONS_CODEC_KEY.to_owned(),
@@ -1161,7 +1161,7 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     if with_position {
         metadata.insert(
             POSITIONS_LAYOUT_KEY.to_owned(),
-            POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned(),
+            POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
         );
         metadata.insert(
             POSITIONS_CODEC_KEY.to_owned(),

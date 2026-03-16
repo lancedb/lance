@@ -76,10 +76,11 @@ use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
-// Version 2: Fst TokenSetFormat with shared posting-list position streams using varint blocks
-// Version 3: Fst TokenSetFormat with shared posting-list position streams using Lucene-style packed deltas
-// plus varint-delta posting tail encoding for doc/freq remainder blocks
-pub const INVERTED_INDEX_VERSION: u32 = 3;
+// Version 2: Fst TokenSetFormat with shared posting-list position streams.
+// Older version-2 indices may omit codec metadata and default to varint-doc-delta positions
+// plus fixed32 posting tails; current version-2 writes Lucene-style packed position deltas
+// plus varint-delta posting tails.
+pub const INVERTED_INDEX_VERSION: u32 = 2;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -107,7 +108,6 @@ pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
 pub const POSTING_TAIL_CODEC_FIXED32_V1: &str = "fixed32_v1";
 pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
-pub const POSITIONS_LAYOUT_SHARED_STREAM_V3: &str = "shared_stream_v3";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_LUCENE_PACKED_DELTA_V1: &str = "lucene_packed_delta_v1";
 
@@ -245,7 +245,6 @@ fn parse_shared_position_codec(metadata: &HashMap<String, String>) -> Result<Pos
         .get(POSITIONS_LAYOUT_KEY)
         .map(|layout| layout.as_str())
     {
-        Some(POSITIONS_LAYOUT_SHARED_STREAM_V3) => Ok(PositionStreamCodec::LucenePackedDelta),
         Some(POSITIONS_LAYOUT_SHARED_STREAM_V2) => Ok(PositionStreamCodec::VarintDocDelta),
         _ => Ok(PositionStreamCodec::VarintDocDelta),
     }
@@ -3751,7 +3750,7 @@ mod tests {
         );
         assert_eq!(
             batch.schema_ref().metadata().get(POSITIONS_LAYOUT_KEY),
-            Some(&POSITIONS_LAYOUT_SHARED_STREAM_V3.to_owned())
+            Some(&POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned())
         );
         assert_eq!(
             batch.schema_ref().metadata().get(POSITIONS_CODEC_KEY),
