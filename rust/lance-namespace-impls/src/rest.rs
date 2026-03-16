@@ -18,7 +18,6 @@ use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    BatchCreateTableVersionsRequest, BatchCreateTableVersionsResponse,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
     CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
@@ -1181,16 +1180,6 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/version/delete", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "batch_delete_table_versions", &id)
-            .await
-    }
-
-    async fn batch_create_table_versions(
-        &self,
-        request: BatchCreateTableVersionsRequest,
-    ) -> Result<BatchCreateTableVersionsResponse> {
-        let path = "/v1/table/version/batch-create".to_string();
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "batch_create_table_versions", "")
             .await
     }
 

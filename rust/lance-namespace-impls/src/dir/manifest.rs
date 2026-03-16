@@ -97,6 +97,22 @@ pub struct TableInfo {
     pub location: String,
 }
 
+/// An entry to be inserted into the manifest table.
+///
+/// This struct makes the meaning of each field explicit, replacing the
+/// previous tuple-based API `(String, ObjectType, Option<String>, Option<String>)`.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    /// The unique object identifier (e.g., table name or version object_id)
+    pub object_id: String,
+    /// The type of the object (Namespace, Table, or TableVersion)
+    pub object_type: ObjectType,
+    /// The storage location (e.g., directory name for tables)
+    pub location: Option<String>,
+    /// Additional metadata serialized as JSON
+    pub metadata: Option<String>,
+}
+
 /// Information about a namespace stored in the manifest
 #[derive(Debug, Clone)]
 pub struct NamespaceInfo {
@@ -342,10 +358,15 @@ impl ManifestNamespace {
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
+        table_version_storage_enabled: bool,
     ) -> Result<Self> {
-        let manifest_dataset =
-            Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
-                .await?;
+        let manifest_dataset = Self::ensure_manifest_table_up_to_date(
+            &root,
+            &storage_options,
+            session.clone(),
+            table_version_storage_enabled,
+        )
+        .await?;
 
         Ok(Self {
             root,
@@ -428,10 +449,8 @@ impl ManifestNamespace {
     ///
     /// The object_id is formatted as `{table_id}${zero_padded_version}`.
     pub fn parse_version_from_object_id(object_id: &str) -> Option<i64> {
-        object_id
-            .rsplit(DELIMITER)
-            .next()
-            .and_then(|ver_str| ver_str.parse::<i64>().ok())
+        let (_namespace, name) = Self::parse_object_id(object_id);
+        name.parse::<i64>().ok()
     }
 
     /// Generate a new directory name in format: <hash>_<object_id>
@@ -820,22 +839,39 @@ impl ManifestNamespace {
         object_type: ObjectType,
         location: Option<String>,
     ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(object_id, object_type, location, None, None)
-            .await
+        self.insert_into_manifest_with_metadata(
+            vec![ManifestEntry {
+                object_id,
+                object_type,
+                location,
+                metadata: None,
+            }],
+            None,
+        )
+        .await
     }
 
-    /// Insert an entry into the manifest table with metadata and base_objects
+    /// Insert one or more entries into the manifest table with metadata and base_objects.
+    ///
+    /// This is the unified entry point for both single and batch inserts.
+    /// Uses a single MergeInsert operation to insert all entries at once.
+    /// If any entry already exists (matching object_id), the entire batch fails.
     pub async fn insert_into_manifest_with_metadata(
         &self,
-        object_id: String,
-        object_type: ObjectType,
-        location: Option<String>,
-        metadata: Option<String>,
+        entries: Vec<ManifestEntry>,
         base_objects: Option<Vec<String>>,
     ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         let schema = Self::manifest_schema();
 
-        // Create base_objects array from the provided list
+        let mut object_ids = Vec::with_capacity(entries.len());
+        let mut object_types = Vec::with_capacity(entries.len());
+        let mut locations: Vec<Option<String>> = Vec::with_capacity(entries.len());
+        let mut metadatas: Vec<Option<String>> = Vec::with_capacity(entries.len());
+
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
             "object_id",
@@ -843,42 +879,52 @@ impl ManifestNamespace {
             true,
         )));
 
-        match base_objects {
-            Some(objects) => {
-                for obj in objects {
-                    list_builder.values().append_value(obj);
+        for (i, entry) in entries.iter().enumerate() {
+            object_ids.push(entry.object_id.as_str());
+            object_types.push(entry.object_type.as_str());
+            locations.push(entry.location.clone());
+            metadatas.push(entry.metadata.clone());
+
+            // Only the first entry gets the base_objects (for single-entry inserts
+            // with base_objects like view creation); batch entries use null.
+            if i == 0 {
+                match &base_objects {
+                    Some(objects) => {
+                        for obj in objects {
+                            list_builder.values().append_value(obj);
+                        }
+                        list_builder.append(true);
+                    }
+                    None => {
+                        list_builder.append_null();
+                    }
                 }
-                list_builder.append(true);
-            }
-            None => {
+            } else {
                 list_builder.append_null();
             }
         }
 
         let base_objects_array = list_builder.finish();
 
-        // Create arrays with optional values
-        let location_array = match location {
-            Some(loc) => Arc::new(StringArray::from(vec![Some(loc)])),
-            None => Arc::new(StringArray::from(vec![None::<String>])),
-        };
+        let location_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            locations.iter().map(|l| l.as_deref()).collect::<Vec<_>>(),
+        ));
 
-        let metadata_array = match metadata {
-            Some(meta) => Arc::new(StringArray::from(vec![Some(meta)])),
-            None => Arc::new(StringArray::from(vec![None::<String>])),
-        };
+        let metadata_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            metadatas.iter().map(|m| m.as_deref()).collect::<Vec<_>>(),
+        ));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec![object_id.as_str()])),
-                Arc::new(StringArray::from(vec![object_type.as_str()])),
+                Arc::new(StringArray::from(object_ids)),
+                Arc::new(StringArray::from(object_types.to_vec())),
                 location_array,
                 metadata_array,
                 Arc::new(base_objects_array),
             ],
         )
-        .map_err(|e| Error::io(format!("Failed to create manifest entry: {}", e)))?;
+        .map_err(|e| Error::io(format!("Failed to create manifest entries: {}", e)))?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
@@ -924,7 +970,7 @@ impl ManifestNamespace {
             .execute_reader(Box::new(reader))
             .await
             .map_err(|e| {
-                convert_lance_commit_error(&e, "Failed to execute merge", Some(&object_id))
+                convert_lance_commit_error(&e, "Failed to execute merge insert into manifest", None)
             })?;
 
         let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
@@ -1598,10 +1644,12 @@ impl ManifestNamespace {
     /// 1. Try to load an existing manifest table
     /// 2. If it exists, check and migrate the schema if needed (e.g., add primary key metadata)
     /// 3. If it doesn't exist, create a new manifest table with the current schema
+    /// 4. Persist feature flags (e.g., table_version_storage_enabled) if requested
     async fn ensure_manifest_table_up_to_date(
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
+        table_version_storage_enabled: bool,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
@@ -1653,6 +1701,27 @@ impl ManifestNamespace {
                             e
                         ))))
                     })?;
+            }
+
+            // Persist table_version_storage_enabled flag in __manifest so that once
+            // enabled, it becomes a permanent property of this namespace.
+            if table_version_storage_enabled {
+                let needs_flag = dataset
+                    .metadata()
+                    .get("table_version_storage_enabled")
+                    .map(|v| v != "true")
+                    .unwrap_or(true);
+
+                if needs_flag
+                    && let Err(e) = dataset
+                        .update_metadata([("table_version_storage_enabled", "true")])
+                        .await
+                {
+                    log::warn!(
+                        "Failed to persist table_version_storage_enabled flag in __manifest: {:?}",
+                        e
+                    );
+                }
             }
 
             Ok(DatasetConsistencyWrapper::new(dataset))
@@ -2197,10 +2266,12 @@ impl LanceNamespace for ManifestNamespace {
         });
 
         self.insert_into_manifest_with_metadata(
-            object_id,
-            ObjectType::Namespace,
-            None,
-            metadata,
+            vec![ManifestEntry {
+                object_id,
+                object_type: ObjectType::Namespace,
+                location: None,
+                metadata,
+            }],
             None,
         )
         .await?;

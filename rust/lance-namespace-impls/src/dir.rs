@@ -26,17 +26,15 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchCommitTablesRequest, BatchCommitTablesResponse, BatchCreateTableVersionsRequest,
-    BatchCreateTableVersionsResponse, BatchDeleteTableVersionsRequest,
-    BatchDeleteTableVersionsResponse, CommitTableResult, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionEntry,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
-    DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceExistsRequest, TableExistsRequest, TableVersion,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
+    ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
+    TableExistsRequest, TableVersion,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -104,8 +102,7 @@ pub struct DirectoryNamespaceBuilder {
     inline_optimization_enabled: bool,
     table_version_tracking_enabled: bool,
     /// When true, table versions are stored in the `__manifest` table instead of
-    /// relying on Lance's native version management. This enables atomic multi-table
-    /// version creation via `batch_create_table_versions`.
+    /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
@@ -205,7 +202,6 @@ impl DirectoryNamespaceBuilder {
     ///
     /// When enabled, table versions are tracked as `table_version` entries in the
     /// `__manifest` Lance table. This enables:
-    /// - Atomic multi-table version creation via `batch_create_table_versions`
     /// - Centralized version tracking instead of per-table `_versions/` directories
     ///
     /// Requires `manifest_enabled` to be true.
@@ -507,6 +503,7 @@ impl DirectoryNamespaceBuilder {
                 self.dir_listing_enabled,
                 self.inline_optimization_enabled,
                 self.commit_retries,
+                self.table_version_storage_enabled,
             )
             .await
             {
@@ -523,22 +520,6 @@ impl DirectoryNamespaceBuilder {
         } else {
             None
         };
-
-        // Persist table_version_storage_enabled flag in __manifest so that once
-        // enabled, it becomes a permanent property of this namespace.
-        if self.table_version_storage_enabled {
-            if let Some(ref ns) = manifest_ns {
-                if let Err(e) = ns
-                    .set_property("table_version_storage_enabled", "true")
-                    .await
-                {
-                    log::warn!(
-                        "Failed to persist table_version_storage_enabled flag in __manifest: {:?}",
-                        e
-                    );
-                }
-            }
-        }
 
         // Create credential vendor once during initialization if enabled
         let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
@@ -634,7 +615,6 @@ pub struct DirectoryNamespace {
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
     /// When true, table versions are stored in the `__manifest` table.
-    /// Enables atomic multi-table version creation via `batch_create_table_versions`.
     table_version_storage_enabled: bool,
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
@@ -655,6 +635,13 @@ impl std::fmt::Display for DirectoryNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.namespace_id())
     }
+}
+
+/// Describes the version ranges to delete for a single table.
+/// Used by `batch_delete_table_versions` and `delete_physical_version_files`.
+struct TableDeleteEntry {
+    table_id: Option<Vec<String>>,
+    ranges: Vec<(i64, i64)>,
 }
 
 impl DirectoryNamespace {
@@ -969,6 +956,60 @@ impl DirectoryNamespace {
         }
 
         Ok(migrated_count)
+    }
+
+    /// Delete physical manifest files for the given table version ranges (best-effort).
+    ///
+    /// This helper is used by `batch_delete_table_versions` in both the manifest-enabled
+    /// and non-manifest paths. It resolves each table's storage location, computes the
+    /// version file paths, and attempts to delete them. Errors are logged (best-effort)
+    /// when `best_effort` is true, or returned immediately when false.
+    ///
+    /// Returns the number of files successfully deleted.
+    async fn delete_physical_version_files(
+        &self,
+        table_entries: &[TableDeleteEntry],
+        best_effort: bool,
+    ) -> Result<i64> {
+        let mut deleted_count = 0i64;
+        for te in table_entries {
+            let table_uri = self.resolve_table_location(&te.table_id).await?;
+            let table_path = Self::uri_to_object_store_path(&table_uri);
+            let table_path_str = table_path.as_ref();
+            let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+
+            for (start, end) in &te.ranges {
+                for version in *start..=*end {
+                    let version_path =
+                        versions_dir_path.child(format!("{}.manifest", version as u64));
+                    match self.object_store.inner.delete(&version_path).await {
+                        Ok(_) => {
+                            deleted_count += 1;
+                        }
+                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(e) => {
+                            if best_effort {
+                                log::warn!(
+                                    "Failed to delete manifest file for version {} of table {:?}: {:?}",
+                                    version,
+                                    te.table_id,
+                                    e
+                                );
+                            } else {
+                                return Err(Error::namespace_source(
+                                    format!(
+                                        "Failed to delete version {} for table at '{}': {}",
+                                        version, table_uri, e
+                                    )
+                                    .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(deleted_count)
     }
 }
 
@@ -1577,7 +1618,7 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Legacy behavior: list from _versions/ directory
+        // Fallback when table_version_storage is not enabled: list from _versions/ directory
         let table_uri = self.resolve_table_location(&request.id).await?;
 
         let table_path = Self::uri_to_object_store_path(&table_uri);
@@ -1768,10 +1809,12 @@ impl LanceNamespace for DirectoryNamespace {
 
                 if let Err(e) = manifest_ns
                     .insert_into_manifest_with_metadata(
-                        object_id,
-                        manifest::ObjectType::TableVersion,
-                        None,
-                        Some(metadata_json),
+                        vec![manifest::ManifestEntry {
+                            object_id,
+                            object_type: manifest::ObjectType::TableVersion,
+                            location: None,
+                            metadata: Some(metadata_json),
+                        }],
                         None,
                     )
                     .await
@@ -1810,7 +1853,7 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Legacy behavior: open the dataset to describe the version
+        // Fallback when table_version_storage is not enabled: open the dataset to describe the version
         let table_uri = self.resolve_table_location(&request.id).await?;
 
         // Use DatasetBuilder with storage options to support S3 with custom endpoints
@@ -1870,13 +1913,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
         // Single-table mode: use `id` (from path parameter) + `ranges` to delete
-        // versions from one table. For multi-table deletion, use `batch_commit_tables`
-        // with `CommitTableOperation::delete_table_versions`.
-        struct TableDeleteEntry {
-            table_id: Option<Vec<String>>,
-            ranges: Vec<(i64, i64)>,
-        }
-
+        // versions from one table.
         let ranges: Vec<(i64, i64)> = request
             .ranges
             .iter()
@@ -1931,29 +1968,9 @@ impl LanceNamespace for DirectoryNamespace {
                 // Even if some file deletions fail, the versions are already removed from
                 // __manifest, so they won't be visible to readers. Leftover files are
                 // orphaned but harmless and can be cleaned up later.
-                for te in &table_entries {
-                    let table_uri = self.resolve_table_location(&te.table_id).await?;
-                    let table_path = Self::uri_to_object_store_path(&table_uri);
-                    let table_path_str = table_path.as_ref();
-                    let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
-
-                    for (start, end) in &te.ranges {
-                        for version in *start..=*end {
-                            let version_path =
-                                versions_dir_path.child(format!("{}.manifest", version as u64));
-                            if let Err(e) = self.object_store.inner.delete(&version_path).await {
-                                if !matches!(e, object_store::Error::NotFound { .. }) {
-                                    log::warn!(
-                                        "Failed to delete manifest file for version {} of table {:?}: {:?}",
-                                        version,
-                                        te.table_id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                let _ = self
+                    .delete_physical_version_files(&table_entries, true)
+                    .await;
 
                 return Ok(BatchDeleteTableVersionsResponse {
                     deleted_count: Some(total_deleted_count),
@@ -1962,583 +1979,14 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Legacy behavior: delete physical files directly (no __manifest)
-        for te in &table_entries {
-            let table_uri = self.resolve_table_location(&te.table_id).await?;
-            let table_path = Self::uri_to_object_store_path(&table_uri);
-            let table_path_str = table_path.as_ref();
-            let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
-
-            for (start, end) in &te.ranges {
-                for version in *start..=*end {
-                    let version_path =
-                        versions_dir_path.child(format!("{}.manifest", version as u64));
-                    match self.object_store.inner.delete(&version_path).await {
-                        Ok(_) => {
-                            total_deleted_count += 1;
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {}
-                        Err(e) => {
-                            return Err(Error::namespace_source(
-                                format!(
-                                    "Failed to delete version {} for table at '{}': {}",
-                                    version, table_uri, e
-                                )
-                                .into(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        // Fallback when table_version_storage is not enabled: delete physical files directly (no __manifest)
+        total_deleted_count = self
+            .delete_physical_version_files(&table_entries, false)
+            .await?;
 
         Ok(BatchDeleteTableVersionsResponse {
             deleted_count: Some(total_deleted_count),
             transaction_id: None,
-        })
-    }
-
-    async fn batch_create_table_versions(
-        &self,
-        request: BatchCreateTableVersionsRequest,
-    ) -> Result<BatchCreateTableVersionsResponse> {
-        if !self.table_version_storage_enabled {
-            // Legacy behavior: sequentially create each version (no atomicity)
-            let mut versions = Vec::new();
-
-            for entry in &request.entries {
-                let create_request = CreateTableVersionRequest {
-                    id: Some(entry.id.clone()),
-                    version: entry.version,
-                    manifest_path: entry.manifest_path.clone(),
-                    manifest_size: entry.manifest_size,
-                    e_tag: entry.e_tag.clone(),
-                    metadata: entry.metadata.clone(),
-                    naming_scheme: entry.naming_scheme.clone(),
-                    ..Default::default()
-                };
-
-                let result = self.create_table_version(create_request).await?;
-                if let Some(version) = result.version {
-                    versions.push(*version);
-                }
-            }
-
-            return Ok(BatchCreateTableVersionsResponse {
-                transaction_id: None,
-                versions,
-            });
-        }
-
-        // Atomic multi-table version creation via __manifest table
-        let manifest_ns = self.manifest_ns.as_ref().ok_or_else(|| {
-            Error::namespace_source(
-                "table_version_storage_enabled requires manifest to be enabled and initialized"
-                    .into(),
-            )
-        })?;
-
-        // Pre-compute final paths and read staging data for all entries
-        struct StagingEntry {
-            entry: CreateTableVersionEntry,
-            final_path: object_store::path::Path,
-            staging_path: object_store::path::Path,
-            manifest_data: bytes::Bytes,
-            manifest_size: i64,
-        }
-
-        let mut staging_entries: Vec<StagingEntry> = Vec::with_capacity(request.entries.len());
-
-        for entry in &request.entries {
-            let table_uri = self.resolve_table_location(&Some(entry.id.clone())).await?;
-            let table_path = Self::uri_to_object_store_path(&table_uri);
-
-            let naming_scheme = match entry.naming_scheme.as_deref() {
-                Some("V1") => ManifestNamingScheme::V1,
-                _ => ManifestNamingScheme::V2,
-            };
-
-            let final_path = naming_scheme.manifest_path(&table_path, entry.version as u64);
-            let staging_path = Self::uri_to_object_store_path(&entry.manifest_path);
-
-            let manifest_data = self
-                .object_store
-                .inner
-                .get(&staging_path)
-                .await
-                .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
-                            "Failed to read staging manifest at '{}': {}",
-                            entry.manifest_path, e
-                        )
-                        .into(),
-                    )
-                })?
-                .bytes()
-                .await
-                .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
-                            "Failed to read staging manifest bytes at '{}': {}",
-                            entry.manifest_path, e
-                        )
-                        .into(),
-                    )
-                })?;
-
-            let manifest_size = manifest_data.len() as i64;
-
-            staging_entries.push(StagingEntry {
-                entry: entry.clone(),
-                final_path,
-                staging_path,
-                manifest_data,
-                manifest_size,
-            });
-        }
-
-        // Phase 1 (atomic commit point): Insert all version entries into __manifest.
-        // Uses MergeInsert with WhenMatched::Fail so if any version already exists,
-        // the entire batch is rejected. No files have been written yet, so there is
-        // nothing to roll back on conflict.
-        let manifest_entries: Vec<(String, manifest::ObjectType, Option<String>, Option<String>)> =
-            staging_entries
-                .iter()
-                .map(|se| {
-                    let table_id_str = manifest::ManifestNamespace::str_object_id(&se.entry.id);
-                    let object_id = manifest::ManifestNamespace::build_version_object_id(
-                        &table_id_str,
-                        se.entry.version,
-                    );
-                    let metadata_json = serde_json::json!({
-                        "manifest_path": se.final_path.to_string(),
-                        "manifest_size": se.manifest_size,
-                        "naming_scheme": se.entry.naming_scheme.as_deref().unwrap_or("V2"),
-                    })
-                    .to_string();
-                    (
-                        object_id,
-                        manifest::ObjectType::TableVersion,
-                        None, // location — not used for table versions
-                        Some(metadata_json),
-                    )
-                })
-                .collect();
-
-        manifest_ns
-            .batch_insert_into_manifest(manifest_entries)
-            .await
-            .map_err(|e| {
-                Error::namespace_source(
-                    format!("Atomic multi-table version creation failed: {}", e).into(),
-                )
-            })?;
-
-        // Phase 2: Copy staging manifests to their final locations (best-effort).
-        // The __manifest entries are already committed (Phase 1 is the atomic commit
-        // point), so the versions are logically visible to readers. Physical file
-        // writes are best-effort — failures are logged but do NOT roll back Phase 1.
-        // Metadata is the source of truth: if a physical file is missing, readers
-        // will see the version in __manifest but get a 404 on the file (orphaned
-        // metadata that can be repaired or retried later).
-        let mut committed: Vec<(StagingEntry, Option<String>)> =
-            Vec::with_capacity(staging_entries.len());
-
-        for se in staging_entries {
-            let put_result = self
-                .object_store
-                .inner
-                .put(&se.final_path, se.manifest_data.clone().into())
-                .await;
-
-            match put_result {
-                Ok(result) => {
-                    // Delete staging file (best-effort)
-                    if let Err(e) = self.object_store.inner.delete(&se.staging_path).await {
-                        log::warn!(
-                            "Failed to delete staging manifest at '{}': {:?}",
-                            se.staging_path,
-                            e
-                        );
-                    }
-                    committed.push((se, result.e_tag));
-                }
-                Err(e) => {
-                    // Log the failure but continue with remaining entries.
-                    // The __manifest entry is already committed so this version
-                    // is logically visible; the physical file can be retried later.
-                    log::warn!(
-                        "Failed to write manifest for table {:?} version {} (best-effort, \
-                         __manifest entry already committed): {:?}",
-                        se.entry.id,
-                        se.entry.version,
-                        e
-                    );
-                    committed.push((se, None));
-                }
-            }
-        }
-
-        // Phase 3: Build response
-        let versions: Vec<TableVersion> = committed
-            .into_iter()
-            .map(|(se, e_tag)| TableVersion {
-                version: se.entry.version,
-                manifest_path: se.final_path.to_string(),
-                manifest_size: Some(se.manifest_size),
-                e_tag,
-                timestamp_millis: None,
-                metadata: se.entry.metadata,
-            })
-            .collect();
-
-        Ok(BatchCreateTableVersionsResponse {
-            transaction_id: None,
-            versions,
-        })
-    }
-
-    async fn batch_commit_tables(
-        &self,
-        request: BatchCommitTablesRequest,
-    ) -> Result<BatchCommitTablesResponse> {
-        let manifest_ns = self.manifest_ns.as_ref().ok_or_else(|| {
-            Error::namespace_source(
-                "batch_commit_tables requires manifest to be enabled and initialized".into(),
-            )
-        })?;
-
-        if request.operations.is_empty() {
-            return Ok(BatchCommitTablesResponse {
-                transaction_id: None,
-                results: Vec::new(),
-            });
-        }
-
-        // Pre-process: resolve paths, read staging data, build manifest entries
-        // for the atomic Phase 1 commit.
-
-        // Entries to INSERT into __manifest (declare_table + create_table_version)
-        let mut insert_entries: Vec<(
-            String,
-            manifest::ObjectType,
-            Option<String>,
-            Option<String>,
-        )> = Vec::new();
-        // Object IDs to DELETE from __manifest (deregister_table + delete_table_versions)
-        let mut delete_object_ids: Vec<String> = Vec::new();
-
-        // Per-operation metadata for Phase 2 (physical I/O) and Phase 3 (response)
-        enum PreparedOp {
-            DeclareTable {
-                id: Vec<String>,
-                location: String,
-            },
-            CreateTableVersion {
-                id: Vec<String>,
-                version: i64,
-                final_path: object_store::path::Path,
-                staging_path: object_store::path::Path,
-                manifest_data: bytes::Bytes,
-                manifest_size: i64,
-                metadata: Option<std::collections::HashMap<String, String>>,
-            },
-            DeleteTableVersions {
-                version_count: i64,
-            },
-            DeregisterTable {
-                id: Vec<String>,
-                location: Option<String>,
-            },
-        }
-
-        let mut prepared_ops: Vec<PreparedOp> = Vec::with_capacity(request.operations.len());
-
-        for op in &request.operations {
-            if let Some(declare_op) = &op.declare_table {
-                let id = declare_op.id.clone().unwrap_or_default();
-                let table_name = Self::table_name_from_id(&Some(id.clone()))?;
-                let table_uri = self.table_full_uri(&table_name);
-
-                if let Some(loc) = &declare_op.location {
-                    let loc = loc.trim_end_matches('/');
-                    if loc != table_uri {
-                        return Err(Error::namespace_source(
-                            format!(
-                                "Cannot declare table {} at location {}, must be at location {}",
-                                table_name, loc, table_uri
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-
-                let (namespace_parts, tname) = manifest::ManifestNamespace::split_object_id(&id);
-                let full_object_id =
-                    manifest::ManifestNamespace::build_object_id(&namespace_parts, &tname);
-                let dir_name = manifest::ManifestNamespace::generate_dir_name(&full_object_id);
-                let object_id = manifest::ManifestNamespace::str_object_id(&id);
-
-                insert_entries.push((object_id, manifest::ObjectType::Table, Some(dir_name), None));
-                prepared_ops.push(PreparedOp::DeclareTable {
-                    id,
-                    location: table_uri,
-                });
-            } else if let Some(create_op) = &op.create_table_version {
-                let id = create_op.id.clone().unwrap_or_default();
-                let table_uri = self.resolve_table_location(&Some(id.clone())).await?;
-                let table_path = Self::uri_to_object_store_path(&table_uri);
-                let scheme = match create_op.naming_scheme.as_deref() {
-                    Some("V1") => ManifestNamingScheme::V1,
-                    _ => ManifestNamingScheme::V2,
-                };
-                let final_path = scheme.manifest_path(&table_path, create_op.version as u64);
-                let staging_path = Self::uri_to_object_store_path(&create_op.manifest_path);
-
-                let data = self
-                    .object_store
-                    .inner
-                    .get(&staging_path)
-                    .await
-                    .map_err(|e| {
-                        Error::namespace_source(
-                            format!(
-                                "Failed to read staging manifest at '{}': {}",
-                                create_op.manifest_path, e
-                            )
-                            .into(),
-                        )
-                    })?
-                    .bytes()
-                    .await
-                    .map_err(|e| {
-                        Error::namespace_source(
-                            format!(
-                                "Failed to read staging manifest bytes at '{}': {}",
-                                create_op.manifest_path, e
-                            )
-                            .into(),
-                        )
-                    })?;
-
-                let size = data.len() as i64;
-                let table_id_str = manifest::ManifestNamespace::str_object_id(&id);
-                let ver_object_id = manifest::ManifestNamespace::build_version_object_id(
-                    &table_id_str,
-                    create_op.version,
-                );
-                let metadata_json = serde_json::json!({
-                    "manifest_path": final_path.to_string(),
-                    "manifest_size": size,
-                    "naming_scheme": create_op.naming_scheme.as_deref().unwrap_or("V2"),
-                })
-                .to_string();
-
-                insert_entries.push((
-                    ver_object_id,
-                    manifest::ObjectType::TableVersion,
-                    None,
-                    Some(metadata_json),
-                ));
-                prepared_ops.push(PreparedOp::CreateTableVersion {
-                    id,
-                    version: create_op.version,
-                    final_path,
-                    staging_path,
-                    manifest_data: data,
-                    manifest_size: size,
-                    metadata: create_op.metadata.clone(),
-                });
-            } else if let Some(delete_op) = &op.delete_table_versions {
-                let id = delete_op.id.clone().unwrap_or_default();
-                let table_id_str = manifest::ManifestNamespace::str_object_id(&id);
-                let mut count = 0i64;
-                for range in &delete_op.ranges {
-                    let start = range.start_version;
-                    let end = if range.end_version > 0 {
-                        range.end_version
-                    } else {
-                        start
-                    };
-                    for version in start..=end {
-                        let oid = manifest::ManifestNamespace::build_version_object_id(
-                            &table_id_str,
-                            version,
-                        );
-                        delete_object_ids.push(oid);
-                        count += 1;
-                    }
-                }
-                prepared_ops.push(PreparedOp::DeleteTableVersions {
-                    version_count: count,
-                });
-            } else if let Some(deregister_op) = &op.deregister_table {
-                let id = deregister_op.id.clone().unwrap_or_default();
-                let object_id = manifest::ManifestNamespace::str_object_id(&id);
-                // Look up the table location before we delete
-                let location = match self.resolve_table_location(&Some(id.clone())).await {
-                    Ok(loc) => Some(loc),
-                    Err(_) => None,
-                };
-                delete_object_ids.push(object_id);
-                prepared_ops.push(PreparedOp::DeregisterTable { id, location });
-            } else {
-                return Err(Error::invalid_input(
-                    "CommitTableOperation must have exactly one operation field set",
-                ));
-            }
-        }
-
-        // Phase 1 (atomic commit point): Execute inserts and deletes atomically.
-        // Inserts use MergeInsert (WhenMatched::Fail), deletes use DeleteBuilder.
-        // We execute inserts first, then deletes. Both are individual atomic ops on __manifest.
-        if !insert_entries.is_empty() {
-            manifest_ns
-                .batch_insert_into_manifest(insert_entries)
-                .await
-                .map_err(|e| {
-                    Error::namespace_source(
-                        format!("Atomic batch commit (insert phase) failed: {}", e).into(),
-                    )
-                })?;
-        }
-
-        if !delete_object_ids.is_empty() {
-            manifest_ns
-                .batch_delete_table_versions_by_object_ids(&delete_object_ids)
-                .await
-                .map_err(|e| {
-                    Error::namespace_source(
-                        format!("Atomic batch commit (delete phase) failed: {}", e).into(),
-                    )
-                })?;
-        }
-
-        // Phase 2: Physical I/O (best-effort).
-        // Write manifest files, delete staging files, create marker files, etc.
-        let mut results: Vec<CommitTableResult> = Vec::with_capacity(prepared_ops.len());
-
-        for prepared in prepared_ops {
-            match prepared {
-                PreparedOp::DeclareTable { id, location } => {
-                    // Best-effort: create .lance-reserved marker file
-                    let table_name = Self::table_name_from_id(&Some(id.clone()))?;
-                    let reserved_file_path = self.table_reserved_file_path(&table_name);
-                    if let Err(e) = self
-                        .put_marker_file_atomic(
-                            &reserved_file_path,
-                            &format!("table {}", table_name),
-                        )
-                        .await
-                    {
-                        log::warn!(
-                            "Failed to create .lance-reserved marker for table {:?} (best-effort): {}",
-                            id,
-                            e
-                        );
-                    }
-                    results.push(CommitTableResult {
-                        declare_table: Some(Box::new(DeclareTableResponse {
-                            transaction_id: None,
-                            location: Some(location),
-                            storage_options: None,
-                            properties: None,
-                            managed_versioning: None,
-                        })),
-                        create_table_version: None,
-                        delete_table_versions: None,
-                        deregister_table: None,
-                    });
-                }
-                PreparedOp::CreateTableVersion {
-                    id,
-                    version,
-                    final_path,
-                    staging_path,
-                    manifest_data,
-                    manifest_size,
-                    metadata,
-                } => {
-                    let mut e_tag = None;
-                    match self
-                        .object_store
-                        .inner
-                        .put(&final_path, manifest_data.into())
-                        .await
-                    {
-                        Ok(result) => {
-                            e_tag = result.e_tag;
-                            // Delete staging file (best-effort)
-                            if let Err(e) = self.object_store.inner.delete(&staging_path).await {
-                                log::warn!(
-                                    "Failed to delete staging manifest at '{}': {:?}",
-                                    staging_path,
-                                    e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to write manifest for table {:?} version {} \
-                                 (best-effort, __manifest entry already committed): {:?}",
-                                id,
-                                version,
-                                e
-                            );
-                        }
-                    }
-                    results.push(CommitTableResult {
-                        declare_table: None,
-                        create_table_version: Some(Box::new(CreateTableVersionResponse {
-                            transaction_id: None,
-                            version: Some(Box::new(TableVersion {
-                                version,
-                                manifest_path: final_path.to_string(),
-                                manifest_size: Some(manifest_size),
-                                e_tag,
-                                timestamp_millis: None,
-                                metadata,
-                            })),
-                        })),
-                        delete_table_versions: None,
-                        deregister_table: None,
-                    });
-                }
-                PreparedOp::DeleteTableVersions { version_count } => {
-                    // Physical file deletion is handled separately if needed.
-                    // The metadata is already deleted in Phase 1.
-                    results.push(CommitTableResult {
-                        declare_table: None,
-                        create_table_version: None,
-                        delete_table_versions: Some(Box::new(BatchDeleteTableVersionsResponse {
-                            deleted_count: Some(version_count),
-                            transaction_id: None,
-                        })),
-                        deregister_table: None,
-                    });
-                }
-                PreparedOp::DeregisterTable { id, location } => {
-                    results.push(CommitTableResult {
-                        declare_table: None,
-                        create_table_version: None,
-                        delete_table_versions: None,
-                        deregister_table: Some(Box::new(
-                            lance_namespace::models::DeregisterTableResponse {
-                                transaction_id: None,
-                                id: Some(id),
-                                location,
-                                properties: None,
-                            },
-                        )),
-                    });
-                }
-            }
-        }
-
-        Ok(BatchCommitTablesResponse {
-            transaction_id: None,
-            results,
         })
     }
 
@@ -5622,9 +5070,7 @@ mod tests {
         use super::*;
         use futures::TryStreamExt;
         use lance::dataset::builder::DatasetBuilder;
-        use lance_namespace::models::{
-            BatchCreateTableVersionsRequest, CreateTableVersionEntry, CreateTableVersionRequest,
-        };
+        use lance_namespace::models::CreateTableVersionRequest;
 
         /// Helper to create a namespace with table_version_storage_enabled enabled
         async fn create_managed_namespace(temp_path: &str) -> Arc<DirectoryNamespace> {
@@ -5702,130 +5148,6 @@ mod tests {
                 .unwrap();
 
             (table_id, staging_path)
-        }
-
-        #[tokio::test]
-        #[cfg(not(windows))]
-        async fn test_batch_create_table_versions_atomic() {
-            // Test that batch_create_table_versions with table_version_storage_enabled
-            // atomically creates versions for multiple tables.
-            let temp_dir = TempStrDir::default();
-            let temp_path: &str = &temp_dir;
-
-            let namespace = create_managed_namespace(temp_path).await;
-            let ns: Arc<dyn LanceNamespace> = namespace.clone();
-
-            // Create two tables
-            let (table_id_1, staging_path_1) =
-                create_table_and_get_staging(ns.clone(), "table_a").await;
-            let (table_id_2, staging_path_2) =
-                create_table_and_get_staging(ns.clone(), "table_b").await;
-
-            // Batch create version 2 for both tables atomically
-            let entries = vec![
-                CreateTableVersionEntry::new(table_id_1.clone(), 2, staging_path_1.to_string()),
-                CreateTableVersionEntry::new(table_id_2.clone(), 2, staging_path_2.to_string()),
-            ];
-            let request = BatchCreateTableVersionsRequest::new(entries);
-
-            let response = namespace
-                .batch_create_table_versions(request)
-                .await
-                .unwrap();
-
-            // Both versions should be created
-            assert_eq!(response.versions.len(), 2, "Should have created 2 versions");
-            assert_eq!(response.versions[0].version, 2);
-            assert_eq!(response.versions[1].version, 2);
-
-            // Verify manifest files exist at the returned paths
-            for version in &response.versions {
-                let path = Path::from(version.manifest_path.clone());
-                let head_result = namespace.object_store.inner.head(&path).await;
-                assert!(
-                    head_result.is_ok(),
-                    "Manifest file should exist at {}",
-                    version.manifest_path
-                );
-            }
-        }
-
-        #[tokio::test]
-        #[cfg(not(windows))]
-        async fn test_batch_create_conflict_detection() {
-            // Test that batch_create_table_versions fails when a version already exists
-            let temp_dir = TempStrDir::default();
-            let temp_path: &str = &temp_dir;
-
-            let namespace = create_managed_namespace(temp_path).await;
-            let ns: Arc<dyn LanceNamespace> = namespace.clone();
-
-            // Create a table
-            let (table_id_1, staging_path_1) =
-                create_table_and_get_staging(ns.clone(), "table_conflict").await;
-
-            // First: create version 2 via single create_table_version
-            let mut create_req = CreateTableVersionRequest::new(2, staging_path_1.to_string());
-            create_req.id = Some(table_id_1.clone());
-            create_req.naming_scheme = Some("V2".to_string());
-            namespace.create_table_version(create_req).await.unwrap();
-
-            // Re-stage a manifest for the next attempt
-            let dataset = DatasetBuilder::from_namespace(ns.clone(), table_id_1.clone())
-                .await
-                .unwrap()
-                .load()
-                .await
-                .unwrap();
-
-            let versions_path = dataset.versions_dir();
-            let manifest_metas: Vec<_> = dataset
-                .object_store()
-                .inner
-                .list(Some(&versions_path))
-                .try_collect()
-                .await
-                .unwrap();
-            let manifest_meta = manifest_metas
-                .iter()
-                .find(|m| {
-                    m.location
-                        .filename()
-                        .map(|f| f.ends_with(".manifest"))
-                        .unwrap_or(false)
-                })
-                .expect("No manifest file found");
-            let manifest_data = dataset
-                .object_store()
-                .inner
-                .get(&manifest_meta.location)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            let staging_path_2 = dataset.versions_dir().child("staging_conflict_2");
-            dataset
-                .object_store()
-                .inner
-                .put(&staging_path_2, manifest_data.into())
-                .await
-                .unwrap();
-
-            // Try to batch create version 2 again - should fail because
-            // the version entry already exists in __manifest
-            let entries = vec![CreateTableVersionEntry::new(
-                table_id_1.clone(),
-                2,
-                staging_path_2.to_string(),
-            )];
-            let request = BatchCreateTableVersionsRequest::new(entries);
-
-            let result = namespace.batch_create_table_versions(request).await;
-            assert!(
-                result.is_err(),
-                "batch_create should fail when version already exists in __manifest"
-            );
         }
 
         #[tokio::test]
