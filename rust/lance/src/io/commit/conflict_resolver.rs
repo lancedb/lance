@@ -523,11 +523,9 @@ impl<'a> TransactionRebase<'a> {
                             idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
                         })
                         .any(|new_index| {
-                            created_indices.iter().any(|created_index| {
-                                created_index.name != FRAG_REUSE_INDEX_NAME
-                                    && created_index.name != MEM_WAL_INDEX_NAME
-                                    && created_index.name == new_index.name
-                            })
+                            created_indices
+                                .iter()
+                                .any(|created_index| created_index.name == new_index.name)
                         });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
