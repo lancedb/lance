@@ -14,6 +14,7 @@ use lance_core::{
     Error, Result,
     utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
 };
+use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_table::format::IndexMetadata;
@@ -1451,7 +1452,11 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
-        if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
+        if let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &mut self.transaction.operation
+        {
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -1531,6 +1536,25 @@ impl<'a> TransactionRebase<'a> {
 
                 let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
                 new_indices.push(new_meta);
+            }
+
+            for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+                if new_indices.iter().any(|idx| idx.name == singleton_name) {
+                    for existing_idx in dataset
+                        .load_indices()
+                        .await?
+                        .iter()
+                        .filter(|idx| idx.name == singleton_name)
+                        .cloned()
+                    {
+                        if !removed_indices
+                            .iter()
+                            .any(|removed_idx| removed_idx.uuid == existing_idx.uuid)
+                        {
+                            removed_indices.push(existing_idx);
+                        }
+                    }
+                }
             }
 
             Ok(self.transaction)

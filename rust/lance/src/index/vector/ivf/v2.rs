@@ -2367,6 +2367,7 @@ mod tests {
             Some((dataset.clone(), vectors.clone())),
         )
         .await;
+        dataset.checkout_latest().await.unwrap();
         // retest with v3 params on the same dataset
         test_index(
             v3_params,
