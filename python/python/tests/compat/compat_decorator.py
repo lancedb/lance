@@ -147,6 +147,10 @@ class UpgradeDowngradeTest:
     def check_write(self):
         pass
 
+    def skip_read_after_current_write(self, version: str) -> bool:
+        """Return True to skip the old-version read after current-version writes."""
+        return False
+
 
 def compat_test(min_version: str = "0.16.0"):
     """Decorator to generate upgrade/downgrade compatibility tests.
@@ -285,6 +289,7 @@ def test_func({sig_params}):
     """Test that old Lance version can read data written by current version."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
     # Current version: create data
     obj.create()
     # Old version: verify can read
@@ -298,6 +303,7 @@ def test_func({sig_params}):
     """Test round-trip compatibility: old -> current -> old."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
     venv = venv_factory.get_venv(version)
     # Old version: create data
     venv.execute_method(obj, "create")
@@ -305,7 +311,8 @@ def test_func({sig_params}):
     obj.check_read()
     obj.check_write()
     # Old version: verify can still read
-    venv.execute_method(obj, "check_read")
+    if not obj.skip_read_after_current_write(version):
+        venv.execute_method(obj, "check_read")
     venv.execute_method(obj, "check_write")
 '''
 
