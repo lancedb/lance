@@ -445,7 +445,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 .load_indices()
                 .await?
                 .iter()
-                .filter(|idx| idx.name == new_idx.name && idx.fields == new_idx.fields)
+                .filter(|idx| idx.name == new_idx.name)
                 .cloned()
                 .collect()
         } else {
