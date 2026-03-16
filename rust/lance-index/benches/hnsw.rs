@@ -32,7 +32,6 @@ fn bench_hnsw(c: &mut Criterion) {
     const DIMENSION: usize = 128;
     const TOTAL: usize = 100_000;
     const SEED: [u8; 32] = [42; 32];
-    const HNSW_LEVEL_SEED: u64 = 42;
     const K: usize = 100;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -46,7 +45,7 @@ fn bench_hnsw(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let hnsw = HNSW::index_vectors(
                 vectors.as_ref(),
-                HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                HnswBuildParams::default(),
             )
             .unwrap();
             let uids: HashSet<u32> = hnsw
@@ -76,7 +75,7 @@ fn bench_hnsw(c: &mut Criterion) {
         .install(|| {
             HNSW::index_vectors(
                 vectors.as_ref(),
-                HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                HnswBuildParams::default(),
             )
         })
         .unwrap();
@@ -109,7 +108,6 @@ fn bench_hnsw_sq(c: &mut Criterion) {
     const DIMENSION: usize = 128;
     const TOTAL: usize = 100_000;
     const SEED: [u8; 32] = [42; 32];
-    const HNSW_LEVEL_SEED: u64 = 42;
     const K: usize = 100;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -147,7 +145,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let hnsw = HNSW::index_vectors(
                     vectors.as_ref(),
-                    HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                    HnswBuildParams::default(),
                 )
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
@@ -178,7 +176,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
         .install(|| {
             HNSW::index_vectors(
                 vectors.as_ref(),
-                HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                HnswBuildParams::default(),
             )
         })
         .unwrap();
@@ -211,7 +209,6 @@ fn bench_hnsw_pq(c: &mut Criterion) {
     const DIMENSION: usize = 128;
     const TOTAL: usize = 100_000;
     const SEED: [u8; 32] = [42; 32];
-    const HNSW_LEVEL_SEED: u64 = 42;
     const K: usize = 100;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -252,7 +249,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let hnsw = HNSW::index_vectors(
                     vectors.as_ref(),
-                    HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                    HnswBuildParams::default(),
                 )
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
@@ -283,7 +280,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
         .install(|| {
             HNSW::index_vectors(
                 vectors.as_ref(),
-                HnswBuildParams::default().level_seed(HNSW_LEVEL_SEED),
+                HnswBuildParams::default(),
             )
         })
         .unwrap();

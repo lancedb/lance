@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, SeedableRng, rng, rngs::StdRng};
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -58,9 +58,6 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
-
-    /// Optional seed for deterministic level generation.
-    pub level_seed: Option<u64>,
 }
 
 impl Default for HnswBuildParams {
@@ -70,7 +67,6 @@ impl Default for HnswBuildParams {
             m: 20,
             ef_construction: 150,
             prefetch_distance: Some(2),
-            level_seed: None,
         }
     }
 }
@@ -96,12 +92,6 @@ impl HnswBuildParams {
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Seed the random level generation for deterministic graph structure.
-    pub fn level_seed(mut self, level_seed: u64) -> Self {
-        self.level_seed = Some(level_seed);
         self
     }
 
@@ -446,22 +436,12 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
-            if let Some(level_seed) = builder.params.level_seed {
-                let mut level_rng = StdRng::seed_from_u64(level_seed);
-                for i in 1..len {
-                    nodes.push(RwLock::new(GraphBuilderNode::new(
-                        i as u32,
-                        builder.random_level(&mut level_rng) as usize + 1,
-                    )));
-                }
-            } else {
-                let mut level_rng = rng();
-                for i in 1..len {
-                    nodes.push(RwLock::new(GraphBuilderNode::new(
-                        i as u32,
-                        builder.random_level(&mut level_rng) as usize + 1,
-                    )));
-                }
+            let mut level_rng = rng();
+            for i in 1..len {
+                nodes.push(RwLock::new(GraphBuilderNode::new(
+                    i as u32,
+                    builder.random_level(&mut level_rng) as usize + 1,
+                )));
             }
         }
         builder.nodes = Arc::new(nodes);
@@ -555,7 +535,7 @@ impl HnswBuilder {
         ep: &OrderedNode,
         level: u16,
         dist_calc: &impl DistCalculator,
-        nodes: &Vec<RwLock<GraphBuilderNode>>,
+        nodes: &[RwLock<GraphBuilderNode>],
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
@@ -993,8 +973,7 @@ mod tests {
             store.as_ref(),
             HnswBuildParams::default()
                 .num_edges(NUM_EDGES)
-                .ef_construction(50)
-                .level_seed(42),
+                .ef_construction(50),
         )
         .unwrap();
 
