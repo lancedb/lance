@@ -3775,8 +3775,8 @@ mod tests {
 
     #[test]
     fn test_legacy_compressed_positions_still_readable() {
-        let doc_ids = vec![1_u32, 3_u32];
-        let frequencies = vec![2_u32, 3_u32];
+        let doc_ids = [1_u32, 3_u32];
+        let frequencies = [2_u32, 3_u32];
         let posting = compress_posting_list_with_tail_codec(
             doc_ids.len(),
             doc_ids.iter(),
@@ -3845,8 +3845,8 @@ mod tests {
 
     #[test]
     fn test_shared_stream_v2_without_codec_still_readable() {
-        let doc_ids = vec![1_u32, 3_u32];
-        let frequencies = vec![2_u32, 3_u32];
+        let doc_ids = [1_u32, 3_u32];
+        let frequencies = [2_u32, 3_u32];
         let posting = compress_posting_list_with_tail_codec(
             doc_ids.len(),
             doc_ids.iter(),

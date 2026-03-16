@@ -52,6 +52,30 @@ impl<'a> Iterator for PostingListIterator<'a> {
 pub type PlainPostingListIterator<'a> =
     Box<dyn Iterator<Item = (u64, f32, Option<Box<dyn Iterator<Item = u32> + 'a>>)> + 'a>;
 
+struct OwnedPositionsIter {
+    positions: Box<[u32]>,
+    index: usize,
+}
+
+impl OwnedPositionsIter {
+    fn new(positions: &[u32]) -> Self {
+        Self {
+            positions: Box::<[u32]>::from(positions),
+            index: 0,
+        }
+    }
+}
+
+impl Iterator for OwnedPositionsIter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let position = self.positions.get(self.index).copied()?;
+        self.index += 1;
+        Some(position)
+    }
+}
+
 pub struct CompressedPostingListIterator {
     remainder: usize,
     blocks: LargeBinaryArray,
@@ -116,7 +140,7 @@ impl Iterator for CompressedPostingListIterator {
                 CompressedPositionStorage::SharedStream(_) => {
                     let start = self.position_offsets[self.doc_idx_in_block];
                     let end = self.position_offsets[self.doc_idx_in_block + 1];
-                    Box::new(self.decoded_positions[start..end].to_vec().into_iter())
+                    Box::new(OwnedPositionsIter::new(&self.decoded_positions[start..end]))
                         as Box<dyn Iterator<Item = u32>>
                 }
             });

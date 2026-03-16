@@ -912,9 +912,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(|posting| posting.position_cursor().expect("positions must exist"))
             .collect::<Vec<_>>();
         position_iters.sort_unstable_by_key(|iter| iter.len());
-        let lead = match position_iters.first() {
-            Some(anchor) => anchor,
-            None => return false,
+        let Some(lead) = position_iters.first() else {
+            return false;
         };
         let lead_position = lead.position_in_query;
 
